@@ -1,5 +1,5 @@
 <p align="center">
-  Redis compatible server implemented with [buntdb](https://github.com/tidwall/buntdb)
+  Redis compatible server implemented with <a href="https://github.com/tidwall/buntdb">buntdb</a>
   <br/>
   <br/>
   <a href="https://github.com/kcmvp/respx/blob/main/LICENSE">
@@ -31,4 +31,3 @@
 ```bash
 go get github.com/kcmvp/respx
 ```
-
