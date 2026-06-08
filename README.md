@@ -5,9 +5,11 @@
   <a href="https://github.com/kcmvp/respx/blob/main/LICENSE">
     <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/dvo"/>
   </a>
-
   <a href="https://pkg.go.dev/github.com/kcmvp/respx">
     <img src="https://pkg.go.dev/badge/github.com/kcmvp/respx.svg" alt="Go Reference"/>
+  </a>
+  <a href="https://goreportcard.com/report/github.com/kcmvp/respx">
+    <img src="https://goreportcard.com/badge/github.com/kcmvp/respx" alt="report"/>
   </a>
   <a href="https://github.com/kcmvp/archunit/blob/main/.github/workflows/build.yml" rel="nofollow">
      <img src="https://img.shields.io/github/actions/workflow/status/kcmvp/dvo/build.yml?branch=main" alt="Build" />
