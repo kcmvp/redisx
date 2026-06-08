@@ -17,7 +17,7 @@ const clientTestMaxConns = 3
 
 func ensureClientTestServer(t *testing.T) {
 	t.Helper()
-	t.Setenv("mresp.auth_key", clientTestExternalAuthKey)
+	t.Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
 
 	server.Start(clientTestServerAddr, clientTestMaxConns)
 

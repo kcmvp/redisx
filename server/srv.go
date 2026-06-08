@@ -12,8 +12,7 @@ import (
 )
 
 const (
-	privateAddr     = "127.0.0.1:6380"
-	mrespAuthKeyEnv = "mresp.auth_key"
+	privateAddr = "127.0.0.1:6380"
 
 	cmdAuth       = "auth"
 	cmdHello      = "hello"
@@ -45,7 +44,7 @@ var (
 )
 
 func resolveExternalAuthKey(getenv func(string) string) string {
-	if v := getenv(mrespAuthKeyEnv); v != "" {
+	if v := getenv(internal.RespxAuthKeyEnv); v != "" {
 		return v
 	}
 	return rand.Text()
@@ -56,8 +55,8 @@ func ensureExternalAuthKey() {
 		return
 	}
 	authKey = resolveExternalAuthKey(os.Getenv)
-	if os.Getenv(mrespAuthKeyEnv) == "" {
-		slog.Warn("auth key env is not set, generated random external auth key", "env", mrespAuthKeyEnv)
+	if os.Getenv(internal.RespxAuthKeyEnv) == "" {
+		slog.Warn("auth key env is not set, generated random external auth key", "env", internal.RespxAuthKeyEnv)
 	}
 }
 
