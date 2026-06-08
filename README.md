@@ -6,7 +6,7 @@
     <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/dvo"/>
   </a>
   <a href="https://goreportcard.com/report/github.com/kcmvp/respx">
-    <img src="https://goreportcard.com/badge/github.com/kcmvp/respx" alt=""/>
+    <img src="https://goreportcard.com/badge/github.com/kcmvp/respx" alt="report"/>
   </a>
   <a href="https://pkg.go.dev/github.com/kcmvp/respx">
     <img src="https://pkg.go.dev/badge/github.com/kcmvp/respx.svg" alt="Go Reference"/>
