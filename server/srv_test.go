@@ -56,7 +56,6 @@ func resetTestState(t *testing.T) {
 	originalInternalAuthKey := internalAuthKey
 	originalAuthKey := authKey
 	originalExternalMaxConns := externalMaxConns
-	originalSrvOnce := srvOnce
 	originalListenAndServeFn := listenAndServeFn
 
 	connAuthState = make(map[string]string)
@@ -71,7 +70,6 @@ func resetTestState(t *testing.T) {
 		internalAuthKey = originalInternalAuthKey
 		authKey = originalAuthKey
 		externalMaxConns = originalExternalMaxConns
-		srvOnce = originalSrvOnce
 		listenAndServeFn = originalListenAndServeFn
 	})
 }
