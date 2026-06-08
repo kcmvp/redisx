@@ -1,5 +1,5 @@
 <p align="center">
-  Declarative Value Object (DVO)
+  Redis compatible server implemented with [buntdb](https://github.com/tidwall/buntdb)
   <br/>
   <br/>
   <a href="https://github.com/kcmvp/respx/blob/main/LICENSE">
@@ -20,7 +20,7 @@
 
 </p>
 
-Redis compatible server implemented with [buntdb](https://github.com/tidwall/buntdb)
+
 
 
 ## Features
