@@ -14,8 +14,8 @@
   <a href="https://github.com/kcmvp/archunit/blob/main/.github/workflows/build.yml" rel="nofollow">
      <img src="https://img.shields.io/github/actions/workflow/status/kcmvp/dvo/build.yml?branch=main" alt="Build" />
   </a>
-  <a href="https://app.codecov.io/gh/kcmvp/dvo" ref="nofollow">
-    <img src ="https://img.shields.io/codecov/c/github/kcmvp/dvo" alt="coverage"/>
+  <a href="https://app.codecov.io/gh/kcmvp/respx" ref="nofollow">
+    <img src ="https://img.shields.io/codecov/c/github/kcmvp/respx" alt="coverage"/>
   </a>
 
 </p>
