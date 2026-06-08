@@ -1,0 +1,413 @@
+package client
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/samber/lo"
+)
+
+const (
+	bufferSize     = 200
+	dialTimeout    = 3 * time.Second
+	reconnectEvery = 5 * time.Second
+)
+
+// ReceivedMessage is a transport-agnostic message exposed to callers.
+type ReceivedMessage struct {
+	Channel string
+	Pattern string
+	Payload string
+}
+
+type outgoingMessage struct {
+	topic   string
+	payload string
+}
+
+// MessageHandler is a writable channel that receives streamed messages.
+type MessageHandler chan<- *ReceivedMessage
+
+var (
+	pubChan   = make(chan outgoingMessage, bufferSize)
+	pipeDrops uint64
+	subReqCh  = make(chan string, bufferSize)
+
+	handlersMu      sync.RWMutex
+	handlersByTopic = make(map[string]MessageHandler)
+
+	kvClientMu sync.RWMutex
+	kvClient   *redis.Client
+	cliOnce    sync.Once
+)
+
+func setSharedClient(client *redis.Client) *redis.Client {
+	kvClientMu.Lock()
+	prev := kvClient
+	kvClient = client
+	kvClientMu.Unlock()
+	return prev
+}
+
+func getSharedClient() *redis.Client {
+	kvClientMu.RLock()
+	client := kvClient
+	kvClientMu.RUnlock()
+	return client
+}
+
+func clearSharedClientIf(target *redis.Client) {
+	kvClientMu.Lock()
+	if kvClient == target {
+		kvClient = nil
+	}
+	kvClientMu.Unlock()
+}
+
+// RegisterHandler registers a message handler for a topic.
+func RegisterHandler(topic string, handler MessageHandler) error {
+	if topic == "" {
+		return errors.New("topic is empty")
+	}
+	if handler == nil {
+		return errors.New("handler channel is nil")
+	}
+
+	handlersMu.Lock()
+	if _, exists := handlersByTopic[topic]; exists {
+		handlersMu.Unlock()
+		return errors.New("duplicated handler for topic")
+	}
+	handlersByTopic[topic] = handler
+	handlersMu.Unlock()
+
+	select {
+	case subReqCh <- topic:
+	default:
+	}
+
+	return nil
+}
+
+// Connect starts the bridge lifecycle.
+func Connect(respAddr, authKey string) error {
+	if authKey == "" {
+		return errors.New("auth key is empty")
+	}
+
+	cliOnce.Do(func() {
+		go func() {
+			for {
+				var err error
+				var client *redis.Client
+				_, _, _ = lo.AttemptWhileWithDelay(-1, reconnectEvery, func(i int, duration time.Duration) (error, bool) {
+					if client, err = connect(respAddr, authKey); err != nil {
+						slog.Warn("mresp connect failed", "error", err)
+						return err, true
+					}
+					return nil, false
+				})
+
+				if prev := setSharedClient(client); prev != nil && prev != client {
+					if err := prev.Close(); err != nil {
+						slog.Warn("mresp close previous client failed", "error", err)
+					}
+				}
+
+				slog.Info("mresp connected")
+
+				runCtx, cancelRun := context.WithCancel(context.Background())
+				firstExit := make(chan string, 1)
+				var wg sync.WaitGroup
+				notifyExit := func(worker string) {
+					select {
+					case firstExit <- worker:
+					default:
+					}
+				}
+
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					if err := produce(runCtx, client); err != nil {
+						slog.Warn("mresp producer exited", "error", err)
+					}
+					notifyExit("producer")
+				}()
+				go func() {
+					defer wg.Done()
+					if err := consume(runCtx, client); err != nil {
+						slog.Warn("mresp consumer exited", "error", err)
+					}
+					notifyExit("consumer")
+				}()
+
+				healthTicker := time.NewTicker(5 * time.Second)
+				lost := false
+
+				for !lost {
+					select {
+					case worker := <-firstExit:
+						slog.Warn("mresp connection lost, restarting lifecycle", "worker", worker)
+						lost = true
+					case <-healthTicker.C:
+						if err := healthCheck(context.Background(), client); err != nil {
+							slog.Warn("mresp connection lost, restarting lifecycle", "error", err)
+							lost = true
+						}
+					}
+				}
+
+				healthTicker.Stop()
+				cancelRun()
+
+				// Remove this client from shared state first, then close it to unblock workers.
+				clearSharedClientIf(client)
+				if err := client.Close(); err != nil {
+					slog.Warn("mresp close client failed", "error", err)
+				}
+
+				waitDone := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(waitDone)
+				}()
+
+				waitTicker := time.NewTicker(1 * time.Second)
+				for {
+					select {
+					case <-waitDone:
+						waitTicker.Stop()
+						goto workersStopped
+					case <-waitTicker.C:
+						slog.Warn("mresp still waiting workers to stop")
+					}
+				}
+
+			workersStopped:
+			}
+		}()
+	})
+
+	return nil
+}
+
+// Get retrieves the value for the given key using the shared resp client.
+func Get(key string) (string, error) {
+	if key == "" {
+		return "", nil
+	}
+	client := getSharedClient()
+	if client == nil {
+		return "", errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	val, err := client.Get(ctx, key).Result()
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// Set stores a value for the given key using the shared resp client.
+func Set(key, value string) error {
+	if key == "" {
+		return nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.Set(ctx, key, value, 0).Err()
+}
+
+// Auth authenticates the shared resp client connection with the given key.
+func Auth(authKey string) error {
+	if authKey == "" {
+		return errors.New("auth key is empty")
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.Do(ctx, "AUTH", authKey).Err()
+}
+
+// SendTo enqueues a message for publishing to a specific topic.
+func SendTo(topic, msg string) bool {
+	if topic == "" {
+		return false
+	}
+
+	if getSharedClient() == nil {
+		slog.Warn("mresp send skipped, resp client is not connected")
+		return false
+	}
+
+	select {
+	case pubChan <- outgoingMessage{topic: topic, payload: msg}:
+		return true
+	default:
+		cnt := atomic.AddUint64(&pipeDrops, 1)
+		if cnt%100 == 0 {
+			slog.Warn("pubChan is full, message dropped", "total_drops", cnt)
+		}
+		return false
+	}
+}
+
+// healthCheck checks if a redis client is alive by sending a Ping with timeout.
+// Returns error if the ping fails or times out.
+func healthCheck(ctx context.Context, client *redis.Client) error {
+	ctxPing, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	return client.Ping(ctxPing).Err()
+}
+
+// connect attempts to create and verify a single Resp client connection.
+// Returns the connected client on success, or nil + error on failure.
+// Caller must handle cleanup (Close) if an error is returned.
+func connect(respAddr, authKey string) (*redis.Client, error) {
+	if authKey == "" {
+		return nil, errors.New("auth key is empty")
+	}
+
+	options := &redis.Options{
+		Addr:        respAddr,
+		DialTimeout: dialTimeout,
+		ReadTimeout: 0,
+		Protocol:    2,
+		OnConnect: func(ctx context.Context, cn *redis.Conn) error {
+			return cn.Do(ctx, "AUTH", authKey).Err()
+		},
+	}
+
+	client := redis.NewClient(options)
+	if err := healthCheck(context.Background(), client); err != nil {
+		if closeErr := client.Close(); closeErr != nil {
+			slog.Warn("mresp close client after failed health check failed", "error", closeErr)
+		}
+		return nil, err
+	}
+	return client, nil
+}
+
+// produce publishes messages from pubChan using the provided client until ctx is done.
+func produce(ctx context.Context, client *redis.Client) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case msg := <-pubChan:
+			if msg.topic == "" {
+				continue
+			}
+			if err := client.Publish(ctx, msg.topic, msg.payload).Err(); err != nil {
+				slog.Warn("mresp publish failed", "topic", msg.topic, "error", err)
+				return err
+			}
+		}
+	}
+}
+
+// consume subscribes by registered handler topics and dispatches messages.
+func consume(ctx context.Context, client *redis.Client) error {
+	consumerTopics := make(map[string]struct{})
+
+	handlersMu.RLock()
+	for topic := range handlersByTopic {
+		if topic != "" {
+			consumerTopics[topic] = struct{}{}
+		}
+	}
+	handlersMu.RUnlock()
+
+	var consumer *redis.PubSub
+	var ch <-chan *redis.Message
+	subscribed := make(map[string]struct{}, len(consumerTopics))
+
+	subscribeTopic := func(topic string) error {
+		if topic == "" {
+			return nil
+		}
+		if _, exists := subscribed[topic]; exists {
+			return nil
+		}
+
+		if consumer == nil {
+			consumer = client.Subscribe(ctx, topic)
+			if _, err := consumer.Receive(ctx); err != nil {
+				slog.Warn("mresp subscribe receive error", "error", err)
+				return err
+			}
+			ch = consumer.Channel()
+			subscribed[topic] = struct{}{}
+			return nil
+		}
+
+		if err := consumer.Subscribe(ctx, topic); err != nil {
+			return err
+		}
+		subscribed[topic] = struct{}{}
+		return nil
+	}
+
+	defer func() {
+		if consumer != nil {
+			if err := consumer.Close(); err != nil {
+				slog.Warn("mresp close consumer failed", "error", err)
+			}
+		}
+	}()
+
+	for topic := range consumerTopics {
+		if err := subscribeTopic(topic); err != nil {
+			return err
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case topic := <-subReqCh:
+			if err := subscribeTopic(topic); err != nil {
+				return err
+			}
+		case msg, ok := <-ch:
+			if !ok {
+				return fmt.Errorf("subscribe channel closed")
+			}
+			handlersMu.RLock()
+			h := handlersByTopic[msg.Channel]
+			handlersMu.RUnlock()
+			if h == nil {
+				continue
+			}
+			select {
+			case h <- &ReceivedMessage{Channel: msg.Channel, Pattern: msg.Pattern, Payload: msg.Payload}:
+			default:
+				slog.Warn("message handler channel full, message dropped", "topic", msg.Channel)
+			}
+		}
+	}
+}

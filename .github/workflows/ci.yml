@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  # Step 1: Check go mod tidiness
+  go-mod:
+    name: Go Mod Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.25'
+
+    - name: Check go mod
+      run: |
+        go mod tidy
+        git diff --exit-code go.mod go.sum || (echo "go.mod or go.sum is not tidied" && exit 1)
+
+  # Step 2: Run tests (depends on go-mod passing)
+  test:
+    name: Tests
+    needs: go-mod
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        go-version: ['1.25', '1.26']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go-version }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.out ./...
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.out
+        flags: unittests
+        fail_ci_if_error: false
+
+  # Step 3: Build and lint (depends on test passing)
+  build:
+    name: Build & Lint
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.25'
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: v1.65.0
+        args: --timeout=5m
+
+    - name: Vet
+      run: go vet ./...
+
+  # Summary job (depends on all previous jobs)
+  ci-success:
+    name: CI Success
+    needs: [go-mod, test, build]
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+    - name: CI passed
+      run: echo "✅ All CI checks passed!"
+
