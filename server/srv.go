@@ -57,6 +57,7 @@ var (
 	userHomeDirFn    = os.UserHomeDir
 	signalNotifyFn   = signal.Notify
 	signalStopFn     = signal.Stop
+	osExitFn         = os.Exit
 )
 
 func resolveExternalAuthKey(getenv func(string) string) string {
@@ -258,15 +259,13 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 			val = v
 			return e
 		})
-		if err != nil {
-			if errors.Is(err, buntdb.ErrNotFound) {
-				conn.WriteNull()
-				return
-			}
+		if errors.Is(err, buntdb.ErrNotFound) {
+			conn.WriteNull()
+		} else if err != nil {
 			conn.WriteError("ERR " + err.Error())
-			return
+		} else {
+			conn.WriteBulk([]byte(val))
 		}
-		conn.WriteBulk([]byte(val))
 	case cmdSetNX:
 		if len(cmd.Args) != 3 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -279,21 +278,18 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 				set = false
 				return nil
 			}
-			if !errors.Is(e, buntdb.ErrNotFound) {
+			if errors.Is(e, buntdb.ErrNotFound) {
+				_, _, e = tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), nil)
+				if e == nil {
+					set = true
+				}
 				return e
 			}
-			_, _, e = tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), nil)
-			if e != nil {
-				return e
-			}
-			set = true
-			return nil
+			return e
 		})
 		if err != nil {
 			conn.WriteError("ERR " + err.Error())
-			return
-		}
-		if set {
+		} else if set {
 			conn.WriteInt(1)
 		} else {
 			conn.WriteInt(0)
@@ -317,9 +313,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 		})
 		if err != nil {
 			conn.WriteError("ERR " + err.Error())
-			return
-		}
-		if deleted {
+		} else if deleted {
 			conn.WriteInt(1)
 		} else {
 			conn.WriteInt(0)
@@ -378,20 +372,23 @@ func startDB() {
 	homeDir, err := userHomeDirFn()
 	if err != nil {
 		slog.Error("failed to resolve user home directory", "error", err)
-		os.Exit(1)
+		osExitFn(1)
+		return
 	}
 
 	dataDir := filepath.Join(homeDir, ".respx")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		slog.Error("failed to create data directory", "path", dataDir, "error", err)
-		os.Exit(1)
+		osExitFn(1)
+		return
 	}
 
 	dbPath := filepath.Join(dataDir, "data.db")
 	storage, err = buntdb.Open(dbPath)
 	if err != nil {
 		slog.Error("failed to open buntdb", "path", dbPath, "error", err)
-		os.Exit(1)
+		osExitFn(1)
+		return
 	}
 }
 
@@ -461,7 +458,7 @@ func Start(address string, maxConn int) {
 			)
 			if err != nil && !isServerShutdownErr(err) {
 				slog.Error("resp server stopped", "error", err)
-				panic(err)
+				osExitFn(1)
 			} else if err != nil {
 				slog.Info("resp server stopped")
 			}

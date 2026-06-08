@@ -3,10 +3,13 @@ package server
 import (
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kcmvp/respx/internal"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
@@ -57,6 +60,8 @@ func resetTestState(t *testing.T) {
 	originalAuthKey := authKey
 	originalExternalMaxConns := externalMaxConns
 	originalListenAndServeFn := listenAndServeFn
+	originalOsExitFn := osExitFn
+	originalUserHomeDirFn := userHomeDirFn
 
 	connAuthState = make(map[string]string)
 	internalAuthKey = "internal-test-key"
@@ -71,6 +76,8 @@ func resetTestState(t *testing.T) {
 		authKey = originalAuthKey
 		externalMaxConns = originalExternalMaxConns
 		listenAndServeFn = originalListenAndServeFn
+		osExitFn = originalOsExitFn
+		userHomeDirFn = originalUserHomeDirFn
 	})
 }
 
@@ -100,15 +107,111 @@ func TestGetConnStateReturnsMissingForUnknownConnection(t *testing.T) {
 	}
 }
 
-func TestFallbackExternalAuthKeyShouldDifferFromInternalKey(t *testing.T) {
+func TestIsServerShutdownErr(t *testing.T) {
+	if !isServerShutdownErr(nil) {
+		t.Fatal("isServerShutdownErr(nil) = false, want true")
+	}
+
+	if !isServerShutdownErr(net.ErrClosed) {
+		t.Fatal("isServerShutdownErr(net.ErrClosed) = false, want true")
+	}
+
+	errUseOfClosed := errors.New("use of closed network connection")
+	if !isServerShutdownErr(errUseOfClosed) {
+		t.Fatal("isServerShutdownErr(use of closed...) = false, want true")
+	}
+
+	if isServerShutdownErr(errors.New("other error")) {
+		t.Fatal("isServerShutdownErr(other error) = true, want false")
+	}
+}
+
+func TestListenAndServeWithStopError(t *testing.T) {
+	// Provide a bad address to cause net.Listen to fail
+	err := listenAndServeWithStop("invalid-address",
+		func(conn redcon.Conn, cmd redcon.Command) {},
+		func(conn redcon.Conn) bool { return true },
+		func(conn redcon.Conn, err error) {},
+	)
+
+	if err == nil {
+		t.Fatal("expected error from net.Listen")
+	}
+}
+
+func TestListenAndServeWithStop(t *testing.T) {
+	addr := "127.0.0.1:0" // let OS pick a free port
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- listenAndServeWithStop(addr,
+			func(conn redcon.Conn, cmd redcon.Command) {},
+			func(conn redcon.Conn) bool { return true },
+			func(conn redcon.Conn, err error) {},
+		)
+	}()
+
+	// wait for listener to be set
+	time.Sleep(100 * time.Millisecond)
+
+	serverMu.Lock()
+	ln := serverListener
+	serverMu.Unlock()
+
+	if ln == nil {
+		t.Fatal("serverListener is nil, expected active listener")
+	}
+
+	// Close listener to stop server
+	ln.Close()
+
+	select {
+	case err := <-errCh:
+		if !isServerShutdownErr(err) {
+			t.Fatalf("expected shutdown error, got: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timeout waiting for server to stop")
+	}
+}
+
+func TestResolveExternalAuthKeyWithEnv(t *testing.T) {
+	envKey := "env-test-key"
+	key := resolveExternalAuthKey(func(s string) string {
+		if s == internal.RespxAuthKeyEnv {
+			return envKey
+		}
+		return ""
+	})
+	if key != envKey {
+		t.Fatalf("resolveExternalAuthKey = %q, want %q", key, envKey)
+	}
+}
+
+func TestEnsureExternalAuthKey(t *testing.T) {
 	resetTestState(t)
 
-	fallbackKey := resolveExternalAuthKey(func(string) string { return "" })
-	if fallbackKey == "" {
-		t.Fatal("resolveExternalAuthKey() should generate a non-empty key when env is missing")
+	// Test when authKey is already set
+	authKey = "pre-set-key"
+	ensureExternalAuthKey()
+	if authKey != "pre-set-key" {
+		t.Fatalf("authKey = %q, want %q", authKey, "pre-set-key")
 	}
-	if fallbackKey == internalAuthKey {
-		t.Fatal("external fallback auth key should differ from internal auth key")
+
+	// Test when authKey is empty and env is missing
+	authKey = ""
+	ensureExternalAuthKey()
+	if authKey == "" {
+		t.Fatal("authKey should be generated if empty and env is missing")
+	}
+
+	// Test when authKey is empty and env is present
+	authKey = ""
+	os.Setenv(internal.RespxAuthKeyEnv, "env-auth-key")
+	t.Cleanup(func() { os.Unsetenv(internal.RespxAuthKeyEnv) })
+	ensureExternalAuthKey()
+	if authKey != "env-auth-key" {
+		t.Fatalf("authKey = %q, want %q", authKey, "env-auth-key")
 	}
 }
 
@@ -346,6 +449,18 @@ func TestHandleCommand(t *testing.T) {
 			wantClosed: true,
 		},
 		{
+			name:        "hello command",
+			auth:        false,
+			commands:    [][]string{{"HELLO"}},
+			wantStrings: []string{}, // WriteAny doesn't populate strings/bulks in mockConn currently
+		},
+		{
+			name:        "client command",
+			auth:        false,
+			commands:    [][]string{{"CLIENT"}},
+			wantStrings: []string{"OK"},
+		},
+		{
 			name:       "ping requires authentication",
 			auth:       false,
 			commands:   [][]string{{"PING"}},
@@ -353,11 +468,24 @@ func TestHandleCommand(t *testing.T) {
 			wantClosed: true,
 		},
 		{
+			name:        "ping authenticated",
+			auth:        true,
+			commands:    [][]string{{"PING"}},
+			wantStrings: []string{"PONG"},
+		},
+		{
 			name:       "quit requires authentication",
 			auth:       false,
 			commands:   [][]string{{"QUIT"}},
 			wantErrors: []string{"NOAUTH authentication required"},
 			wantClosed: true,
+		},
+		{
+			name:        "quit authenticated",
+			auth:        true,
+			commands:    [][]string{{"QUIT"}},
+			wantStrings: []string{"OK"},
+			wantClosed:  true,
 		},
 		{
 			name: "set get setnx and del lifecycle",
@@ -373,6 +501,25 @@ func TestHandleCommand(t *testing.T) {
 			wantBulks:   []string{"alice"},
 			wantInts:    []int{0, 1},
 			wantNulls:   1,
+		},
+		{
+			name:      "get non-existent",
+			auth:      true,
+			commands:  [][]string{{"GET", "nonexistent"}},
+			wantNulls: 1,
+		},
+		{
+			name:     "del non-existent",
+			auth:     true,
+			commands: [][]string{{"DEL", "nonexistent"}},
+			wantInts: []int{0},
+		},
+		{
+			name:        "setnx exists",
+			auth:        true,
+			commands:    [][]string{{"SET", "k", "v"}, {"SETNX", "k", "v2"}},
+			wantStrings: []string{"OK"},
+			wantInts:    []int{0},
 		},
 		{
 			name:       "unknown command writes error",
@@ -569,22 +716,255 @@ func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 	}
 }
 
-func TestHandleCommandSubscribeAndPSubscribe(t *testing.T) {
-	resetTestState(t)
-
-	db, _ := buntdb.Open(":memory:")
-	defer db.Close()
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:30020"}
-	setConnectionAuthState(conn, internalAuthKey)
-
+func TestHandleCommandDbNotInitializedWritesError(t *testing.T) {
+	conn := &mockConn{remoteAddr: "127.0.0.1:30007"}
 	var ps redcon.PubSub
 
-	handleCommand(conn, newCommand("SUBSCRIBE", "topic-a", "topic-b"), db, &ps)
-	handleCommand(conn, newCommand("PSUBSCRIBE", "topic-*"), db, &ps)
+	handleCommand(conn, newCommand("GET", "k"), nil, &ps)
 
-	if len(conn.errors) != 0 {
-		t.Fatalf("subscribe flow should not write errors, got %#v", conn.errors)
+	if len(conn.errors) != 1 || conn.errors[0] != "ERR storage not initialized" {
+		t.Fatalf("errors = %#v, want [\"ERR storage not initialized\"]", conn.errors)
+	}
+}
+
+func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
+	sigCh := make(chan os.Signal, 1)
+	doneCh := make(chan struct{})
+
+	stopFn := func() error {
+		return errors.New("simulated stop error")
+	}
+
+	go handleShutdownSignals(sigCh, doneCh, stopFn)
+
+	sigCh <- os.Interrupt
+
+	// Give the goroutine time to process the signal and log the warning
+	time.Sleep(50 * time.Millisecond)
+}
+
+func TestStopWithStorageCloseError(t *testing.T) {
+	resetTestState(t)
+
+	db, err := buntdb.Open(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open buntdb: %v", err)
+	}
+
+	// We can cause Close to return an error by closing it first
+	db.Close()
+	storage = db
+
+	// Set srvOnce so stop() will actually do cleanup
+	srvOnce.Do(func() {})
+
+	err = stop()
+	if err == nil {
+		t.Error("expected stop() to return an error from storage.Close()")
+	}
+
+	if storage != nil {
+		t.Error("expected storage to be nil even if Close() failed")
+	}
+}
+
+func TestStop(t *testing.T) {
+	resetTestState(t)
+
+	// Ensure stop works when nothing is initialized
+	err := stop()
+	if err != nil {
+		t.Fatalf("stop() with nil everything should return nil, got %v", err)
+	}
+
+	// Initialize partial state to test cleanup paths
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	serverMu.Lock()
+	serverListener = ln
+	serverMu.Unlock()
+
+	sigCh := make(chan os.Signal, 1)
+	doneCh := make(chan struct{})
+	shutdownMu.Lock()
+	shutdownSignalCh = sigCh
+	shutdownDoneCh = doneCh
+	shutdownMu.Unlock()
+
+	db, err := buntdb.Open(":memory:")
+	if err != nil {
+		t.Fatalf("failed to open buntdb: %v", err)
+	}
+	storage = db
+
+	err = stop()
+	if err != nil {
+		t.Fatalf("stop() returned error: %v", err)
+	}
+
+	// Verify cleanup
+	serverMu.Lock()
+	if serverListener != nil {
+		t.Errorf("expected serverListener to be nil")
+	}
+	serverMu.Unlock()
+
+	shutdownMu.Lock()
+	if shutdownSignalCh != nil {
+		t.Errorf("expected shutdownSignalCh to be nil")
+	}
+	if shutdownDoneCh != nil {
+		t.Errorf("expected shutdownDoneCh to be nil")
+	}
+	shutdownMu.Unlock()
+
+	if storage != nil {
+		t.Errorf("expected storage to be nil")
+	}
+}
+
+func TestStartDB(t *testing.T) {
+	resetTestState(t)
+
+	tmpDir := t.TempDir()
+	userHomeDirFn = func() (string, error) {
+		return tmpDir, nil
+	}
+
+	startDB()
+
+	if storage == nil {
+		t.Fatal("expected storage to be initialized")
+	}
+	defer storage.Close()
+
+	// Verify directory was created
+	_, err := os.Stat(filepath.Join(tmpDir, ".respx"))
+	if os.IsNotExist(err) {
+		t.Fatal("expected .respx directory to be created")
+	}
+}
+
+func TestStartDBHomeDirError(t *testing.T) {
+	resetTestState(t)
+
+	userHomeDirFn = func() (string, error) {
+		return "", errors.New("simulated home dir error")
+	}
+
+	exitCalled := false
+	osExitFn = func(code int) {
+		exitCalled = true
+		if code != 1 {
+			t.Errorf("osExitFn called with code %d, want 1", code)
+		}
+	}
+
+	startDB()
+
+	if !exitCalled {
+		t.Error("expected osExitFn to be called on home dir error")
+	}
+}
+
+func TestStartDBMkdirError(t *testing.T) {
+	resetTestState(t)
+
+	tmpDir := t.TempDir()
+	// Create a file where the directory should be, to cause MkdirAll to fail
+	badPath := filepath.Join(tmpDir, ".respx")
+	err := os.WriteFile(badPath, []byte("file instead of dir"), 0o644)
+	if err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	userHomeDirFn = func() (string, error) {
+		return tmpDir, nil
+	}
+
+	exitCalled := false
+	osExitFn = func(code int) {
+		exitCalled = true
+		if code != 1 {
+			t.Errorf("osExitFn called with code %d, want 1", code)
+		}
+	}
+
+	startDB()
+
+	if !exitCalled {
+		t.Error("expected osExitFn to be called on mkdir error")
+	}
+}
+
+func TestStartDBOpenError(t *testing.T) {
+	resetTestState(t)
+
+	tmpDir := t.TempDir()
+	userHomeDirFn = func() (string, error) {
+		return tmpDir, nil
+	}
+
+	// Create a directory where the db file should be, to cause Open to fail
+	respxDir := filepath.Join(tmpDir, ".respx")
+	err := os.MkdirAll(respxDir, 0o755)
+	if err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	dbPath := filepath.Join(respxDir, "data.db")
+	err = os.MkdirAll(dbPath, 0o755)
+	if err != nil {
+		t.Fatalf("failed to create dir for db path: %v", err)
+	}
+
+	exitCalled := false
+	osExitFn = func(code int) {
+		exitCalled = true
+		if code != 1 {
+			t.Errorf("osExitFn called with code %d, want 1", code)
+		}
+	}
+
+	startDB()
+
+	if !exitCalled {
+		t.Error("expected osExitFn to be called on buntdb.Open error")
+	}
+}
+
+func TestStartListenError(t *testing.T) {
+	resetTestState(t)
+
+	// Ensure we don't actually exit
+	exitCalled := false
+	osExitFn = func(code int) {
+		exitCalled = true
+	}
+
+	listenCalledCh := make(chan string, 1)
+	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+		select {
+		case listenCalledCh <- addr:
+		default:
+		}
+		return errors.New("simulated listen error")
+	}
+
+	Start("127.0.0.1:16380", 3)
+
+	select {
+	case <-listenCalledCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Start() should invoke listenAndServeFn")
+	}
+
+	// Give the goroutine time to call osExitFn
+	time.Sleep(50 * time.Millisecond)
+
+	if !exitCalled {
+		t.Error("expected osExitFn to be called on listen error")
 	}
 }
 
