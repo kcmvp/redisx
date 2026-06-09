@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,15 +63,19 @@ func resetTestState(t *testing.T) {
 	originalListenAndServeFn := listenAndServeFn
 	originalOsExitFn := osExitFn
 	originalUserHomeDirFn := userHomeDirFn
+	originalSrvOnce := srvOnce
 
+	globalMu.Lock()
 	connAuthState = make(map[string]string)
 	internalAuthKey = "internal-test-key"
 	authKey = "external-test-key"
 	externalMaxConns = 1
 	srvOnce = sync.Once{}
 	listenAndServeFn = redcon.ListenAndServe
+	globalMu.Unlock()
 
 	t.Cleanup(func() {
+		globalMu.Lock()
 		connAuthState = originalState
 		internalAuthKey = originalInternalAuthKey
 		authKey = originalAuthKey
@@ -78,6 +83,8 @@ func resetTestState(t *testing.T) {
 		listenAndServeFn = originalListenAndServeFn
 		osExitFn = originalOsExitFn
 		userHomeDirFn = originalUserHomeDirFn
+		srvOnce = originalSrvOnce
+		globalMu.Unlock()
 	})
 }
 
@@ -163,7 +170,7 @@ func TestListenAndServeWithStop(t *testing.T) {
 	}
 
 	// Close listener to stop server
-	ln.Close()
+	_ = ln.Close()
 
 	select {
 	case err := <-errCh:
@@ -207,8 +214,8 @@ func TestEnsureExternalAuthKey(t *testing.T) {
 
 	// Test when authKey is empty and env is present
 	authKey = ""
-	os.Setenv(internal.RespxAuthKeyEnv, "env-auth-key")
-	t.Cleanup(func() { os.Unsetenv(internal.RespxAuthKeyEnv) })
+	_ = os.Setenv(internal.RespxAuthKeyEnv, "env-auth-key")
+	t.Cleanup(func() { _ = os.Unsetenv(internal.RespxAuthKeyEnv) })
 	ensureExternalAuthKey()
 	if authKey != "env-auth-key" {
 		t.Fatalf("authKey = %q, want %q", authKey, "env-auth-key")
@@ -588,7 +595,7 @@ func TestHandleCommand(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to open buntdb: %v", err)
 			}
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
@@ -678,7 +685,7 @@ func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 	resetTestState(t)
 
 	db, _ := buntdb.Open(":memory:")
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
@@ -699,7 +706,7 @@ func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 	resetTestState(t)
 
 	db, _ := buntdb.Open(":memory:")
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
@@ -752,7 +759,7 @@ func TestStopWithStorageCloseError(t *testing.T) {
 	}
 
 	// We can cause Close to return an error by closing it first
-	db.Close()
+	_ = db.Close()
 	storage = db
 
 	// Set srvOnce so stop() will actually do cleanup
@@ -838,7 +845,7 @@ func TestStartDB(t *testing.T) {
 	if storage == nil {
 		t.Fatal("expected storage to be initialized")
 	}
-	defer storage.Close()
+	defer func() { _ = storage.Close() }()
 
 	// Verify directory was created
 	_, err := os.Stat(filepath.Join(tmpDir, ".respx"))
@@ -850,6 +857,7 @@ func TestStartDB(t *testing.T) {
 func TestStartDBHomeDirError(t *testing.T) {
 	resetTestState(t)
 
+	globalMu.Lock()
 	userHomeDirFn = func() (string, error) {
 		return "", errors.New("simulated home dir error")
 	}
@@ -861,6 +869,7 @@ func TestStartDBHomeDirError(t *testing.T) {
 			t.Errorf("osExitFn called with code %d, want 1", code)
 		}
 	}
+	globalMu.Unlock()
 
 	startDB()
 
@@ -880,6 +889,7 @@ func TestStartDBMkdirError(t *testing.T) {
 		t.Fatalf("failed to write file: %v", err)
 	}
 
+	globalMu.Lock()
 	userHomeDirFn = func() (string, error) {
 		return tmpDir, nil
 	}
@@ -891,6 +901,7 @@ func TestStartDBMkdirError(t *testing.T) {
 			t.Errorf("osExitFn called with code %d, want 1", code)
 		}
 	}
+	globalMu.Unlock()
 
 	startDB()
 
@@ -903,9 +914,12 @@ func TestStartDBOpenError(t *testing.T) {
 	resetTestState(t)
 
 	tmpDir := t.TempDir()
+
+	globalMu.Lock()
 	userHomeDirFn = func() (string, error) {
 		return tmpDir, nil
 	}
+	globalMu.Unlock()
 
 	// Create a directory where the db file should be, to cause Open to fail
 	respxDir := filepath.Join(tmpDir, ".respx")
@@ -919,6 +933,7 @@ func TestStartDBOpenError(t *testing.T) {
 		t.Fatalf("failed to create dir for db path: %v", err)
 	}
 
+	globalMu.Lock()
 	exitCalled := false
 	osExitFn = func(code int) {
 		exitCalled = true
@@ -926,6 +941,7 @@ func TestStartDBOpenError(t *testing.T) {
 			t.Errorf("osExitFn called with code %d, want 1", code)
 		}
 	}
+	globalMu.Unlock()
 
 	startDB()
 
@@ -937,10 +953,12 @@ func TestStartDBOpenError(t *testing.T) {
 func TestStartListenError(t *testing.T) {
 	resetTestState(t)
 
-	// Ensure we don't actually exit
-	exitCalled := false
+	// We use an atomic flag to track if exit was called
+	var exitCalled atomic.Bool
+
+	globalMu.Lock()
 	osExitFn = func(code int) {
-		exitCalled = true
+		exitCalled.Store(true)
 	}
 
 	listenCalledCh := make(chan string, 1)
@@ -951,8 +969,14 @@ func TestStartListenError(t *testing.T) {
 		}
 		return errors.New("simulated listen error")
 	}
+	globalMu.Unlock()
 
-	Start("127.0.0.1:16380", 3)
+	// Make sure the Start completes execution before the test finishes
+	doneCh := make(chan struct{})
+	go func() {
+		Start("127.0.0.1:16380", 3)
+		close(doneCh)
+	}()
 
 	select {
 	case <-listenCalledCh:
@@ -960,10 +984,17 @@ func TestStartListenError(t *testing.T) {
 		t.Fatal("Start() should invoke listenAndServeFn")
 	}
 
-	// Give the goroutine time to call osExitFn
-	time.Sleep(50 * time.Millisecond)
+	// Wait for goroutine to fully finish and call osExitFn
+	select {
+	case <-doneCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Start() goroutine did not complete")
+	}
 
-	if !exitCalled {
+	// Small sleep to ensure the osExitFn callback finishes execution
+	time.Sleep(10 * time.Millisecond)
+
+	if !exitCalled.Load() {
 		t.Error("expected osExitFn to be called on listen error")
 	}
 }

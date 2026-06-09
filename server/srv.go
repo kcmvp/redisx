@@ -52,6 +52,7 @@ var (
 	shutdownSignalCh chan os.Signal
 	shutdownDoneCh   chan struct{}
 
+	globalMu         sync.RWMutex
 	listenAndServeFn = listenAndServeWithStop
 	storage          *buntdb.DB
 	userHomeDirFn    = os.UserHomeDir
@@ -59,6 +60,18 @@ var (
 	signalStopFn     = signal.Stop
 	osExitFn         = os.Exit
 )
+
+func getOsExitFn() func(int) {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return osExitFn
+}
+
+func getListenAndServeFn() func(string, func(redcon.Conn, redcon.Command), func(redcon.Conn) bool, func(redcon.Conn, error)) error {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return listenAndServeFn
+}
 
 func resolveExternalAuthKey(getenv func(string) string) string {
 	if v := getenv(internal.RespxAuthKeyEnv); v != "" {
@@ -369,17 +382,25 @@ func closeCon(conn redcon.Conn, err error) {
 func startDB() {
 	var err error
 
-	homeDir, err := userHomeDirFn()
+	globalMu.RLock()
+	homeFn := userHomeDirFn
+	globalMu.RUnlock()
+
+	homeDir, err := homeFn()
 	if err != nil {
 		slog.Error("failed to resolve user home directory", "error", err)
-		osExitFn(1)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
 		return
 	}
 
 	dataDir := filepath.Join(homeDir, ".respx")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		slog.Error("failed to create data directory", "path", dataDir, "error", err)
-		osExitFn(1)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
 		return
 	}
 
@@ -387,7 +408,9 @@ func startDB() {
 	storage, err = buntdb.Open(dbPath)
 	if err != nil {
 		slog.Error("failed to open buntdb", "path", dbPath, "error", err)
-		osExitFn(1)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
 		return
 	}
 }
@@ -448,8 +471,13 @@ func Start(address string, maxConn int) {
 
 		slog.Info("generated internal bootstrap token")
 		var ps redcon.PubSub
+
+		startedCh := make(chan struct{})
+
 		go func() {
-			err := listenAndServeFn(resolvedAddr,
+			close(startedCh)
+			listenFn := getListenAndServeFn()
+			err := listenFn(resolvedAddr,
 				func(conn redcon.Conn, cmd redcon.Command) {
 					handleCommand(conn, cmd, storage, &ps)
 				},
@@ -458,10 +486,14 @@ func Start(address string, maxConn int) {
 			)
 			if err != nil && !isServerShutdownErr(err) {
 				slog.Error("resp server stopped", "error", err)
-				osExitFn(1)
+				if exitFn := getOsExitFn(); exitFn != nil {
+					exitFn(1)
+				}
 			} else if err != nil {
 				slog.Info("resp server stopped")
 			}
 		}()
+
+		<-startedCh
 	})
 }
