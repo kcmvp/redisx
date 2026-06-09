@@ -2,12 +2,18 @@ package server
 
 import (
 	"crypto/rand"
+	"errors"
 	"log/slog"
+	"net"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/kcmvp/respx/internal"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
@@ -39,9 +45,33 @@ var (
 	connAuthState    = make(map[string]string)
 	authStateMu      sync.RWMutex
 	externalMaxConns = 1
+	serverMu         sync.Mutex
+	serverListener   net.Listener
+	shutdownOnce     sync.Once
+	shutdownMu       sync.Mutex
+	shutdownSignalCh chan os.Signal
+	shutdownDoneCh   chan struct{}
 
-	listenAndServeFn = redcon.ListenAndServe
+	globalMu         sync.RWMutex
+	listenAndServeFn = listenAndServeWithStop
+	storage          *buntdb.DB
+	userHomeDirFn    = os.UserHomeDir
+	signalNotifyFn   = signal.Notify
+	signalStopFn     = signal.Stop
+	osExitFn         = os.Exit
 )
+
+func getOsExitFn() func(int) {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return osExitFn
+}
+
+func getListenAndServeFn() func(string, func(redcon.Conn, redcon.Command), func(redcon.Conn) bool, func(redcon.Conn, error)) error {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return listenAndServeFn
+}
 
 func resolveExternalAuthKey(getenv func(string) string) string {
 	if v := getenv(internal.RespxAuthKeyEnv); v != "" {
@@ -104,9 +134,66 @@ func clearConnectionAuthState(conn redcon.Conn) {
 	authStateMu.Unlock()
 }
 
-func handleCommand(conn redcon.Conn, cmd redcon.Command, items map[string][]byte, mu *sync.RWMutex, ps *redcon.PubSub) {
+func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	serverMu.Lock()
+	serverListener = ln
+	serverMu.Unlock()
+
+	defer func() {
+		serverMu.Lock()
+		if serverListener == ln {
+			serverListener = nil
+		}
+		serverMu.Unlock()
+	}()
+
+	return redcon.Serve(ln, handler, accept, closed)
+}
+
+func isServerShutdownErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
+}
+
+func handleShutdownSignals(sigCh <-chan os.Signal, doneCh <-chan struct{}, stopFn func() error) {
+	select {
+	case <-sigCh:
+		if err := stopFn(); err != nil {
+			slog.Warn("graceful shutdown failed", "error", err)
+		}
+	case <-doneCh:
+	}
+}
+
+func watchShutdownSignals() {
+	shutdownOnce.Do(func() {
+		sigCh := make(chan os.Signal, 1)
+		doneCh := make(chan struct{})
+		shutdownMu.Lock()
+		shutdownSignalCh = sigCh
+		shutdownDoneCh = doneCh
+		shutdownMu.Unlock()
+
+		signalNotifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
+		go handleShutdownSignals(sigCh, doneCh, stop)
+	})
+}
+
+func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redcon.PubSub) {
 	if len(cmd.Args) == 0 {
 		conn.WriteError("ERR empty command")
+		return
+	}
+
+	if db == nil {
+		conn.WriteError("ERR storage not initialized")
 		return
 	}
 
@@ -165,52 +252,84 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, items map[string][]byte
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		mu.Lock()
-		items[string(cmd.Args[1])] = cmd.Args[2]
-		mu.Unlock()
+		err := db.Update(func(tx *buntdb.Tx) error {
+			_, _, err := tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), nil)
+			return err
+		})
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+			return
+		}
 		conn.WriteString("OK")
 	case cmdGet:
 		if len(cmd.Args) != 2 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		mu.RLock()
-		val, ok := items[string(cmd.Args[1])]
-		mu.RUnlock()
-		if !ok {
+		var val string
+		err := db.View(func(tx *buntdb.Tx) error {
+			v, e := tx.Get(string(cmd.Args[1]))
+			val = v
+			return e
+		})
+		if errors.Is(err, buntdb.ErrNotFound) {
 			conn.WriteNull()
+		} else if err != nil {
+			conn.WriteError("ERR " + err.Error())
 		} else {
-			conn.WriteBulk(val)
+			conn.WriteBulk([]byte(val))
 		}
 	case cmdSetNX:
 		if len(cmd.Args) != 3 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		mu.RLock()
-		_, ok := items[string(cmd.Args[1])]
-		mu.RUnlock()
-		if ok {
+		var set bool
+		err := db.Update(func(tx *buntdb.Tx) error {
+			_, e := tx.Get(string(cmd.Args[1]))
+			if e == nil {
+				set = false
+				return nil
+			}
+			if errors.Is(e, buntdb.ErrNotFound) {
+				_, _, e = tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), nil)
+				if e == nil {
+					set = true
+				}
+				return e
+			}
+			return e
+		})
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+		} else if set {
+			conn.WriteInt(1)
+		} else {
 			conn.WriteInt(0)
-			return
 		}
-		mu.Lock()
-		items[string(cmd.Args[1])] = cmd.Args[2]
-		mu.Unlock()
-		conn.WriteInt(1)
 	case cmdDel:
 		if len(cmd.Args) != 2 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		mu.Lock()
-		_, ok := items[string(cmd.Args[1])]
-		delete(items, string(cmd.Args[1]))
-		mu.Unlock()
-		if !ok {
-			conn.WriteInt(0)
-		} else {
+		var deleted bool
+		err := db.Update(func(tx *buntdb.Tx) error {
+			_, e := tx.Delete(string(cmd.Args[1]))
+			if errors.Is(e, buntdb.ErrNotFound) {
+				deleted = false
+				return nil
+			}
+			if e == nil {
+				deleted = true
+			}
+			return e
+		})
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+		} else if deleted {
 			conn.WriteInt(1)
+		} else {
+			conn.WriteInt(0)
 		}
 	case cmdPublish:
 		if len(cmd.Args) != 3 {
@@ -260,8 +379,85 @@ func closeCon(conn redcon.Conn, err error) {
 	}
 }
 
+func startDB() {
+	var err error
+
+	globalMu.RLock()
+	homeFn := userHomeDirFn
+	globalMu.RUnlock()
+
+	homeDir, err := homeFn()
+	if err != nil {
+		slog.Error("failed to resolve user home directory", "error", err)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return
+	}
+
+	dataDir := filepath.Join(homeDir, ".respx")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		slog.Error("failed to create data directory", "path", dataDir, "error", err)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return
+	}
+
+	dbPath := filepath.Join(dataDir, "data.db")
+	storage, err = buntdb.Open(dbPath)
+	if err != nil {
+		slog.Error("failed to open buntdb", "path", dbPath, "error", err)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return
+	}
+}
+
+func stop() error {
+	serverMu.Lock()
+	ln := serverListener
+	serverListener = nil
+	serverMu.Unlock()
+
+	shutdownMu.Lock()
+	sigCh := shutdownSignalCh
+	doneCh := shutdownDoneCh
+	shutdownSignalCh = nil
+	shutdownDoneCh = nil
+	shutdownMu.Unlock()
+
+	if sigCh != nil {
+		signalStopFn(sigCh)
+	}
+	if doneCh != nil {
+		close(doneCh)
+	}
+
+	var err error
+	if ln != nil {
+		err = ln.Close()
+	}
+
+	if storage != nil {
+		if closeErr := storage.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		} else if closeErr != nil {
+			slog.Warn("failed to close buntdb", "error", closeErr)
+		}
+		storage = nil
+	}
+
+	srvOnce = sync.Once{}
+	return err
+}
+
 func Start(address string, maxConn int) {
+	watchShutdownSignals()
+
 	srvOnce.Do(func() {
+		startDB()
 		ensureExternalAuthKey()
 
 		resolvedAddr := address
@@ -274,21 +470,30 @@ func Start(address string, maxConn int) {
 		externalMaxConns = maxConn
 
 		slog.Info("generated internal bootstrap token")
-		var mu sync.RWMutex
-		var items = make(map[string][]byte)
 		var ps redcon.PubSub
+
+		startedCh := make(chan struct{})
+
 		go func() {
-			err := listenAndServeFn(resolvedAddr,
+			close(startedCh)
+			listenFn := getListenAndServeFn()
+			err := listenFn(resolvedAddr,
 				func(conn redcon.Conn, cmd redcon.Command) {
-					handleCommand(conn, cmd, items, &mu, &ps)
+					handleCommand(conn, cmd, storage, &ps)
 				},
 				acceptCon,
 				closeCon,
 			)
-			if err != nil {
+			if err != nil && !isServerShutdownErr(err) {
 				slog.Error("resp server stopped", "error", err)
-				panic(err)
+				if exitFn := getOsExitFn(); exitFn != nil {
+					exitFn(1)
+				}
+			} else if err != nil {
+				slog.Info("resp server stopped")
 			}
 		}()
+
+		<-startedCh
 	})
 }
