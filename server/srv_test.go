@@ -63,7 +63,6 @@ func resetTestState(t *testing.T) {
 	originalListenAndServeFn := listenAndServeFn
 	originalOsExitFn := osExitFn
 	originalUserHomeDirFn := userHomeDirFn
-	originalSrvOnce := srvOnce
 
 	globalMu.Lock()
 	connAuthState = make(map[string]string)
@@ -83,7 +82,7 @@ func resetTestState(t *testing.T) {
 		listenAndServeFn = originalListenAndServeFn
 		osExitFn = originalOsExitFn
 		userHomeDirFn = originalUserHomeDirFn
-		srvOnce = originalSrvOnce
+		srvOnce = sync.Once{}
 		globalMu.Unlock()
 	})
 }
