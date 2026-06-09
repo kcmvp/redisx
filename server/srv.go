@@ -42,15 +42,15 @@ var (
 	// authKey is for external client AUTH and can be configured via environment.
 	authKey = ""
 
-	connAuthState    = make(map[string]string)
-	authStateMu      sync.RWMutex
-	externalMaxConns = 1
-	serverMu         sync.Mutex
-	serverListener   net.Listener
-	shutdownOnce     sync.Once
-	shutdownMu       sync.Mutex
-	shutdownSignalCh chan os.Signal
-	shutdownDoneCh   chan struct{}
+	activeExternalConns int
+	connCountMu         sync.Mutex
+	externalMaxConns    = 1
+	serverMu            sync.Mutex
+	serverListener      net.Listener
+	shutdownOnce        sync.Once
+	shutdownMu          sync.Mutex
+	shutdownSignalCh    chan os.Signal
+	shutdownDoneCh      chan struct{}
 
 	globalMu         sync.RWMutex
 	listenAndServeFn = listenAndServeWithStop
@@ -90,50 +90,40 @@ func ensureExternalAuthKey() {
 	}
 }
 
-// getConnKey returns a unique key for the connection
-func getConnKey(conn redcon.Conn) string {
-	return conn.RemoteAddr()
-}
+func acceptCon(conn redcon.Conn) bool {
+	connCountMu.Lock()
+	defer connCountMu.Unlock()
 
-func getConnState(conn redcon.Conn) (string, bool) {
-	connKey := getConnKey(conn)
-	authStateMu.RLock()
-	defer authStateMu.RUnlock()
-	connAuthKey, ok := connAuthState[connKey]
-	return connAuthKey, ok
-}
-
-// externalConnection counts connections that are not authenticated with internalAuthKey.
-// Caller must hold authStateMu (read or write lock).
-func externalConnection() int {
-	count := 0
-	for _, stateKey := range connAuthState {
-		if stateKey != internalAuthKey {
-			count++
-		}
+	if activeExternalConns >= externalMaxConns {
+		slog.Warn("reject connection", "remote", conn.RemoteAddr(), "active", activeExternalConns, "external_max_conns", externalMaxConns)
+		return false
 	}
-	return count
+
+	activeExternalConns++
+	conn.SetContext("")
+	return true
 }
 
-// setConnectionAuthState stores auth state for a connection.
-func setConnectionAuthState(conn redcon.Conn, connAuthKey string) {
-	connKey := getConnKey(conn)
+func closeCon(conn redcon.Conn, err error) {
+	ctx := conn.Context()
+	if ctx == nil {
+		return
+	}
+	prevAuth, _ := ctx.(string)
 
-	authStateMu.Lock()
-	defer authStateMu.Unlock()
+	connCountMu.Lock()
+	if prevAuth != internalAuthKey {
+		activeExternalConns--
+	}
+	current := activeExternalConns
+	connCountMu.Unlock()
 
-	connAuthState[connKey] = connAuthKey
+	if err != nil {
+		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current, "error", err)
+	} else {
+		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current)
+	}
 }
-
-// clearConnectionAuthState removes authentication state for a connection.
-func clearConnectionAuthState(conn redcon.Conn) {
-	connKey := getConnKey(conn)
-
-	authStateMu.Lock()
-	delete(connAuthState, connKey)
-	authStateMu.Unlock()
-}
-
 func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -201,7 +191,8 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 
 	// Enforce strict auth: only AUTH is allowed before a connection is authenticated.
 	if cmdName != cmdAuth && cmdName != cmdHello && cmdName != cmdClient {
-		if connAuthKey, ok := getConnState(conn); !ok || connAuthKey == "" {
+		connAuthKey, _ := conn.Context().(string)
+		if conn.Context() == nil || connAuthKey == "" {
 			conn.WriteError("NOAUTH authentication required")
 			slog.Warn("unauthenticated command attempt", "remote", conn.RemoteAddr(), "cmd", cmdName)
 			_ = conn.Close()
@@ -221,7 +212,17 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 		}
 		providedKey := string(cmd.Args[1])
 		if providedKey == internalAuthKey || (authKey != "" && providedKey == authKey) {
-			setConnectionAuthState(conn, providedKey)
+			prevAuth, _ := conn.Context().(string)
+			if providedKey == internalAuthKey && prevAuth != internalAuthKey {
+				connCountMu.Lock()
+				activeExternalConns--
+				connCountMu.Unlock()
+			} else if providedKey != internalAuthKey && prevAuth == internalAuthKey {
+				connCountMu.Lock()
+				activeExternalConns++
+				connCountMu.Unlock()
+			}
+			conn.SetContext(providedKey)
 			conn.WriteString("OK")
 			slog.Info("connection authenticated", "remote", conn.RemoteAddr())
 		} else {
@@ -353,32 +354,6 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 	}
 }
 
-func acceptCon(conn redcon.Conn) bool {
-	authStateMu.Lock()
-	defer authStateMu.Unlock()
-
-	current := externalConnection()
-	if current >= externalMaxConns {
-		slog.Warn("reject connection", "remote", conn.RemoteAddr(), "active", current, "external_max_conns", externalMaxConns)
-		return false
-	}
-
-	connAuthState[getConnKey(conn)] = ""
-	return true
-}
-
-func closeCon(conn redcon.Conn, err error) {
-	clearConnectionAuthState(conn)
-	authStateMu.RLock()
-	current := externalConnection()
-	authStateMu.RUnlock()
-	if err != nil {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current, "error", err)
-	} else {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current)
-	}
-}
-
 func startDB() {
 	var err error
 
@@ -453,6 +428,11 @@ func stop() error {
 	return err
 }
 
+// Start initializes and starts the Redis-compatible server on the given address.
+// This function returns immediately after the server has successfully started binding
+// to the port, as the server runs in a background goroutine.
+// The service itself is long-running and will remain active until interrupted by
+// a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
 func Start(address string, maxConn int) {
 	watchShutdownSignals()
 
