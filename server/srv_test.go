@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/respx/internal"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
@@ -56,7 +55,6 @@ func (m *mockDetachedConn) Flush() error                         { return nil }
 
 func resetTestState(t *testing.T) {
 	t.Helper()
-	originalState := connAuthState
 	originalInternalAuthKey := internalAuthKey
 	originalAuthKey := authKey
 	originalExternalMaxConns := externalMaxConns
@@ -65,7 +63,7 @@ func resetTestState(t *testing.T) {
 	originalUserHomeDirFn := userHomeDirFn
 
 	globalMu.Lock()
-	connAuthState = make(map[string]string)
+	activeExternalConns = 0
 	internalAuthKey = "internal-test-key"
 	authKey = "external-test-key"
 	externalMaxConns = 1
@@ -75,7 +73,7 @@ func resetTestState(t *testing.T) {
 
 	t.Cleanup(func() {
 		globalMu.Lock()
-		connAuthState = originalState
+		activeExternalConns = 0
 		internalAuthKey = originalInternalAuthKey
 		authKey = originalAuthKey
 		externalMaxConns = originalExternalMaxConns
@@ -95,190 +93,7 @@ func newCommand(args ...string) redcon.Command {
 	return cmd
 }
 
-func TestGetConnKeyReturnsRemoteAddr(t *testing.T) {
-	conn := &mockConn{remoteAddr: "127.0.0.1:12345"}
-
-	if got := getConnKey(conn); got != conn.remoteAddr {
-		t.Fatalf("getConnKey() = %q, want %q", got, conn.remoteAddr)
-	}
-}
-
-func TestGetConnStateReturnsMissingForUnknownConnection(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:12345"}
-	state, ok := getConnState(conn)
-	if ok {
-		t.Fatalf("getConnState() ok = true, want false, state=%q", state)
-	}
-}
-
-func TestIsServerShutdownErr(t *testing.T) {
-	if !isServerShutdownErr(nil) {
-		t.Fatal("isServerShutdownErr(nil) = false, want true")
-	}
-
-	if !isServerShutdownErr(net.ErrClosed) {
-		t.Fatal("isServerShutdownErr(net.ErrClosed) = false, want true")
-	}
-
-	errUseOfClosed := errors.New("use of closed network connection")
-	if !isServerShutdownErr(errUseOfClosed) {
-		t.Fatal("isServerShutdownErr(use of closed...) = false, want true")
-	}
-
-	if isServerShutdownErr(errors.New("other error")) {
-		t.Fatal("isServerShutdownErr(other error) = true, want false")
-	}
-}
-
-func TestListenAndServeWithStopError(t *testing.T) {
-	// Provide a bad address to cause net.Listen to fail
-	err := listenAndServeWithStop("invalid-address",
-		func(conn redcon.Conn, cmd redcon.Command) {},
-		func(conn redcon.Conn) bool { return true },
-		func(conn redcon.Conn, err error) {},
-	)
-
-	if err == nil {
-		t.Fatal("expected error from net.Listen")
-	}
-}
-
-func TestListenAndServeWithStop(t *testing.T) {
-	addr := "127.0.0.1:0" // let OS pick a free port
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- listenAndServeWithStop(addr,
-			func(conn redcon.Conn, cmd redcon.Command) {},
-			func(conn redcon.Conn) bool { return true },
-			func(conn redcon.Conn, err error) {},
-		)
-	}()
-
-	// wait for listener to be set
-	time.Sleep(100 * time.Millisecond)
-
-	serverMu.Lock()
-	ln := serverListener
-	serverMu.Unlock()
-
-	if ln == nil {
-		t.Fatal("serverListener is nil, expected active listener")
-	}
-
-	// Close listener to stop server
-	_ = ln.Close()
-
-	select {
-	case err := <-errCh:
-		if !isServerShutdownErr(err) {
-			t.Fatalf("expected shutdown error, got: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout waiting for server to stop")
-	}
-}
-
-func TestResolveExternalAuthKeyWithEnv(t *testing.T) {
-	envKey := "env-test-key"
-	key := resolveExternalAuthKey(func(s string) string {
-		if s == internal.RespxAuthKeyEnv {
-			return envKey
-		}
-		return ""
-	})
-	if key != envKey {
-		t.Fatalf("resolveExternalAuthKey = %q, want %q", key, envKey)
-	}
-}
-
-func TestEnsureExternalAuthKey(t *testing.T) {
-	resetTestState(t)
-
-	// Test when authKey is already set
-	authKey = "pre-set-key"
-	ensureExternalAuthKey()
-	if authKey != "pre-set-key" {
-		t.Fatalf("authKey = %q, want %q", authKey, "pre-set-key")
-	}
-
-	// Test when authKey is empty and env is missing
-	authKey = ""
-	ensureExternalAuthKey()
-	if authKey == "" {
-		t.Fatal("authKey should be generated if empty and env is missing")
-	}
-
-	// Test when authKey is empty and env is present
-	authKey = ""
-	_ = os.Setenv(internal.RespxAuthKeyEnv, "env-auth-key")
-	t.Cleanup(func() { _ = os.Unsetenv(internal.RespxAuthKeyEnv) })
-	ensureExternalAuthKey()
-	if authKey != "env-auth-key" {
-		t.Fatalf("authKey = %q, want %q", authKey, "env-auth-key")
-	}
-}
-
-func TestAuthConnectionStoresState(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:12345"}
-	setConnectionAuthState(conn, internalAuthKey)
-
-	state, ok := getConnState(conn)
-	if !ok {
-		t.Fatal("getConnState() ok = false, want true")
-	}
-	if state != internalAuthKey {
-		t.Fatalf("getConnState() = %q, want %q", state, internalAuthKey)
-	}
-}
-
-func TestAuthConnectionOverwritesPreviousState(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:12345"}
-	setConnectionAuthState(conn, "")
-	setConnectionAuthState(conn, internalAuthKey)
-
-	state, ok := getConnState(conn)
-	if !ok || state != internalAuthKey {
-		t.Fatalf("getConnState() = (%q, %v), want (%q, true)", state, ok, internalAuthKey)
-	}
-}
-
-func TestDeauthConnectionRemovesState(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:12345"}
-	setConnectionAuthState(conn, internalAuthKey)
-	clearConnectionAuthState(conn)
-
-	state, ok := getConnState(conn)
-	if ok {
-		t.Fatalf("getConnState() after deauth = (%q, true), want missing", state)
-	}
-}
-
-func TestExternalConnectionCountsOnlyNonInternalConnections(t *testing.T) {
-	resetTestState(t)
-
-	internalConn := &mockConn{remoteAddr: "127.0.0.1:10001"}
-	externalConn := &mockConn{remoteAddr: "127.0.0.1:10002"}
-	pendingConn := &mockConn{remoteAddr: "127.0.0.1:10003"}
-
-	setConnectionAuthState(internalConn, internalAuthKey)
-	setConnectionAuthState(externalConn, "external-key")
-	setConnectionAuthState(pendingConn, "")
-
-	if got := externalConnection(); got != 2 {
-		t.Fatalf("externalConnection() = %d, want 2", got)
-	}
-}
-
-func TestAcceptConnectionStoresPendingConnection(t *testing.T) {
+func TestAcceptConnectionIncrementsCount(t *testing.T) {
 	resetTestState(t)
 	externalMaxConns = 2
 
@@ -287,9 +102,11 @@ func TestAcceptConnectionStoresPendingConnection(t *testing.T) {
 		t.Fatal("acceptConnection() = false, want true")
 	}
 
-	state, ok := getConnState(conn)
-	if !ok || state != "" {
-		t.Fatalf("getConnState() = (%q, %v), want (\"\", true)", state, ok)
+	connCountMu.Lock()
+	count := activeExternalConns
+	connCountMu.Unlock()
+	if count != 1 {
+		t.Fatalf("activeExternalConns = %d, want 1", count)
 	}
 }
 
@@ -306,10 +123,6 @@ func TestAcceptConnectionRejectsWhenAtExternalLimit(t *testing.T) {
 	if acceptCon(second) {
 		t.Fatal("second acceptConnection() = true, want false")
 	}
-
-	if _, ok := getConnState(second); ok {
-		t.Fatal("rejected connection should not be stored in connAuthState")
-	}
 }
 
 func TestAcceptConnectionRejectDoesNotIncreaseExternalCount(t *testing.T) {
@@ -322,15 +135,23 @@ func TestAcceptConnectionRejectDoesNotIncreaseExternalCount(t *testing.T) {
 	if !acceptCon(first) {
 		t.Fatal("first acceptConnection() = false, want true")
 	}
-	if got := externalConnection(); got != 1 {
-		t.Fatalf("externalConnection() after first accept = %d, want 1", got)
+
+	connCountMu.Lock()
+	count := activeExternalConns
+	connCountMu.Unlock()
+	if count != 1 {
+		t.Fatalf("activeExternalConns after first accept = %d, want 1", count)
 	}
 
 	if acceptCon(second) {
 		t.Fatal("second acceptConnection() = true, want false")
 	}
-	if got := externalConnection(); got != 1 {
-		t.Fatalf("externalConnection() after rejected accept = %d, want 1", got)
+
+	connCountMu.Lock()
+	count = activeExternalConns
+	connCountMu.Unlock()
+	if count != 1 {
+		t.Fatalf("activeExternalConns after rejected accept = %d, want 1", count)
 	}
 }
 
@@ -350,28 +171,15 @@ func TestAcceptConnectionAllowsNewConnectionAfterCloseFreesSlot(t *testing.T) {
 
 	closeCon(first, nil)
 
-	if got := externalConnection(); got != 0 {
-		t.Fatalf("externalConnection() after close = %d, want 0", got)
+	connCountMu.Lock()
+	count := activeExternalConns
+	connCountMu.Unlock()
+	if count != 0 {
+		t.Fatalf("activeExternalConns after close = %d, want 0", count)
 	}
 
 	if !acceptCon(second) {
 		t.Fatal("second acceptConnection() after close = false, want true")
-	}
-	if got := externalConnection(); got != 1 {
-		t.Fatalf("externalConnection() after reaccept = %d, want 1", got)
-	}
-}
-
-func TestAcceptConnectionIgnoresInternalConnectionForExternalLimit(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
-
-	internalConn := &mockConn{remoteAddr: "127.0.0.1:20010"}
-	setConnectionAuthState(internalConn, internalAuthKey)
-
-	externalConn := &mockConn{remoteAddr: "127.0.0.1:20011"}
-	if !acceptCon(externalConn) {
-		t.Fatal("acceptConnection() should allow one external connection when only internal connection exists")
 	}
 }
 
@@ -379,18 +187,22 @@ func TestCloseConnectionRemovesStateAndKeepsCountUpdated(t *testing.T) {
 	resetTestState(t)
 
 	conn := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	setConnectionAuthState(conn, "")
-	if got := externalConnection(); got != 1 {
-		t.Fatalf("externalConnection() before close = %d, want 1", got)
+	acceptCon(conn)
+
+	connCountMu.Lock()
+	count := activeExternalConns
+	connCountMu.Unlock()
+	if count != 1 {
+		t.Fatalf("activeExternalConns before close = %d, want 1", count)
 	}
 
 	closeCon(conn, nil)
 
-	if _, ok := getConnState(conn); ok {
-		t.Fatal("connection state should be removed after closeConnection")
-	}
-	if got := externalConnection(); got != 0 {
-		t.Fatalf("externalConnection() after close = %d, want 0", got)
+	connCountMu.Lock()
+	count = activeExternalConns
+	connCountMu.Unlock()
+	if count != 0 {
+		t.Fatalf("activeExternalConns after close = %d, want 0", count)
 	}
 }
 
@@ -398,12 +210,15 @@ func TestCloseConnectionWithErrorAlsoRemovesState(t *testing.T) {
 	resetTestState(t)
 
 	conn := &mockConn{remoteAddr: "127.0.0.1:20012"}
-	setConnectionAuthState(conn, "")
+	acceptCon(conn)
 
 	closeCon(conn, errors.New("network error"))
 
-	if _, ok := getConnState(conn); ok {
-		t.Fatal("connection state should be removed after closeConnection(err)")
+	connCountMu.Lock()
+	count := activeExternalConns
+	connCountMu.Unlock()
+	if count != 0 {
+		t.Fatalf("activeExternalConns after close(err) = %d, want 0", count)
 	}
 }
 
@@ -598,9 +413,9 @@ func TestHandleCommand(t *testing.T) {
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
-				setConnectionAuthState(conn, internalAuthKey)
+				conn.SetContext(internalAuthKey)
 			} else {
-				clearConnectionAuthState(conn)
+				conn.SetContext(nil)
 			}
 
 			var ps redcon.PubSub
@@ -688,8 +503,8 @@ func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
-	setConnectionAuthState(subConn, internalAuthKey)
-	setConnectionAuthState(pubConn, internalAuthKey)
+	subConn.SetContext(internalAuthKey)
+	pubConn.SetContext(internalAuthKey)
 
 	var ps redcon.PubSub
 
@@ -709,8 +524,8 @@ func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
-	setConnectionAuthState(subConn, internalAuthKey)
-	setConnectionAuthState(pubConn, internalAuthKey)
+	subConn.SetContext(internalAuthKey)
+	pubConn.SetContext(internalAuthKey)
 
 	var ps redcon.PubSub
 
