@@ -349,6 +349,30 @@ func TestHandleCommand(t *testing.T) {
 			wantErrors: []string{"ERR unknown command 'WHATEVER'"},
 		},
 		{
+			name:        "set with EX",
+			auth:        true,
+			commands:    [][]string{{"set", "k2", "v2", "EX", "1"}},
+			wantStrings: []string{"OK"},
+		},
+		{
+			name:        "set with PX",
+			auth:        true,
+			commands:    [][]string{{"set", "k3", "v3", "PX", "500"}},
+			wantStrings: []string{"OK"},
+		},
+		{
+			name:        "setex command",
+			auth:        true,
+			commands:    [][]string{{"setex", "k4", "1", "v4"}},
+			wantStrings: []string{"OK"},
+		},
+		{
+			name:       "wrong number of args setex",
+			auth:       true,
+			commands:   [][]string{{"setex", "k"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'setex' command"},
+		},
+		{
 			name:       "wrong number of args set",
 			auth:       true,
 			commands:   [][]string{{"SET", "k"}},
@@ -654,7 +678,7 @@ func TestStartDB(t *testing.T) {
 		return tmpDir, nil
 	}
 
-	startDB()
+	start()
 
 	if storage == nil {
 		t.Fatal("expected storage to be initialized")
@@ -685,7 +709,7 @@ func TestStartDBHomeDirError(t *testing.T) {
 	}
 	globalMu.Unlock()
 
-	startDB()
+	start()
 
 	if !exitCalled {
 		t.Error("expected osExitFn to be called on home dir error")
@@ -717,7 +741,7 @@ func TestStartDBMkdirError(t *testing.T) {
 	}
 	globalMu.Unlock()
 
-	startDB()
+	start()
 
 	if !exitCalled {
 		t.Error("expected osExitFn to be called on mkdir error")
@@ -757,7 +781,7 @@ func TestStartDBOpenError(t *testing.T) {
 	}
 	globalMu.Unlock()
 
-	startDB()
+	start()
 
 	if !exitCalled {
 		t.Error("expected osExitFn to be called on buntdb.Open error")

@@ -8,11 +8,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/kcmvp/respx/internal"
+	"github.com/kcmvp/respx/schema"
+	"github.com/samber/lo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
@@ -25,6 +29,7 @@ const (
 	cmdPing       = "ping"
 	cmdQuit       = "quit"
 	cmdSet        = "set"
+	cmdSetEx      = "setex"
 	cmdGet        = "get"
 	cmdSetNX      = "setnx"
 	cmdDel        = "del"
@@ -249,12 +254,68 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 		conn.WriteString("OK")
 		_ = conn.Close()
 	case cmdSet:
-		if len(cmd.Args) != 3 {
+		if len(cmd.Args) < 3 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
+
+		var opts *buntdb.SetOptions
+		if len(cmd.Args) > 3 {
+			for i := 3; i < len(cmd.Args); i++ {
+				arg := strings.ToUpper(string(cmd.Args[i]))
+				if arg == "EX" && i+1 < len(cmd.Args) {
+					secs, err := strconv.Atoi(string(cmd.Args[i+1]))
+					if err != nil {
+						conn.WriteError("ERR value is not an integer or out of range")
+						return
+					}
+					if opts == nil {
+						opts = &buntdb.SetOptions{}
+					}
+					opts.Expires = true
+					opts.TTL = time.Duration(secs) * time.Second
+					i++
+				} else if arg == "PX" && i+1 < len(cmd.Args) {
+					msecs, err := strconv.Atoi(string(cmd.Args[i+1]))
+					if err != nil {
+						conn.WriteError("ERR value is not an integer or out of range")
+						return
+					}
+					if opts == nil {
+						opts = &buntdb.SetOptions{}
+					}
+					opts.Expires = true
+					opts.TTL = time.Duration(msecs) * time.Millisecond
+					i++
+				}
+			}
+		}
+
 		err := db.Update(func(tx *buntdb.Tx) error {
-			_, _, err := tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), nil)
+			_, _, err := tx.Set(string(cmd.Args[1]), string(cmd.Args[2]), opts)
+			return err
+		})
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+			return
+		}
+		conn.WriteString("OK")
+	case cmdSetEx:
+		if len(cmd.Args) != 4 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		secs, err := strconv.Atoi(string(cmd.Args[2]))
+		if err != nil {
+			conn.WriteError("ERR value is not an integer or out of range")
+			return
+		}
+		opts := &buntdb.SetOptions{
+			Expires: true,
+			TTL:     time.Duration(secs) * time.Second,
+		}
+		err = db.Update(func(tx *buntdb.Tx) error {
+			_, _, err := tx.Set(string(cmd.Args[1]), string(cmd.Args[3]), opts)
 			return err
 		})
 		if err != nil {
@@ -332,6 +393,32 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 		} else {
 			conn.WriteInt(0)
 		}
+	case internal.XCmdQuery:
+		if len(cmd.Args) != 3 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		indexName := string(cmd.Args[1])
+		value := string(cmd.Args[2])
+
+		var results []string
+		err := db.View(func(tx *buntdb.Tx) error {
+			return tx.AscendEqual(indexName, value, func(key, val string) bool {
+				results = append(results, val)
+				return true // continue iterating
+			})
+		})
+
+		if errors.Is(err, buntdb.ErrNotFound) {
+			conn.WriteArray(0)
+		} else if err != nil {
+			conn.WriteError("ERR " + err.Error())
+		} else {
+			conn.WriteArray(len(results))
+			for _, res := range results {
+				conn.WriteBulk([]byte(res))
+			}
+		}
 	case cmdPublish:
 		if len(cmd.Args) != 3 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -354,7 +441,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 	}
 }
 
-func startDB() {
+func start(indexes ...schema.Index) {
 	var err error
 
 	globalMu.RLock()
@@ -387,6 +474,22 @@ func startDB() {
 			exitFn(1)
 		}
 		return
+	}
+
+	if duplicated := lo.FindDuplicatesBy(indexes, func(idx schema.Index) string {
+		return idx.Name()
+	}); len(duplicated) > 0 {
+		slog.Error("duplicate index provided", "index", duplicated[0])
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return
+	}
+
+	for _, idx := range indexes {
+		if err := storage.CreateIndex(idx.Name(), idx.Pattern(), buntdb.IndexJSON(idx.Path())); err != nil {
+			slog.Error("failed to create index", "index", idx.Name(), "error", err)
+		}
 	}
 }
 
@@ -433,11 +536,12 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int) {
+func Start(address string, maxConn int, indexes ...schema.Index) {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
-		startDB()
+		start(indexes...)
+
 		ensureExternalAuthKey()
 
 		resolvedAddr := address
