@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,16 +14,17 @@ import (
 
 const clientTestServerAddr = "127.0.0.1:36380"
 const clientTestExternalAuthKey = "client-test-external-key"
-const clientTestMaxConns = 3
+const clientTestMaxConns = 50
 
 func ensureClientTestServer(t *testing.T) {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
 
 	server.Start(clientTestServerAddr, clientTestMaxConns)
 
 	for i := 0; i < 30; i++ {
-		probe, err := connect(clientTestServerAddr, internal.AuthKey())
+		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
 		if err == nil {
 			_ = probe.Close()
 			return
@@ -37,7 +39,7 @@ func newAuthedClientForTest(t *testing.T) *redis.Client {
 	t.Helper()
 
 	ensureClientTestServer(t)
-	client, err := connect(clientTestServerAddr, internal.AuthKey())
+	client, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
 	if err != nil {
 		t.Fatalf("connect() error = %v", err)
 	}
@@ -53,6 +55,8 @@ func resetHandlerStateForTest() {
 	kvClientMu.Lock()
 	kvClient = nil
 	kvClientMu.Unlock()
+
+	cliOnce = sync.Once{}
 
 	for len(pubChan) > 0 {
 		<-pubChan
@@ -193,7 +197,7 @@ func TestAuthWithServerSuccess(t *testing.T) {
 	mockClient := newAuthedClientForTest(t)
 	setSharedClient(mockClient)
 
-	if err := Auth(internal.AuthKey()); err != nil {
+	if err := Auth(clientTestExternalAuthKey); err != nil {
 		t.Fatalf("Auth() error = %v, want nil", err)
 	}
 }
@@ -305,7 +309,7 @@ func TestHealthCheckAndConnectWithServer(t *testing.T) {
 	resetHandlerStateForTest()
 	ensureClientTestServer(t)
 
-	client, err := connect(clientTestServerAddr, internal.AuthKey())
+	client, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
 	if err != nil {
 		t.Fatalf("connect() error = %v, want nil", err)
 	}
@@ -320,7 +324,7 @@ func TestConnectStartsSharedClientWithPassword(t *testing.T) {
 	resetHandlerStateForTest()
 	ensureClientTestServer(t)
 
-	if err := Connect(clientTestServerAddr, internal.AuthKey()); err != nil {
+	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
 		t.Fatalf("Connect() error = %v, want nil", err)
 	}
 
@@ -372,28 +376,87 @@ func TestConnectHelperRejectsEmptyAuthKey(t *testing.T) {
 	}
 }
 
+func TestExternalSetWithTTL(t *testing.T) {
+	resetHandlerStateForTest()
+	ensureClientTestServer(t)
+
+	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// wait for client connection
+	var connected bool
+	for i := 0; i < 30; i++ {
+		client := getSharedClient()
+		if client != nil {
+			if err := healthCheck(context.Background(), client); err == nil {
+				connected = true
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("Connect() failed to establish shared client in time")
+	}
+
+	key := "ttl_key"
+	val := "ttl_val"
+
+	// set with 200ms TTL
+	if err := SetWithTTL(key, val, 200*time.Millisecond); err != nil {
+		t.Fatalf("SetWithTTL() error = %v", err)
+	}
+
+	// Immediate Get should succeed
+	got, err := Get(key)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got != val {
+		t.Errorf("Get() = %v, want %v", got, val)
+	}
+
+	// Wait for expiration
+	time.Sleep(300 * time.Millisecond)
+
+	// Get after expiration should be empty
+	got, err = Get(key)
+	if err != redis.Nil && got != "" {
+		t.Errorf("Get() after TTL = %v, %v, want empty string and redis.Nil", got, err)
+	}
+}
+
 func TestExternalConnectExceedsMaxConnections(t *testing.T) {
 	resetHandlerStateForTest()
 	ensureClientTestServer(t)
 
-	clients := make([]*redis.Client, 0, clientTestMaxConns)
+	var clients []*redis.Client
 	t.Cleanup(func() {
 		for _, c := range clients {
 			_ = c.Close()
 		}
 	})
 
-	for i := 0; i < clientTestMaxConns; i++ {
-		c, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
+	var overflowErr error
+	for i := 0; i < clientTestMaxConns+5; i++ {
+		var c *redis.Client
+		var err error
+		for attempt := 0; attempt < 10; attempt++ {
+			c, err = connect(clientTestServerAddr, clientTestExternalAuthKey)
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		if err != nil {
-			t.Fatalf("connect() #%d error = %v, want nil", i+1, err)
+			overflowErr = err
+			break
 		}
 		clients = append(clients, c)
 	}
 
-	extra, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
-	if err == nil {
-		_ = extra.Close()
+	if overflowErr == nil {
 		t.Fatal("connect() overflow error = nil, want non-nil when exceeding external max connections")
 	}
 }

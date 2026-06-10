@@ -219,6 +219,23 @@ func Get(key string) (string, error) {
 }
 
 // Set stores a value for the given key using the shared resp client.
+func SetWithTTL(key, value string, ttl time.Duration) error {
+	if key == "" {
+		return nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.Set(ctx, key, value, ttl).Err()
+}
+
+// Set stores a value for the given key using the shared resp client.
 func Set(key, value string) error {
 	if key == "" {
 		return nil

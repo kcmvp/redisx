@@ -1,0 +1,7 @@
+# respx AI Rules
+
+## Coding Style
+- Always prefer functional programming patterns using `samber/lo` and `samber/mo` where applicable.
+- Avoid using global locks (`sync.Mutex` / `sync.RWMutex`) on critical hot paths; prefer connection-scoped context or atomic operations.
+- Avoid using global variables unless explicitly asked.
+- Always try to use a function instead of creating a new struct
