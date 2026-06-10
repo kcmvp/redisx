@@ -3,7 +3,7 @@
   <br/>
   <br/>
   <a href="https://github.com/kcmvp/respx/blob/main/LICENSE">
-    <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/dvo"/>
+    <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/resp"/>
   </a>
   <a href="https://pkg.go.dev/github.com/kcmvp/respx">
     <img src="https://pkg.go.dev/badge/github.com/kcmvp/respx.svg" alt="Go Reference"/>
