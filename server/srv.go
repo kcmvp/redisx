@@ -581,3 +581,10 @@ func Start(address string, maxConn int, indexes ...schema.Index) {
 		<-startedCh
 	})
 }
+
+func DB() *buntdb.DB {
+	if storage == nil {
+		panic("storage is not initialized")
+	}
+	return storage
+}
