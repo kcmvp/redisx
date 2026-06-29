@@ -487,9 +487,7 @@ func start(indexes ...schema.Index) {
 	}
 
 	for _, idx := range indexes {
-		if err := storage.CreateIndex(idx.Name(), idx.Pattern(), buntdb.IndexJSON(idx.Path())); err != nil {
-			slog.Error("failed to create index", "index", idx.Name(), "error", err)
-		}
+		_ = CreateIndex(idx)
 	}
 }
 
@@ -580,6 +578,14 @@ func Start(address string, maxConn int, indexes ...schema.Index) {
 
 		<-startedCh
 	})
+}
+
+func CreateIndex(index schema.Index) error {
+	err := storage.CreateIndex(index.Name(), index.Pattern(), lo.If(len(index.Path()) > 0, buntdb.IndexJSON(index.Path())).Else(buntdb.IndexString))
+	if err != nil {
+		slog.Error("failed to create index", "index", index.Name(), "error", err)
+	}
+	return err
 }
 
 func DB() *buntdb.DB {
