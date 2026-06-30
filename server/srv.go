@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/respx/internal"
-	"github.com/kcmvp/respx/schema"
+	"github.com/kcmvp/respx/meta"
 	"github.com/samber/lo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
@@ -441,7 +441,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *buntdb.DB, ps *redc
 	}
 }
 
-func start(indexes ...schema.Index) {
+func start(indexes ...meta.Index) {
 	var err error
 
 	globalMu.RLock()
@@ -476,7 +476,7 @@ func start(indexes ...schema.Index) {
 		return
 	}
 
-	if duplicated := lo.FindDuplicatesBy(indexes, func(idx schema.Index) string {
+	if duplicated := lo.FindDuplicatesBy(indexes, func(idx meta.Index) string {
 		return idx.Name()
 	}); len(duplicated) > 0 {
 		slog.Error("duplicate index provided", "index", duplicated[0])
@@ -534,7 +534,7 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int, indexes ...schema.Index) {
+func Start(address string, maxConn int, indexes ...meta.Index) {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
@@ -580,7 +580,7 @@ func Start(address string, maxConn int, indexes ...schema.Index) {
 	})
 }
 
-func CreateIndex(index schema.Index) error {
+func CreateIndex(index meta.Index) error {
 	err := storage.CreateIndex(index.Name(), index.Pattern(), lo.If(len(index.Path()) > 0, buntdb.IndexJSON(index.Path())).Else(buntdb.IndexString))
 	if err != nil {
 		slog.Error("failed to create index", "index", index.Name(), "error", err)

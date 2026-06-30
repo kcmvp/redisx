@@ -1,4 +1,4 @@
-package schema
+package meta
 
 // Index represents the configuration required to create a JSON index in the backend storage (BuntDB).
 // By defining an index, you enable the respx server to perform highly efficient lookups on specific JSON fields
