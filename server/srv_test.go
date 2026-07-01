@@ -598,7 +598,7 @@ func TestStopWithStorageCloseError(t *testing.T) {
 
 	// We can cause Close to return an error by closing it first
 	_ = db.Close()
-	storage = db
+	Repository = db
 
 	// Set srvOnce so stop() will actually do cleanup
 	srvOnce.Do(func() {})
@@ -608,7 +608,7 @@ func TestStopWithStorageCloseError(t *testing.T) {
 		t.Error("expected stop() to return an error from storage.Close()")
 	}
 
-	if storage != nil {
+	if Repository != nil {
 		t.Error("expected storage to be nil even if Close() failed")
 	}
 }
@@ -642,7 +642,7 @@ func TestStop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open buntdb: %v", err)
 	}
-	storage = db
+	Repository = db
 
 	err = stop()
 	if err != nil {
@@ -665,7 +665,7 @@ func TestStop(t *testing.T) {
 	}
 	shutdownMu.Unlock()
 
-	if storage != nil {
+	if Repository != nil {
 		t.Errorf("expected storage to be nil")
 	}
 }
@@ -680,10 +680,10 @@ func TestStartDB(t *testing.T) {
 
 	start()
 
-	if storage == nil {
+	if Repository == nil {
 		t.Fatal("expected storage to be initialized")
 	}
-	defer func() { _ = storage.Close() }()
+	defer func() { _ = Repository.Close() }()
 
 	// Verify directory was created
 	_, err := os.Stat(filepath.Join(tmpDir, ".respx"))
