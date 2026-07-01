@@ -1,9 +1,11 @@
-package meta
+package storage
 
-// Index represents the configuration required to create a JSON index in the backend storage (BuntDB).
+import "time"
+
+// Schema represents the configuration required to create a JSON index in the backend storage (BuntDB).
 // By defining an index, you enable the respx server to perform highly efficient lookups on specific JSON fields
 // across your stored values using the QueryX command.
-type Index interface {
+type Schema interface {
 	// Name returns the unique identifier for the index.
 	// This name is used by the client when executing a QueryX command to specify which index to search against.
 	Name() string
@@ -16,4 +18,7 @@ type Index interface {
 	// Path returns the specific path within the JSON document that should be indexed.
 	// For example, returning "age" or "address.city" will index those specific fields from the JSON values.
 	Path() string
+
+	// Ttl define the TTL of the data in this schema
+	Ttl() time.Duration
 }
