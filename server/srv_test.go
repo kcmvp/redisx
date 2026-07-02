@@ -468,7 +468,9 @@ func TestHandleCommand(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			storage.Reset()
 			db := storage.Start(false)
-			defer db.Close()
+			defer func() {
+				_ = db.Close()
+			}()
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
@@ -590,7 +592,9 @@ func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 
 	storage.Reset()
 	db := storage.Start(false)
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
@@ -612,7 +616,9 @@ func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 
 	storage.Reset()
 	db := storage.Start(false)
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
