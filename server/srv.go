@@ -452,7 +452,7 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int, persistent bool, schemas ...storage.Schema) {
+func Start(address string, maxConn int, persistent bool, schemas ...storage.Schema) storage.DB {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
@@ -500,4 +500,10 @@ func Start(address string, maxConn int, persistent bool, schemas ...storage.Sche
 
 		<-startedCh
 	})
+
+	globalMu.RLock()
+	db := currentDB
+	globalMu.RUnlock()
+
+	return db
 }
