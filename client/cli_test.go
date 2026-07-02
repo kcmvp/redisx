@@ -21,7 +21,7 @@ func ensureClientTestServer(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
 
-	server.Start(clientTestServerAddr, clientTestMaxConns)
+	server.Start(clientTestServerAddr, clientTestMaxConns, false)
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)

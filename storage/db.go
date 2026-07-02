@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,8 +14,6 @@ import (
 var (
 	db   DB
 	once sync.Once
-	_    DB = (*xdb)(nil)
-	_    DB = (*mem)(nil)
 )
 
 // Schema represents the configuration required to create a JSON index in the backend storage (BuntDB).
@@ -40,12 +37,19 @@ type Schema interface {
 	Ttl() time.Duration
 }
 
-func Start(schemas ...Schema) {
+func Start(persistent bool, schemas ...Schema) DB {
 	once.Do(func() {
-		if len(schemas) == 0 {
-			db = mem{raw: map[string]string{}}
+		var err error
+		var raw *buntdb.DB
+
+		if !persistent {
+			raw, err = buntdb.Open(":memory:")
+			if err != nil {
+				slog.Error("failed to open in-memory buntdb", "error", err)
+				os.Exit(1)
+				return
+			}
 		} else {
-			var err error
 			homeDir, err := os.UserHomeDir()
 			if err != nil {
 				slog.Error("failed to resolve user home directory", "error", err)
@@ -61,15 +65,17 @@ func Start(schemas ...Schema) {
 			}
 
 			dbPath := filepath.Join(dataDir, "data.db")
-			raw, err := buntdb.Open(dbPath)
+			raw, err = buntdb.Open(dbPath)
 			if err != nil {
 				slog.Error("failed to open buntdb", "path", dbPath, "error", err)
 				os.Exit(1)
 				return
 			}
+		}
 
-			db = &xdb{raw: raw}
+		db = &xdb{raw: raw}
 
+		if len(schemas) > 0 {
 			if duplicated := lo.FindDuplicatesBy(schemas, func(idx Schema) string {
 				return idx.Name()
 			}); len(duplicated) > 0 {
@@ -82,54 +88,37 @@ func Start(schemas ...Schema) {
 			}
 		}
 	})
+	return db
 }
 
-func Get() DB {
-	return db
+// Reset clears the singleton instance. Used only for testing.
+func Reset() {
+	if x, ok := db.(*xdb); ok && x != nil && x.raw != nil {
+		_ = x.raw.Close()
+	}
+	db = nil
+	once = sync.Once{}
 }
 
 type DB interface {
 	Set(key string, value string) error
 	SetWithTtl(key string, value string, ttl time.Duration) error
+	SetNX(key string, value string) (bool, error)
 	Get(key string) (string, error)
 	Delete(key string) (bool, error)
+	Keys(pattern string) ([]string, error)
+	Close() error
 
 	Create(schema Schema) error
 	Raw() any
 }
 
-type mem struct {
-	raw map[string]string
-}
-
-func (d mem) Raw() any {
-	return d.raw
-}
-
-func (d mem) Create(schema Schema) error {
-	return fmt.Errorf("not supported on mem")
-}
-
-func (d mem) Set(key string, value string) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (d mem) SetWithTtl(key string, value string, ttl time.Duration) error {
-	return d.Set(key, value)
-}
-
-func (d mem) Get(key string) (string, error) {
-	//TODO implement me
-	panic("implement me")
-}
-func (d mem) Delete(key string) (bool, error) {
-	//TODO implement me
-	panic("implement me")
-}
-
 type xdb struct {
 	raw *buntdb.DB
+}
+
+func (x *xdb) Close() error {
+	return x.raw.Close()
 }
 
 func (x *xdb) Raw() any {
@@ -164,6 +153,26 @@ func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 	}
 }
 
+func (x *xdb) SetNX(key string, value string) (bool, error) {
+	var set bool
+	err := x.raw.Update(func(tx *buntdb.Tx) error {
+		_, err := tx.Get(key)
+		if err == nil {
+			set = false
+			return nil
+		}
+		if err == buntdb.ErrNotFound {
+			_, _, err = tx.Set(key, value, nil)
+			if err == nil {
+				set = true
+			}
+			return err
+		}
+		return err
+	})
+	return set, err
+}
+
 func (x *xdb) Get(key string) (string, error) {
 	var val string
 	var err error
@@ -178,7 +187,24 @@ func (x *xdb) Delete(key string) (bool, error) {
 	var err error
 	_ = x.raw.Update(func(tx *buntdb.Tx) error {
 		val, err = tx.Delete(key)
+		if err == buntdb.ErrNotFound {
+			err = nil
+			return nil
+		}
 		return nil
 	})
 	return len(val) > 0, err
+}
+
+func (x *xdb) Keys(pattern string) ([]string, error) {
+	var keys []string
+	err := x.raw.View(func(tx *buntdb.Tx) error {
+		// Keys uses AscendKeys which supports simple glob matching (*, ?)
+		// In buntdb, AscendKeys iterates over keys matching the pattern
+		return tx.AscendKeys(pattern, func(key, value string) bool {
+			keys = append(keys, key)
+			return true
+		})
+	})
+	return keys, err
 }

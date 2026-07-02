@@ -32,6 +32,7 @@ const (
 	cmdGet        = "get"
 	cmdSetNX      = "setnx"
 	cmdDel        = "del"
+	cmdKeys       = "keys"
 	cmdPublish    = "publish"
 	cmdSubscribe  = "subscribe"
 	cmdPSubscribe = "psubscribe"
@@ -61,6 +62,7 @@ var (
 	signalNotifyFn   = signal.Notify
 	signalStopFn     = signal.Stop
 	osExitFn         = os.Exit
+	currentDB        storage.DB
 )
 
 func getOsExitFn() func(int) {
@@ -285,6 +287,35 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			return
 		}
 		conn.WriteString("OK")
+	case cmdSetEx:
+		if len(cmd.Args) != 4 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		secs, err := strconv.Atoi(string(cmd.Args[2]))
+		if err != nil {
+			conn.WriteError("ERR value is not an integer or out of range")
+			return
+		}
+		ttl := time.Duration(secs) * time.Second
+		if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[3]), ttl); err != nil {
+			conn.WriteError("ERR " + err.Error())
+			return
+		}
+		conn.WriteString("OK")
+	case cmdSetNX:
+		if len(cmd.Args) != 3 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		set, err := db.SetNX(string(cmd.Args[1]), string(cmd.Args[2]))
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+		} else if set {
+			conn.WriteInt(1)
+		} else {
+			conn.WriteInt(0)
+		}
 	case cmdGet:
 		if len(cmd.Args) != 2 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -311,6 +342,20 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			conn.WriteInt(1)
 		} else {
 			conn.WriteInt(0)
+		}
+	case cmdKeys:
+		if len(cmd.Args) != 2 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		keys, err := db.Keys(string(cmd.Args[1]))
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+		} else {
+			conn.WriteArray(len(keys))
+			for _, key := range keys {
+				conn.WriteBulk([]byte(key))
+			}
 		}
 	case internal.XCmdQuery:
 		if len(cmd.Args) != 3 {
@@ -384,6 +429,20 @@ func stop() error {
 	if ln != nil {
 		err = ln.Close()
 	}
+
+	globalMu.Lock()
+	dbToClose := currentDB
+	currentDB = nil
+	globalMu.Unlock()
+
+	if dbToClose != nil {
+		if closeErr := dbToClose.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		} else if closeErr != nil {
+			slog.Warn("failed to close storage", "error", closeErr)
+		}
+	}
+
 	srvOnce = sync.Once{}
 	return err
 }
@@ -393,11 +452,15 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int, schemas ...storage.Schema) {
+func Start(address string, maxConn int, persistent bool, schemas ...storage.Schema) {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
-		storage.Start(schemas...)
+		db := storage.Start(persistent, schemas...)
+
+		globalMu.Lock()
+		currentDB = db
+		globalMu.Unlock()
 
 		ensureExternalAuthKey()
 
@@ -420,7 +483,7 @@ func Start(address string, maxConn int, schemas ...storage.Schema) {
 			listenFn := getListenAndServeFn()
 			err := listenFn(resolvedAddr,
 				func(conn redcon.Conn, cmd redcon.Command) {
-					handleCommand(conn, cmd, storage.Get(), &ps)
+					handleCommand(conn, cmd, db, &ps)
 				},
 				acceptCon,
 				closeCon,

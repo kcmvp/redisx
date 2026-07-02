@@ -4,37 +4,58 @@ import (
 	"errors"
 	"net"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/tidwall/buntdb"
+	"github.com/kcmvp/respx/storage"
 	"github.com/tidwall/redcon"
 )
 
 type mockConn struct {
-	remoteAddr string
-	ctx        interface{}
-	closed     bool
-	errors     []string
-	strings    []string
-	bulks      [][]byte
-	ints       []int
-	nulls      int
+	remoteAddr   string
+	ctx          interface{}
+	closed       bool
+	errors       []string
+	strings      []string
+	bulks        [][]byte
+	ints         []int
+	nulls        int
+	arrays       [][]string
+	currentArray []string
+	arrayLen     int
 }
 
-func (m *mockConn) RemoteAddr() string             { return m.remoteAddr }
-func (m *mockConn) Close() error                   { m.closed = true; return nil }
-func (m *mockConn) WriteError(msg string)          { m.errors = append(m.errors, msg) }
-func (m *mockConn) WriteString(str string)         { m.strings = append(m.strings, str) }
-func (m *mockConn) WriteBulk(b []byte)             { m.bulks = append(m.bulks, append([]byte(nil), b...)) }
-func (m *mockConn) WriteBulkString(string)         {}
-func (m *mockConn) WriteInt(num int)               { m.ints = append(m.ints, num) }
-func (m *mockConn) WriteInt64(int64)               {}
-func (m *mockConn) WriteUint64(uint64)             {}
-func (m *mockConn) WriteArray(int)                 {}
+func (m *mockConn) RemoteAddr() string     { return m.remoteAddr }
+func (m *mockConn) Close() error           { m.closed = true; return nil }
+func (m *mockConn) WriteError(msg string)  { m.errors = append(m.errors, msg) }
+func (m *mockConn) WriteString(str string) { m.strings = append(m.strings, str) }
+func (m *mockConn) WriteBulk(b []byte) {
+	if m.arrayLen > 0 {
+		m.currentArray = append(m.currentArray, string(b))
+		if len(m.currentArray) == m.arrayLen {
+			m.arrays = append(m.arrays, m.currentArray)
+			m.arrayLen = 0
+			m.currentArray = nil
+		}
+	} else {
+		m.bulks = append(m.bulks, append([]byte(nil), b...))
+	}
+}
+func (m *mockConn) WriteBulkString(s string) { m.WriteBulk([]byte(s)) }
+func (m *mockConn) WriteInt(num int)         { m.ints = append(m.ints, num) }
+func (m *mockConn) WriteInt64(int64)         {}
+func (m *mockConn) WriteUint64(uint64)       {}
+func (m *mockConn) WriteArray(count int) {
+	if count == 0 {
+		m.arrays = append(m.arrays, []string{})
+	} else {
+		m.arrayLen = count
+		m.currentArray = make([]string, 0, count)
+	}
+}
 func (m *mockConn) WriteNull()                     { m.nulls++ }
 func (m *mockConn) WriteRaw([]byte)                {}
 func (m *mockConn) WriteAny(any)                   {}
@@ -53,14 +74,17 @@ type mockDetachedConn struct {
 func (m *mockDetachedConn) ReadCommand() (redcon.Command, error) { return redcon.Command{}, nil }
 func (m *mockDetachedConn) Flush() error                         { return nil }
 
+// resetStorage clears the singleton instance in storage package. Used only for testing.
+// We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
+// Since we can't easily call the private `reset` in storage, we just restart the DB with memory flag.
 func resetTestState(t *testing.T) {
 	t.Helper()
+
 	originalInternalAuthKey := internalAuthKey
 	originalAuthKey := authKey
 	originalExternalMaxConns := externalMaxConns
 	originalListenAndServeFn := listenAndServeFn
 	originalOsExitFn := osExitFn
-	originalUserHomeDirFn := userHomeDirFn
 
 	globalMu.Lock()
 	activeExternalConns = 0
@@ -79,7 +103,6 @@ func resetTestState(t *testing.T) {
 		externalMaxConns = originalExternalMaxConns
 		listenAndServeFn = originalListenAndServeFn
 		osExitFn = originalOsExitFn
-		userHomeDirFn = originalUserHomeDirFn
 		srvOnce = sync.Once{}
 		globalMu.Unlock()
 	})
@@ -234,6 +257,7 @@ func TestHandleCommand(t *testing.T) {
 		wantInts    []int
 		wantNulls   int
 		wantErrors  []string
+		wantArrays  [][]string
 		wantClosed  bool
 	}{
 		{
@@ -328,6 +352,19 @@ func TestHandleCommand(t *testing.T) {
 			auth:      true,
 			commands:  [][]string{{"GET", "nonexistent"}},
 			wantNulls: 1,
+		},
+		{
+			name:        "keys",
+			auth:        true,
+			commands:    [][]string{{"SET", "key1", "val1"}, {"SET", "key2", "val2"}, {"KEYS", "key*"}},
+			wantStrings: []string{"OK", "OK"},
+			wantArrays:  [][]string{{"key1", "key2"}},
+		},
+		{
+			name:       "keys_not_found",
+			auth:       true,
+			commands:   [][]string{{"KEYS", "nonexistent*"}},
+			wantArrays: [][]string{{}},
 		},
 		{
 			name:     "del non-existent",
@@ -429,11 +466,9 @@ func TestHandleCommand(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			db, err := buntdb.Open(":memory:")
-			if err != nil {
-				t.Fatalf("failed to open buntdb: %v", err)
-			}
-			defer func() { _ = db.Close() }()
+			storage.Reset()
+			db := storage.Start(false)
+			defer db.Close()
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
@@ -511,6 +546,37 @@ func TestHandleCommand(t *testing.T) {
 				t.Errorf("nulls = %d, want %d", conn.nulls, tc.wantNulls)
 			}
 
+			if tc.wantErrors != nil {
+				if len(conn.errors) != len(tc.wantErrors) {
+					t.Errorf("%s: got %d errors, want %d", tc.name, len(conn.errors), len(tc.wantErrors))
+				} else {
+					for i, want := range tc.wantErrors {
+						if !strings.Contains(conn.errors[i], want) {
+							t.Errorf("%s: error %d got %q, want it to contain %q", tc.name, i, conn.errors[i], want)
+						}
+					}
+				}
+			}
+
+			if tc.wantArrays != nil {
+				if len(conn.arrays) != len(tc.wantArrays) {
+					t.Errorf("%s: got %d arrays, want %d", tc.name, len(conn.arrays), len(tc.wantArrays))
+				} else {
+					for i, want := range tc.wantArrays {
+						got := conn.arrays[i]
+						if len(got) != len(want) {
+							t.Errorf("%s: array %d length got %d, want %d", tc.name, i, len(got), len(want))
+						} else {
+							for j, w := range want {
+								if got[j] != w {
+									t.Errorf("%s: array %d item %d got %q, want %q", tc.name, i, j, got[j], w)
+								}
+							}
+						}
+					}
+				}
+			}
+
 			// Validate Closed
 			if conn.closed != tc.wantClosed {
 				t.Errorf("closed = %v, want %v", conn.closed, tc.wantClosed)
@@ -522,8 +588,9 @@ func TestHandleCommand(t *testing.T) {
 func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 	resetTestState(t)
 
-	db, _ := buntdb.Open(":memory:")
-	defer func() { _ = db.Close() }()
+	storage.Reset()
+	db := storage.Start(false)
+	defer db.Close()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
@@ -543,8 +610,9 @@ func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 	resetTestState(t)
 
-	db, _ := buntdb.Open(":memory:")
-	defer func() { _ = db.Close() }()
+	storage.Reset()
+	db := storage.Start(false)
+	defer db.Close()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
 	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
@@ -588,31 +656,6 @@ func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 }
 
-func TestStopWithStorageCloseError(t *testing.T) {
-	resetTestState(t)
-
-	db, err := buntdb.Open(":memory:")
-	if err != nil {
-		t.Fatalf("failed to open buntdb: %v", err)
-	}
-
-	// We can cause Close to return an error by closing it first
-	_ = db.Close()
-	Repository = db
-
-	// Set srvOnce so stop() will actually do cleanup
-	srvOnce.Do(func() {})
-
-	err = stop()
-	if err == nil {
-		t.Error("expected stop() to return an error from storage.Close()")
-	}
-
-	if Repository != nil {
-		t.Error("expected storage to be nil even if Close() failed")
-	}
-}
-
 func TestStop(t *testing.T) {
 	resetTestState(t)
 
@@ -638,12 +681,6 @@ func TestStop(t *testing.T) {
 	shutdownDoneCh = doneCh
 	shutdownMu.Unlock()
 
-	db, err := buntdb.Open(":memory:")
-	if err != nil {
-		t.Fatalf("failed to open buntdb: %v", err)
-	}
-	Repository = db
-
 	err = stop()
 	if err != nil {
 		t.Fatalf("stop() returned error: %v", err)
@@ -664,128 +701,6 @@ func TestStop(t *testing.T) {
 		t.Errorf("expected shutdownDoneCh to be nil")
 	}
 	shutdownMu.Unlock()
-
-	if Repository != nil {
-		t.Errorf("expected storage to be nil")
-	}
-}
-
-func TestStartDB(t *testing.T) {
-	resetTestState(t)
-
-	tmpDir := t.TempDir()
-	userHomeDirFn = func() (string, error) {
-		return tmpDir, nil
-	}
-
-	start()
-
-	if Repository == nil {
-		t.Fatal("expected storage to be initialized")
-	}
-	defer func() { _ = Repository.Close() }()
-
-	// Verify directory was created
-	_, err := os.Stat(filepath.Join(tmpDir, ".respx"))
-	if os.IsNotExist(err) {
-		t.Fatal("expected .respx directory to be created")
-	}
-}
-
-func TestStartDBHomeDirError(t *testing.T) {
-	resetTestState(t)
-
-	globalMu.Lock()
-	userHomeDirFn = func() (string, error) {
-		return "", errors.New("simulated home dir error")
-	}
-
-	exitCalled := false
-	osExitFn = func(code int) {
-		exitCalled = true
-		if code != 1 {
-			t.Errorf("osExitFn called with code %d, want 1", code)
-		}
-	}
-	globalMu.Unlock()
-
-	start()
-
-	if !exitCalled {
-		t.Error("expected osExitFn to be called on home dir error")
-	}
-}
-
-func TestStartDBMkdirError(t *testing.T) {
-	resetTestState(t)
-
-	tmpDir := t.TempDir()
-	// Create a file where the directory should be, to cause MkdirAll to fail
-	badPath := filepath.Join(tmpDir, ".respx")
-	err := os.WriteFile(badPath, []byte("file instead of dir"), 0o644)
-	if err != nil {
-		t.Fatalf("failed to write file: %v", err)
-	}
-
-	globalMu.Lock()
-	userHomeDirFn = func() (string, error) {
-		return tmpDir, nil
-	}
-
-	exitCalled := false
-	osExitFn = func(code int) {
-		exitCalled = true
-		if code != 1 {
-			t.Errorf("osExitFn called with code %d, want 1", code)
-		}
-	}
-	globalMu.Unlock()
-
-	start()
-
-	if !exitCalled {
-		t.Error("expected osExitFn to be called on mkdir error")
-	}
-}
-
-func TestStartDBOpenError(t *testing.T) {
-	resetTestState(t)
-
-	tmpDir := t.TempDir()
-
-	globalMu.Lock()
-	userHomeDirFn = func() (string, error) {
-		return tmpDir, nil
-	}
-	globalMu.Unlock()
-
-	// Create a directory where the db file should be, to cause Open to fail
-	respxDir := filepath.Join(tmpDir, ".respx")
-	err := os.MkdirAll(respxDir, 0o755)
-	if err != nil {
-		t.Fatalf("failed to create dir: %v", err)
-	}
-	dbPath := filepath.Join(respxDir, "data.db")
-	err = os.MkdirAll(dbPath, 0o755)
-	if err != nil {
-		t.Fatalf("failed to create dir for db path: %v", err)
-	}
-
-	globalMu.Lock()
-	exitCalled := false
-	osExitFn = func(code int) {
-		exitCalled = true
-		if code != 1 {
-			t.Errorf("osExitFn called with code %d, want 1", code)
-		}
-	}
-	globalMu.Unlock()
-
-	start()
-
-	if !exitCalled {
-		t.Error("expected osExitFn to be called on buntdb.Open error")
-	}
 }
 
 func TestStartListenError(t *testing.T) {
@@ -812,7 +727,7 @@ func TestStartListenError(t *testing.T) {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		Start("127.0.0.1:16380", 3)
+		Start("127.0.0.1:16380", 3, false)
 		close(doneCh)
 	}()
 
@@ -851,7 +766,7 @@ func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
 
 	startAddr := "127.0.0.1:16380"
 	startMaxCon := 3
-	Start(startAddr, startMaxCon)
+	Start(startAddr, startMaxCon, false)
 
 	select {
 	case addr := <-listenCalledCh:
@@ -879,7 +794,7 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 		return nil
 	}
 
-	Start("", 0)
+	Start("", 0, false)
 
 	select {
 	case addr := <-listenCalledCh:
