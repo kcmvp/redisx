@@ -98,9 +98,21 @@ func Subscribe(topic string, handler MessageHandler) error {
 }
 
 var (
-	runLifecycleCtx context.Context
-	cancelLifecycle context.CancelFunc
+	lifecycleCtx atomic.Value
 )
+
+func setLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
+	lifecycleCtx.Store(lo.T2(ctx, cancel))
+}
+
+func getLifecycleCtx() (context.Context, context.CancelFunc) {
+	val := lifecycleCtx.Load()
+	if val == nil {
+		return nil, nil
+	}
+	t := val.(lo.Tuple2[context.Context, context.CancelFunc])
+	return t.A, t.B
+}
 
 // Connect starts the bridge lifecycle.
 func Connect(respAddr, authKey string) error {
@@ -109,14 +121,21 @@ func Connect(respAddr, authKey string) error {
 	}
 
 	cliOnce.Do(func() {
-		runLifecycleCtx, cancelLifecycle = context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(context.Background())
+		setLifecycleCtx(ctx, cancel)
+
 		go func() {
 			for {
 				var err error
 				var client *redis.Client
 				_, _, _ = lo.AttemptWhileWithDelay(-1, reconnectEvery, func(i int, duration time.Duration) (error, bool) {
+					runCtx, _ := getLifecycleCtx()
+					if runCtx == nil {
+						return nil, false
+					}
+
 					select {
-					case <-runLifecycleCtx.Done():
+					case <-runCtx.Done():
 						return nil, false
 					default:
 					}
@@ -127,7 +146,8 @@ func Connect(respAddr, authKey string) error {
 					return nil, false
 				})
 
-				if runLifecycleCtx.Err() != nil {
+				runCtx, _ := getLifecycleCtx()
+				if runCtx == nil || runCtx.Err() != nil {
 					return
 				}
 
@@ -139,7 +159,9 @@ func Connect(respAddr, authKey string) error {
 
 				slog.Info("mresp connected")
 
-				runCtx, cancelRun := context.WithCancel(runLifecycleCtx)
+				rootCtx, _ := getLifecycleCtx()
+				workerCtx, cancelRun := context.WithCancel(rootCtx)
+
 				firstExit := make(chan string, 1)
 				var wg sync.WaitGroup
 				notifyExit := func(worker string) {
@@ -152,14 +174,14 @@ func Connect(respAddr, authKey string) error {
 				wg.Add(2)
 				go func() {
 					defer wg.Done()
-					if err := produce(runCtx, client); err != nil && err != context.Canceled {
+					if err := produce(workerCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp producer exited", "error", err)
 					}
 					notifyExit("producer")
 				}()
 				go func() {
 					defer wg.Done()
-					if err := consume(runCtx, client); err != nil && err != context.Canceled {
+					if err := consume(workerCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp consumer exited", "error", err)
 					}
 					notifyExit("consumer")
@@ -170,7 +192,7 @@ func Connect(respAddr, authKey string) error {
 
 				for !lost {
 					select {
-					case <-runLifecycleCtx.Done():
+					case <-rootCtx.Done():
 						lost = true
 					case worker := <-firstExit:
 						slog.Warn("mresp connection lost, restarting lifecycle", "worker", worker)
@@ -209,7 +231,8 @@ func Connect(respAddr, authKey string) error {
 					}
 				}
 			workersStopped:
-				if runLifecycleCtx.Err() != nil {
+				stopCtx, _ := getLifecycleCtx()
+				if stopCtx == nil || stopCtx.Err() != nil {
 					return
 				}
 			}
@@ -221,8 +244,10 @@ func Connect(respAddr, authKey string) error {
 
 // Disconnect stops the bridge lifecycle and closes the shared client.
 func Disconnect() {
-	if cancelLifecycle != nil {
-		cancelLifecycle()
+	_, cancel := getLifecycleCtx()
+
+	if cancel != nil {
+		cancel()
 	}
 	client := getSharedClient()
 	if client != nil {
