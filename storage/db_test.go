@@ -85,7 +85,7 @@ func TestDB_Lifecycle(t *testing.T) {
 		tempDir := t.TempDir()
 		fileHome := tempDir + "/fakehome"
 		f, _ := os.Create(fileHome)
-		f.Close()
+		_ = f.Close()
 		_ = os.Setenv("HOME", fileHome)
 		
 		db := Open(true)

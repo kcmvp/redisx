@@ -177,6 +177,8 @@ func Open(persistent bool, schemas ...Schema) DB {
 	return dbInstance
 }
 
+type seal struct{}
+
 type DB interface {
 	Set(key string, value string) error
 	SetWithTtl(key string, value string, ttl time.Duration) error
@@ -191,10 +193,15 @@ type DB interface {
 	// ByKey queries the database using a key pattern and filter.
 	ByKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string]
 	Close() error
+	mark() seal
 }
 
 type xdb struct {
 	*buntdb.DB
+}
+
+func (x *xdb) mark() seal {
+	return seal{}
 }
 
 func (x *xdb) Close() error {
@@ -231,7 +238,7 @@ func (xdb *xdb) ByIndex(schemaName string, indexAttr string, filter x.Filter, de
 	valuePath := strings.ToLower(strings.ReplaceAll(indexAttr, ".", "_"))
 	indexName := fmt.Sprintf("%s_%s", strings.ToLower(schemaName), valuePath)
 
-	err := xdb.DB.View(func(tx *buntdb.Tx) error {
+	err := xdb.View(func(tx *buntdb.Tx) error {
 		iter := lo.If(desc, tx.Descend).Else(tx.Ascend)
 		err := iter(indexName, func(key, value string) bool {
 			// If no filter is provided, or the filter passes on the full JSON value, add it
@@ -259,7 +266,7 @@ func (xdb *xdb) ByKey(schemaName string, pattern string, filter x.Filter, desc b
 
 	keyPattern := fmt.Sprintf("%s%s%s", schemaName, KeySeparator, pattern)
 
-	err := xdb.DB.View(func(tx *buntdb.Tx) error {
+	err := xdb.View(func(tx *buntdb.Tx) error {
 		iter := lo.If(desc, tx.DescendKeys).Else(tx.AscendKeys)
 		return iter(keyPattern, func(key, value string) bool {
 			if filter == nil || filter.Eval(value) {
@@ -277,7 +284,7 @@ func (xdb *xdb) ByKey(schemaName string, pattern string, filter x.Filter, desc b
 }
 
 func (x *xdb) Set(key string, value string) error {
-	return x.DB.Update(func(tx *buntdb.Tx) error {
+	return x.Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
@@ -286,7 +293,7 @@ func (x *xdb) Set(key string, value string) error {
 func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 	if ttl > 0 {
 		opt := &buntdb.SetOptions{Expires: true, TTL: ttl}
-		return x.DB.Update(func(tx *buntdb.Tx) error {
+		return x.Update(func(tx *buntdb.Tx) error {
 			_, _, err := tx.Set(key, value, opt)
 			return err
 		})
@@ -298,7 +305,7 @@ func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 
 func (x *xdb) SetNX(key string, value string) (bool, error) {
 	var set bool
-	err := x.DB.Update(func(tx *buntdb.Tx) error {
+	err := x.Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == nil {
 			set = false
@@ -319,7 +326,7 @@ func (x *xdb) SetNX(key string, value string) (bool, error) {
 func (x *xdb) Get(key string) mo.Result[string] {
 	var val string
 	var err error
-	_ = x.DB.View(func(tx *buntdb.Tx) error {
+	_ = x.View(func(tx *buntdb.Tx) error {
 		val, err = tx.Get(key)
 		return err
 	})
@@ -332,7 +339,7 @@ func (x *xdb) Get(key string) mo.Result[string] {
 func (x *xdb) Delete(key string) (bool, error) {
 	var val string
 	var err error
-	_ = x.DB.Update(func(tx *buntdb.Tx) error {
+	_ = x.Update(func(tx *buntdb.Tx) error {
 		val, err = tx.Delete(key)
 		if err == buntdb.ErrNotFound {
 			err = nil
@@ -345,7 +352,7 @@ func (x *xdb) Delete(key string) (bool, error) {
 
 func (x *xdb) Keys(pattern string) mo.Result[[]string] {
 	var keys []string
-	err := x.DB.View(func(tx *buntdb.Tx) error {
+	err := x.View(func(tx *buntdb.Tx) error {
 		// Keys uses AscendKeys which supports simple glob matching (*, ?)
 		// In buntdb, AscendKeys iterates over keys matching the pattern
 		return tx.AscendKeys(pattern, func(key, value string) bool {
