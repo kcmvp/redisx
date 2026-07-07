@@ -657,7 +657,7 @@ func (s *ServerTestSuite) TestPubSub() {
 	defer func() { _ = subConn.Close() }()
 
 	// Auth Sub
-	_, _ = subConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	_, _ = fmt.Fprintf(subConn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)
 	buf := make([]byte, 1024)
 	_, _ = subConn.Read(buf)
 
@@ -678,7 +678,7 @@ func (s *ServerTestSuite) TestPubSub() {
 	defer func() { _ = pubConn.Close() }()
 
 	// Auth Pub
-	_, _ = pubConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	_, _ = fmt.Fprintf(pubConn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)
 	_, _ = pubConn.Read(buf)
 
 	// Publish (Case insensitive check as well)
