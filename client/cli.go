@@ -33,16 +33,13 @@ type outgoingMessage struct {
 	payload string
 }
 
-// MessageHandler is a writable channel that receives streamed messages.
-type MessageHandler chan<- *ReceivedMessage
-
 var (
 	pubChan   = make(chan outgoingMessage, bufferSize)
 	pipeDrops uint64
 	subReqCh  = make(chan string, bufferSize)
 
 	handlersMu      sync.RWMutex
-	handlersByTopic = make(map[string]MessageHandler)
+	handlersByTopic = make(map[string]chan *ReceivedMessage)
 
 	kvClientMu sync.RWMutex
 	kvClient   *redis.Client
@@ -72,21 +69,19 @@ func clearSharedClientIf(target *redis.Client) {
 	kvClientMu.Unlock()
 }
 
-// Subscribe registers a message handler for a topic.
-func Subscribe(topic string, handler MessageHandler) error {
+// Subscribe registers a message handler for a topic and returns a read-only channel.
+func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
-		return errors.New("topic is empty")
-	}
-	if handler == nil {
-		return errors.New("handler channel is nil")
+		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
 	}
 
 	handlersMu.Lock()
 	if _, exists := handlersByTopic[topic]; exists {
 		handlersMu.Unlock()
-		return errors.New("duplicated handler for topic")
+		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
 	}
-	handlersByTopic[topic] = handler
+	ch := make(chan *ReceivedMessage, bufferSize)
+	handlersByTopic[topic] = ch
 	handlersMu.Unlock()
 
 	select {
@@ -94,7 +89,7 @@ func Subscribe(topic string, handler MessageHandler) error {
 	default:
 	}
 
-	return nil
+	return mo.Ok[<-chan *ReceivedMessage](ch)
 }
 
 var (
@@ -584,6 +579,17 @@ func consume(ctx context.Context, client *redis.Client) error {
 				slog.Warn("mresp close consumer failed", "error", err)
 			}
 		}
+
+		// Close all registered handler channels when the consumer exits
+		handlersMu.Lock()
+		for _, ch := range handlersByTopic {
+			if ch != nil {
+				close(ch)
+			}
+		}
+		// Clear the map so any new Connect/lifecycle start starts fresh
+		handlersByTopic = make(map[string]chan *ReceivedMessage)
+		handlersMu.Unlock()
 	}()
 
 	for topic := range consumerTopics {

@@ -27,7 +27,7 @@ func (s *ClientTestSuite) SetupTest() {
 	Disconnect()
 
 	handlersMu.Lock()
-	handlersByTopic = make(map[string]MessageHandler)
+	handlersByTopic = make(map[string]chan *ReceivedMessage)
 	handlersMu.Unlock()
 
 	kvClientMu.Lock()
@@ -90,19 +90,16 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 	tests := []struct {
 		name        string
 		topic       string
-		handler     MessageHandler
 		setup       func()
 		expectErr   bool
 		wantErrMsg  string
 		checkStored bool
 	}{
-		{"Nil handler", "topic-a", nil, nil, true, "handler channel is nil", false},
-		{"Empty topic", "", make(chan *ReceivedMessage, 1), nil, true, "topic is empty", false},
+		{"Empty topic", "", nil, true, "topic is empty", false},
 		{
 			"Duplicate handler",
 			"orders",
-			make(chan *ReceivedMessage, 1),
-			func() { _ = Subscribe("orders", make(chan *ReceivedMessage, 1)) },
+			func() { _ = Subscribe("orders") },
 			true,
 			"duplicated handler for topic",
 			false,
@@ -110,7 +107,6 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 		{
 			"Success",
 			"orders_success",
-			make(chan *ReceivedMessage, 1),
 			nil,
 			false,
 			"",
@@ -125,14 +121,15 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 				tc.setup()
 			}
 
-			err := Subscribe(tc.topic, tc.handler)
+			res := Subscribe(tc.topic)
 			if tc.expectErr {
-				s.Error(err)
+				s.True(res.IsError())
 				if tc.wantErrMsg != "" {
-					s.Contains(err.Error(), tc.wantErrMsg)
+					s.Contains(res.Error().Error(), tc.wantErrMsg)
 				}
 			} else {
-				s.NoError(err)
+				s.False(res.IsError())
+				s.NotNil(res.MustGet())
 			}
 
 			if tc.checkStored {
@@ -626,6 +623,59 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 					s.Equal("orders", msg.Channel)
 				case <-time.After(2 * time.Second):
 					s.FailNow("timeout waiting published message")
+				}
+
+				// Test Pattern Matching (PSUBSCRIBE)
+				psub := client.PSubscribe(ctxSub, "event:*")
+				s.T().Cleanup(func() { _ = psub.Close() })
+				_, err = psub.Receive(ctxSub)
+				s.NoError(err)
+
+				pubChan <- outgoingMessage{topic: "event:login", payload: "user_1"}
+
+				pmsgCh := psub.Channel()
+				select {
+				case msg := <-pmsgCh:
+					s.Equal("user_1", msg.Payload)
+					s.Equal("event:login", msg.Channel)
+					s.Equal("event:*", msg.Pattern)
+				case <-time.After(2 * time.Second):
+					s.FailNow("timeout waiting pattern published message")
+				}
+
+				// Test Broadcast (Multiple clients subscribe to the same topic)
+				client2, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client2.Close() })
+				sub2 := client2.Subscribe(ctxSub, "broadcast_topic")
+				s.T().Cleanup(func() { _ = sub2.Close() })
+				_, err = sub2.Receive(ctxSub)
+				s.NoError(err)
+
+				client3, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client3.Close() })
+				sub3 := client3.Subscribe(ctxSub, "broadcast_topic")
+				s.T().Cleanup(func() { _ = sub3.Close() })
+				_, err = sub3.Receive(ctxSub)
+				s.NoError(err)
+
+				pubChan <- outgoingMessage{topic: "broadcast_topic", payload: "alert"}
+
+				msgCh2 := sub2.Channel()
+				select {
+				case msg := <-msgCh2:
+					s.Equal("alert", msg.Payload)
+					s.Equal("broadcast_topic", msg.Channel)
+				case <-time.After(2 * time.Second):
+					s.FailNow("client2 timeout waiting broadcast message")
+				}
+
+				msgCh3 := sub3.Channel()
+				select {
+				case msg := <-msgCh3:
+					s.Equal("alert", msg.Payload)
+					s.Equal("broadcast_topic", msg.Channel)
+				case <-time.After(2 * time.Second):
+					s.FailNow("client3 timeout waiting broadcast message")
 				}
 
 				cancel()
