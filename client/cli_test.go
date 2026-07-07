@@ -12,6 +12,7 @@ import (
 	"github.com/kcmvp/respx/storage"
 	"github.com/kcmvp/respx/x"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/suite"
 )
 
 const clientTestServerAddr = "127.0.0.1:36380"
@@ -19,39 +20,9 @@ const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestMaxConns = 50
 
 var testSchema = storage.JsonSchema("user", 0).PrefixAttr("id").Index("email").Index("age")
+var productSchema = storage.JsonSchema("product", 0).PrefixAttr("id")
 
-func ensureClientTestServer(t *testing.T) {
-	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
-
-	server.Start(clientTestServerAddr, clientTestMaxConns, false, testSchema)
-
-	for i := 0; i < 30; i++ {
-		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
-		if err == nil {
-			_ = probe.Close()
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	t.Fatal("test server did not become ready")
-}
-
-func newAuthedClientForTest(t *testing.T) *redis.Client {
-	t.Helper()
-
-	ensureClientTestServer(t)
-	client, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
-	if err != nil {
-		t.Fatalf("connect() error = %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-	return client
-}
-
-func resetHandlerStateForTest() {
+func (s *ClientTestSuite) SetupTest() {
 	Disconnect()
 
 	handlersMu.Lock()
@@ -59,6 +30,9 @@ func resetHandlerStateForTest() {
 	handlersMu.Unlock()
 
 	kvClientMu.Lock()
+	if kvClient != nil {
+		_ = kvClient.Close()
+	}
 	kvClient = nil
 	kvClientMu.Unlock()
 
@@ -73,208 +47,434 @@ func resetHandlerStateForTest() {
 	atomic.StoreUint64(&pipeDrops, 0)
 }
 
-func TestSubscribeRejectsNilHandler(t *testing.T) {
-	resetHandlerStateForTest()
-
-	err := Subscribe("topic-a", nil)
-	if err == nil {
-		t.Fatal("Subscribe() error = nil, want non-nil")
-	}
+type ClientTestSuite struct {
+	suite.Suite
 }
 
-func TestSubscribeRejectsEmptyTopic(t *testing.T) {
-	resetHandlerStateForTest()
+func (s *ClientTestSuite) SetupSuite() {
+	s.T().Setenv("HOME", s.T().TempDir())
+	s.T().Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
+	server.Start(clientTestServerAddr, clientTestMaxConns, false, testSchema, productSchema)
 
-	err := Subscribe("", make(chan *ReceivedMessage, 1))
-	if err == nil {
-		t.Fatal("Subscribe() empty topic error = nil, want non-nil")
-	}
-}
-
-func TestSubscribeRejectsDuplicateHandlerOnSameTopic(t *testing.T) {
-	resetHandlerStateForTest()
-
-	h := make(chan *ReceivedMessage, 2)
-	h2 := make(chan *ReceivedMessage, 2)
-	if err := Subscribe("orders", h); err != nil {
-		t.Fatalf("first Subscribe() error = %v, want nil", err)
-	}
-	if err := Subscribe("orders", h2); err == nil {
-		t.Fatal("duplicate Subscribe() error = nil, want non-nil")
-	}
-}
-
-func TestSubscribeStoresHandlerAndSignalsSubscription(t *testing.T) {
-	resetHandlerStateForTest()
-
-	h := make(chan *ReceivedMessage, 1)
-	if err := Subscribe("orders", h); err != nil {
-		t.Fatalf("Subscribe() error = %v, want nil", err)
-	}
-
-	handlersMu.RLock()
-	stored := handlersByTopic["orders"]
-	handlersMu.RUnlock()
-	if stored == nil {
-		t.Fatal("handlersByTopic[orders] = nil, want non-nil")
-	}
-
-	select {
-	case topic := <-subReqCh:
-		if topic != "orders" {
-			t.Fatalf("subReqCh topic = %q, want %q", topic, "orders")
+	for i := 0; i < 30; i++ {
+		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
+		if err == nil {
+			_ = probe.Close()
+			return
 		}
-	default:
-		t.Fatal("subReqCh should contain one subscription request")
+		time.Sleep(50 * time.Millisecond)
 	}
+	s.T().Fatal("test server did not become ready")
 }
 
-func TestGetReturnsNotConnectedWhenNoSharedClient(t *testing.T) {
-	resetHandlerStateForTest()
-
-	_, err := Get("k")
-	if err == nil {
-		t.Fatal("Get() error = nil, want non-nil")
-	}
-	if err.Error() != "resp client is not connected" {
-		t.Fatalf("Get() error = %q, want %q", err.Error(), "resp client is not connected")
-	}
+func TestClientSuite(t *testing.T) {
+	suite.Run(t, new(ClientTestSuite))
 }
 
-func TestSetReturnsNotConnectedWhenNoSharedClient(t *testing.T) {
-	resetHandlerStateForTest()
-
-	err := Set("k", "v")
-	if err == nil {
-		t.Fatal("Set() error = nil, want non-nil")
-	}
-	if err.Error() != "resp client is not connected" {
-		t.Fatalf("Set() error = %q, want %q", err.Error(), "resp client is not connected")
-	}
-}
-
-func TestGetReturnsEmptyForEmptyKey(t *testing.T) {
-	resetHandlerStateForTest()
-
-	v, err := Get("")
-	if err != nil {
-		t.Fatalf("Get(\"\") error = %v, want nil", err)
-	}
-	if v != "" {
-		t.Fatalf("Get(\"\") value = %q, want empty", v)
-	}
-}
-
-func TestSetReturnsNilForEmptyKey(t *testing.T) {
-	resetHandlerStateForTest()
-
-	if err := Set("", "v"); err != nil {
-		t.Fatalf("Set(\"\") error = %v, want nil", err)
-	}
-}
-
-func TestAuthRejectsEmptyAuthKey(t *testing.T) {
-	resetHandlerStateForTest()
-
-	err := Auth("")
-	if err == nil {
-		t.Fatal("Auth() error = nil, want non-nil")
-	}
-	if err.Error() != "auth key is empty" {
-		t.Fatalf("Auth() error = %q, want %q", err.Error(), "auth key is empty")
-	}
-}
-
-func TestAuthReturnsNotConnectedWhenNoSharedClient(t *testing.T) {
-	resetHandlerStateForTest()
-
-	err := Auth("token")
-	if err == nil {
-		t.Fatal("Auth() error = nil, want non-nil")
-	}
-	if err.Error() != "resp client is not connected" {
-		t.Fatalf("Auth() error = %q, want %q", err.Error(), "resp client is not connected")
-	}
-}
-
-func TestAuthWithServerSuccess(t *testing.T) {
-	resetHandlerStateForTest()
-
-	mockClient := newAuthedClientForTest(t)
-	setSharedClient(mockClient)
-
-	if err := Auth(clientTestExternalAuthKey); err != nil {
-		t.Fatalf("Auth() error = %v, want nil", err)
-	}
-}
-
-func TestAuthWithServerInvalidPassword(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, PoolSize: 1, Protocol: 2})
-	t.Cleanup(func() { _ = mockClient.Close() })
-	setSharedClient(mockClient)
-
-	if err := Auth("wrong"); err == nil {
-		t.Fatal("Auth() error = nil, want non-nil for invalid password")
-	}
-}
-
-func TestSetAndClearSharedClientHelpers(t *testing.T) {
-	resetHandlerStateForTest()
-
-	c1 := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
-	c2 := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
-	t.Cleanup(func() {
-		_ = c1.Close()
-		_ = c2.Close()
-	})
-
-	if prev := setSharedClient(c1); prev != nil {
-		t.Fatal("first setSharedClient() prev != nil, want nil")
-	}
-	if got := getSharedClient(); got != c1 {
-		t.Fatal("getSharedClient() should return c1")
-	}
-	if prev := setSharedClient(c2); prev != c1 {
-		t.Fatal("second setSharedClient() prev should be c1")
-	}
-
-	clearSharedClientIf(c1)
-	if got := getSharedClient(); got != c2 {
-		t.Fatal("clearSharedClientIf(c1) should not clear current c2")
-	}
-
-	clearSharedClientIf(c2)
-	if got := getSharedClient(); got != nil {
-		t.Fatal("clearSharedClientIf(c2) should clear shared client")
-	}
-}
-
-func TestQueryIndexCommand(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	// wait for client connection
-	var connected bool
+// ensureConnected waits until the shared client is fully connected
+func (s *ClientTestSuite) ensureConnected() {
 	for i := 0; i < 30; i++ {
 		client := getSharedClient()
 		if client != nil {
 			if err := healthCheck(context.Background(), client); err == nil {
-				connected = true
-				break
+				return
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !connected {
-		t.Fatal("Connect() failed to establish shared client in time")
+	s.T().Fatal("Connect() failed to establish shared client in time")
+}
+
+func (s *ClientTestSuite) TestSubscribeCommand() {
+	tests := []struct {
+		name        string
+		topic       string
+		handler     MessageHandler
+		setup       func()
+		expectErr   bool
+		wantErrMsg  string
+		checkStored bool
+	}{
+		{"Nil handler", "topic-a", nil, nil, true, "handler channel is nil", false},
+		{"Empty topic", "", make(chan *ReceivedMessage, 1), nil, true, "topic is empty", false},
+		{
+			"Duplicate handler",
+			"orders",
+			make(chan *ReceivedMessage, 1),
+			func() { _ = Subscribe("orders", make(chan *ReceivedMessage, 1)) },
+			true,
+			"duplicated handler for topic",
+			false,
+		},
+		{
+			"Success",
+			"orders_success",
+			make(chan *ReceivedMessage, 1),
+			nil,
+			false,
+			"",
+			true,
+		},
 	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			if tc.setup != nil {
+				tc.setup()
+			}
+
+			err := Subscribe(tc.topic, tc.handler)
+			if tc.expectErr {
+				s.Error(err)
+				if tc.wantErrMsg != "" {
+					s.Contains(err.Error(), tc.wantErrMsg)
+				}
+			} else {
+				s.NoError(err)
+			}
+
+			if tc.checkStored {
+				handlersMu.RLock()
+				stored := handlersByTopic[tc.topic]
+				handlersMu.RUnlock()
+				s.NotNil(stored)
+
+				select {
+				case topic := <-subReqCh:
+					s.Equal(tc.topic, topic)
+				default:
+					s.FailNow("subReqCh should contain one subscription request")
+				}
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestGetSetCommand() {
+	tests := []struct {
+		name       string
+		setup      func()
+		action     func() (string, error)
+		expectErr  bool
+		wantErrMsg string
+		expectVal  string
+	}{
+		{
+			"Get not connected",
+			nil,
+			func() (string, error) { return Get("k") },
+			true, "resp client is not connected", "",
+		},
+		{
+			"Set not connected",
+			nil,
+			func() (string, error) { return "", Set("k", "v") },
+			true, "resp client is not connected", "",
+		},
+		{
+			"Get empty key",
+			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
+			func() (string, error) { return Get("") },
+			false, "", "",
+		},
+		{
+			"Set empty key",
+			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
+			func() (string, error) { return "", Set("", "v") },
+			false, "", "",
+		},
+		{
+			"Set and Get Success",
+			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
+			func() (string, error) {
+				if err := Set("external-key", "external-value"); err != nil {
+					return "", err
+				}
+				return Get("external-key")
+			},
+			false, "", "external-value",
+		},
+		{
+			"SetWithTTL Success and Expire",
+			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
+			func() (string, error) {
+				if err := SetWithTTL("ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
+					return "", err
+				}
+				v1, _ := Get("ttl_key")
+				if v1 != "ttl_val" {
+					return v1, nil
+				}
+				time.Sleep(200 * time.Millisecond)
+				v2, err := Get("ttl_key")
+				return v2, err
+			},
+			true, "redis: nil", "",
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			if tc.setup != nil {
+				tc.setup()
+			}
+
+			val, err := tc.action()
+			if tc.expectErr {
+				s.Error(err)
+				if tc.wantErrMsg != "" && err != nil {
+					s.Contains(err.Error(), tc.wantErrMsg)
+				}
+			} else {
+				s.NoError(err)
+				s.Equal(tc.expectVal, val)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestAuthCommand() {
+	tests := []struct {
+		name       string
+		authKey    string
+		setup      func()
+		expectErr  bool
+		wantErrMsg string
+	}{
+		{
+			"Empty auth key",
+			"",
+			nil,
+			true, "auth key is empty",
+		},
+		{
+			"Not connected",
+			"token",
+			nil,
+			true, "resp client is not connected",
+		},
+		{
+			"Success",
+			clientTestExternalAuthKey,
+			func() {
+				mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+				setSharedClient(mockClient)
+			},
+			false, "",
+		},
+		{
+			"Invalid password",
+			"wrong",
+			func() {
+				mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr})
+				setSharedClient(mockClient)
+			},
+			true, "ERR authentication failed",
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			if tc.setup != nil {
+				tc.setup()
+			}
+
+			err := Auth(tc.authKey)
+			if tc.expectErr {
+				s.Error(err)
+				if tc.wantErrMsg != "" && err != nil {
+					s.Contains(err.Error(), tc.wantErrMsg)
+				}
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestConnectCommand() {
+	tests := []struct {
+		name        string
+		addr        string
+		authKey     string
+		expectErr   bool
+		wantErrMsg  string
+		checkExceed bool
+		useConnect  bool // if true, use internal connect() instead of Connect()
+	}{
+		{
+			"Empty auth key",
+			clientTestServerAddr,
+			"",
+			true, "auth key is empty",
+			false,
+			false,
+		},
+		{
+			"Invalid address",
+			"bad-addr:12345",
+			"token",
+			true, "context deadline exceeded",
+			false,
+			true,
+		},
+		{
+			"Success",
+			clientTestServerAddr,
+			clientTestExternalAuthKey,
+			false, "",
+			false,
+			false,
+		},
+		{
+			"Exceed max connections",
+			clientTestServerAddr,
+			clientTestExternalAuthKey,
+			true, "EOF",
+			true,
+			false,
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			if !tc.checkExceed {
+				var err error
+				if tc.useConnect {
+					_, err = connect(tc.addr, tc.authKey)
+				} else {
+					err = Connect(tc.addr, tc.authKey)
+				}
+
+				if tc.expectErr {
+					s.Error(err)
+					if tc.wantErrMsg != "" && err != nil {
+						s.Contains(err.Error(), tc.wantErrMsg)
+					}
+				} else {
+					s.NoError(err)
+					s.ensureConnected()
+				}
+			} else {
+				var clients []*redis.Client
+				defer func() {
+					for _, c := range clients {
+						_ = c.Close()
+					}
+				}()
+
+				var overflowErr error
+				for i := 0; i < clientTestMaxConns+5; i++ {
+					var c *redis.Client
+					var err error
+					for attempt := 0; attempt < 10; attempt++ {
+						c, err = connect(tc.addr, tc.authKey)
+						if err == nil {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					if err != nil {
+						overflowErr = err
+						break
+					}
+					clients = append(clients, c)
+				}
+				s.Error(overflowErr)
+				if overflowErr != nil {
+					s.Contains(overflowErr.Error(), tc.wantErrMsg)
+				}
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestPublishCommand() {
+	tests := []struct {
+		name      string
+		topic     string
+		payload   string
+		setup     func()
+		expectOk  bool
+		checkDrop bool
+	}{
+		{
+			"Not connected",
+			"topic-a",
+			"hello",
+			nil,
+			false,
+			false,
+		},
+		{
+			"Empty topic",
+			"",
+			"hello",
+			nil,
+			false,
+			false,
+		},
+		{
+			"Queue full",
+			"topic-full",
+			"hello",
+			func() {
+				mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+				setSharedClient(mockClient)
+				for i := 0; i < cap(pubChan); i++ {
+					pubChan <- outgoingMessage{topic: "filled", payload: "x"}
+				}
+			},
+			false,
+			true,
+		},
+		{
+			"Success enqueues",
+			"topic-a",
+			"hello",
+			func() {
+				mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+				setSharedClient(mockClient)
+			},
+			true,
+			false,
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			if tc.setup != nil {
+				tc.setup()
+			}
+
+			ok := Publish(tc.topic, tc.payload)
+			s.Equal(tc.expectOk, ok)
+
+			if tc.checkDrop {
+				drops := atomic.LoadUint64(&pipeDrops)
+				s.Equal(uint64(1), drops)
+			} else if tc.expectOk {
+				select {
+				case out := <-pubChan:
+					s.Equal(tc.topic, out.topic)
+					s.Equal(tc.payload, out.payload)
+				default:
+					s.FailNow("pubChan should have one queued message")
+				}
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestQueryIndexCommand() {
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
 
 	// Prepare data
 	data := []struct {
@@ -287,9 +487,8 @@ func TestQueryIndexCommand(t *testing.T) {
 	}
 
 	for _, d := range data {
-		if err := Set(d.key, d.val); err != nil {
-			t.Fatalf("Failed to seed data: %v", err)
-		}
+		err := Set(d.key, d.val)
+		s.NoError(err)
 	}
 
 	tests := []struct {
@@ -304,68 +503,36 @@ func TestQueryIndexCommand(t *testing.T) {
 		{"Missing schema", "", "email", x.Eq("email", "ken@example.com"), false, true, 0},
 		{"Missing index", "user", "", x.Eq("email", "ken@example.com"), false, true, 0},
 		{"Index not exists", "user", "unknown", x.Eq("email", "ken@example.com"), false, true, 0},
-
 		{"Eq string", "user", "email", x.Eq("email", "ken@example.com"), false, false, 1},
 		{"Eq false", "user", "email", x.Eq("email", "nobody@example.com"), false, false, 0},
-
-		{"Gt number", "user", "age", x.Gt("age", 25), false, false, 2}, // 30, 40
-		{"Lt number", "user", "age", x.Lt("age", 35), false, false, 2}, // 20, 30
-
-		{"And true", "user", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2}, // 30, 40
+		{"Gt number", "user", "age", x.Gt("age", 25), false, false, 2},
+		{"Lt number", "user", "age", x.Lt("age", 35), false, false, 2},
+		{"And true", "user", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
 		{"And false", "user", "age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-
-		{"Or", "user", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3}, // 20(lt), 30(active), 40(active)
-
-		{"Empty filter", "user", "email", nil, false, false, 3},          // Matches all in index
-		{"Descend test", "user", "age", x.Gt("age", 10), true, false, 3}, // Test DESC flag
+		{"Or", "user", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
+		{"Empty filter", "user", "email", nil, false, false, 3},
+		{"Descend test", "user", "age", x.Gt("age", 10), true, false, 3},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		s.Run(tt.name, func() {
 			res := QueryIndex(tt.schema, tt.index, tt.filter, tt.desc)
 
 			if tt.expectErr {
-				if !res.IsError() {
-					t.Errorf("expected error, got success")
-				}
-				return
-			}
-
-			if res.IsError() {
-				t.Fatalf("unexpected error: %v", res.Error())
-			}
-
-			results := res.MustGet()
-			if len(results) != tt.expectLen {
-				t.Errorf("expected %d results, got %d", tt.expectLen, len(results))
+				s.True(res.IsError())
+			} else {
+				s.False(res.IsError())
+				results := res.MustGet()
+				s.Len(results, tt.expectLen)
 			}
 		})
 	}
 }
 
-func TestQueryKeyCommand(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	// wait for client connection
-	var connected bool
-	for i := 0; i < 30; i++ {
-		client := getSharedClient()
-		if client != nil {
-			if err := healthCheck(context.Background(), client); err == nil {
-				connected = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !connected {
-		t.Fatal("Connect() failed to establish shared client in time")
-	}
+func (s *ClientTestSuite) TestQueryKeyCommand() {
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
 
 	// Prepare data
 	data := []struct {
@@ -378,9 +545,8 @@ func TestQueryKeyCommand(t *testing.T) {
 	}
 
 	for _, d := range data {
-		if err := Set(d.key, d.val); err != nil {
-			t.Fatalf("Failed to seed data: %v", err)
-		}
+		err := Set(d.key, d.val)
+		s.NoError(err)
 	}
 
 	tests := []struct {
@@ -394,365 +560,162 @@ func TestQueryKeyCommand(t *testing.T) {
 	}{
 		{"Missing schema", "", "*", x.Eq("name", "Apple"), false, true, 0},
 		{"Missing pattern", "product", "", x.Eq("name", "Apple"), false, true, 0},
-
 		{"Match one", "product", "*", x.Eq("name", "Apple"), false, false, 1},
 		{"Match none by filter", "product", "*", x.Eq("name", "Grape"), false, false, 0},
 		{"Match none by pattern", "product", "99*", x.Eq("name", "Apple"), false, false, 0},
-
-		{"Gt number", "product", "*", x.Gt("price", 6), false, false, 2},   // 10, 8
-		{"Lt number", "product", "*", x.Lt("stock", 150), false, false, 2}, // 100, 50
-
-		{"And true", "product", "*", x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1}, // 10
-
-		{"Empty filter", "product", "*", nil, false, false, 3},             // Matches all matching keys
-		{"Descend test", "product", "*", x.Gt("price", 4), true, false, 3}, // Matches all
+		{"Gt number", "product", "*", x.Gt("price", 6), false, false, 2},
+		{"Lt number", "product", "*", x.Lt("stock", 150), false, false, 2},
+		{"And true", "product", "*", x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1},
+		{"Empty filter", "product", "*", nil, false, false, 3},
+		{"Descend test", "product", "*", x.Gt("price", 4), true, false, 3},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		s.Run(tt.name, func() {
 			res := QueryKey(tt.schema, tt.pattern, tt.filter, tt.desc)
 
 			if tt.expectErr {
-				if !res.IsError() {
-					t.Errorf("expected error, got success")
-				}
-				return
-			}
-
-			if res.IsError() {
-				t.Fatalf("unexpected error: %v", res.Error())
-			}
-
-			results := res.MustGet()
-			if len(results) != tt.expectLen {
-				t.Errorf("expected %d results, got %d", tt.expectLen, len(results))
+				s.True(res.IsError())
+			} else {
+				s.False(res.IsError())
+				results := res.MustGet()
+				s.Len(results, tt.expectLen)
 			}
 		})
 	}
 }
 
-func TestPublishReturnsFalseWhenNoSharedClient(t *testing.T) {
-	resetHandlerStateForTest()
+func (s *ClientTestSuite) TestPubSubLifecycle() {
+	tests := []struct {
+		name string
+		run  func()
+	}{
+		{
+			"ProducePublishesMessageAndStopsOnCancel",
+			func() {
+				client, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client.Close() })
 
-	if ok := Publish("topic-a", "hello"); ok {
-		t.Fatal("Publish() = true, want false when client is not connected")
+				ctxSub, cancelSub := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelSub()
+				sub := client.Subscribe(ctxSub, "orders")
+				s.T().Cleanup(func() { _ = sub.Close() })
+				_, err := sub.Receive(ctxSub)
+				s.NoError(err)
+
+				ctx, cancel := context.WithCancel(context.Background())
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- produce(ctx, client)
+				}()
+
+				pubChan <- outgoingMessage{topic: "orders", payload: "hello"}
+
+				msgCh := sub.Channel()
+				select {
+				case msg := <-msgCh:
+					s.Equal("hello", msg.Payload)
+					s.Equal("orders", msg.Channel)
+				case <-time.After(2 * time.Second):
+					s.FailNow("timeout waiting published message")
+				}
+
+				cancel()
+				select {
+				case err := <-errCh:
+					s.NoError(err)
+				case <-time.After(2 * time.Second):
+					s.FailNow("produce() did not exit after cancel")
+				}
+			},
+		},
+		{
+			"ConsumeDispatchesInitialAndRuntimeTopics",
+			func() {
+				client, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client.Close() })
+
+				initialHandler := make(chan *ReceivedMessage, 1)
+				runtimeHandler := make(chan *ReceivedMessage, 1)
+
+				handlersMu.Lock()
+				handlersByTopic["initial-topic"] = initialHandler
+				handlersMu.Unlock()
+
+				ctx, cancel := context.WithCancel(context.Background())
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- consume(ctx, client)
+				}()
+
+				time.Sleep(80 * time.Millisecond)
+
+				err := client.Publish(context.Background(), "initial-topic", "init-msg").Err()
+				s.NoError(err)
+				select {
+				case got := <-initialHandler:
+					s.Equal("initial-topic", got.Channel)
+					s.Equal("init-msg", got.Payload)
+				case <-time.After(2 * time.Second):
+					s.FailNow("timeout waiting initial-topic message")
+				}
+
+				handlersMu.Lock()
+				handlersByTopic["runtime-topic"] = runtimeHandler
+				handlersMu.Unlock()
+				subReqCh <- "runtime-topic"
+
+				deadline := time.After(2 * time.Second)
+				tick := time.NewTicker(30 * time.Millisecond)
+				defer tick.Stop()
+				runtimeDelivered := false
+				for !runtimeDelivered {
+					select {
+					case got := <-runtimeHandler:
+						s.Equal("runtime-topic", got.Channel)
+						s.Equal("rt-msg", got.Payload)
+						runtimeDelivered = true
+					case <-tick.C:
+						_ = client.Publish(context.Background(), "runtime-topic", "rt-msg").Err()
+					case <-deadline:
+						s.FailNow("timeout waiting runtime-topic message")
+					}
+				}
+
+				cancel()
+				select {
+				case err := <-errCh:
+					s.NoError(err)
+				case <-time.After(2 * time.Second):
+					s.FailNow("consume() did not exit after cancel")
+				}
+			},
+		},
 	}
-	if got := len(pubChan); got != 0 {
-		t.Fatalf("pubChan len = %d, want 0", got)
-	}
-}
 
-func TestPublishReturnsFalseForEmptyTopic(t *testing.T) {
-	resetHandlerStateForTest()
-
-	if ok := Publish("", "hello"); ok {
-		t.Fatal("Publish() = true, want false for empty topic")
-	}
-}
-
-func TestPublishEnqueuesWhenSharedClientExists(t *testing.T) {
-	resetHandlerStateForTest()
-
-	mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
-	t.Cleanup(func() { _ = mockClient.Close() })
-	setSharedClient(mockClient)
-
-	if ok := Publish("topic-a", "hello"); !ok {
-		t.Fatal("Publish() = false, want true")
-	}
-
-	select {
-	case out := <-pubChan:
-		if out.topic != "topic-a" || out.payload != "hello" {
-			t.Fatalf("queued message = (%q, %q), want (%q, %q)", out.topic, out.payload, "topic-a", "hello")
-		}
-	default:
-		t.Fatal("pubChan should have one queued message")
-	}
-}
-
-func TestPublishDropsWhenQueueIsFull(t *testing.T) {
-	resetHandlerStateForTest()
-
-	mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
-	t.Cleanup(func() { _ = mockClient.Close() })
-	setSharedClient(mockClient)
-
-	for i := 0; i < cap(pubChan); i++ {
-		pubChan <- outgoingMessage{topic: "filled", payload: "x"}
-	}
-
-	if ok := Publish("topic-a", "hello"); ok {
-		t.Fatal("Publish() = true, want false when pubChan is full")
-	}
-	if drops := atomic.LoadUint64(&pipeDrops); drops != 1 {
-		t.Fatalf("pipeDrops = %d, want 1", drops)
-	}
-}
-
-func TestHealthCheckAndConnectWithServer(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	client, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
-	if err != nil {
-		t.Fatalf("connect() error = %v, want nil", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-
-	if err := healthCheck(context.Background(), client); err != nil {
-		t.Fatalf("healthCheck() error = %v, want nil", err)
-	}
-}
-
-func TestConnectStartsSharedClientWithPassword(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
-		t.Fatalf("Connect() error = %v, want nil", err)
-	}
-
-	for i := 0; i < 30; i++ {
-		client := getSharedClient()
-		if client != nil {
-			if err := healthCheck(context.Background(), client); err == nil {
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	t.Fatal("Connect() should populate a healthy shared client")
-}
-
-func TestConnectFailsForInvalidAddress(t *testing.T) {
-	resetHandlerStateForTest()
-
-	client, err := connect("bad-addr", "token")
-	if err == nil {
-		if client != nil {
-			_ = client.Close()
-		}
-		t.Fatal("connect() error = nil, want non-nil")
-	}
-	if client != nil {
-		t.Fatal("connect() client != nil, want nil")
-	}
-}
-
-func TestConnectRejectsEmptyAuthKey(t *testing.T) {
-	resetHandlerStateForTest()
-
-	if err := Connect(clientTestServerAddr, ""); err == nil {
-		t.Fatal("Connect() error = nil, want non-nil for empty auth key")
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			tc.run()
+		})
 	}
 }
 
-func TestConnectHelperRejectsEmptyAuthKey(t *testing.T) {
-	resetHandlerStateForTest()
-
-	client, err := connect(clientTestServerAddr, "")
-	if err == nil {
-		if client != nil {
-			_ = client.Close()
-		}
-		t.Fatal("connect() error = nil, want non-nil for empty auth key")
-	}
-}
-
-func TestExternalSetWithTTL(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	// wait for client connection
-	var connected bool
-	for i := 0; i < 30; i++ {
-		client := getSharedClient()
-		if client != nil {
-			if err := healthCheck(context.Background(), client); err == nil {
-				connected = true
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if !connected {
-		t.Fatal("Connect() failed to establish shared client in time")
-	}
-
-	key := "ttl_key"
-	val := "ttl_val"
-
-	// set with 200ms TTL
-	if err := SetWithTTL(key, val, 200*time.Millisecond); err != nil {
-		t.Fatalf("SetWithTTL() error = %v", err)
-	}
-
-	// Immediate Get should succeed
-	got, err := Get(key)
-	if err != nil {
-		t.Fatalf("Get() error = %v", err)
-	}
-	if got != val {
-		t.Errorf("Get() = %v, want %v", got, val)
-	}
-
-	// Wait for expiration
-	time.Sleep(300 * time.Millisecond)
-
-	// Get after expiration should be empty
-	got, err = Get(key)
-	if err != redis.Nil && got != "" {
-		t.Errorf("Get() after TTL = %v, %v, want empty string and redis.Nil", got, err)
-	}
-}
-
-func TestExternalConnectExceedsMaxConnections(t *testing.T) {
-	resetHandlerStateForTest()
-	ensureClientTestServer(t)
-
-	var clients []*redis.Client
-	t.Cleanup(func() {
-		for _, c := range clients {
-			_ = c.Close()
-		}
+func (s *ClientTestSuite) TestSetAndClearSharedClientHelpers() {
+	c1 := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+	c2 := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
+	s.T().Cleanup(func() {
+		_ = c1.Close()
+		_ = c2.Close()
 	})
 
-	var overflowErr error
-	for i := 0; i < clientTestMaxConns+5; i++ {
-		var c *redis.Client
-		var err error
-		for attempt := 0; attempt < 10; attempt++ {
-			c, err = connect(clientTestServerAddr, clientTestExternalAuthKey)
-			if err == nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		if err != nil {
-			overflowErr = err
-			break
-		}
-		clients = append(clients, c)
-	}
+	s.Nil(setSharedClient(c1))
+	s.Equal(c1, getSharedClient())
+	s.Equal(c1, setSharedClient(c2))
 
-	if overflowErr == nil {
-		t.Fatal("connect() overflow error = nil, want non-nil when exceeding external max connections")
-	}
-}
+	clearSharedClientIf(c1)
+	s.Equal(c2, getSharedClient())
 
-func TestProducePublishesMessageAndStopsOnCancel(t *testing.T) {
-	resetHandlerStateForTest()
-
-	client := newAuthedClientForTest(t)
-
-	ctxSub, cancelSub := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelSub()
-	sub := client.Subscribe(ctxSub, "orders")
-	t.Cleanup(func() { _ = sub.Close() })
-	if _, err := sub.Receive(ctxSub); err != nil {
-		t.Fatalf("sub.Receive() error = %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- produce(ctx, client)
-	}()
-
-	pubChan <- outgoingMessage{topic: "orders", payload: "hello"}
-
-	msgCh := sub.Channel()
-	select {
-	case msg := <-msgCh:
-		if msg == nil || msg.Payload != "hello" || msg.Channel != "orders" {
-			t.Fatalf("received message = %#v, want topic=orders payload=hello", msg)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting published message")
-	}
-
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("produce() error = %v, want nil after cancel", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("produce() did not exit after cancel")
-	}
-}
-
-func TestConsumeDispatchesInitialAndRuntimeTopics(t *testing.T) {
-	resetHandlerStateForTest()
-
-	client := newAuthedClientForTest(t)
-
-	initialHandler := make(chan *ReceivedMessage, 1)
-	runtimeHandler := make(chan *ReceivedMessage, 1)
-
-	handlersMu.Lock()
-	handlersByTopic["initial-topic"] = initialHandler
-	handlersMu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- consume(ctx, client)
-	}()
-
-	// Give consume a brief moment to finish initial subscribe setup.
-	time.Sleep(80 * time.Millisecond)
-
-	if err := client.Publish(context.Background(), "initial-topic", "init-msg").Err(); err != nil {
-		t.Fatalf("publish initial topic error = %v", err)
-	}
-	select {
-	case got := <-initialHandler:
-		if got == nil || got.Channel != "initial-topic" || got.Payload != "init-msg" {
-			t.Fatalf("initial handler got = %#v, want channel=initial-topic payload=init-msg", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting initial-topic message")
-	}
-
-	handlersMu.Lock()
-	handlersByTopic["runtime-topic"] = runtimeHandler
-	handlersMu.Unlock()
-	subReqCh <- "runtime-topic"
-
-	deadline := time.After(2 * time.Second)
-	tick := time.NewTicker(30 * time.Millisecond)
-	defer tick.Stop()
-	runtimeDelivered := false
-	for !runtimeDelivered {
-		select {
-		case got := <-runtimeHandler:
-			if got == nil || got.Channel != "runtime-topic" || got.Payload != "rt-msg" {
-				t.Fatalf("runtime handler got = %#v, want channel=runtime-topic payload=rt-msg", got)
-			}
-			runtimeDelivered = true
-		case <-tick.C:
-			if err := client.Publish(context.Background(), "runtime-topic", "rt-msg").Err(); err != nil {
-				t.Fatalf("publish runtime topic error = %v", err)
-			}
-		case <-deadline:
-			t.Fatal("timeout waiting runtime-topic message")
-		}
-	}
-
-	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("consume() error = %v, want nil after cancel", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("consume() did not exit after cancel")
-	}
+	clearSharedClientIf(c2)
+	s.Nil(getSharedClient())
 }

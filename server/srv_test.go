@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/suite"
+
 	"github.com/kcmvp/respx/storage"
 	"github.com/tidwall/redcon"
 )
@@ -30,25 +32,44 @@ func getFreePort() string {
 	return l.Addr().String()
 }
 
-func resetTestState(t *testing.T) {
-	t.Helper()
+type ServerTestSuite struct {
+	suite.Suite
+	addr    string
+	db      storage.DB
+	schemas []storage.Schema
 
-	originalInternalAuthKey := internalAuthKey
-	originalAuthKey := authKey
-	originalExternalMaxConns := externalMaxConns
-	originalListenAndServeFn := listenAndServeFn
-	originalOsExitFn := osExitFn
+	origInternalAuthKey  string
+	origAuthKey          string
+	origExternalMaxConns int
+	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
+	origOsExitFn         func(code int)
+}
 
-	// Call stop to properly close current listener and DB
+func (s *ServerTestSuite) SetupSuite() {
+	s.schemas = []storage.Schema{
+		storage.JsonSchema("user_idx", 0).PrefixAttr("id").Index("age"),
+		storage.JsonSchema("user_key", 0).PrefixAttr("id"),
+		storage.JsonSchema("user_no_idx", 0).PrefixAttr("id"),
+	}
+
+	globalMu.Lock()
+	s.origInternalAuthKey = internalAuthKey
+	s.origAuthKey = authKey
+	s.origExternalMaxConns = externalMaxConns
+	s.origListenAndServeFn = listenAndServeFn
+	s.origOsExitFn = osExitFn
+	globalMu.Unlock()
+}
+
+func (s *ServerTestSuite) SetupTest() {
 	_ = stop()
-	// Allow OS to fully release the port
 	time.Sleep(5 * time.Millisecond)
-	// Force reset the sync.Once for DB initialization
 	storage.Reset()
 
 	connCountMu.Lock()
 	activeExternalConns = 0
 	connCountMu.Unlock()
+
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	authKey = "external-test-key"
@@ -56,28 +77,58 @@ func resetTestState(t *testing.T) {
 	srvOnce = sync.Once{}
 	listenAndServeFn = redcon.ListenAndServe
 	globalMu.Unlock()
-
-	t.Cleanup(func() {
-		_ = stop()
-		time.Sleep(5 * time.Millisecond)
-		storage.Reset()
-
-		connCountMu.Lock()
-		activeExternalConns = 0
-		connCountMu.Unlock()
-		globalMu.Lock()
-		internalAuthKey = originalInternalAuthKey
-		authKey = originalAuthKey
-		externalMaxConns = originalExternalMaxConns
-		listenAndServeFn = originalListenAndServeFn
-		osExitFn = originalOsExitFn
-		srvOnce = sync.Once{}
-		globalMu.Unlock()
-	})
 }
 
-func TestConnectionLimits(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TearDownTest() {
+	_ = stop()
+	time.Sleep(5 * time.Millisecond)
+	storage.Reset()
+
+	connCountMu.Lock()
+	activeExternalConns = 0
+	connCountMu.Unlock()
+
+	globalMu.Lock()
+	internalAuthKey = s.origInternalAuthKey
+	authKey = s.origAuthKey
+	externalMaxConns = s.origExternalMaxConns
+	listenAndServeFn = s.origListenAndServeFn
+	osExitFn = s.origOsExitFn
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
+}
+
+func TestServerSuite(t *testing.T) {
+	suite.Run(t, new(ServerTestSuite))
+}
+
+func replaceID(arr [][]string, id string) [][]string {
+	if arr == nil {
+		return nil
+	}
+	res := make([][]string, len(arr))
+	for i, a := range arr {
+		res[i] = make([]string, len(a))
+		for j, str := range a {
+			res[i][j] = strings.ReplaceAll(str, "{id}", id)
+		}
+	}
+	return res
+}
+
+func replaceID1D(arr []string, id string) []string {
+	if arr == nil {
+		return nil
+	}
+	res := make([]string, len(arr))
+	for i, str := range arr {
+		res[i] = strings.ReplaceAll(str, "{id}", id)
+	}
+	return res
+}
+
+func (s *ServerTestSuite) TestConnectionLimits() {
+	t := s.T()
 	addr := getFreePort()
 
 	// Start server with externalMaxConns = 1
@@ -156,7 +207,11 @@ func TestConnectionLimits(t *testing.T) {
 	}
 }
 
-func TestHandleCommand(t *testing.T) {
+func (s *ServerTestSuite) TestCommandTable() {
+	t := s.T()
+	s.addr = getFreePort()
+	s.db = Start(s.addr, 100, false, s.schemas...)
+
 	tests := []struct {
 		name        string
 		auth        bool
@@ -170,12 +225,12 @@ func TestHandleCommand(t *testing.T) {
 		wantClosed  bool
 		dbInit      bool
 		schemas     []storage.Schema
-		setupDB     func(db storage.DB)
+		setupDB     func(uid string)
 	}{
 		{
 			name:       "unauthenticated write command",
 			auth:       false,
-			commands:   [][]string{{"SET", "k", "v"}},
+			commands:   [][]string{{"SET", "k_{id}", "v"}},
 			wantErrors: []string{"NOAUTH authentication required"},
 			wantClosed: true,
 		},
@@ -242,11 +297,11 @@ func TestHandleCommand(t *testing.T) {
 			name: "set get setnx and del lifecycle",
 			auth: true,
 			commands: [][]string{
-				{"SET", "name", "alice"},
-				{"GET", "name"},
-				{"SETNX", "name", "bob"},
-				{"DEL", "name"},
-				{"GET", "name"},
+				{"SET", "name_{id}", "alice"},
+				{"GET", "name_{id}"},
+				{"SETNX", "name_{id}", "bob"},
+				{"DEL", "name_{id}"},
+				{"GET", "name_{id}"},
 			},
 			wantStrings: []string{"OK"},
 			wantBulks:   []string{"alice"},
@@ -256,15 +311,15 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:      "get non-existent",
 			auth:      true,
-			commands:  [][]string{{"GET", "nonexistent"}},
+			commands:  [][]string{{"GET", "nonexistent_{id}"}},
 			wantNulls: 1,
 		},
 		{
 			name:        "keys",
 			auth:        true,
-			commands:    [][]string{{"SET", "key1", "val1"}, {"SET", "key2", "val2"}, {"KEYS", "key*"}},
+			commands:    [][]string{{"SET", "{id}_key1", "val1"}, {"SET", "{id}_key2", "val2"}, {"KEYS", "{id}_key*"}},
 			wantStrings: []string{"OK", "OK"},
-			wantArrays:  [][]string{{"key1", "key2"}},
+			wantArrays:  [][]string{{"{id}_key1", "{id}_key2"}},
 		},
 		{
 			name:       "keys_not_found",
@@ -275,13 +330,13 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:     "del non-existent",
 			auth:     true,
-			commands: [][]string{{"DEL", "nonexistent"}},
+			commands: [][]string{{"DEL", "nonexistent_{id}"}},
 			wantInts: []int{0},
 		},
 		{
 			name:        "setnx exists",
 			auth:        true,
-			commands:    [][]string{{"SET", "k", "v"}, {"SETNX", "k", "v2"}},
+			commands:    [][]string{{"SET", "k_{id}", "v"}, {"SETNX", "k_{id}", "v2"}},
 			wantStrings: []string{"OK"},
 			wantInts:    []int{0},
 		},
@@ -294,31 +349,31 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:        "set with EX",
 			auth:        true,
-			commands:    [][]string{{"set", "k2", "v2", "EX", "1"}},
+			commands:    [][]string{{"set", "k2_{id}", "v2", "EX", "1"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "set with PX",
 			auth:        true,
-			commands:    [][]string{{"set", "k3", "v3", "PX", "500"}},
+			commands:    [][]string{{"set", "k3_{id}", "v3", "PX", "500"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "setex command",
 			auth:        true,
-			commands:    [][]string{{"setex", "k4", "1", "v4"}},
+			commands:    [][]string{{"setex", "k4_{id}", "1", "v4"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:       "wrong number of args setex",
 			auth:       true,
-			commands:   [][]string{{"setex", "k"}},
+			commands:   [][]string{{"setex", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'setex' command"},
 		},
 		{
 			name:       "wrong number of args set",
 			auth:       true,
-			commands:   [][]string{{"SET", "k"}},
+			commands:   [][]string{{"SET", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'SET' command"},
 		},
 		{
@@ -330,7 +385,7 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:       "wrong number of args setnx",
 			auth:       true,
-			commands:   [][]string{{"SETNX", "k"}},
+			commands:   [][]string{{"SETNX", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'SETNX' command"},
 		},
 		{
@@ -407,80 +462,69 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:       "set with EX invalid value",
 			auth:       true,
-			commands:   [][]string{{"set", "k", "v", "EX", "notanumber"}},
+			commands:   [][]string{{"set", "k_{id}", "v", "EX", "notanumber"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "set with PX invalid value",
 			auth:       true,
-			commands:   [][]string{{"set", "k", "v", "PX", "notanumber"}},
+			commands:   [][]string{{"set", "k_{id}", "v", "PX", "notanumber"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "setex command invalid time",
 			auth:       true,
-			commands:   [][]string{{"setex", "k", "notanumber", "v"}},
+			commands:   [][]string{{"setex", "k_{id}", "notanumber", "v"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "queryindex success",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "user", "age", "{}", "ASC"}},
-			wantArrays: [][]string{{`{"id":"1", "age":20}`, `{"id":"2", "age":30}`}},
-			dbInit:     true,
-			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")},
-			setupDB: func(db storage.DB) {
-				schema := storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")
-				_ = db.Save(schema, `{"id":"1", "age":20}`)
-				_ = db.Save(schema, `{"id":"2", "age":30}`)
+			commands:   [][]string{{"queryindex", "user_idx", "age", "{}", "ASC"}},
+			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
+			setupDB: func(uid string) {
+
+				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
 			},
 		},
 		{
 			name:       "queryindex not found",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "user", "unknown", "{}", "ASC"}},
-			wantErrors: []string{"ERR index unknown not found for schema user"},
-			dbInit:     true,
-			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")},
-			setupDB: func(db storage.DB) {
+			commands:   [][]string{{"queryindex", "user_no_idx", "unknown", "{}", "ASC"}},
+			wantErrors: []string{"ERR index unknown not found for schema user_no_idx"},
+			setupDB: func(uid string) {
 			},
 		},
 		{
 			name:       "querykey success",
 			auth:       true,
-			commands:   [][]string{{"querykey", "user", "*", "{}", "DESC"}},
-			wantArrays: [][]string{{`{"id":"2"}`, `{"id":"1"}`}},
-			dbInit:     true,
-			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id")},
-			setupDB: func(db storage.DB) {
-				schema := storage.JsonSchema("user", 0).PrefixAttr("id")
-				_ = db.Save(schema, `{"id":"1"}`)
-				_ = db.Save(schema, `{"id":"2"}`)
+			commands:   [][]string{{"querykey", "user_key", "*_{id}", "{}", "DESC"}},
+			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
+			setupDB: func(uid string) {
+
+				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"1_%s"}`, uid))
+				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"2_%s"}`, uid))
 			},
 		},
 		{
 			name:       "querykey not found",
 			auth:       true,
-			commands:   [][]string{{"querykey", "user", "unknown:*", "{}"}},
+			commands:   [][]string{{"querykey", "user_key", "unknown_{id}:*", "{}"}},
 			wantArrays: [][]string{{}},
-			dbInit:     true,
-			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id")},
-			setupDB: func(db storage.DB) {
+			setupDB: func(uid string) {
 			},
 		},
 	}
 
-	for _, tc := range tests {
+	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			addr := getFreePort()
-			storage.Reset()
-			db := Start(addr, 10, false, tc.schemas...)
+			uid := fmt.Sprintf("%d", i)
 			if tc.setupDB != nil {
-				tc.setupDB(db)
+				tc.setupDB(uid)
 			}
-			defer func() { _ = stop() }()
 
-			conn, err := net.Dial("tcp", addr)
+			conn, err := net.Dial("tcp", s.addr)
 			if err != nil {
 				t.Fatalf("failed to connect to server: %v", err)
 			}
@@ -497,7 +541,7 @@ func TestHandleCommand(t *testing.T) {
 			var finalResp string
 			var closed bool
 
-			for _, args := range tc.commands {
+			for _, args := range replaceID(tc.commands, uid) {
 				var b []byte
 				if len(args) == 0 {
 					b = []byte("*0\r\n")
@@ -536,21 +580,21 @@ func TestHandleCommand(t *testing.T) {
 			}
 
 			// Validate Errors
-			for _, e := range tc.wantErrors {
+			for _, e := range replaceID1D(tc.wantErrors, uid) {
 				if !strings.Contains(finalResp, e) {
 					t.Errorf("expected error %q, got resp: %q", e, finalResp)
 				}
 			}
 
 			// Validate Strings
-			for _, s := range tc.wantStrings {
+			for _, s := range replaceID1D(tc.wantStrings, uid) {
 				if !strings.Contains(finalResp, "+"+s+"\r\n") {
 					t.Errorf("expected string %q, got resp: %q", s, finalResp)
 				}
 			}
 
 			// Validate Bulks
-			for _, b := range tc.wantBulks {
+			for _, b := range replaceID1D(tc.wantBulks, uid) {
 				if !strings.Contains(finalResp, fmt.Sprintf("$%d\r\n%s\r\n", len(b), b)) {
 					t.Errorf("expected bulk %q, got resp: %q", b, finalResp)
 				}
@@ -570,8 +614,8 @@ func TestHandleCommand(t *testing.T) {
 				}
 			}
 
-			if tc.wantArrays != nil {
-				for _, wantArr := range tc.wantArrays {
+			if replaceID(tc.wantArrays, uid) != nil {
+				for _, wantArr := range replaceID(tc.wantArrays, uid) {
 					// Build the expected array RESP
 					var expected string
 					if len(wantArr) == 0 {
@@ -596,8 +640,8 @@ func TestHandleCommand(t *testing.T) {
 	}
 }
 
-func TestPubSub(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestPubSub() {
+	t := s.T()
 	addr := getFreePort()
 	_ = Start(addr, 10, false)
 	defer func() { _ = stop() }()
@@ -657,7 +701,8 @@ func TestPubSub(t *testing.T) {
 	}
 }
 
-func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
+func (s *ServerTestSuite) TestHandleShutdownSignalsWarnsOnError() {
+	_ = s.T()
 	sigCh := make(chan os.Signal, 1)
 	doneCh := make(chan struct{})
 
@@ -673,8 +718,8 @@ func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 }
 
-func TestStop(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStop() {
+	t := s.T()
 
 	// Ensure stop works when nothing is initialized
 	err := stop()
@@ -720,8 +765,8 @@ func TestStop(t *testing.T) {
 	shutdownMu.Unlock()
 }
 
-func TestStartListenError(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartListenError() {
+	t := s.T()
 
 	// We use an atomic flag to track if exit was called
 	var exitCalled atomic.Bool
@@ -769,8 +814,8 @@ func TestStartListenError(t *testing.T) {
 	}
 }
 
-func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
+	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
 	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -799,8 +844,8 @@ func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
 	}
 }
 
-func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
+	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
 	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -827,7 +872,8 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 	}
 }
 
-func TestParseFilter(t *testing.T) {
+func (s *ServerTestSuite) TestParseFilter() {
+	t := s.T()
 	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "score": 95.5}`
 
 	tests := []struct {
