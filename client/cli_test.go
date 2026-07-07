@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -388,8 +389,12 @@ func (s *ClientTestSuite) TestConnectCommand() {
 					clients = append(clients, c)
 				}
 				s.Error(overflowErr)
-				if overflowErr != nil {
-					s.Contains(overflowErr.Error(), tc.wantErrMsg)
+				// The error message for an intentionally rejected connection can be "EOF" or "connection reset by peer"
+				// depending on the OS and timing of when the socket is closed by the server.
+				if overflowErr != nil && tc.wantErrMsg != "" {
+					errMsg := overflowErr.Error()
+					s.True(strings.Contains(errMsg, "EOF") || strings.Contains(errMsg, "connection reset by peer") || strings.Contains(errMsg, tc.wantErrMsg),
+						"Expected error to contain EOF, connection reset by peer, or %q, but got: %s", tc.wantErrMsg, errMsg)
 				}
 			}
 		})
