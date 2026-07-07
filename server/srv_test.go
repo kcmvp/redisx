@@ -310,10 +310,10 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 }
 
 func (s *ServerTestSuite) TestStartListenAndServeFailure() {
-	exitCalled := false
+	exitCh := make(chan struct{})
 	globalMu.Lock()
 	osExitFn = func(code int) {
-		exitCalled = true
+		close(exitCh)
 	}
 	// Force listenAndServeFn to return an unexpected error
 	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -324,10 +324,12 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	db := Start("", 0, false, s.schemas...)
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
-	// Give the goroutine time to run and fail
-	time.Sleep(50 * time.Millisecond)
-
-	s.True(exitCalled)
+	select {
+	case <-exitCh:
+		// success
+	case <-time.After(1 * time.Second):
+		s.Fail("osExitFn was not called")
+	}
 
 	// Reset srvOnce for subsequent tests
 	globalMu.Lock()
