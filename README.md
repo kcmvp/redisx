@@ -85,7 +85,10 @@ BYINDEX user email {"email": "ken@example.com"}
 **Go Client (`client.ByIndex`):**
 
 ```go
-import "github.com/kcmvp/respx/x"
+import (
+    "github.com/kcmvp/respx/client"
+    "github.com/kcmvp/respx/x"
+)
 
 res := client.ByIndex("user", "email", x.Eq("email", "ken@example.com"), false)
 users := res.MustGet()

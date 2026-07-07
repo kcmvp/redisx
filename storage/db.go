@@ -24,10 +24,10 @@ type JsonIndex string
 
 // Schema represents the configuration required to create a JSON index in the backend storage (BuntDB).
 // By defining an index, you enable the respx server to perform highly efficient lookups on specific JSON fields
-// across your stored values using the QueryX command.
+// across your stored values using the BYINDEX/BYKEY commands.
 type Schema interface {
 	// Name returns the unique identifier for the index.
-	// This name is used by the client when executing a QueryX command to specify which index to search against.
+	// This name is used by the client when executing a BYINDEX/BYKEY command to specify which schema to search against.
 	// This name is also used as key prefix, eg if Name() returns "user" the key prefix will be "user:"
 	Name() string
 
@@ -307,10 +307,6 @@ func (x *xdb) SetNX(key string, value string) (bool, error) {
 	var set bool
 	err := x.Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
-		if err == nil {
-			set = false
-			return nil
-		}
 		if err == buntdb.ErrNotFound {
 			_, _, err = tx.Set(key, value, nil)
 			if err == nil {
@@ -320,15 +316,18 @@ func (x *xdb) SetNX(key string, value string) (bool, error) {
 		}
 		return err
 	})
-	return set, err
+	if err != nil {
+		return false, err
+	}
+	return set, nil
 }
 
 func (x *xdb) Get(key string) mo.Result[string] {
 	var val string
-	var err error
-	_ = x.View(func(tx *buntdb.Tx) error {
-		val, err = tx.Get(key)
-		return err
+	err := x.View(func(tx *buntdb.Tx) error {
+		var innerErr error
+		val, innerErr = tx.Get(key)
+		return innerErr
 	})
 
 	if err != nil {
@@ -336,18 +335,21 @@ func (x *xdb) Get(key string) mo.Result[string] {
 	}
 	return mo.Ok(val)
 }
+
 func (x *xdb) Delete(key string) (bool, error) {
 	var val string
-	var err error
-	_ = x.Update(func(tx *buntdb.Tx) error {
-		val, err = tx.Delete(key)
-		if err == buntdb.ErrNotFound {
-			err = nil
+	err := x.Update(func(tx *buntdb.Tx) error {
+		var innerErr error
+		val, innerErr = tx.Delete(key)
+		if innerErr == buntdb.ErrNotFound {
 			return nil
 		}
-		return nil
+		return innerErr
 	})
-	return len(val) > 0, err
+	if err != nil {
+		return false, err
+	}
+	return len(val) > 0, nil
 }
 
 func (x *xdb) Keys(pattern string) mo.Result[[]string] {
