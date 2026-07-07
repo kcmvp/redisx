@@ -127,7 +127,7 @@ func Open(persistent bool, schemas ...Schema) DB {
 				}
 			}
 		}
-		return &xdb{raw: raw}
+		return &xdb{raw}
 	}
 
 	dbOnce.Do(func() {
@@ -168,7 +168,7 @@ func Open(persistent bool, schemas ...Schema) DB {
 		}
 
 		dbMu.Lock()
-		dbInstance = &xdb{raw: raw}
+		dbInstance = &xdb{raw}
 		dbMu.Unlock()
 	})
 
@@ -184,29 +184,26 @@ type DB interface {
 	Get(key string) mo.Result[string]
 	Delete(key string) (bool, error)
 	Keys(pattern string) mo.Result[[]string]
-	Save(schema Schema, jsonValue string) error
-	QueryIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string]
-	QueryKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string]
-	Close() error
+	Save(schema Schema, jsonValue string) mo.Result[string]
+	// ByIndex queries the database using a specific schema index and filter.
+	ByIndex(schemaName string, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string]
 
-	Raw() any
+	// ByKey queries the database using a key pattern and filter.
+	ByKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string]
+	Close() error
 }
 
 type xdb struct {
-	raw *buntdb.DB
+	*buntdb.DB
 }
 
 func (x *xdb) Close() error {
-	return x.raw.Close()
+	return x.DB.Close()
 }
 
-func (x *xdb) Raw() any {
-	return x.raw
-}
-
-func (x *xdb) Save(schema Schema, jsonValue string) error {
+func (x *xdb) Save(schema Schema, jsonValue string) mo.Result[string] {
 	if !gjson.Valid(jsonValue) {
-		return errors.New("invalid json")
+		return mo.Err[string](errors.New("invalid json"))
 	}
 
 	key, err := lo.ReduceErr(schema.Prefixes(), func(agg string, prefix string, _ int) (string, error) {
@@ -218,20 +215,23 @@ func (x *xdb) Save(schema Schema, jsonValue string) error {
 	}, schema.Name())
 
 	if err != nil {
-		return err
+		return mo.Err[string](err)
 	}
 
-	return x.SetWithTtl(key, jsonValue, schema.Ttl())
+	if err := x.SetWithTtl(key, jsonValue, schema.Ttl()); err != nil {
+		return mo.Err[string](err)
+	}
+	return mo.Ok(key)
 }
 
-func (xdb *xdb) QueryIndex(schemaName string, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+func (xdb *xdb) ByIndex(schemaName string, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
 	var results []string
 
 	// Reconstruct the physical index name
 	valuePath := strings.ToLower(strings.ReplaceAll(indexAttr, ".", "_"))
 	indexName := fmt.Sprintf("%s_%s", strings.ToLower(schemaName), valuePath)
 
-	err := xdb.raw.View(func(tx *buntdb.Tx) error {
+	err := xdb.DB.View(func(tx *buntdb.Tx) error {
 		iter := lo.If(desc, tx.Descend).Else(tx.Ascend)
 		err := iter(indexName, func(key, value string) bool {
 			// If no filter is provided, or the filter passes on the full JSON value, add it
@@ -254,12 +254,12 @@ func (xdb *xdb) QueryIndex(schemaName string, indexAttr string, filter x.Filter,
 	return mo.Ok(results)
 }
 
-func (xdb *xdb) QueryKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+func (xdb *xdb) ByKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	var results []string
 
 	keyPattern := fmt.Sprintf("%s%s%s", schemaName, KeySeparator, pattern)
 
-	err := xdb.raw.View(func(tx *buntdb.Tx) error {
+	err := xdb.DB.View(func(tx *buntdb.Tx) error {
 		iter := lo.If(desc, tx.DescendKeys).Else(tx.AscendKeys)
 		return iter(keyPattern, func(key, value string) bool {
 			if filter == nil || filter.Eval(value) {
@@ -277,7 +277,7 @@ func (xdb *xdb) QueryKey(schemaName string, pattern string, filter x.Filter, des
 }
 
 func (x *xdb) Set(key string, value string) error {
-	return x.raw.Update(func(tx *buntdb.Tx) error {
+	return x.DB.Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
@@ -286,7 +286,7 @@ func (x *xdb) Set(key string, value string) error {
 func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 	if ttl > 0 {
 		opt := &buntdb.SetOptions{Expires: true, TTL: ttl}
-		return x.raw.Update(func(tx *buntdb.Tx) error {
+		return x.DB.Update(func(tx *buntdb.Tx) error {
 			_, _, err := tx.Set(key, value, opt)
 			return err
 		})
@@ -298,7 +298,7 @@ func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 
 func (x *xdb) SetNX(key string, value string) (bool, error) {
 	var set bool
-	err := x.raw.Update(func(tx *buntdb.Tx) error {
+	err := x.DB.Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == nil {
 			set = false
@@ -319,7 +319,7 @@ func (x *xdb) SetNX(key string, value string) (bool, error) {
 func (x *xdb) Get(key string) mo.Result[string] {
 	var val string
 	var err error
-	_ = x.raw.View(func(tx *buntdb.Tx) error {
+	_ = x.DB.View(func(tx *buntdb.Tx) error {
 		val, err = tx.Get(key)
 		return err
 	})
@@ -332,7 +332,7 @@ func (x *xdb) Get(key string) mo.Result[string] {
 func (x *xdb) Delete(key string) (bool, error) {
 	var val string
 	var err error
-	_ = x.raw.Update(func(tx *buntdb.Tx) error {
+	_ = x.DB.Update(func(tx *buntdb.Tx) error {
 		val, err = tx.Delete(key)
 		if err == buntdb.ErrNotFound {
 			err = nil
@@ -345,7 +345,7 @@ func (x *xdb) Delete(key string) (bool, error) {
 
 func (x *xdb) Keys(pattern string) mo.Result[[]string] {
 	var keys []string
-	err := x.raw.View(func(tx *buntdb.Tx) error {
+	err := x.DB.View(func(tx *buntdb.Tx) error {
 		// Keys uses AscendKeys which supports simple glob matching (*, ?)
 		// In buntdb, AscendKeys iterates over keys matching the pattern
 		return tx.AscendKeys(pattern, func(key, value string) bool {

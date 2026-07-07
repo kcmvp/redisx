@@ -207,6 +207,149 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 	}
 }
 
+func (s *ServerTestSuite) TestAuthKeyHelpers() {
+	// Test resolveExternalAuthKey
+	v1 := resolveExternalAuthKey(func(k string) string { return "env-key" })
+	s.Equal("env-key", v1)
+
+	v2 := resolveExternalAuthKey(func(k string) string { return "" })
+	s.NotEmpty(v2)
+	s.NotEqual("env-key", v2)
+
+	// Test ensureExternalAuthKey
+	globalMu.Lock()
+	authKey = ""
+	globalMu.Unlock()
+
+	origEnv := os.Getenv("RESPX_AUTH_KEY")
+	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-2")
+	ensureExternalAuthKey()
+	s.Equal("env-key-2", authKey)
+
+	// Second call should not overwrite
+	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-3")
+	ensureExternalAuthKey()
+	s.Equal("env-key-2", authKey)
+
+	// Test ensureExternalAuthKey with empty env var (generates random)
+	globalMu.Lock()
+	authKey = ""
+	globalMu.Unlock()
+	_ = os.Unsetenv("RESPX_AUTH_KEY")
+	ensureExternalAuthKey()
+	s.NotEmpty(authKey)
+	s.NotEqual("env-key-2", authKey)
+	s.NotEqual("env-key-3", authKey)
+
+	if origEnv != "" {
+		_ = os.Setenv("RESPX_AUTH_KEY", origEnv)
+	} else {
+		_ = os.Unsetenv("RESPX_AUTH_KEY")
+	}
+}
+
+func (s *ServerTestSuite) TestListenAndServeWithStop() {
+	addr := getFreePort()
+
+	// Test invalid address
+	err := listenAndServeWithStop("invalid-addr:999999", nil, nil, nil)
+	s.Error(err)
+
+	// Test valid address
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- listenAndServeWithStop(addr,
+			func(conn redcon.Conn, cmd redcon.Command) { conn.WriteString("OK") },
+			func(conn redcon.Conn) bool { return true },
+			func(conn redcon.Conn, err error) {},
+		)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop it by closing the listener
+	serverMu.Lock()
+	ln := serverListener
+	serverMu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+
+	select {
+	case err := <-errCh:
+		s.True(isServerShutdownErr(err))
+	case <-time.After(1 * time.Second):
+		s.Fail("listenAndServeWithStop did not return after closing listener")
+	}
+}
+
+func (s *ServerTestSuite) TestStartStorageFailure() {
+	// Setup environment to make storage.Open fail
+	tempDir := s.T().TempDir()
+	fileHome := tempDir + "/fakehome"
+	f, _ := os.Create(fileHome)
+	_ = f.Close()
+	s.T().Setenv("HOME", fileHome)
+
+	exitCalled := false
+	globalMu.Lock()
+	osExitFn = func(code int) {
+		exitCalled = true
+	}
+	globalMu.Unlock()
+
+	db := Start("127.0.0.1:0", 0, true, s.schemas...)
+	s.Nil(db)
+	s.True(exitCalled)
+
+	// Reset srvOnce for subsequent tests
+	globalMu.Lock()
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
+}
+
+func (s *ServerTestSuite) TestStartListenAndServeFailure() {
+	exitCalled := false
+	globalMu.Lock()
+	osExitFn = func(code int) {
+		exitCalled = true
+	}
+	// Force listenAndServeFn to return an unexpected error
+	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+		return errors.New("mock listen error")
+	}
+	globalMu.Unlock()
+
+	db := Start("", 0, false, s.schemas...)
+	s.NotNil(db) // DB opens successfully, but background listen fails
+
+	// Give the goroutine time to run and fail
+	time.Sleep(50 * time.Millisecond)
+
+	s.True(exitCalled)
+
+	// Reset srvOnce for subsequent tests
+	globalMu.Lock()
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
+}
+
+type localMockConn struct {
+	redcon.Conn
+	lastErr string
+}
+
+func (m *localMockConn) WriteError(msg string) { m.lastErr = msg }
+
+func (s *ServerTestSuite) TestHandleCommandDBNil() {
+	var ps redcon.PubSub
+	conn := &localMockConn{}
+	cmd := redcon.Command{Args: [][]byte{[]byte("PING")}}
+	handleCommand(conn, cmd, nil, &ps)
+	s.Equal("ERR storage not initialized", conn.lastErr)
+}
+
 func (s *ServerTestSuite) TestCommandTable() {
 	t := s.T()
 	s.addr = getFreePort()
@@ -371,6 +514,102 @@ func (s *ServerTestSuite) TestCommandTable() {
 			wantErrors: []string{"ERR wrong number of arguments for 'setex' command"},
 		},
 		{
+			name:       "setex invalid ttl",
+			auth:       true,
+			commands:   [][]string{{"setex", "k_{id}", "abc", "v"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'set' command"},
+		},
+		{
+			name:       "set EX invalid integer",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "EX", "abc"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set PX invalid integer",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "PX", "abc"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "get wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"get"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'get' command"},
+		},
+		{
+			name:       "setnx wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"setnx", "k_{id}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'setnx' command"},
+		},
+		{
+			name:       "del wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"del"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'del' command"},
+		},
+		{
+			name:       "keys wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"keys"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'keys' command"},
+		},
+		{
+			name:       "publish wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"publish", "topic"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'publish' command"},
+		},
+		{
+			name:       "subscribe wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"subscribe"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'subscribe' command"},
+		},
+		{
+			name:       "byindex wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'byindex' command"},
+		},
+		{
+			name:       "byindex invalid order",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "byindex invalid json",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "bykey wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'bykey' command"},
+		},
+		{
+			name:       "bykey invalid order",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "bykey invalid json",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
 			name:       "wrong number of args set",
 			auth:       true,
 			commands:   [][]string{{"SET", "k_{id}"}},
@@ -413,39 +652,39 @@ func (s *ServerTestSuite) TestCommandTable() {
 			wantErrors: []string{"ERR wrong number of arguments for 'PSUBSCRIBE' command"},
 		},
 		{
-			name:       "queryindex wrong number of args",
+			name:       "byindex wrong number of args",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "schema", "attr"}},
-			wantErrors: []string{"ERR wrong number of arguments for 'queryindex' command"},
+			commands:   [][]string{{"byindex", "schema", "attr"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'byindex' command"},
 		},
 		{
-			name:       "queryindex invalid order",
+			name:       "byindex invalid order",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "schema", "attr", "{}", "INVALID"}},
+			commands:   [][]string{{"byindex", "schema", "attr", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
-			name:       "queryindex invalid json",
+			name:       "byindex invalid json",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "schema", "attr", "{invalid}", "ASC"}},
+			commands:   [][]string{{"byindex", "schema", "attr", "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
-			name:       "querykey wrong number of args",
+			name:       "bykey wrong number of args",
 			auth:       true,
-			commands:   [][]string{{"querykey", "schema", "pattern"}},
-			wantErrors: []string{"ERR wrong number of arguments for 'querykey' command"},
+			commands:   [][]string{{"bykey", "schema", "pattern"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'bykey' command"},
 		},
 		{
-			name:       "querykey invalid order",
+			name:       "bykey invalid order",
 			auth:       true,
-			commands:   [][]string{{"querykey", "schema", "pattern", "{}", "INVALID"}},
+			commands:   [][]string{{"bykey", "schema", "pattern", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
-			name:       "querykey invalid json",
+			name:       "bykey invalid json",
 			auth:       true,
-			commands:   [][]string{{"querykey", "schema", "pattern", "{invalid}", "ASC"}},
+			commands:   [][]string{{"bykey", "schema", "pattern", "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
@@ -478,9 +717,9 @@ func (s *ServerTestSuite) TestCommandTable() {
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
-			name:       "queryindex success",
+			name:       "byindex success",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "user_idx", "age", "{}", "ASC"}},
+			commands:   [][]string{{"byindex", "user_idx", "age", "{}", "ASC"}},
 			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
 			setupDB: func(uid string) {
 
@@ -489,17 +728,17 @@ func (s *ServerTestSuite) TestCommandTable() {
 			},
 		},
 		{
-			name:       "queryindex not found",
+			name:       "byindex not found",
 			auth:       true,
-			commands:   [][]string{{"queryindex", "user_no_idx", "unknown", "{}", "ASC"}},
+			commands:   [][]string{{"byindex", "user_no_idx", "unknown", "{}", "ASC"}},
 			wantErrors: []string{"ERR index unknown not found for schema user_no_idx"},
 			setupDB: func(uid string) {
 			},
 		},
 		{
-			name:       "querykey success",
+			name:       "bykey success",
 			auth:       true,
-			commands:   [][]string{{"querykey", "user_key", "*_{id}", "{}", "DESC"}},
+			commands:   [][]string{{"bykey", "user_key", "*_{id}", "{}", "DESC"}},
 			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
 			setupDB: func(uid string) {
 
@@ -508,9 +747,9 @@ func (s *ServerTestSuite) TestCommandTable() {
 			},
 		},
 		{
-			name:       "querykey not found",
+			name:       "bykey not found",
 			auth:       true,
-			commands:   [][]string{{"querykey", "user_key", "unknown_{id}:*", "{}"}},
+			commands:   [][]string{{"bykey", "user_key", "unknown_{id}:*", "{}"}},
 			wantArrays: [][]string{{}},
 			setupDB: func(uid string) {
 			},
@@ -953,9 +1192,12 @@ func (s *ServerTestSuite) TestParseFilter() {
 		},
 
 		// Error cases
+		{"Root not object", `"just-string"`, true, false},
 		{"Unsupported operator", `{"age": {"$unknown": 18}}`, true, false},
 		{"And not array", `{"$and": {"age": 18}}`, true, false},
 		{"Or not array", `{"$or": {"age": 18}}`, true, false},
+		{"And element error", `{"$and": [{"age": {"$unknown": 18}}]}`, true, false},
+		{"Or element error", `{"$or": [{"age": {"$unknown": 18}}]}`, true, false},
 	}
 
 	for _, tt := range tests {

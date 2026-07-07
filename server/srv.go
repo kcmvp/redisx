@@ -35,8 +35,8 @@ const (
 	cmdSetNX      = "setnx"
 	cmdDel        = "del"
 	cmdKeys       = "keys"
-	cmdQueryIndex = "queryindex"
-	cmdQueryKey   = "querykey"
+	cmdByIndex    = "byindex"
+	cmdByKey      = "bykey"
 	cmdPublish    = "publish"
 	cmdSubscribe  = "subscribe"
 	cmdPSubscribe = "psubscribe"
@@ -309,11 +309,6 @@ func watchShutdownSignals() {
 }
 
 func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub) {
-	if len(cmd.Args) == 0 {
-		conn.WriteError("ERR empty command")
-		return
-	}
-
 	if db == nil {
 		conn.WriteError("ERR storage not initialized")
 		return
@@ -488,7 +483,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 				conn.WriteBulk([]byte(key))
 			}
 		}
-	case cmdQueryIndex:
+	case cmdByIndex:
 		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
@@ -515,7 +510,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			return
 		}
 
-		res := db.QueryIndex(schemaName, indexAttr, filter, desc)
+		res := db.ByIndex(schemaName, indexAttr, filter, desc)
 		if res.IsError() {
 			if errors.Is(res.Error(), buntdb.ErrNotFound) {
 				conn.WriteArray(0)
@@ -529,7 +524,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 				conn.WriteBulk([]byte(val))
 			}
 		}
-	case cmdQueryKey:
+	case cmdByKey:
 		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
@@ -555,7 +550,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			return
 		}
 
-		res := db.QueryKey(schemaName, pattern, filter, desc)
+		res := db.ByKey(schemaName, pattern, filter, desc)
 		if res.IsError() {
 			if errors.Is(res.Error(), buntdb.ErrNotFound) {
 				conn.WriteArray(0)

@@ -233,6 +233,70 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 	}
 }
 
+func (s *ClientTestSuite) TestCrudCommands() {
+	s.Run("SetNX not connected", func() {
+		s.SetupTest()
+		ok, err := SetNX("k", "v")
+		s.Error(err)
+		s.Contains(err.Error(), "resp client is not connected")
+		s.False(ok)
+	})
+
+	s.Run("Delete not connected", func() {
+		s.SetupTest()
+		deleted, err := Delete("k")
+		s.Error(err)
+		s.Contains(err.Error(), "resp client is not connected")
+		s.False(deleted)
+	})
+
+	s.Run("Keys not connected", func() {
+		s.SetupTest()
+		keysRes := Keys("k*")
+		s.True(keysRes.IsError())
+		s.Contains(keysRes.Error().Error(), "resp client is not connected")
+	})
+
+	s.Run("SetNX Delete Keys Success", func() {
+		s.SetupTest()
+		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+		s.NoError(err)
+		s.ensureConnected()
+
+		// Test SetNX
+		ok, err := SetNX("nx_key", "val1")
+		s.NoError(err)
+		s.True(ok)
+
+		ok, err = SetNX("nx_key", "val2")
+		s.NoError(err)
+		s.False(ok)
+
+		v, err := Get("nx_key")
+		s.NoError(err)
+		s.Equal("val1", v)
+
+		// Test Keys
+		_ = Set("another_key", "val")
+		keysRes := Keys("*_key")
+		s.False(keysRes.IsError())
+		s.ElementsMatch([]string{"nx_key", "another_key"}, keysRes.MustGet())
+
+		// Test Delete
+		deleted, err := Delete("nx_key")
+		s.NoError(err)
+		s.True(deleted)
+
+		keysRes = Keys("*_key")
+		s.False(keysRes.IsError())
+		s.ElementsMatch([]string{"another_key"}, keysRes.MustGet())
+
+		deleted, err = Delete("another_key")
+		s.NoError(err)
+		s.True(deleted)
+	})
+}
+
 func (s *ClientTestSuite) TestAuthCommand() {
 	tests := []struct {
 		name       string
@@ -476,7 +540,7 @@ func (s *ClientTestSuite) TestPublishCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestQueryIndexCommand() {
+func (s *ClientTestSuite) TestByIndexCommand() {
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
@@ -521,7 +585,7 @@ func (s *ClientTestSuite) TestQueryIndexCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := QueryIndex(tt.schema, tt.index, tt.filter, tt.desc)
+			res := ByIndex(tt.schema, tt.index, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -534,7 +598,7 @@ func (s *ClientTestSuite) TestQueryIndexCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestQueryKeyCommand() {
+func (s *ClientTestSuite) TestByKeyCommand() {
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
@@ -577,7 +641,7 @@ func (s *ClientTestSuite) TestQueryKeyCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := QueryKey(tt.schema, tt.pattern, tt.filter, tt.desc)
+			res := ByKey(tt.schema, tt.pattern, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())

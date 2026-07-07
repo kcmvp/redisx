@@ -319,7 +319,8 @@ func SetNX(key, value string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	return client.SetNX(ctx, key, value, 0).Result()
+	res, err := client.Do(ctx, "SETNX", key, value).Int()
+	return res == 1, err
 }
 
 // Delete removes the specified key using the shared resp client.
@@ -357,8 +358,8 @@ func Keys(pattern string) mo.Result[[]string] {
 	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
 }
 
-// QueryIndex executes a query on a specific JSON index with the provided filter.
-func QueryIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+// ByIndex executes a query on a specific JSON index with the provided filter.
+func ByIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if schemaName == "" || indexAttr == "" {
 		return mo.Err[[]string](errors.New("schema name and index attribute are required"))
 	}
@@ -387,8 +388,8 @@ func QueryIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Res
 		order = "DESC"
 	}
 
-	// The QUERYINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "QUERYINDEX", schemaName, indexAttr, filterJSON, order)
+	// The BYINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "BYINDEX", schemaName, indexAttr, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -397,8 +398,8 @@ func QueryIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Res
 	return mo.Ok(res)
 }
 
-// QueryKey executes a query on matching keys with the provided filter.
-func QueryKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+// ByKey executes a query on matching keys with the provided filter.
+func ByKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if schemaName == "" || pattern == "" {
 		return mo.Err[[]string](errors.New("schema name and pattern are required"))
 	}
@@ -427,8 +428,8 @@ func QueryKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[
 		order = "DESC"
 	}
 
-	// The QUERYKEY command takes schemaName, pattern, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "QUERYKEY", schemaName, pattern, filterJSON, order)
+	// The BYKEY command takes schemaName, pattern, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "BYKEY", schemaName, pattern, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)

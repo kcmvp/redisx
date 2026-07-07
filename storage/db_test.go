@@ -57,8 +57,39 @@ func TestDB_Lifecycle(t *testing.T) {
 
 		db2 := Open(true)
 		assert.Equal(t, db1, db2, "Should return singleton instance")
-
+		
 		_ = db1.Close()
+	})
+	
+	t.Run("Persistent DB singleton duplicate schemas", func(t *testing.T) {
+		Reset()
+		origHome := os.Getenv("HOME")
+		defer func() { _ = os.Setenv("HOME", origHome) }()
+
+		tempDir := t.TempDir()
+		_ = os.Setenv("HOME", tempDir)
+		
+		s1 := JsonSchema("user", 0)
+		s2 := JsonSchema("user", 0)
+		
+		db := Open(true, s1, s2)
+		assert.Nil(t, db)
+	})
+	
+	t.Run("Persistent DB create dir error", func(t *testing.T) {
+		Reset()
+		origHome := os.Getenv("HOME")
+		defer func() { _ = os.Setenv("HOME", origHome) }()
+
+		// Create a file where a directory is expected, so MkdirAll fails
+		tempDir := t.TempDir()
+		fileHome := tempDir + "/fakehome"
+		f, _ := os.Create(fileHome)
+		f.Close()
+		_ = os.Setenv("HOME", fileHome)
+		
+		db := Open(true)
+		assert.Nil(t, db)
 	})
 }
 
@@ -179,21 +210,24 @@ func TestDB_Save(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := db.Save(schema, tt.json)
+			res := db.Save(schema, tt.json)
 			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errStr)
+				assert.True(t, res.IsError())
+				assert.Contains(t, res.Error().Error(), tt.errStr)
 			} else {
-				assert.NoError(t, err)
-				res := db.Get(tt.verifyKey)
-				assert.True(t, res.IsOk())
-				assert.Equal(t, tt.json, res.MustGet())
+				assert.False(t, res.IsError())
+				assert.Equal(t, tt.verifyKey, res.MustGet())
+
+				// verify it was actually saved by fetching the key
+				got := db.Get(res.MustGet())
+				assert.False(t, got.IsError())
+				assert.Equal(t, tt.json, got.MustGet())
 			}
 		})
 	}
 }
 
-func TestDB_QueryIndex(t *testing.T) {
+func TestDB_ByIndex(t *testing.T) {
 	schema := JsonSchema("user", 0).PrefixAttr("id").Index("age")
 	db := setupTestDB(t, schema)
 
@@ -204,8 +238,8 @@ func TestDB_QueryIndex(t *testing.T) {
 		`{"id": "3", "age": 25, "name": "C"}`,
 	}
 	for _, d := range data {
-		err := db.Save(schema, d)
-		assert.NoError(t, err)
+		res := db.Save(schema, d)
+		assert.False(t, res.IsError())
 	}
 
 	tests := []struct {
@@ -251,7 +285,7 @@ func TestDB_QueryIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res := db.QueryIndex(tt.schemaName, tt.indexAttr, tt.filter, tt.desc)
+			res := db.ByIndex(tt.schemaName, tt.indexAttr, tt.filter, tt.desc)
 			if tt.wantErr {
 				assert.True(t, res.IsError())
 			} else {
@@ -262,7 +296,7 @@ func TestDB_QueryIndex(t *testing.T) {
 	}
 }
 
-func TestDB_QueryKey(t *testing.T) {
+func TestDB_ByKey(t *testing.T) {
 	schema := JsonSchema("order", 0).PrefixAttr("region", "id")
 	db := setupTestDB(t, schema)
 
@@ -272,8 +306,8 @@ func TestDB_QueryKey(t *testing.T) {
 		`{"region": "eu", "id": "3", "status": "active"}`,
 	}
 	for _, d := range data {
-		err := db.Save(schema, d)
-		assert.NoError(t, err)
+		res := db.Save(schema, d)
+		assert.False(t, res.IsError())
 	}
 
 	tests := []struct {
@@ -318,7 +352,7 @@ func TestDB_QueryKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res := db.QueryKey(tt.schemaName, tt.pattern, tt.filter, tt.desc)
+			res := db.ByKey(tt.schemaName, tt.pattern, tt.filter, tt.desc)
 			assert.True(t, res.IsOk())
 
 			got := res.MustGet()
