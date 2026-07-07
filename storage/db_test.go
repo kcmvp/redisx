@@ -47,10 +47,10 @@ func TestDB_Lifecycle(t *testing.T) {
 		Reset()
 		// Use a temp home dir to avoid polluting actual user dir
 		origHome := os.Getenv("HOME")
-		defer os.Setenv("HOME", origHome)
+		defer func() { _ = os.Setenv("HOME", origHome) }()
 
 		tempDir := t.TempDir()
-		os.Setenv("HOME", tempDir)
+		_ = os.Setenv("HOME", tempDir)
 
 		db1 := Open(true)
 		assert.NotNil(t, db1)

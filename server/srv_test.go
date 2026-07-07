@@ -82,7 +82,7 @@ func TestConnectionLimits(t *testing.T) {
 
 	// Start server with externalMaxConns = 1
 	_ = Start(addr, 1, false)
-	defer stop()
+	defer func() { _ = stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -111,7 +111,7 @@ func TestConnectionLimits(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	// Read from conn2 should fail
-	conn2.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_ = conn2.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	_, err = conn2.Read(make([]byte, 1))
 	if err == nil {
 		t.Fatal("expected conn2 to be closed due to limits, but read succeeded")
@@ -126,7 +126,7 @@ func TestConnectionLimits(t *testing.T) {
 	}
 
 	// Close connection 1
-	conn1.Close()
+	_ = conn1.Close()
 
 	// Wait for server to process close
 	time.Sleep(50 * time.Millisecond)
@@ -144,7 +144,7 @@ func TestConnectionLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to dial conn3: %v", err)
 	}
-	defer conn3.Close()
+	defer func() { _ = conn3.Close() }()
 
 	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
 
@@ -478,20 +478,20 @@ func TestHandleCommand(t *testing.T) {
 			if tc.setupDB != nil {
 				tc.setupDB(db)
 			}
-			defer stop()
+			defer func() { _ = stop() }()
 
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				t.Fatalf("failed to connect to server: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			if tc.auth {
 				// We use internalAuthKey which is populated by Start
 				b := []byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey))
-				conn.Write(b)
+				_, _ = conn.Write(b)
 				buf := make([]byte, 1024)
-				conn.Read(buf)
+				_, _ = conn.Read(buf)
 			}
 
 			var finalResp string
@@ -513,7 +513,7 @@ func TestHandleCommand(t *testing.T) {
 					break
 				}
 
-				conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 				buf := make([]byte, 4096)
 				n, err := conn.Read(buf)
 				if err != nil {
@@ -527,7 +527,7 @@ func TestHandleCommand(t *testing.T) {
 			}
 
 			// Try one more read to see if it's closed
-			conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 			_, err = conn.Read(make([]byte, 1))
 			if err != nil {
 				if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "reset by peer") {
@@ -600,7 +600,7 @@ func TestPubSub(t *testing.T) {
 	resetTestState(t)
 	addr := getFreePort()
 	_ = Start(addr, 10, false)
-	defer stop()
+	defer func() { _ = stop() }()
 
 	// Need a small sleep to ensure server is ready
 	time.Sleep(10 * time.Millisecond)
@@ -610,16 +610,16 @@ func TestPubSub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to connect sub: %v", err)
 	}
-	defer subConn.Close()
+	defer func() { _ = subConn.Close() }()
 
 	// Auth Sub
-	subConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	_, _ = subConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
 	buf := make([]byte, 1024)
-	subConn.Read(buf)
+	_, _ = subConn.Read(buf)
 
 	// Subscribe
-	subConn.Write([]byte("*2\r\n$9\r\nSUBSCRIBE\r\n$7\r\ntopic-1\r\n"))
-	subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_, _ = subConn.Write([]byte("*2\r\n$9\r\nSUBSCRIBE\r\n$7\r\ntopic-1\r\n"))
+	_ = subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	n, _ := subConn.Read(buf)
 	subResp := string(buf[:n])
 	if !strings.Contains(subResp, "subscribe") || !strings.Contains(subResp, "topic-1") {
@@ -631,15 +631,15 @@ func TestPubSub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to connect pub: %v", err)
 	}
-	defer pubConn.Close()
+	defer func() { _ = pubConn.Close() }()
 
 	// Auth Pub
-	pubConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
-	pubConn.Read(buf)
+	_, _ = pubConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	_, _ = pubConn.Read(buf)
 
 	// Publish (Case insensitive check as well)
-	pubConn.Write([]byte("*3\r\n$7\r\npUbLiSh\r\n$7\r\ntopic-1\r\n$7\r\npayload\r\n"))
-	pubConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_, _ = pubConn.Write([]byte("*3\r\n$7\r\npUbLiSh\r\n$7\r\ntopic-1\r\n$7\r\npayload\r\n"))
+	_ = pubConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	n, _ = pubConn.Read(buf)
 	pubResp := string(buf[:n])
 
@@ -649,7 +649,7 @@ func TestPubSub(t *testing.T) {
 	}
 
 	// Check if Sub connection received the message
-	subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_ = subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	n, _ = subConn.Read(buf)
 	msgResp := string(buf[:n])
 	if !strings.Contains(msgResp, "message") || !strings.Contains(msgResp, "payload") {
