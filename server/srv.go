@@ -99,27 +99,27 @@ func ensureExternalAuthKey() {
 
 func acceptCon(conn redcon.Conn) bool {
 	connCountMu.Lock()
-	defer connCountMu.Unlock()
-
 	if activeExternalConns >= externalMaxConns {
+		connCountMu.Unlock()
 		slog.Warn("reject connection", "remote", conn.RemoteAddr(), "active", activeExternalConns, "external_max_conns", externalMaxConns)
 		return false
 	}
-
 	activeExternalConns++
+	connCountMu.Unlock()
+
 	conn.SetContext("")
 	return true
 }
 
 func closeCon(conn redcon.Conn, err error) {
 	ctx := conn.Context()
-	if ctx == nil {
-		return
+	var prevAuth string
+	if ctx != nil {
+		prevAuth, _ = ctx.(string)
 	}
-	prevAuth, _ := ctx.(string)
 
 	connCountMu.Lock()
-	if prevAuth != internalAuthKey {
+	if ctx != nil && prevAuth != internalAuthKey && activeExternalConns > 0 {
 		activeExternalConns--
 	}
 	current := activeExternalConns

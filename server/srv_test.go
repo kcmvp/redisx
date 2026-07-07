@@ -46,8 +46,10 @@ func resetTestState(t *testing.T) {
 	// Force reset the sync.Once for DB initialization
 	storage.Reset()
 
-	globalMu.Lock()
+	connCountMu.Lock()
 	activeExternalConns = 0
+	connCountMu.Unlock()
+	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	authKey = "external-test-key"
 	externalMaxConns = 1
@@ -59,8 +61,11 @@ func resetTestState(t *testing.T) {
 		_ = stop()
 		time.Sleep(5 * time.Millisecond)
 		storage.Reset()
-		globalMu.Lock()
+
+		connCountMu.Lock()
 		activeExternalConns = 0
+		connCountMu.Unlock()
+		globalMu.Lock()
 		internalAuthKey = originalInternalAuthKey
 		authKey = originalAuthKey
 		externalMaxConns = originalExternalMaxConns
