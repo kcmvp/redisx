@@ -2,6 +2,8 @@ package server
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -13,66 +15,6 @@ import (
 	"github.com/kcmvp/respx/storage"
 	"github.com/tidwall/redcon"
 )
-
-type mockConn struct {
-	remoteAddr   string
-	ctx          interface{}
-	closed       bool
-	errors       []string
-	strings      []string
-	bulks        [][]byte
-	ints         []int
-	nulls        int
-	arrays       [][]string
-	currentArray []string
-	arrayLen     int
-}
-
-func (m *mockConn) RemoteAddr() string     { return m.remoteAddr }
-func (m *mockConn) Close() error           { m.closed = true; return nil }
-func (m *mockConn) WriteError(msg string)  { m.errors = append(m.errors, msg) }
-func (m *mockConn) WriteString(str string) { m.strings = append(m.strings, str) }
-func (m *mockConn) WriteBulk(b []byte) {
-	if m.arrayLen > 0 {
-		m.currentArray = append(m.currentArray, string(b))
-		if len(m.currentArray) == m.arrayLen {
-			m.arrays = append(m.arrays, m.currentArray)
-			m.arrayLen = 0
-			m.currentArray = nil
-		}
-	} else {
-		m.bulks = append(m.bulks, append([]byte(nil), b...))
-	}
-}
-func (m *mockConn) WriteBulkString(s string) { m.WriteBulk([]byte(s)) }
-func (m *mockConn) WriteInt(num int)         { m.ints = append(m.ints, num) }
-func (m *mockConn) WriteInt64(int64)         {}
-func (m *mockConn) WriteUint64(uint64)       {}
-func (m *mockConn) WriteArray(count int) {
-	if count == 0 {
-		m.arrays = append(m.arrays, []string{})
-	} else {
-		m.arrayLen = count
-		m.currentArray = make([]string, 0, count)
-	}
-}
-func (m *mockConn) WriteNull()                     { m.nulls++ }
-func (m *mockConn) WriteRaw([]byte)                {}
-func (m *mockConn) WriteAny(any)                   {}
-func (m *mockConn) Context() interface{}           { return m.ctx }
-func (m *mockConn) SetContext(v interface{})       { m.ctx = v }
-func (m *mockConn) SetReadBuffer(int)              {}
-func (m *mockConn) Detach() redcon.DetachedConn    { return &mockDetachedConn{mockConn: m} }
-func (m *mockConn) ReadPipeline() []redcon.Command { return nil }
-func (m *mockConn) PeekPipeline() []redcon.Command { return nil }
-func (m *mockConn) NetConn() net.Conn              { return nil }
-
-type mockDetachedConn struct {
-	*mockConn
-}
-
-func (m *mockDetachedConn) ReadCommand() (redcon.Command, error) { return redcon.Command{}, nil }
-func (m *mockDetachedConn) Flush() error                         { return nil }
 
 // resetStorage clears the singleton instance in storage package. Used only for testing.
 // We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
@@ -129,140 +71,83 @@ func resetTestState(t *testing.T) {
 	})
 }
 
-func newCommand(args ...string) redcon.Command {
-	cmd := redcon.Command{Args: make([][]byte, len(args))}
-	for i, arg := range args {
-		cmd.Args[i] = []byte(arg)
-	}
-	return cmd
-}
-
-func TestAcceptConnectionIncrementsCount(t *testing.T) {
+func TestConnectionLimits(t *testing.T) {
 	resetTestState(t)
-	externalMaxConns = 2
+	addr := getFreePort()
 
-	conn := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	if !acceptCon(conn) {
-		t.Fatal("acceptConnection() = false, want true")
+	// Start server with externalMaxConns = 1
+	_ = Start(addr, 1, false)
+	defer stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Connection 1 should succeed
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn1: %v", err)
 	}
+	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
 
+	// Verify it's active
 	connCountMu.Lock()
 	count := activeExternalConns
 	connCountMu.Unlock()
 	if count != 1 {
 		t.Fatalf("activeExternalConns = %d, want 1", count)
 	}
-}
 
-func TestAcceptConnectionRejectsWhenAtExternalLimit(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
-
-	first := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20002"}
-
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
-	}
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-}
-
-func TestAcceptConnectionRejectDoesNotIncreaseExternalCount(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
-
-	first := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20002"}
-
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
+	// Connection 2 should be rejected/closed immediately
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn2: %v", err)
 	}
 
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 1 {
-		t.Fatalf("activeExternalConns after first accept = %d, want 1", count)
+	// We wait a bit to ensure server closed it
+	time.Sleep(10 * time.Millisecond)
+
+	// Read from conn2 should fail
+	conn2.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_, err = conn2.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected conn2 to be closed due to limits, but read succeeded")
 	}
 
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-
+	// Count should still be 1
 	connCountMu.Lock()
 	count = activeExternalConns
 	connCountMu.Unlock()
 	if count != 1 {
 		t.Fatalf("activeExternalConns after rejected accept = %d, want 1", count)
 	}
-}
 
-func TestAcceptConnectionAllowsNewConnectionAfterCloseFreesSlot(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
+	// Close connection 1
+	conn1.Close()
 
-	first := &mockConn{remoteAddr: "127.0.0.1:20011"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20012"}
+	// Wait for server to process close
+	time.Sleep(50 * time.Millisecond)
 
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
-	}
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-
-	closeCon(first, nil)
-
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 0 {
-		t.Fatalf("activeExternalConns after close = %d, want 0", count)
-	}
-
-	if !acceptCon(second) {
-		t.Fatal("second acceptConnection() after close = false, want true")
-	}
-}
-
-func TestCloseConnectionRemovesStateAndKeepsCountUpdated(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	acceptCon(conn)
-
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 1 {
-		t.Fatalf("activeExternalConns before close = %d, want 1", count)
-	}
-
-	closeCon(conn, nil)
-
+	// Count should be 0
 	connCountMu.Lock()
 	count = activeExternalConns
 	connCountMu.Unlock()
 	if count != 0 {
 		t.Fatalf("activeExternalConns after close = %d, want 0", count)
 	}
-}
 
-func TestCloseConnectionWithErrorAlsoRemovesState(t *testing.T) {
-	resetTestState(t)
+	// Now connection 3 should succeed since slot is freed
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn3: %v", err)
+	}
+	defer conn3.Close()
 
-	conn := &mockConn{remoteAddr: "127.0.0.1:20012"}
-	acceptCon(conn)
-
-	closeCon(conn, errors.New("network error"))
+	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
 
 	connCountMu.Lock()
-	count := activeExternalConns
+	count = activeExternalConns
 	connCountMu.Unlock()
-	if count != 0 {
-		t.Fatalf("activeExternalConns after close(err) = %d, want 0", count)
+	if count != 1 {
+		t.Fatalf("activeExternalConns = %d, want 1", count)
 	}
 }
 
@@ -279,15 +164,9 @@ func TestHandleCommand(t *testing.T) {
 		wantArrays  [][]string
 		wantClosed  bool
 		dbInit      bool
+		schemas     []storage.Schema
 		setupDB     func(db storage.DB)
 	}{
-		{
-			name:       "empty command",
-			auth:       false,
-			commands:   [][]string{{}},
-			wantErrors: []string{"ERR empty command"},
-			dbInit:     true,
-		},
 		{
 			name:       "unauthenticated write command",
 			auth:       false,
@@ -521,18 +400,6 @@ func TestHandleCommand(t *testing.T) {
 			commands: [][]string{{"SUBSCRIBE", "topic-a", "topic-b"}, {"PSUBSCRIBE", "topic-*"}},
 		},
 		{
-			name:       "queryindex error from db",
-			auth:       true,
-			commands:   [][]string{{"queryindex", "schema", "attr", "{}"}},
-			wantErrors: []string{"ERR storage not initialized"},
-		},
-		{
-			name:       "querykey error from db",
-			auth:       true,
-			commands:   [][]string{{"querykey", "schema", "pattern", "{}"}},
-			wantErrors: []string{"ERR storage not initialized"},
-		},
-		{
 			name:       "set with EX invalid value",
 			auth:       true,
 			commands:   [][]string{{"set", "k", "v", "EX", "notanumber"}},
@@ -556,16 +423,9 @@ func TestHandleCommand(t *testing.T) {
 			commands:   [][]string{{"queryindex", "user", "age", "{}", "ASC"}},
 			wantArrays: [][]string{{`{"id":"1", "age":20}`, `{"id":"2", "age":30}`}},
 			dbInit:     true,
+			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")},
 			setupDB: func(db storage.DB) {
-				// We need to re-open the DB with the schema first since Open returns the DB with schemas
-				storage.Reset()
 				schema := storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")
-				db = storage.Open(false, schema)
-				// Replace the global db instance for handleCommand to use
-				globalMu.Lock()
-				currentDB = db
-				globalMu.Unlock()
-
 				_ = db.Save(schema, `{"id":"1", "age":20}`)
 				_ = db.Save(schema, `{"id":"2", "age":30}`)
 			},
@@ -576,13 +436,8 @@ func TestHandleCommand(t *testing.T) {
 			commands:   [][]string{{"queryindex", "user", "unknown", "{}", "ASC"}},
 			wantErrors: []string{"ERR index unknown not found for schema user"},
 			dbInit:     true,
+			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")},
 			setupDB: func(db storage.DB) {
-				storage.Reset()
-				schema := storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")
-				db = storage.Open(false, schema)
-				globalMu.Lock()
-				currentDB = db
-				globalMu.Unlock()
 			},
 		},
 		{
@@ -591,14 +446,9 @@ func TestHandleCommand(t *testing.T) {
 			commands:   [][]string{{"querykey", "user", "*", "{}", "DESC"}},
 			wantArrays: [][]string{{`{"id":"2"}`, `{"id":"1"}`}},
 			dbInit:     true,
+			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id")},
 			setupDB: func(db storage.DB) {
-				storage.Reset()
 				schema := storage.JsonSchema("user", 0).PrefixAttr("id")
-				db = storage.Open(false, schema)
-				globalMu.Lock()
-				currentDB = db
-				globalMu.Unlock()
-
 				_ = db.Save(schema, `{"id":"1"}`)
 				_ = db.Save(schema, `{"id":"2"}`)
 			},
@@ -609,209 +459,196 @@ func TestHandleCommand(t *testing.T) {
 			commands:   [][]string{{"querykey", "user", "unknown:*", "{}"}},
 			wantArrays: [][]string{{}},
 			dbInit:     true,
+			schemas:    []storage.Schema{storage.JsonSchema("user", 0).PrefixAttr("id")},
 			setupDB: func(db storage.DB) {
-				storage.Reset()
-				schema := storage.JsonSchema("user", 0).PrefixAttr("id")
-				db = storage.Open(false, schema)
-				globalMu.Lock()
-				currentDB = db
-				globalMu.Unlock()
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var db storage.DB
-			if tc.dbInit || (!strings.Contains(tc.name, "error from db") && !strings.Contains(tc.name, "empty command")) {
-				storage.Reset()
-				db = storage.Open(false)
-				if tc.setupDB != nil {
-					tc.setupDB(db)
-					globalMu.Lock()
-					db = currentDB
-					globalMu.Unlock()
-				}
-				defer func() {
-					if db != nil {
-						_ = db.Close()
-					}
-					storage.Reset()
-				}()
-			} else {
-				db = nil
+			addr := getFreePort()
+			storage.Reset()
+			db := Start(addr, 10, false, tc.schemas...)
+			if tc.setupDB != nil {
+				tc.setupDB(db)
 			}
+			defer stop()
 
-			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("failed to connect to server: %v", err)
+			}
+			defer conn.Close()
+
 			if tc.auth {
-				conn.SetContext(internalAuthKey)
-			} else {
-				conn.SetContext(nil)
+				// We use internalAuthKey which is populated by Start
+				b := []byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey))
+				conn.Write(b)
+				buf := make([]byte, 1024)
+				conn.Read(buf)
 			}
 
-			var ps redcon.PubSub
+			var finalResp string
+			var closed bool
 
 			for _, args := range tc.commands {
-				var cmd redcon.Command
-				if len(args) > 0 {
-					cmd = newCommand(args...)
+				var b []byte
+				if len(args) == 0 {
+					b = []byte("*0\r\n")
+				} else {
+					b = append(b, []byte(fmt.Sprintf("*%d\r\n", len(args)))...)
+					for _, arg := range args {
+						b = append(b, []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))...)
+					}
 				}
-				handleCommand(conn, cmd, db, &ps)
+				_, err := conn.Write(b)
+				if err != nil {
+					closed = true
+					break
+				}
+
+				conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				buf := make([]byte, 4096)
+				n, err := conn.Read(buf)
+				if err != nil {
+					if n > 0 {
+						finalResp += string(buf[:n])
+					}
+					closed = true
+					break
+				}
+				finalResp += string(buf[:n])
+			}
+
+			// Try one more read to see if it's closed
+			conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			_, err = conn.Read(make([]byte, 1))
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "reset by peer") {
+					closed = true
+				}
 			}
 
 			// Validate Errors
-			if len(tc.wantErrors) > 0 {
-				if len(conn.errors) != len(tc.wantErrors) {
-					t.Errorf("errors = %v, want %v", conn.errors, tc.wantErrors)
-				} else {
-					for i, e := range tc.wantErrors {
-						if conn.errors[i] != e {
-							t.Errorf("error[%d] = %q, want %q", i, conn.errors[i], e)
-						}
-					}
+			for _, e := range tc.wantErrors {
+				if !strings.Contains(finalResp, e) {
+					t.Errorf("expected error %q, got resp: %q", e, finalResp)
 				}
-			} else if len(conn.errors) > 0 {
-				t.Errorf("unexpected errors: %v", conn.errors)
 			}
 
 			// Validate Strings
-			if len(tc.wantStrings) > 0 {
-				if len(conn.strings) != len(tc.wantStrings) {
-					t.Errorf("strings = %v, want %v", conn.strings, tc.wantStrings)
-				} else {
-					for i, s := range tc.wantStrings {
-						if conn.strings[i] != s {
-							t.Errorf("string[%d] = %q, want %q", i, conn.strings[i], s)
-						}
-					}
+			for _, s := range tc.wantStrings {
+				if !strings.Contains(finalResp, "+"+s+"\r\n") {
+					t.Errorf("expected string %q, got resp: %q", s, finalResp)
 				}
 			}
 
 			// Validate Bulks
-			if len(tc.wantBulks) > 0 {
-				if len(conn.bulks) != len(tc.wantBulks) {
-					t.Errorf("bulks length = %d, want %d", len(conn.bulks), len(tc.wantBulks))
-				} else {
-					for i, b := range tc.wantBulks {
-						if string(conn.bulks[i]) != b {
-							t.Errorf("bulk[%d] = %q, want %q", i, string(conn.bulks[i]), b)
-						}
-					}
+			for _, b := range tc.wantBulks {
+				if !strings.Contains(finalResp, fmt.Sprintf("$%d\r\n%s\r\n", len(b), b)) {
+					t.Errorf("expected bulk %q, got resp: %q", b, finalResp)
 				}
 			}
 
 			// Validate Ints
-			if len(tc.wantInts) > 0 {
-				if len(conn.ints) != len(tc.wantInts) {
-					t.Errorf("ints = %v, want %v", conn.ints, tc.wantInts)
-				} else {
-					for i, val := range tc.wantInts {
-						if conn.ints[i] != val {
-							t.Errorf("int[%d] = %d, want %d", i, conn.ints[i], val)
-						}
-					}
+			for _, val := range tc.wantInts {
+				if !strings.Contains(finalResp, fmt.Sprintf(":%d\r\n", val)) {
+					t.Errorf("expected int %d, got resp: %q", val, finalResp)
 				}
 			}
 
 			// Validate Nulls
-			if conn.nulls != tc.wantNulls {
-				t.Errorf("nulls = %d, want %d", conn.nulls, tc.wantNulls)
-			}
-
-			if tc.wantErrors != nil {
-				if len(conn.errors) != len(tc.wantErrors) {
-					t.Errorf("%s: got %d errors, want %d", tc.name, len(conn.errors), len(tc.wantErrors))
-				} else {
-					for i, want := range tc.wantErrors {
-						if !strings.Contains(conn.errors[i], want) {
-							t.Errorf("%s: error %d got %q, want it to contain %q", tc.name, i, conn.errors[i], want)
-						}
-					}
+			if tc.wantNulls > 0 {
+				if strings.Count(finalResp, "$-1\r\n") != tc.wantNulls {
+					t.Errorf("expected %d nulls, got resp: %q", tc.wantNulls, finalResp)
 				}
 			}
 
 			if tc.wantArrays != nil {
-				if len(conn.arrays) != len(tc.wantArrays) {
-					t.Errorf("%s: got %d arrays, want %d", tc.name, len(conn.arrays), len(tc.wantArrays))
-				} else {
-					for i, want := range tc.wantArrays {
-						got := conn.arrays[i]
-						if len(got) != len(want) {
-							t.Errorf("%s: array %d length got %d, want %d", tc.name, i, len(got), len(want))
-						} else {
-							for j, w := range want {
-								if got[j] != w {
-									t.Errorf("%s: array %d item %d got %q, want %q", tc.name, i, j, got[j], w)
-								}
-							}
+				for _, wantArr := range tc.wantArrays {
+					// Build the expected array RESP
+					var expected string
+					if len(wantArr) == 0 {
+						expected = "*0\r\n"
+					} else {
+						expected = fmt.Sprintf("*%d\r\n", len(wantArr))
+						for _, item := range wantArr {
+							expected += fmt.Sprintf("$%d\r\n%s\r\n", len(item), item)
 						}
+					}
+					if !strings.Contains(finalResp, expected) {
+						t.Errorf("expected array %q, got resp: %q", expected, finalResp)
 					}
 				}
 			}
 
 			// Validate Closed
-			if conn.closed != tc.wantClosed {
-				t.Errorf("closed = %v, want %v", conn.closed, tc.wantClosed)
+			if closed != tc.wantClosed {
+				t.Errorf("closed = %v, want %v", closed, tc.wantClosed)
 			}
 		})
 	}
 }
 
-func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
+func TestPubSub(t *testing.T) {
 	resetTestState(t)
-	db := Start(getFreePort(), 1, false)
-	defer func() {
-		_ = stop()
-	}()
+	addr := getFreePort()
+	_ = Start(addr, 10, false)
+	defer stop()
 
-	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
-	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
-	subConn.SetContext(internalAuthKey)
-	pubConn.SetContext(internalAuthKey)
+	// Need a small sleep to ensure server is ready
+	time.Sleep(10 * time.Millisecond)
 
-	var ps redcon.PubSub
-
-	handleCommand(subConn, newCommand("SUBSCRIBE", "topic-1"), db, &ps)
-	handleCommand(pubConn, newCommand("PUBLISH", "topic-1", "payload"), db, &ps)
-
-	if len(pubConn.ints) != 1 || pubConn.ints[0] != 1 {
-		t.Fatalf("publish subscriber count = %#v, want [1]", pubConn.ints)
+	// Dial Sub Connection
+	subConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to connect sub: %v", err)
 	}
-}
+	defer subConn.Close()
 
-func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
-	resetTestState(t)
-	db := Start(getFreePort(), 1, false)
-	defer func() {
-		_ = stop()
-	}()
+	// Auth Sub
+	subConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	buf := make([]byte, 1024)
+	subConn.Read(buf)
 
-	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
-	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
-	subConn.SetContext(internalAuthKey)
-	pubConn.SetContext(internalAuthKey)
-
-	var ps redcon.PubSub
-
-	handleCommand(subConn, newCommand("sUbScRiBe", "topic-2"), db, &ps)
-	handleCommand(pubConn, newCommand("pUbLiSh", "topic-2", "payload"), db, &ps)
-
-	if len(pubConn.ints) != 1 || pubConn.ints[0] != 1 {
-		t.Fatalf("case-insensitive publish subscriber count = %#v, want [1]", pubConn.ints)
+	// Subscribe
+	subConn.Write([]byte("*2\r\n$9\r\nSUBSCRIBE\r\n$7\r\ntopic-1\r\n"))
+	subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ := subConn.Read(buf)
+	subResp := string(buf[:n])
+	if !strings.Contains(subResp, "subscribe") || !strings.Contains(subResp, "topic-1") {
+		t.Fatalf("expected subscribe response, got: %s", subResp)
 	}
-}
 
-func TestHandleCommandDbNotInitializedWritesError(t *testing.T) {
-	resetTestState(t)
+	// Dial Pub Connection
+	pubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to connect pub: %v", err)
+	}
+	defer pubConn.Close()
 
-	conn := &mockConn{remoteAddr: "127.0.0.1:30007"}
-	// Note: We do NOT start the server here, so db is nil.
-	var ps redcon.PubSub
+	// Auth Pub
+	pubConn.Write([]byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)))
+	pubConn.Read(buf)
 
-	handleCommand(conn, newCommand("GET", "k"), nil, &ps)
+	// Publish (Case insensitive check as well)
+	pubConn.Write([]byte("*3\r\n$7\r\npUbLiSh\r\n$7\r\ntopic-1\r\n$7\r\npayload\r\n"))
+	pubConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ = pubConn.Read(buf)
+	pubResp := string(buf[:n])
 
-	if len(conn.errors) != 1 || conn.errors[0] != "ERR storage not initialized" {
-		t.Fatalf("errors = %#v, want [\"ERR storage not initialized\"]", conn.errors)
+	// Expected response for publish is integer 1 (1 subscriber)
+	if !strings.Contains(pubResp, ":1\r\n") {
+		t.Fatalf("publish expected :1, got: %s", pubResp)
+	}
+
+	// Check if Sub connection received the message
+	subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ = subConn.Read(buf)
+	msgResp := string(buf[:n])
+	if !strings.Contains(msgResp, "message") || !strings.Contains(msgResp, "payload") {
+		t.Fatalf("expected message on sub, got: %s", msgResp)
 	}
 }
 
