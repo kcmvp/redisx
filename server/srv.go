@@ -16,7 +16,9 @@ import (
 
 	"github.com/kcmvp/respx/internal"
 	"github.com/kcmvp/respx/storage"
+	"github.com/kcmvp/respx/x"
 	"github.com/tidwall/buntdb"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
 )
 
@@ -33,6 +35,8 @@ const (
 	cmdSetNX      = "setnx"
 	cmdDel        = "del"
 	cmdKeys       = "keys"
+	cmdQueryIndex = "queryindex"
+	cmdQueryKey   = "querykey"
 	cmdPublish    = "publish"
 	cmdSubscribe  = "subscribe"
 	cmdPSubscribe = "psubscribe"
@@ -40,8 +44,6 @@ const (
 )
 
 var (
-	srvOnce sync.Once
-
 	// internalAuthKey is generated per-process and used only for internal bootstrap auth.
 	internalAuthKey = internal.AuthKey()
 	// authKey is for external client AUTH and can be configured via environment.
@@ -63,6 +65,7 @@ var (
 	signalStopFn     = signal.Stop
 	osExitFn         = os.Exit
 	currentDB        storage.DB
+	srvOnce          sync.Once
 )
 
 func getOsExitFn() func(int) {
@@ -138,6 +141,7 @@ func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redc
 	serverListener = ln
 	serverMu.Unlock()
 
+	// cleanup on exit
 	defer func() {
 		serverMu.Lock()
 		if serverListener == ln {
@@ -149,6 +153,130 @@ func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redc
 	return redcon.Serve(ln, handler, accept, closed)
 }
 
+// parseFilter recursively parses a MongoDB-style JSON string into an x.Filter.
+func parseFilter(jsonStr string) (x.Filter, error) {
+	if jsonStr == "" || jsonStr == "{}" {
+		return nil, nil // empty filter passes everything
+	}
+
+	if !gjson.Valid(jsonStr) {
+		return nil, errors.New("invalid JSON filter format")
+	}
+
+	root := gjson.Parse(jsonStr)
+	return parseNode(root)
+}
+
+func parseNode(node gjson.Result) (x.Filter, error) {
+	if node.Type != gjson.JSON {
+		return nil, errors.New("expected JSON object")
+	}
+
+	var filters []x.Filter
+	var parseErr error
+
+	node.ForEach(func(key, value gjson.Result) bool {
+		k := key.String()
+
+		switch k {
+		case "$and":
+			if !value.IsArray() {
+				parseErr = errors.New("$and must be an array")
+				return false
+			}
+			var subFilters []x.Filter
+			value.ForEach(func(_, subNode gjson.Result) bool {
+				f, err := parseNode(subNode)
+				if err != nil {
+					parseErr = err
+					return false
+				}
+				subFilters = append(subFilters, f)
+				return true
+			})
+			if parseErr != nil {
+				return false
+			}
+			filters = append(filters, x.And(subFilters...))
+		case "$or":
+			if !value.IsArray() {
+				parseErr = errors.New("$or must be an array")
+				return false
+			}
+			var subFilters []x.Filter
+			value.ForEach(func(_, subNode gjson.Result) bool {
+				f, err := parseNode(subNode)
+				if err != nil {
+					parseErr = err
+					return false
+				}
+				subFilters = append(subFilters, f)
+				return true
+			})
+			if parseErr != nil {
+				return false
+			}
+			filters = append(filters, x.Or(subFilters...))
+		default:
+			// Field comparison. E.g. "age": {"$gt": 18} or "status": "active"
+			if value.Type == gjson.JSON {
+				// Object with operators
+				value.ForEach(func(opKey, opVal gjson.Result) bool {
+					op := opKey.String()
+					switch op {
+					case "$eq":
+						filters = append(filters, x.Eq(k, opVal.Value()))
+					case "$neq":
+						filters = append(filters, x.Neq(k, opVal.Value()))
+					case "$gt":
+						filters = append(filters, x.Gt(k, opVal.Float()))
+					case "$gte":
+						filters = append(filters, x.Gte(k, opVal.Float()))
+					case "$lt":
+						filters = append(filters, x.Lt(k, opVal.Float()))
+					case "$lte":
+						filters = append(filters, x.Lte(k, opVal.Float()))
+					case "$contains":
+						filters = append(filters, x.Contains(k, opVal.String()))
+					case "$in":
+						if !opVal.IsArray() {
+							parseErr = fmt.Errorf("$in operator requires an array for field %s", k)
+							return false
+						}
+						var inValues []any
+						opVal.ForEach(func(_, v gjson.Result) bool {
+							inValues = append(inValues, v.Value())
+							return true
+						})
+						filters = append(filters, x.In(k, inValues...))
+					default:
+						parseErr = fmt.Errorf("unsupported operator: %s", op)
+						return false
+					}
+					return true
+				})
+			} else {
+				// Implicit $eq. E.g. "status": "active"
+				filters = append(filters, x.Eq(k, value.Value()))
+			}
+		}
+
+		return parseErr == nil
+	})
+
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	if len(filters) == 1 {
+		return filters[0], nil
+	}
+	// Implicit AND for multiple keys in the same object
+	return x.And(filters...), nil
+}
 func isServerShutdownErr(err error) bool {
 	if err == nil {
 		return true
@@ -321,13 +449,15 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		val, err := db.Get(string(cmd.Args[1]))
-		if errors.Is(err, buntdb.ErrNotFound) {
-			conn.WriteNull()
-		} else if err != nil {
-			conn.WriteError("ERR " + err.Error())
+		res := db.Get(string(cmd.Args[1]))
+		if res.IsError() {
+			if errors.Is(res.Error(), buntdb.ErrNotFound) {
+				conn.WriteNull()
+			} else {
+				conn.WriteError("ERR " + res.Error().Error())
+			}
 		} else {
-			conn.WriteBulk([]byte(val))
+			conn.WriteBulk([]byte(res.MustGet()))
 		}
 	case cmdDel:
 		if len(cmd.Args) != 2 {
@@ -348,41 +478,97 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		keys, err := db.Keys(string(cmd.Args[1]))
-		if err != nil {
-			conn.WriteError("ERR " + err.Error())
+		res := db.Keys(string(cmd.Args[1]))
+		if res.IsError() {
+			conn.WriteError("ERR " + res.Error().Error())
 		} else {
+			keys := res.MustGet()
 			conn.WriteArray(len(keys))
 			for _, key := range keys {
 				conn.WriteBulk([]byte(key))
 			}
 		}
-	case internal.XCmdQuery:
-		if len(cmd.Args) != 3 {
+	case cmdQueryIndex:
+		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
 		}
-		indexName := string(cmd.Args[1])
-		value := string(cmd.Args[2])
-		fmt.Printf("Querying %s for %s\n", indexName, value)
-		//var results []string
-		//err := db.View(func(tx *buntdb.Tx) error {
-		//	return tx.AscendEqual(indexName, value, func(key, val string) bool {
-		//		results = append(results, val)
-		//		return true // continue iterating
-		//	})
-		//})
-		//
-		//if errors.Is(err, buntdb.ErrNotFound) {
-		//	conn.WriteArray(0)
-		//} else if err != nil {
-		//	conn.WriteError("ERR " + err.Error())
-		//} else {
-		//	conn.WriteArray(len(results))
-		//	for _, res := range results {
-		//		conn.WriteBulk([]byte(res))
-		//	}
-		//}
+		schemaName := string(cmd.Args[1])
+		indexAttr := string(cmd.Args[2])
+		filterJSON := string(cmd.Args[3])
+
+		desc := false
+		if len(cmd.Args) == 5 {
+			order := strings.ToUpper(string(cmd.Args[4]))
+			if order == "DESC" {
+				desc = true
+			} else if order != "ASC" {
+				conn.WriteError("ERR invalid order: " + order)
+				return
+			}
+		}
+
+		// Parse the MongoDB-style JSON string into an x.Filter
+		filter, err := parseFilter(filterJSON)
+		if err != nil {
+			conn.WriteError("ERR invalid query: " + err.Error())
+			return
+		}
+
+		res := db.QueryIndex(schemaName, indexAttr, filter, desc)
+		if res.IsError() {
+			if errors.Is(res.Error(), buntdb.ErrNotFound) {
+				conn.WriteArray(0)
+			} else {
+				conn.WriteError("ERR " + res.Error().Error())
+			}
+		} else {
+			results := res.MustGet()
+			conn.WriteArray(len(results))
+			for _, val := range results {
+				conn.WriteBulk([]byte(val))
+			}
+		}
+	case cmdQueryKey:
+		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
+			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+			return
+		}
+		schemaName := string(cmd.Args[1])
+		pattern := string(cmd.Args[2])
+		filterJSON := string(cmd.Args[3])
+
+		desc := false
+		if len(cmd.Args) == 5 {
+			order := strings.ToUpper(string(cmd.Args[4]))
+			if order == "DESC" {
+				desc = true
+			} else if order != "ASC" {
+				conn.WriteError("ERR invalid order: " + order)
+				return
+			}
+		}
+
+		filter, err := parseFilter(filterJSON)
+		if err != nil {
+			conn.WriteError("ERR invalid query: " + err.Error())
+			return
+		}
+
+		res := db.QueryKey(schemaName, pattern, filter, desc)
+		if res.IsError() {
+			if errors.Is(res.Error(), buntdb.ErrNotFound) {
+				conn.WriteArray(0)
+			} else {
+				conn.WriteError("ERR " + res.Error().Error())
+			}
+		} else {
+			results := res.MustGet()
+			conn.WriteArray(len(results))
+			for _, val := range results {
+				conn.WriteBulk([]byte(val))
+			}
+		}
 	case cmdPublish:
 		if len(cmd.Args) != 3 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -428,6 +614,8 @@ func stop() error {
 	var err error
 	if ln != nil {
 		err = ln.Close()
+		// Sleep a bit more to ensure TCP TIME_WAIT is not an issue locally during rapid test restarts.
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	globalMu.Lock()
@@ -456,7 +644,14 @@ func Start(address string, maxConn int, persistent bool, schemas ...storage.Sche
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
-		db := storage.Start(persistent, schemas...)
+		db := storage.Open(persistent, schemas...)
+		if db == nil {
+			slog.Error("failed to open storage")
+			if exitFn := getOsExitFn(); exitFn != nil {
+				exitFn(1)
+			}
+			return
+		}
 
 		globalMu.Lock()
 		currentDB = db
@@ -479,7 +674,6 @@ func Start(address string, maxConn int, persistent bool, schemas ...storage.Sche
 		startedCh := make(chan struct{})
 
 		go func() {
-			close(startedCh)
 			listenFn := getListenAndServeFn()
 			err := listenFn(resolvedAddr,
 				func(conn redcon.Conn, cmd redcon.Command) {
@@ -488,6 +682,7 @@ func Start(address string, maxConn int, persistent bool, schemas ...storage.Sche
 				acceptCon,
 				closeCon,
 			)
+
 			if err != nil && !isServerShutdownErr(err) {
 				slog.Error("resp server stopped", "error", err)
 				if exitFn := getOsExitFn(); exitFn != nil {
@@ -496,9 +691,11 @@ func Start(address string, maxConn int, persistent bool, schemas ...storage.Sche
 			} else if err != nil {
 				slog.Info("resp server stopped")
 			}
+			close(startedCh)
 		}()
 
-		<-startedCh
+		// Wait for server to bind or error
+		time.Sleep(10 * time.Millisecond)
 	})
 
 	globalMu.RLock()

@@ -7,7 +7,6 @@ import (
 
 const (
 	RespxAuthKeyEnv = "RESPX_AUTH_KEY"
-	XCmdQuery       = "query"
 )
 
 func AuthKey() string {

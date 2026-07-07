@@ -77,6 +77,17 @@ func (m *mockDetachedConn) Flush() error                         { return nil }
 // resetStorage clears the singleton instance in storage package. Used only for testing.
 // We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
 // Since we can't easily call the private `reset` in storage, we just restart the DB with memory flag.
+func getFreePort() string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "127.0.0.1:6380"
+	}
+	defer func() {
+		_ = l.Close()
+	}()
+	return l.Addr().String()
+}
+
 func resetTestState(t *testing.T) {
 	t.Helper()
 
@@ -85,6 +96,13 @@ func resetTestState(t *testing.T) {
 	originalExternalMaxConns := externalMaxConns
 	originalListenAndServeFn := listenAndServeFn
 	originalOsExitFn := osExitFn
+
+	// Call stop to properly close current listener and DB
+	_ = stop()
+	// Allow OS to fully release the port
+	time.Sleep(5 * time.Millisecond)
+	// Force reset the sync.Once for DB initialization
+	storage.Reset()
 
 	globalMu.Lock()
 	activeExternalConns = 0
@@ -96,6 +114,9 @@ func resetTestState(t *testing.T) {
 	globalMu.Unlock()
 
 	t.Cleanup(func() {
+		_ = stop()
+		time.Sleep(5 * time.Millisecond)
+		storage.Reset()
 		globalMu.Lock()
 		activeExternalConns = 0
 		internalAuthKey = originalInternalAuthKey
@@ -246,8 +267,6 @@ func TestCloseConnectionWithErrorAlsoRemovesState(t *testing.T) {
 }
 
 func TestHandleCommand(t *testing.T) {
-	resetTestState(t)
-
 	tests := []struct {
 		name        string
 		auth        bool
@@ -466,11 +485,8 @@ func TestHandleCommand(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			storage.Reset()
-			db := storage.Start(false)
-			defer func() {
-				_ = db.Close()
-			}()
+			storage.Reset()            // clear database state for each test
+			db := storage.Open(false) // initialize a fresh db instance
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
@@ -589,11 +605,9 @@ func TestHandleCommand(t *testing.T) {
 
 func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 	resetTestState(t)
-
-	storage.Reset()
-	db := storage.Start(false)
+	db := Start(getFreePort(), 1, false)
 	defer func() {
-		_ = db.Close()
+		_ = stop()
 	}()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
@@ -613,11 +627,9 @@ func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
 
 func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 	resetTestState(t)
-
-	storage.Reset()
-	db := storage.Start(false)
+	db := Start(getFreePort(), 1, false)
 	defer func() {
-		_ = db.Close()
+		_ = stop()
 	}()
 
 	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
@@ -636,7 +648,10 @@ func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
 }
 
 func TestHandleCommandDbNotInitializedWritesError(t *testing.T) {
+	resetTestState(t)
+
 	conn := &mockConn{remoteAddr: "127.0.0.1:30007"}
+	// Note: We do NOT start the server here, so db is nil.
 	var ps redcon.PubSub
 
 	handleCommand(conn, newCommand("GET", "k"), nil, &ps)
@@ -733,7 +748,7 @@ func TestStartListenError(t *testing.T) {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		Start("127.0.0.1:16380", 3, false)
+		_ = Start(getFreePort(), 3, false)
 		close(doneCh)
 	}()
 
@@ -772,7 +787,7 @@ func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
 
 	startAddr := "127.0.0.1:16380"
 	startMaxCon := 3
-	Start(startAddr, startMaxCon, false)
+	_ = Start(startAddr, startMaxCon, false)
 
 	select {
 	case addr := <-listenCalledCh:
@@ -800,7 +815,7 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 		return nil
 	}
 
-	Start("", 0, false)
+	_ = Start("", 0, false)
 
 	select {
 	case addr := <-listenCalledCh:

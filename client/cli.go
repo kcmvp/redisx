@@ -9,8 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kcmvp/respx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
+	"github.com/samber/mo"
 )
 
 const (
@@ -70,8 +72,8 @@ func clearSharedClientIf(target *redis.Client) {
 	kvClientMu.Unlock()
 }
 
-// RegisterHandler registers a message handler for a topic.
-func RegisterHandler(topic string, handler MessageHandler) error {
+// Subscribe registers a message handler for a topic.
+func Subscribe(topic string, handler MessageHandler) error {
 	if topic == "" {
 		return errors.New("topic is empty")
 	}
@@ -95,6 +97,11 @@ func RegisterHandler(topic string, handler MessageHandler) error {
 	return nil
 }
 
+var (
+	runLifecycleCtx context.Context
+	cancelLifecycle context.CancelFunc
+)
+
 // Connect starts the bridge lifecycle.
 func Connect(respAddr, authKey string) error {
 	if authKey == "" {
@@ -102,17 +109,27 @@ func Connect(respAddr, authKey string) error {
 	}
 
 	cliOnce.Do(func() {
+		runLifecycleCtx, cancelLifecycle = context.WithCancel(context.Background())
 		go func() {
 			for {
 				var err error
 				var client *redis.Client
 				_, _, _ = lo.AttemptWhileWithDelay(-1, reconnectEvery, func(i int, duration time.Duration) (error, bool) {
+					select {
+					case <-runLifecycleCtx.Done():
+						return nil, false
+					default:
+					}
 					if client, err = connect(respAddr, authKey); err != nil {
 						slog.Warn("mresp connect failed", "error", err)
 						return err, true
 					}
 					return nil, false
 				})
+
+				if runLifecycleCtx.Err() != nil {
+					return
+				}
 
 				if prev := setSharedClient(client); prev != nil && prev != client {
 					if err := prev.Close(); err != nil {
@@ -122,7 +139,7 @@ func Connect(respAddr, authKey string) error {
 
 				slog.Info("mresp connected")
 
-				runCtx, cancelRun := context.WithCancel(context.Background())
+				runCtx, cancelRun := context.WithCancel(runLifecycleCtx)
 				firstExit := make(chan string, 1)
 				var wg sync.WaitGroup
 				notifyExit := func(worker string) {
@@ -135,14 +152,14 @@ func Connect(respAddr, authKey string) error {
 				wg.Add(2)
 				go func() {
 					defer wg.Done()
-					if err := produce(runCtx, client); err != nil {
+					if err := produce(runCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp producer exited", "error", err)
 					}
 					notifyExit("producer")
 				}()
 				go func() {
 					defer wg.Done()
-					if err := consume(runCtx, client); err != nil {
+					if err := consume(runCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp consumer exited", "error", err)
 					}
 					notifyExit("consumer")
@@ -153,6 +170,8 @@ func Connect(respAddr, authKey string) error {
 
 				for !lost {
 					select {
+					case <-runLifecycleCtx.Done():
+						lost = true
 					case worker := <-firstExit:
 						slog.Warn("mresp connection lost, restarting lifecycle", "worker", worker)
 						lost = true
@@ -186,16 +205,30 @@ func Connect(respAddr, authKey string) error {
 						waitTicker.Stop()
 						goto workersStopped
 					case <-waitTicker.C:
-						slog.Warn("mresp still waiting workers to stop")
+						slog.Warn("mresp waiting for workers to stop")
 					}
 				}
-
 			workersStopped:
+				if runLifecycleCtx.Err() != nil {
+					return
+				}
 			}
 		}()
 	})
 
 	return nil
+}
+
+// Disconnect stops the bridge lifecycle and closes the shared client.
+func Disconnect() {
+	if cancelLifecycle != nil {
+		cancelLifecycle()
+	}
+	client := getSharedClient()
+	if client != nil {
+		_ = client.Close()
+		clearSharedClientIf(client)
+	}
 }
 
 // Get retrieves the value for the given key using the shared resp client.
@@ -252,6 +285,138 @@ func Set(key, value string) error {
 	return client.Set(ctx, key, value, 0).Err()
 }
 
+// SetNX stores a value for the given key only if the key does not exist.
+func SetNX(key, value string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return false, errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.SetNX(ctx, key, value, 0).Result()
+}
+
+// Delete removes the specified key using the shared resp client.
+func Delete(key string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return false, errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	res, err := client.Del(ctx, key).Result()
+	return res > 0, err
+}
+
+// Keys returns all keys matching the given pattern.
+func Keys(pattern string) mo.Result[[]string] {
+	if pattern == "" {
+		return mo.Ok([]string{})
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
+}
+
+// QueryIndex executes a query on a specific JSON index with the provided filter.
+func QueryIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if schemaName == "" || indexAttr == "" {
+		return mo.Err[[]string](errors.New("schema name and index attribute are required"))
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	var filterJSON string
+	if filter != nil {
+		b, err := filter.MarshalJSON()
+		if err != nil {
+			return mo.Err[[]string](fmt.Errorf("failed to serialize filter: %w", err))
+		}
+		filterJSON = string(b)
+	} else {
+		filterJSON = "{}" // empty filter
+	}
+
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+
+	// The QUERYINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "QUERYINDEX", schemaName, indexAttr, filterJSON, order)
+	res, err := cmd.StringSlice()
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(res)
+}
+
+// QueryKey executes a query on matching keys with the provided filter.
+func QueryKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if schemaName == "" || pattern == "" {
+		return mo.Err[[]string](errors.New("schema name and pattern are required"))
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	var filterJSON string
+	if filter != nil {
+		b, err := filter.MarshalJSON()
+		if err != nil {
+			return mo.Err[[]string](fmt.Errorf("failed to serialize filter: %w", err))
+		}
+		filterJSON = string(b)
+	} else {
+		filterJSON = "{}" // empty filter
+	}
+
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+
+	// The QUERYKEY command takes schemaName, pattern, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "QUERYKEY", schemaName, pattern, filterJSON, order)
+	res, err := cmd.StringSlice()
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(res)
+}
+
 // Auth authenticates the shared resp client connection with the given key.
 func Auth(authKey string) error {
 	if authKey == "" {
@@ -269,8 +434,8 @@ func Auth(authKey string) error {
 	return client.Do(ctx, "AUTH", authKey).Err()
 }
 
-// SendTo enqueues a message for publishing to a specific topic.
-func SendTo(topic, msg string) bool {
+// Publish enqueues a message for publishing to a specific topic.
+func Publish(topic, msg string) bool {
 	if topic == "" {
 		return false
 	}

@@ -9,6 +9,8 @@ import (
 
 	"github.com/kcmvp/respx/internal"
 	"github.com/kcmvp/respx/server"
+	"github.com/kcmvp/respx/storage"
+	"github.com/kcmvp/respx/x"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -16,12 +18,14 @@ const clientTestServerAddr = "127.0.0.1:36380"
 const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestMaxConns = 50
 
+var testSchema = storage.JsonSchema("user", 0).PrefixAttr("id").Index("email").Index("age")
+
 func ensureClientTestServer(t *testing.T) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
 
-	server.Start(clientTestServerAddr, clientTestMaxConns, false)
+	server.Start(clientTestServerAddr, clientTestMaxConns, false, testSchema)
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -48,6 +52,8 @@ func newAuthedClientForTest(t *testing.T) *redis.Client {
 }
 
 func resetHandlerStateForTest() {
+	Disconnect()
+
 	handlersMu.Lock()
 	handlersByTopic = make(map[string]MessageHandler)
 	handlersMu.Unlock()
@@ -67,43 +73,43 @@ func resetHandlerStateForTest() {
 	atomic.StoreUint64(&pipeDrops, 0)
 }
 
-func TestRegisterHandlerRejectsNilHandler(t *testing.T) {
+func TestSubscribeRejectsNilHandler(t *testing.T) {
 	resetHandlerStateForTest()
 
-	err := RegisterHandler("topic-a", nil)
+	err := Subscribe("topic-a", nil)
 	if err == nil {
-		t.Fatal("RegisterHandler() error = nil, want non-nil")
+		t.Fatal("Subscribe() error = nil, want non-nil")
 	}
 }
 
-func TestRegisterHandlerRejectsEmptyTopic(t *testing.T) {
+func TestSubscribeRejectsEmptyTopic(t *testing.T) {
 	resetHandlerStateForTest()
 
-	err := RegisterHandler("", make(chan *ReceivedMessage, 1))
+	err := Subscribe("", make(chan *ReceivedMessage, 1))
 	if err == nil {
-		t.Fatal("RegisterHandler() empty topic error = nil, want non-nil")
+		t.Fatal("Subscribe() empty topic error = nil, want non-nil")
 	}
 }
 
-func TestRegisterHandlerRejectsDuplicateHandlerOnSameTopic(t *testing.T) {
+func TestSubscribeRejectsDuplicateHandlerOnSameTopic(t *testing.T) {
 	resetHandlerStateForTest()
 
 	h := make(chan *ReceivedMessage, 2)
 	h2 := make(chan *ReceivedMessage, 2)
-	if err := RegisterHandler("orders", h); err != nil {
-		t.Fatalf("first RegisterHandler() error = %v, want nil", err)
+	if err := Subscribe("orders", h); err != nil {
+		t.Fatalf("first Subscribe() error = %v, want nil", err)
 	}
-	if err := RegisterHandler("orders", h2); err == nil {
-		t.Fatal("duplicate RegisterHandler() error = nil, want non-nil")
+	if err := Subscribe("orders", h2); err == nil {
+		t.Fatal("duplicate Subscribe() error = nil, want non-nil")
 	}
 }
 
-func TestRegisterHandlerStoresHandlerAndSignalsSubscription(t *testing.T) {
+func TestSubscribeStoresHandlerAndSignalsSubscription(t *testing.T) {
 	resetHandlerStateForTest()
 
 	h := make(chan *ReceivedMessage, 1)
-	if err := RegisterHandler("orders", h); err != nil {
-		t.Fatalf("RegisterHandler() error = %v, want nil", err)
+	if err := Subscribe("orders", h); err != nil {
+		t.Fatalf("Subscribe() error = %v, want nil", err)
 	}
 
 	handlersMu.RLock()
@@ -246,34 +252,213 @@ func TestSetAndClearSharedClientHelpers(t *testing.T) {
 	}
 }
 
-func TestSendToReturnsFalseWhenNoSharedClient(t *testing.T) {
+func TestQueryIndexCommand(t *testing.T) {
+	resetHandlerStateForTest()
+	ensureClientTestServer(t)
+
+	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// wait for client connection
+	var connected bool
+	for i := 0; i < 30; i++ {
+		client := getSharedClient()
+		if client != nil {
+			if err := healthCheck(context.Background(), client); err == nil {
+				connected = true
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("Connect() failed to establish shared client in time")
+	}
+
+	// Prepare data
+	data := []struct {
+		key string
+		val string
+	}{
+		{"user:1", `{"id": "1", "email": "ken@example.com", "age": 30, "status": "active"}`},
+		{"user:2", `{"id": "2", "email": "john@example.com", "age": 20, "status": "pending"}`},
+		{"user:3", `{"id": "3", "email": "admin@example.com", "age": 40, "status": "active"}`},
+	}
+
+	for _, d := range data {
+		if err := Set(d.key, d.val); err != nil {
+			t.Fatalf("Failed to seed data: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		schema    string
+		index     string
+		filter    x.Filter
+		desc      bool
+		expectErr bool
+		expectLen int
+	}{
+		{"Missing schema", "", "email", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Missing index", "user", "", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Index not exists", "user", "unknown", x.Eq("email", "ken@example.com"), false, true, 0},
+
+		{"Eq string", "user", "email", x.Eq("email", "ken@example.com"), false, false, 1},
+		{"Eq false", "user", "email", x.Eq("email", "nobody@example.com"), false, false, 0},
+
+		{"Gt number", "user", "age", x.Gt("age", 25), false, false, 2}, // 30, 40
+		{"Lt number", "user", "age", x.Lt("age", 35), false, false, 2}, // 20, 30
+
+		{"And true", "user", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2}, // 30, 40
+		{"And false", "user", "age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
+
+		{"Or", "user", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3}, // 20(lt), 30(active), 40(active)
+
+		{"Empty filter", "user", "email", nil, false, false, 3},          // Matches all in index
+		{"Descend test", "user", "age", x.Gt("age", 10), true, false, 3}, // Test DESC flag
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := QueryIndex(tt.schema, tt.index, tt.filter, tt.desc)
+
+			if tt.expectErr {
+				if !res.IsError() {
+					t.Errorf("expected error, got success")
+				}
+				return
+			}
+
+			if res.IsError() {
+				t.Fatalf("unexpected error: %v", res.Error())
+			}
+
+			results := res.MustGet()
+			if len(results) != tt.expectLen {
+				t.Errorf("expected %d results, got %d", tt.expectLen, len(results))
+			}
+		})
+	}
+}
+
+func TestQueryKeyCommand(t *testing.T) {
+	resetHandlerStateForTest()
+	ensureClientTestServer(t)
+
+	if err := Connect(clientTestServerAddr, clientTestExternalAuthKey); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// wait for client connection
+	var connected bool
+	for i := 0; i < 30; i++ {
+		client := getSharedClient()
+		if client != nil {
+			if err := healthCheck(context.Background(), client); err == nil {
+				connected = true
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatal("Connect() failed to establish shared client in time")
+	}
+
+	// Prepare data
+	data := []struct {
+		key string
+		val string
+	}{
+		{"product:1", `{"id": "1", "name": "Apple", "price": 10, "stock": 100}`},
+		{"product:2", `{"id": "2", "name": "Banana", "price": 5, "stock": 50}`},
+		{"product:3", `{"id": "3", "name": "Orange", "price": 8, "stock": 200}`},
+	}
+
+	for _, d := range data {
+		if err := Set(d.key, d.val); err != nil {
+			t.Fatalf("Failed to seed data: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		schema    string
+		pattern   string
+		filter    x.Filter
+		desc      bool
+		expectErr bool
+		expectLen int
+	}{
+		{"Missing schema", "", "*", x.Eq("name", "Apple"), false, true, 0},
+		{"Missing pattern", "product", "", x.Eq("name", "Apple"), false, true, 0},
+
+		{"Match one", "product", "*", x.Eq("name", "Apple"), false, false, 1},
+		{"Match none by filter", "product", "*", x.Eq("name", "Grape"), false, false, 0},
+		{"Match none by pattern", "product", "99*", x.Eq("name", "Apple"), false, false, 0},
+
+		{"Gt number", "product", "*", x.Gt("price", 6), false, false, 2},   // 10, 8
+		{"Lt number", "product", "*", x.Lt("stock", 150), false, false, 2}, // 100, 50
+
+		{"And true", "product", "*", x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1}, // 10
+
+		{"Empty filter", "product", "*", nil, false, false, 3},             // Matches all matching keys
+		{"Descend test", "product", "*", x.Gt("price", 4), true, false, 3}, // Matches all
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := QueryKey(tt.schema, tt.pattern, tt.filter, tt.desc)
+
+			if tt.expectErr {
+				if !res.IsError() {
+					t.Errorf("expected error, got success")
+				}
+				return
+			}
+
+			if res.IsError() {
+				t.Fatalf("unexpected error: %v", res.Error())
+			}
+
+			results := res.MustGet()
+			if len(results) != tt.expectLen {
+				t.Errorf("expected %d results, got %d", tt.expectLen, len(results))
+			}
+		})
+	}
+}
+
+func TestPublishReturnsFalseWhenNoSharedClient(t *testing.T) {
 	resetHandlerStateForTest()
 
-	if ok := SendTo("topic-a", "hello"); ok {
-		t.Fatal("SendTo() = true, want false when client is not connected")
+	if ok := Publish("topic-a", "hello"); ok {
+		t.Fatal("Publish() = true, want false when client is not connected")
 	}
 	if got := len(pubChan); got != 0 {
 		t.Fatalf("pubChan len = %d, want 0", got)
 	}
 }
 
-func TestSendToReturnsFalseForEmptyTopic(t *testing.T) {
+func TestPublishReturnsFalseForEmptyTopic(t *testing.T) {
 	resetHandlerStateForTest()
 
-	if ok := SendTo("", "hello"); ok {
-		t.Fatal("SendTo() = true, want false for empty topic")
+	if ok := Publish("", "hello"); ok {
+		t.Fatal("Publish() = true, want false for empty topic")
 	}
 }
 
-func TestSendToEnqueuesWhenSharedClientExists(t *testing.T) {
+func TestPublishEnqueuesWhenSharedClientExists(t *testing.T) {
 	resetHandlerStateForTest()
 
 	mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
 	t.Cleanup(func() { _ = mockClient.Close() })
 	setSharedClient(mockClient)
 
-	if ok := SendTo("topic-a", "hello"); !ok {
-		t.Fatal("SendTo() = false, want true")
+	if ok := Publish("topic-a", "hello"); !ok {
+		t.Fatal("Publish() = false, want true")
 	}
 
 	select {
@@ -286,7 +471,7 @@ func TestSendToEnqueuesWhenSharedClientExists(t *testing.T) {
 	}
 }
 
-func TestSendToDropsWhenQueueIsFull(t *testing.T) {
+func TestPublishDropsWhenQueueIsFull(t *testing.T) {
 	resetHandlerStateForTest()
 
 	mockClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:0"})
@@ -297,8 +482,8 @@ func TestSendToDropsWhenQueueIsFull(t *testing.T) {
 		pubChan <- outgoingMessage{topic: "filled", payload: "x"}
 	}
 
-	if ok := SendTo("topic-a", "hello"); ok {
-		t.Fatal("SendTo() = true, want false when pubChan is full")
+	if ok := Publish("topic-a", "hello"); ok {
+		t.Fatal("Publish() = true, want false when pubChan is full")
 	}
 	if drops := atomic.LoadUint64(&pipeDrops); drops != 1 {
 		t.Fatalf("pipeDrops = %d, want 1", drops)
