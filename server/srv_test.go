@@ -278,12 +278,15 @@ func TestHandleCommand(t *testing.T) {
 		wantErrors  []string
 		wantArrays  [][]string
 		wantClosed  bool
+		dbInit      bool
+		setupDB     func(db storage.DB)
 	}{
 		{
 			name:       "empty command",
-			auth:       true,
+			auth:       false,
 			commands:   [][]string{{}},
 			wantErrors: []string{"ERR empty command"},
+			dbInit:     true,
 		},
 		{
 			name:       "unauthenticated write command",
@@ -471,6 +474,42 @@ func TestHandleCommand(t *testing.T) {
 			wantErrors: []string{"ERR wrong number of arguments for 'PSUBSCRIBE' command"},
 		},
 		{
+			name:       "queryindex wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "schema", "attr"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'queryindex' command"},
+		},
+		{
+			name:       "queryindex invalid order",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "schema", "attr", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "queryindex invalid json",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "schema", "attr", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "querykey wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"querykey", "schema", "pattern"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'querykey' command"},
+		},
+		{
+			name:       "querykey invalid order",
+			auth:       true,
+			commands:   [][]string{{"querykey", "schema", "pattern", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "querykey invalid json",
+			auth:       true,
+			commands:   [][]string{{"querykey", "schema", "pattern", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
 			name:     "publish returns subscriber count",
 			auth:     true,
 			commands: [][]string{{"PUBLISH", "topic", "payload"}},
@@ -481,12 +520,127 @@ func TestHandleCommand(t *testing.T) {
 			auth:     true,
 			commands: [][]string{{"SUBSCRIBE", "topic-a", "topic-b"}, {"PSUBSCRIBE", "topic-*"}},
 		},
+		{
+			name:       "queryindex error from db",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "schema", "attr", "{}"}},
+			wantErrors: []string{"ERR storage not initialized"},
+		},
+		{
+			name:       "querykey error from db",
+			auth:       true,
+			commands:   [][]string{{"querykey", "schema", "pattern", "{}"}},
+			wantErrors: []string{"ERR storage not initialized"},
+		},
+		{
+			name:       "set with EX invalid value",
+			auth:       true,
+			commands:   [][]string{{"set", "k", "v", "EX", "notanumber"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set with PX invalid value",
+			auth:       true,
+			commands:   [][]string{{"set", "k", "v", "PX", "notanumber"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "setex command invalid time",
+			auth:       true,
+			commands:   [][]string{{"setex", "k", "notanumber", "v"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "queryindex success",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "user", "age", "{}", "ASC"}},
+			wantArrays: [][]string{{`{"id":"1", "age":20}`, `{"id":"2", "age":30}`}},
+			dbInit:     true,
+			setupDB: func(db storage.DB) {
+				// We need to re-open the DB with the schema first since Open returns the DB with schemas
+				storage.Reset()
+				schema := storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")
+				db = storage.Open(false, schema)
+				// Replace the global db instance for handleCommand to use
+				globalMu.Lock()
+				currentDB = db
+				globalMu.Unlock()
+
+				_ = db.Save(schema, `{"id":"1", "age":20}`)
+				_ = db.Save(schema, `{"id":"2", "age":30}`)
+			},
+		},
+		{
+			name:       "queryindex not found",
+			auth:       true,
+			commands:   [][]string{{"queryindex", "user", "unknown", "{}", "ASC"}},
+			wantErrors: []string{"ERR index unknown not found for schema user"},
+			dbInit:     true,
+			setupDB: func(db storage.DB) {
+				storage.Reset()
+				schema := storage.JsonSchema("user", 0).PrefixAttr("id").Index("age")
+				db = storage.Open(false, schema)
+				globalMu.Lock()
+				currentDB = db
+				globalMu.Unlock()
+			},
+		},
+		{
+			name:       "querykey success",
+			auth:       true,
+			commands:   [][]string{{"querykey", "user", "*", "{}", "DESC"}},
+			wantArrays: [][]string{{`{"id":"2"}`, `{"id":"1"}`}},
+			dbInit:     true,
+			setupDB: func(db storage.DB) {
+				storage.Reset()
+				schema := storage.JsonSchema("user", 0).PrefixAttr("id")
+				db = storage.Open(false, schema)
+				globalMu.Lock()
+				currentDB = db
+				globalMu.Unlock()
+
+				_ = db.Save(schema, `{"id":"1"}`)
+				_ = db.Save(schema, `{"id":"2"}`)
+			},
+		},
+		{
+			name:       "querykey not found",
+			auth:       true,
+			commands:   [][]string{{"querykey", "user", "unknown:*", "{}"}},
+			wantArrays: [][]string{{}},
+			dbInit:     true,
+			setupDB: func(db storage.DB) {
+				storage.Reset()
+				schema := storage.JsonSchema("user", 0).PrefixAttr("id")
+				db = storage.Open(false, schema)
+				globalMu.Lock()
+				currentDB = db
+				globalMu.Unlock()
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			storage.Reset()            // clear database state for each test
-			db := storage.Open(false) // initialize a fresh db instance
+			var db storage.DB
+			if tc.dbInit || (!strings.Contains(tc.name, "error from db") && !strings.Contains(tc.name, "empty command")) {
+				storage.Reset()
+				db = storage.Open(false)
+				if tc.setupDB != nil {
+					tc.setupDB(db)
+					globalMu.Lock()
+					db = currentDB
+					globalMu.Unlock()
+				}
+				defer func() {
+					if db != nil {
+						_ = db.Close()
+					}
+					storage.Reset()
+				}()
+			} else {
+				db = nil
+			}
 
 			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
 			if tc.auth {
@@ -828,5 +982,119 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 
 	if externalMaxConns != 1 {
 		t.Fatalf("externalMaxConns = %d, want 1", externalMaxConns)
+	}
+}
+
+func TestParseFilter(t *testing.T) {
+	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "score": 95.5}`
+
+	tests := []struct {
+		name       string
+		jsonFilter string
+		expectErr  bool
+		expected   bool // expected result when evaluating jsonRecord
+	}{
+		// Empty filters
+		{"Empty string", ``, false, true},
+		{"Empty object", `{}`, false, true},
+		{"Invalid JSON", `{invalid`, true, false},
+
+		// Basic equality
+		{"Implicit Eq string", `{"name": "ken"}`, false, true},
+		{"Implicit Eq false", `{"name": "john"}`, false, false},
+		{"Explicit Eq string", `{"name": {"$eq": "ken"}}`, false, true},
+		{"Explicit Eq number", `{"age": {"$eq": 30}}`, false, true},
+
+		// Other comparators
+		{"Neq true", `{"name": {"$neq": "john"}}`, false, true},
+		{"Neq false", `{"name": {"$neq": "ken"}}`, false, false},
+
+		{"Gt true", `{"age": {"$gt": 20}}`, false, true},
+		{"Gt false", `{"age": {"$gt": 40}}`, false, false},
+
+		{"Gte true", `{"age": {"$gte": 30}}`, false, true},
+
+		{"Lt true", `{"age": {"$lt": 40}}`, false, true},
+		{"Lt false", `{"age": {"$lt": 20}}`, false, false},
+
+		{"Lte true", `{"age": {"$lte": 30}}`, false, true},
+
+		{"Contains true", `{"status": {"$contains": "act"}}`, false, true},
+		{"Contains false", `{"status": {"$contains": "pen"}}`, false, false},
+
+		{"In true", `{"status": {"$in": ["pending", "active"]}}`, false, true},
+		{"In false", `{"status": {"$in": ["pending", "banned"]}}`, false, false},
+		{"In not array", `{"status": {"$in": "active"}}`, true, false},
+
+		// Logical Combinators
+		{
+			name:       "Implicit AND (multiple keys)",
+			jsonFilter: `{"age": {"$gt": 20}, "status": "active"}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Implicit AND false",
+			jsonFilter: `{"age": {"$gt": 40}, "status": "active"}`,
+			expectErr:  false,
+			expected:   false,
+		},
+		{
+			name:       "Explicit AND",
+			jsonFilter: `{"$and": [{"age": {"$gt": 20}}, {"status": "active"}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Explicit OR true",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"status": "active"}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Explicit OR false",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"status": "pending"}]}`,
+			expectErr:  false,
+			expected:   false,
+		},
+		{
+			name:       "Complex Nested",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+
+		// Error cases
+		{"Unsupported operator", `{"age": {"$unknown": 18}}`, true, false},
+		{"And not array", `{"$and": {"age": 18}}`, true, false},
+		{"Or not array", `{"$or": {"age": 18}}`, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter, err := parseFilter(tt.jsonFilter)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if filter == nil {
+				if !tt.expected {
+					t.Errorf("got nil filter (passes everything) but expected false")
+				}
+				return
+			}
+
+			result := filter.Eval(jsonRecord)
+			if result != tt.expected {
+				t.Errorf("expected eval result %v, got %v", tt.expected, result)
+			}
+		})
 	}
 }
