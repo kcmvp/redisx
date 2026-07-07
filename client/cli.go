@@ -9,8 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kcmvp/respx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
+	"github.com/samber/mo"
 )
 
 const (
@@ -31,16 +33,13 @@ type outgoingMessage struct {
 	payload string
 }
 
-// MessageHandler is a writable channel that receives streamed messages.
-type MessageHandler chan<- *ReceivedMessage
-
 var (
 	pubChan   = make(chan outgoingMessage, bufferSize)
 	pipeDrops uint64
 	subReqCh  = make(chan string, bufferSize)
 
 	handlersMu      sync.RWMutex
-	handlersByTopic = make(map[string]MessageHandler)
+	handlersByTopic = make(map[string]chan *ReceivedMessage)
 
 	kvClientMu sync.RWMutex
 	kvClient   *redis.Client
@@ -70,21 +69,19 @@ func clearSharedClientIf(target *redis.Client) {
 	kvClientMu.Unlock()
 }
 
-// RegisterHandler registers a message handler for a topic.
-func RegisterHandler(topic string, handler MessageHandler) error {
+// Subscribe registers a message handler for a topic and returns a read-only channel.
+func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
-		return errors.New("topic is empty")
-	}
-	if handler == nil {
-		return errors.New("handler channel is nil")
+		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
 	}
 
 	handlersMu.Lock()
 	if _, exists := handlersByTopic[topic]; exists {
 		handlersMu.Unlock()
-		return errors.New("duplicated handler for topic")
+		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
 	}
-	handlersByTopic[topic] = handler
+	ch := make(chan *ReceivedMessage, bufferSize)
+	handlersByTopic[topic] = ch
 	handlersMu.Unlock()
 
 	select {
@@ -92,7 +89,24 @@ func RegisterHandler(topic string, handler MessageHandler) error {
 	default:
 	}
 
-	return nil
+	return mo.Ok[<-chan *ReceivedMessage](ch)
+}
+
+var (
+	lifecycleCtx atomic.Value
+)
+
+func setLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
+	lifecycleCtx.Store(lo.T2(ctx, cancel))
+}
+
+func getLifecycleCtx() (context.Context, context.CancelFunc) {
+	val := lifecycleCtx.Load()
+	if val == nil {
+		return nil, nil
+	}
+	t := val.(lo.Tuple2[context.Context, context.CancelFunc])
+	return t.A, t.B
 }
 
 // Connect starts the bridge lifecycle.
@@ -102,17 +116,35 @@ func Connect(respAddr, authKey string) error {
 	}
 
 	cliOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		setLifecycleCtx(ctx, cancel)
+
 		go func() {
 			for {
 				var err error
 				var client *redis.Client
 				_, _, _ = lo.AttemptWhileWithDelay(-1, reconnectEvery, func(i int, duration time.Duration) (error, bool) {
+					runCtx, _ := getLifecycleCtx()
+					if runCtx == nil {
+						return nil, false
+					}
+
+					select {
+					case <-runCtx.Done():
+						return nil, false
+					default:
+					}
 					if client, err = connect(respAddr, authKey); err != nil {
 						slog.Warn("mresp connect failed", "error", err)
 						return err, true
 					}
 					return nil, false
 				})
+
+				runCtx, _ := getLifecycleCtx()
+				if runCtx == nil || runCtx.Err() != nil {
+					return
+				}
 
 				if prev := setSharedClient(client); prev != nil && prev != client {
 					if err := prev.Close(); err != nil {
@@ -122,7 +154,9 @@ func Connect(respAddr, authKey string) error {
 
 				slog.Info("mresp connected")
 
-				runCtx, cancelRun := context.WithCancel(context.Background())
+				rootCtx, _ := getLifecycleCtx()
+				workerCtx, cancelRun := context.WithCancel(rootCtx)
+
 				firstExit := make(chan string, 1)
 				var wg sync.WaitGroup
 				notifyExit := func(worker string) {
@@ -135,14 +169,14 @@ func Connect(respAddr, authKey string) error {
 				wg.Add(2)
 				go func() {
 					defer wg.Done()
-					if err := produce(runCtx, client); err != nil {
+					if err := produce(workerCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp producer exited", "error", err)
 					}
 					notifyExit("producer")
 				}()
 				go func() {
 					defer wg.Done()
-					if err := consume(runCtx, client); err != nil {
+					if err := consume(workerCtx, client); err != nil && err != context.Canceled {
 						slog.Warn("mresp consumer exited", "error", err)
 					}
 					notifyExit("consumer")
@@ -153,6 +187,8 @@ func Connect(respAddr, authKey string) error {
 
 				for !lost {
 					select {
+					case <-rootCtx.Done():
+						lost = true
 					case worker := <-firstExit:
 						slog.Warn("mresp connection lost, restarting lifecycle", "worker", worker)
 						lost = true
@@ -186,16 +222,33 @@ func Connect(respAddr, authKey string) error {
 						waitTicker.Stop()
 						goto workersStopped
 					case <-waitTicker.C:
-						slog.Warn("mresp still waiting workers to stop")
+						slog.Warn("mresp waiting for workers to stop")
 					}
 				}
-
 			workersStopped:
+				stopCtx, _ := getLifecycleCtx()
+				if stopCtx == nil || stopCtx.Err() != nil {
+					return
+				}
 			}
 		}()
 	})
 
 	return nil
+}
+
+// Disconnect stops the bridge lifecycle and closes the shared client.
+func Disconnect() {
+	_, cancel := getLifecycleCtx()
+
+	if cancel != nil {
+		cancel()
+	}
+	client := getSharedClient()
+	if client != nil {
+		_ = client.Close()
+		clearSharedClientIf(client)
+	}
 }
 
 // Get retrieves the value for the given key using the shared resp client.
@@ -252,6 +305,139 @@ func Set(key, value string) error {
 	return client.Set(ctx, key, value, 0).Err()
 }
 
+// SetNX stores a value for the given key only if the key does not exist.
+func SetNX(key, value string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return false, errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	res, err := client.Do(ctx, "SETNX", key, value).Int()
+	return res == 1, err
+}
+
+// Delete removes the specified key using the shared resp client.
+func Delete(key string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return false, errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	res, err := client.Del(ctx, key).Result()
+	return res > 0, err
+}
+
+// Keys returns all keys matching the given pattern.
+func Keys(pattern string) mo.Result[[]string] {
+	if pattern == "" {
+		return mo.Ok([]string{})
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
+}
+
+// ByIndex executes a query on a specific JSON index with the provided filter.
+func ByIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if schemaName == "" || indexAttr == "" {
+		return mo.Err[[]string](errors.New("schema name and index attribute are required"))
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	var filterJSON string
+	if filter != nil {
+		b, err := filter.MarshalJSON()
+		if err != nil {
+			return mo.Err[[]string](fmt.Errorf("failed to serialize filter: %w", err))
+		}
+		filterJSON = string(b)
+	} else {
+		filterJSON = "{}" // empty filter
+	}
+
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+
+	// The BYINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "BYINDEX", schemaName, indexAttr, filterJSON, order)
+	res, err := cmd.StringSlice()
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(res)
+}
+
+// ByKey executes a query on matching keys with the provided filter.
+func ByKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if schemaName == "" || pattern == "" {
+		return mo.Err[[]string](errors.New("schema name and pattern are required"))
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	var filterJSON string
+	if filter != nil {
+		b, err := filter.MarshalJSON()
+		if err != nil {
+			return mo.Err[[]string](fmt.Errorf("failed to serialize filter: %w", err))
+		}
+		filterJSON = string(b)
+	} else {
+		filterJSON = "{}" // empty filter
+	}
+
+	order := "ASC"
+	if desc {
+		order = "DESC"
+	}
+
+	// The BYKEY command takes schemaName, pattern, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "BYKEY", schemaName, pattern, filterJSON, order)
+	res, err := cmd.StringSlice()
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(res)
+}
+
 // Auth authenticates the shared resp client connection with the given key.
 func Auth(authKey string) error {
 	if authKey == "" {
@@ -269,8 +455,8 @@ func Auth(authKey string) error {
 	return client.Do(ctx, "AUTH", authKey).Err()
 }
 
-// SendTo enqueues a message for publishing to a specific topic.
-func SendTo(topic, msg string) bool {
+// Publish enqueues a message for publishing to a specific topic.
+func Publish(topic, msg string) bool {
 	if topic == "" {
 		return false
 	}
@@ -394,6 +580,17 @@ func consume(ctx context.Context, client *redis.Client) error {
 				slog.Warn("mresp close consumer failed", "error", err)
 			}
 		}
+
+		// Close all registered handler channels when the consumer exits
+		handlersMu.Lock()
+		for _, ch := range handlersByTopic {
+			if ch != nil {
+				close(ch)
+			}
+		}
+		// Clear the map so any new Connect/lifecycle start starts fresh
+		handlersByTopic = make(map[string]chan *ReceivedMessage)
+		handlersMu.Unlock()
 	}()
 
 	for topic := range consumerTopics {

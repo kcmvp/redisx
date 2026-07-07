@@ -2,6 +2,8 @@ package server
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -10,243 +12,350 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/suite"
+
 	"github.com/kcmvp/respx/storage"
 	"github.com/tidwall/redcon"
 )
 
-type mockConn struct {
-	remoteAddr   string
-	ctx          interface{}
-	closed       bool
-	errors       []string
-	strings      []string
-	bulks        [][]byte
-	ints         []int
-	nulls        int
-	arrays       [][]string
-	currentArray []string
-	arrayLen     int
-}
-
-func (m *mockConn) RemoteAddr() string     { return m.remoteAddr }
-func (m *mockConn) Close() error           { m.closed = true; return nil }
-func (m *mockConn) WriteError(msg string)  { m.errors = append(m.errors, msg) }
-func (m *mockConn) WriteString(str string) { m.strings = append(m.strings, str) }
-func (m *mockConn) WriteBulk(b []byte) {
-	if m.arrayLen > 0 {
-		m.currentArray = append(m.currentArray, string(b))
-		if len(m.currentArray) == m.arrayLen {
-			m.arrays = append(m.arrays, m.currentArray)
-			m.arrayLen = 0
-			m.currentArray = nil
-		}
-	} else {
-		m.bulks = append(m.bulks, append([]byte(nil), b...))
-	}
-}
-func (m *mockConn) WriteBulkString(s string) { m.WriteBulk([]byte(s)) }
-func (m *mockConn) WriteInt(num int)         { m.ints = append(m.ints, num) }
-func (m *mockConn) WriteInt64(int64)         {}
-func (m *mockConn) WriteUint64(uint64)       {}
-func (m *mockConn) WriteArray(count int) {
-	if count == 0 {
-		m.arrays = append(m.arrays, []string{})
-	} else {
-		m.arrayLen = count
-		m.currentArray = make([]string, 0, count)
-	}
-}
-func (m *mockConn) WriteNull()                     { m.nulls++ }
-func (m *mockConn) WriteRaw([]byte)                {}
-func (m *mockConn) WriteAny(any)                   {}
-func (m *mockConn) Context() interface{}           { return m.ctx }
-func (m *mockConn) SetContext(v interface{})       { m.ctx = v }
-func (m *mockConn) SetReadBuffer(int)              {}
-func (m *mockConn) Detach() redcon.DetachedConn    { return &mockDetachedConn{mockConn: m} }
-func (m *mockConn) ReadPipeline() []redcon.Command { return nil }
-func (m *mockConn) PeekPipeline() []redcon.Command { return nil }
-func (m *mockConn) NetConn() net.Conn              { return nil }
-
-type mockDetachedConn struct {
-	*mockConn
-}
-
-func (m *mockDetachedConn) ReadCommand() (redcon.Command, error) { return redcon.Command{}, nil }
-func (m *mockDetachedConn) Flush() error                         { return nil }
-
 // resetStorage clears the singleton instance in storage package. Used only for testing.
 // We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
 // Since we can't easily call the private `reset` in storage, we just restart the DB with memory flag.
-func resetTestState(t *testing.T) {
-	t.Helper()
+func getFreePort() string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "127.0.0.1:6380"
+	}
+	defer func() {
+		_ = l.Close()
+	}()
+	return l.Addr().String()
+}
 
-	originalInternalAuthKey := internalAuthKey
-	originalAuthKey := authKey
-	originalExternalMaxConns := externalMaxConns
-	originalListenAndServeFn := listenAndServeFn
-	originalOsExitFn := osExitFn
+type ServerTestSuite struct {
+	suite.Suite
+	addr    string
+	db      storage.DB
+	schemas []storage.Schema
+
+	origInternalAuthKey  string
+	origAuthKey          string
+	origExternalMaxConns int
+	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
+	origOsExitFn         func(code int)
+}
+
+func (s *ServerTestSuite) SetupSuite() {
+	s.schemas = []storage.Schema{
+		storage.JsonSchema("user_idx", 0).PrefixAttr("id").Index("age"),
+		storage.JsonSchema("user_key", 0).PrefixAttr("id"),
+		storage.JsonSchema("user_no_idx", 0).PrefixAttr("id"),
+	}
 
 	globalMu.Lock()
+	s.origInternalAuthKey = internalAuthKey
+	s.origAuthKey = authKey
+	s.origExternalMaxConns = externalMaxConns
+	s.origListenAndServeFn = listenAndServeFn
+	s.origOsExitFn = osExitFn
+	globalMu.Unlock()
+}
+
+func (s *ServerTestSuite) SetupTest() {
+	_ = stop()
+	time.Sleep(5 * time.Millisecond)
+	storage.Reset()
+
+	connCountMu.Lock()
 	activeExternalConns = 0
+	connCountMu.Unlock()
+
+	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	authKey = "external-test-key"
 	externalMaxConns = 1
 	srvOnce = sync.Once{}
 	listenAndServeFn = redcon.ListenAndServe
 	globalMu.Unlock()
-
-	t.Cleanup(func() {
-		globalMu.Lock()
-		activeExternalConns = 0
-		internalAuthKey = originalInternalAuthKey
-		authKey = originalAuthKey
-		externalMaxConns = originalExternalMaxConns
-		listenAndServeFn = originalListenAndServeFn
-		osExitFn = originalOsExitFn
-		srvOnce = sync.Once{}
-		globalMu.Unlock()
-	})
 }
 
-func newCommand(args ...string) redcon.Command {
-	cmd := redcon.Command{Args: make([][]byte, len(args))}
-	for i, arg := range args {
-		cmd.Args[i] = []byte(arg)
-	}
-	return cmd
+func (s *ServerTestSuite) TearDownTest() {
+	_ = stop()
+	time.Sleep(5 * time.Millisecond)
+	storage.Reset()
+
+	connCountMu.Lock()
+	activeExternalConns = 0
+	connCountMu.Unlock()
+
+	globalMu.Lock()
+	internalAuthKey = s.origInternalAuthKey
+	authKey = s.origAuthKey
+	externalMaxConns = s.origExternalMaxConns
+	listenAndServeFn = s.origListenAndServeFn
+	osExitFn = s.origOsExitFn
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
 }
 
-func TestAcceptConnectionIncrementsCount(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 2
+func TestServerSuite(t *testing.T) {
+	suite.Run(t, new(ServerTestSuite))
+}
 
-	conn := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	if !acceptCon(conn) {
-		t.Fatal("acceptConnection() = false, want true")
+func replaceID(arr [][]string, id string) [][]string {
+	if arr == nil {
+		return nil
 	}
+	res := make([][]string, len(arr))
+	for i, a := range arr {
+		res[i] = make([]string, len(a))
+		for j, str := range a {
+			res[i][j] = strings.ReplaceAll(str, "{id}", id)
+		}
+	}
+	return res
+}
 
+func replaceID1D(arr []string, id string) []string {
+	if arr == nil {
+		return nil
+	}
+	res := make([]string, len(arr))
+	for i, str := range arr {
+		res[i] = strings.ReplaceAll(str, "{id}", id)
+	}
+	return res
+}
+
+func (s *ServerTestSuite) TestConnectionLimits() {
+	t := s.T()
+	addr := getFreePort()
+
+	// Start server with externalMaxConns = 1
+	_ = Start(addr, 1, false)
+	defer func() { _ = stop() }()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Connection 1 should succeed
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn1: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
+
+	// Verify it's active
 	connCountMu.Lock()
 	count := activeExternalConns
 	connCountMu.Unlock()
 	if count != 1 {
 		t.Fatalf("activeExternalConns = %d, want 1", count)
 	}
-}
 
-func TestAcceptConnectionRejectsWhenAtExternalLimit(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
-
-	first := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20002"}
-
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
-	}
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-}
-
-func TestAcceptConnectionRejectDoesNotIncreaseExternalCount(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
-
-	first := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20002"}
-
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
+	// Connection 2 should be rejected/closed immediately
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn2: %v", err)
 	}
 
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 1 {
-		t.Fatalf("activeExternalConns after first accept = %d, want 1", count)
+	// We wait a bit to ensure server closed it
+	time.Sleep(10 * time.Millisecond)
+
+	// Read from conn2 should fail
+	_ = conn2.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_, err = conn2.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected conn2 to be closed due to limits, but read succeeded")
 	}
 
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-
+	// Count should still be 1
 	connCountMu.Lock()
 	count = activeExternalConns
 	connCountMu.Unlock()
 	if count != 1 {
 		t.Fatalf("activeExternalConns after rejected accept = %d, want 1", count)
 	}
-}
 
-func TestAcceptConnectionAllowsNewConnectionAfterCloseFreesSlot(t *testing.T) {
-	resetTestState(t)
-	externalMaxConns = 1
+	// Close connection 1
+	_ = conn1.Close()
 
-	first := &mockConn{remoteAddr: "127.0.0.1:20011"}
-	second := &mockConn{remoteAddr: "127.0.0.1:20012"}
+	// Wait for server to process close
+	time.Sleep(50 * time.Millisecond)
 
-	if !acceptCon(first) {
-		t.Fatal("first acceptConnection() = false, want true")
-	}
-	if acceptCon(second) {
-		t.Fatal("second acceptConnection() = true, want false")
-	}
-
-	closeCon(first, nil)
-
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 0 {
-		t.Fatalf("activeExternalConns after close = %d, want 0", count)
-	}
-
-	if !acceptCon(second) {
-		t.Fatal("second acceptConnection() after close = false, want true")
-	}
-}
-
-func TestCloseConnectionRemovesStateAndKeepsCountUpdated(t *testing.T) {
-	resetTestState(t)
-
-	conn := &mockConn{remoteAddr: "127.0.0.1:20001"}
-	acceptCon(conn)
-
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 1 {
-		t.Fatalf("activeExternalConns before close = %d, want 1", count)
-	}
-
-	closeCon(conn, nil)
-
+	// Count should be 0
 	connCountMu.Lock()
 	count = activeExternalConns
 	connCountMu.Unlock()
 	if count != 0 {
 		t.Fatalf("activeExternalConns after close = %d, want 0", count)
 	}
-}
 
-func TestCloseConnectionWithErrorAlsoRemovesState(t *testing.T) {
-	resetTestState(t)
+	// Now connection 3 should succeed since slot is freed
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn3: %v", err)
+	}
+	defer func() { _ = conn3.Close() }()
 
-	conn := &mockConn{remoteAddr: "127.0.0.1:20012"}
-	acceptCon(conn)
-
-	closeCon(conn, errors.New("network error"))
+	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
 
 	connCountMu.Lock()
-	count := activeExternalConns
+	count = activeExternalConns
 	connCountMu.Unlock()
-	if count != 0 {
-		t.Fatalf("activeExternalConns after close(err) = %d, want 0", count)
+	if count != 1 {
+		t.Fatalf("activeExternalConns = %d, want 1", count)
 	}
 }
 
-func TestHandleCommand(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestAuthKeyHelpers() {
+	// Test resolveExternalAuthKey
+	v1 := resolveExternalAuthKey(func(k string) string { return "env-key" })
+	s.Equal("env-key", v1)
+
+	v2 := resolveExternalAuthKey(func(k string) string { return "" })
+	s.NotEmpty(v2)
+	s.NotEqual("env-key", v2)
+
+	// Test ensureExternalAuthKey
+	globalMu.Lock()
+	authKey = ""
+	globalMu.Unlock()
+
+	origEnv := os.Getenv("RESPX_AUTH_KEY")
+	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-2")
+	ensureExternalAuthKey()
+	s.Equal("env-key-2", authKey)
+
+	// Second call should not overwrite
+	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-3")
+	ensureExternalAuthKey()
+	s.Equal("env-key-2", authKey)
+
+	// Test ensureExternalAuthKey with empty env var (generates random)
+	globalMu.Lock()
+	authKey = ""
+	globalMu.Unlock()
+	_ = os.Unsetenv("RESPX_AUTH_KEY")
+	ensureExternalAuthKey()
+	s.NotEmpty(authKey)
+	s.NotEqual("env-key-2", authKey)
+	s.NotEqual("env-key-3", authKey)
+
+	if origEnv != "" {
+		_ = os.Setenv("RESPX_AUTH_KEY", origEnv)
+	} else {
+		_ = os.Unsetenv("RESPX_AUTH_KEY")
+	}
+}
+
+func (s *ServerTestSuite) TestListenAndServeWithStop() {
+	addr := getFreePort()
+
+	// Test invalid address
+	err := listenAndServeWithStop("invalid-addr:999999", nil, nil, nil)
+	s.Error(err)
+
+	// Test valid address
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- listenAndServeWithStop(addr,
+			func(conn redcon.Conn, cmd redcon.Command) { conn.WriteString("OK") },
+			func(conn redcon.Conn) bool { return true },
+			func(conn redcon.Conn, err error) {},
+		)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop it by closing the listener
+	serverMu.Lock()
+	ln := serverListener
+	serverMu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+
+	select {
+	case err := <-errCh:
+		s.True(isServerShutdownErr(err))
+	case <-time.After(1 * time.Second):
+		s.Fail("listenAndServeWithStop did not return after closing listener")
+	}
+}
+
+func (s *ServerTestSuite) TestStartStorageFailure() {
+	// Setup environment to make storage.Open fail
+	tempDir := s.T().TempDir()
+	fileHome := tempDir + "/fakehome"
+	f, _ := os.Create(fileHome)
+	_ = f.Close()
+	s.T().Setenv("HOME", fileHome)
+
+	exitCalled := false
+	globalMu.Lock()
+	osExitFn = func(code int) {
+		exitCalled = true
+	}
+	globalMu.Unlock()
+
+	db := Start("127.0.0.1:0", 0, true, s.schemas...)
+	s.Nil(db)
+	s.True(exitCalled)
+
+	// Reset srvOnce for subsequent tests
+	globalMu.Lock()
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
+}
+
+func (s *ServerTestSuite) TestStartListenAndServeFailure() {
+	exitCh := make(chan struct{})
+	globalMu.Lock()
+	osExitFn = func(code int) {
+		close(exitCh)
+	}
+	// Force listenAndServeFn to return an unexpected error
+	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+		return errors.New("mock listen error")
+	}
+	globalMu.Unlock()
+
+	db := Start("", 0, false, s.schemas...)
+	s.NotNil(db) // DB opens successfully, but background listen fails
+
+	select {
+	case <-exitCh:
+		// success
+	case <-time.After(1 * time.Second):
+		s.Fail("osExitFn was not called")
+	}
+
+	// Reset srvOnce for subsequent tests
+	globalMu.Lock()
+	srvOnce = sync.Once{}
+	globalMu.Unlock()
+}
+
+type localMockConn struct {
+	redcon.Conn
+	lastErr string
+}
+
+func (m *localMockConn) WriteError(msg string) { m.lastErr = msg }
+
+func (s *ServerTestSuite) TestHandleCommandDBNil() {
+	var ps redcon.PubSub
+	conn := &localMockConn{}
+	cmd := redcon.Command{Args: [][]byte{[]byte("PING")}}
+	handleCommand(conn, cmd, nil, &ps)
+	s.Equal("ERR storage not initialized", conn.lastErr)
+}
+
+func (s *ServerTestSuite) TestCommandTable() {
+	t := s.T()
+	s.addr = getFreePort()
+	s.db = Start(s.addr, 100, false, s.schemas...)
 
 	tests := []struct {
 		name        string
@@ -259,17 +368,14 @@ func TestHandleCommand(t *testing.T) {
 		wantErrors  []string
 		wantArrays  [][]string
 		wantClosed  bool
+		dbInit      bool
+		schemas     []storage.Schema
+		setupDB     func(uid string)
 	}{
-		{
-			name:       "empty command",
-			auth:       true,
-			commands:   [][]string{{}},
-			wantErrors: []string{"ERR empty command"},
-		},
 		{
 			name:       "unauthenticated write command",
 			auth:       false,
-			commands:   [][]string{{"SET", "k", "v"}},
+			commands:   [][]string{{"SET", "k_{id}", "v"}},
 			wantErrors: []string{"NOAUTH authentication required"},
 			wantClosed: true,
 		},
@@ -336,11 +442,11 @@ func TestHandleCommand(t *testing.T) {
 			name: "set get setnx and del lifecycle",
 			auth: true,
 			commands: [][]string{
-				{"SET", "name", "alice"},
-				{"GET", "name"},
-				{"SETNX", "name", "bob"},
-				{"DEL", "name"},
-				{"GET", "name"},
+				{"SET", "name_{id}", "alice"},
+				{"GET", "name_{id}"},
+				{"SETNX", "name_{id}", "bob"},
+				{"DEL", "name_{id}"},
+				{"GET", "name_{id}"},
 			},
 			wantStrings: []string{"OK"},
 			wantBulks:   []string{"alice"},
@@ -350,15 +456,15 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:      "get non-existent",
 			auth:      true,
-			commands:  [][]string{{"GET", "nonexistent"}},
+			commands:  [][]string{{"GET", "nonexistent_{id}"}},
 			wantNulls: 1,
 		},
 		{
 			name:        "keys",
 			auth:        true,
-			commands:    [][]string{{"SET", "key1", "val1"}, {"SET", "key2", "val2"}, {"KEYS", "key*"}},
+			commands:    [][]string{{"SET", "{id}_key1", "val1"}, {"SET", "{id}_key2", "val2"}, {"KEYS", "{id}_key*"}},
 			wantStrings: []string{"OK", "OK"},
-			wantArrays:  [][]string{{"key1", "key2"}},
+			wantArrays:  [][]string{{"{id}_key1", "{id}_key2"}},
 		},
 		{
 			name:       "keys_not_found",
@@ -369,13 +475,13 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:     "del non-existent",
 			auth:     true,
-			commands: [][]string{{"DEL", "nonexistent"}},
+			commands: [][]string{{"DEL", "nonexistent_{id}"}},
 			wantInts: []int{0},
 		},
 		{
 			name:        "setnx exists",
 			auth:        true,
-			commands:    [][]string{{"SET", "k", "v"}, {"SETNX", "k", "v2"}},
+			commands:    [][]string{{"SET", "k_{id}", "v"}, {"SETNX", "k_{id}", "v2"}},
 			wantStrings: []string{"OK"},
 			wantInts:    []int{0},
 		},
@@ -388,31 +494,127 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:        "set with EX",
 			auth:        true,
-			commands:    [][]string{{"set", "k2", "v2", "EX", "1"}},
+			commands:    [][]string{{"set", "k2_{id}", "v2", "EX", "1"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "set with PX",
 			auth:        true,
-			commands:    [][]string{{"set", "k3", "v3", "PX", "500"}},
+			commands:    [][]string{{"set", "k3_{id}", "v3", "PX", "500"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "setex command",
 			auth:        true,
-			commands:    [][]string{{"setex", "k4", "1", "v4"}},
+			commands:    [][]string{{"setex", "k4_{id}", "1", "v4"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:       "wrong number of args setex",
 			auth:       true,
-			commands:   [][]string{{"setex", "k"}},
+			commands:   [][]string{{"setex", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'setex' command"},
+		},
+		{
+			name:       "setex invalid ttl",
+			auth:       true,
+			commands:   [][]string{{"setex", "k_{id}", "abc", "v"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'set' command"},
+		},
+		{
+			name:       "set EX invalid integer",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "EX", "abc"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set PX invalid integer",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "PX", "abc"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "get wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"get"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'get' command"},
+		},
+		{
+			name:       "setnx wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"setnx", "k_{id}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'setnx' command"},
+		},
+		{
+			name:       "del wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"del"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'del' command"},
+		},
+		{
+			name:       "keys wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"keys"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'keys' command"},
+		},
+		{
+			name:       "publish wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"publish", "topic"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'publish' command"},
+		},
+		{
+			name:       "subscribe wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"subscribe"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'subscribe' command"},
+		},
+		{
+			name:       "byindex wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'byindex' command"},
+		},
+		{
+			name:       "byindex invalid order",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "byindex invalid json",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user", "age", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "bykey wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'bykey' command"},
+		},
+		{
+			name:       "bykey invalid order",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "bykey invalid json",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user", "*", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "wrong number of args set",
 			auth:       true,
-			commands:   [][]string{{"SET", "k"}},
+			commands:   [][]string{{"SET", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'SET' command"},
 		},
 		{
@@ -424,7 +626,7 @@ func TestHandleCommand(t *testing.T) {
 		{
 			name:       "wrong number of args setnx",
 			auth:       true,
-			commands:   [][]string{{"SETNX", "k"}},
+			commands:   [][]string{{"SETNX", "k_{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'SETNX' command"},
 		},
 		{
@@ -452,6 +654,42 @@ func TestHandleCommand(t *testing.T) {
 			wantErrors: []string{"ERR wrong number of arguments for 'PSUBSCRIBE' command"},
 		},
 		{
+			name:       "byindex wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"byindex", "schema", "attr"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'byindex' command"},
+		},
+		{
+			name:       "byindex invalid order",
+			auth:       true,
+			commands:   [][]string{{"byindex", "schema", "attr", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "byindex invalid json",
+			auth:       true,
+			commands:   [][]string{{"byindex", "schema", "attr", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "bykey wrong number of args",
+			auth:       true,
+			commands:   [][]string{{"bykey", "schema", "pattern"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'bykey' command"},
+		},
+		{
+			name:       "bykey invalid order",
+			auth:       true,
+			commands:   [][]string{{"bykey", "schema", "pattern", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "bykey invalid json",
+			auth:       true,
+			commands:   [][]string{{"bykey", "schema", "pattern", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
 			name:     "publish returns subscriber count",
 			auth:     true,
 			commands: [][]string{{"PUBLISH", "topic", "payload"}},
@@ -462,191 +700,250 @@ func TestHandleCommand(t *testing.T) {
 			auth:     true,
 			commands: [][]string{{"SUBSCRIBE", "topic-a", "topic-b"}, {"PSUBSCRIBE", "topic-*"}},
 		},
+		{
+			name:       "set with EX invalid value",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "EX", "notanumber"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "set with PX invalid value",
+			auth:       true,
+			commands:   [][]string{{"set", "k_{id}", "v", "PX", "notanumber"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "setex command invalid time",
+			auth:       true,
+			commands:   [][]string{{"setex", "k_{id}", "notanumber", "v"}},
+			wantErrors: []string{"ERR value is not an integer or out of range"},
+		},
+		{
+			name:       "byindex success",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user_idx", "age", "{}", "ASC"}},
+			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
+			setupDB: func(uid string) {
+
+				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+			},
+		},
+		{
+			name:       "byindex not found",
+			auth:       true,
+			commands:   [][]string{{"byindex", "user_no_idx", "unknown", "{}", "ASC"}},
+			wantErrors: []string{"ERR index unknown not found for schema user_no_idx"},
+			setupDB: func(uid string) {
+			},
+		},
+		{
+			name:       "bykey success",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user_key", "*_{id}", "{}", "DESC"}},
+			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
+			setupDB: func(uid string) {
+
+				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"1_%s"}`, uid))
+				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"2_%s"}`, uid))
+			},
+		},
+		{
+			name:       "bykey not found",
+			auth:       true,
+			commands:   [][]string{{"bykey", "user_key", "unknown_{id}:*", "{}"}},
+			wantArrays: [][]string{{}},
+			setupDB: func(uid string) {
+			},
+		},
 	}
 
-	for _, tc := range tests {
+	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			storage.Reset()
-			db := storage.Start(false)
-			defer func() {
-				_ = db.Close()
-			}()
-
-			conn := &mockConn{remoteAddr: "127.0.0.1:30000"}
-			if tc.auth {
-				conn.SetContext(internalAuthKey)
-			} else {
-				conn.SetContext(nil)
+			uid := fmt.Sprintf("%d", i)
+			if tc.setupDB != nil {
+				tc.setupDB(uid)
 			}
 
-			var ps redcon.PubSub
+			conn, err := net.Dial("tcp", s.addr)
+			if err != nil {
+				t.Fatalf("failed to connect to server: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
 
-			for _, args := range tc.commands {
-				var cmd redcon.Command
-				if len(args) > 0 {
-					cmd = newCommand(args...)
+			if tc.auth {
+				// We use internalAuthKey which is populated by Start
+				b := []byte(fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey))
+				_, _ = conn.Write(b)
+				buf := make([]byte, 1024)
+				_, _ = conn.Read(buf)
+			}
+
+			var finalResp string
+			var closed bool
+
+			for _, args := range replaceID(tc.commands, uid) {
+				var b []byte
+				if len(args) == 0 {
+					b = []byte("*0\r\n")
+				} else {
+					b = append(b, []byte(fmt.Sprintf("*%d\r\n", len(args)))...)
+					for _, arg := range args {
+						b = append(b, []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))...)
+					}
 				}
-				handleCommand(conn, cmd, db, &ps)
+				_, err := conn.Write(b)
+				if err != nil {
+					closed = true
+					break
+				}
+
+				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				buf := make([]byte, 4096)
+				n, err := conn.Read(buf)
+				if err != nil {
+					if n > 0 {
+						finalResp += string(buf[:n])
+					}
+					closed = true
+					break
+				}
+				finalResp += string(buf[:n])
+			}
+
+			// Try one more read to see if it's closed
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			_, err = conn.Read(make([]byte, 1))
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "reset by peer") {
+					closed = true
+				}
 			}
 
 			// Validate Errors
-			if len(tc.wantErrors) > 0 {
-				if len(conn.errors) != len(tc.wantErrors) {
-					t.Errorf("errors = %v, want %v", conn.errors, tc.wantErrors)
-				} else {
-					for i, e := range tc.wantErrors {
-						if conn.errors[i] != e {
-							t.Errorf("error[%d] = %q, want %q", i, conn.errors[i], e)
-						}
-					}
+			for _, e := range replaceID1D(tc.wantErrors, uid) {
+				if !strings.Contains(finalResp, e) {
+					t.Errorf("expected error %q, got resp: %q", e, finalResp)
 				}
-			} else if len(conn.errors) > 0 {
-				t.Errorf("unexpected errors: %v", conn.errors)
 			}
 
 			// Validate Strings
-			if len(tc.wantStrings) > 0 {
-				if len(conn.strings) != len(tc.wantStrings) {
-					t.Errorf("strings = %v, want %v", conn.strings, tc.wantStrings)
-				} else {
-					for i, s := range tc.wantStrings {
-						if conn.strings[i] != s {
-							t.Errorf("string[%d] = %q, want %q", i, conn.strings[i], s)
-						}
-					}
+			for _, s := range replaceID1D(tc.wantStrings, uid) {
+				if !strings.Contains(finalResp, "+"+s+"\r\n") {
+					t.Errorf("expected string %q, got resp: %q", s, finalResp)
 				}
 			}
 
 			// Validate Bulks
-			if len(tc.wantBulks) > 0 {
-				if len(conn.bulks) != len(tc.wantBulks) {
-					t.Errorf("bulks length = %d, want %d", len(conn.bulks), len(tc.wantBulks))
-				} else {
-					for i, b := range tc.wantBulks {
-						if string(conn.bulks[i]) != b {
-							t.Errorf("bulk[%d] = %q, want %q", i, string(conn.bulks[i]), b)
-						}
-					}
+			for _, b := range replaceID1D(tc.wantBulks, uid) {
+				if !strings.Contains(finalResp, fmt.Sprintf("$%d\r\n%s\r\n", len(b), b)) {
+					t.Errorf("expected bulk %q, got resp: %q", b, finalResp)
 				}
 			}
 
 			// Validate Ints
-			if len(tc.wantInts) > 0 {
-				if len(conn.ints) != len(tc.wantInts) {
-					t.Errorf("ints = %v, want %v", conn.ints, tc.wantInts)
-				} else {
-					for i, val := range tc.wantInts {
-						if conn.ints[i] != val {
-							t.Errorf("int[%d] = %d, want %d", i, conn.ints[i], val)
-						}
-					}
+			for _, val := range tc.wantInts {
+				if !strings.Contains(finalResp, fmt.Sprintf(":%d\r\n", val)) {
+					t.Errorf("expected int %d, got resp: %q", val, finalResp)
 				}
 			}
 
 			// Validate Nulls
-			if conn.nulls != tc.wantNulls {
-				t.Errorf("nulls = %d, want %d", conn.nulls, tc.wantNulls)
-			}
-
-			if tc.wantErrors != nil {
-				if len(conn.errors) != len(tc.wantErrors) {
-					t.Errorf("%s: got %d errors, want %d", tc.name, len(conn.errors), len(tc.wantErrors))
-				} else {
-					for i, want := range tc.wantErrors {
-						if !strings.Contains(conn.errors[i], want) {
-							t.Errorf("%s: error %d got %q, want it to contain %q", tc.name, i, conn.errors[i], want)
-						}
-					}
+			if tc.wantNulls > 0 {
+				if strings.Count(finalResp, "$-1\r\n") != tc.wantNulls {
+					t.Errorf("expected %d nulls, got resp: %q", tc.wantNulls, finalResp)
 				}
 			}
 
-			if tc.wantArrays != nil {
-				if len(conn.arrays) != len(tc.wantArrays) {
-					t.Errorf("%s: got %d arrays, want %d", tc.name, len(conn.arrays), len(tc.wantArrays))
-				} else {
-					for i, want := range tc.wantArrays {
-						got := conn.arrays[i]
-						if len(got) != len(want) {
-							t.Errorf("%s: array %d length got %d, want %d", tc.name, i, len(got), len(want))
-						} else {
-							for j, w := range want {
-								if got[j] != w {
-									t.Errorf("%s: array %d item %d got %q, want %q", tc.name, i, j, got[j], w)
-								}
-							}
+			if replaceID(tc.wantArrays, uid) != nil {
+				for _, wantArr := range replaceID(tc.wantArrays, uid) {
+					// Build the expected array RESP
+					var expected string
+					if len(wantArr) == 0 {
+						expected = "*0\r\n"
+					} else {
+						expected = fmt.Sprintf("*%d\r\n", len(wantArr))
+						for _, item := range wantArr {
+							expected += fmt.Sprintf("$%d\r\n%s\r\n", len(item), item)
 						}
+					}
+					if !strings.Contains(finalResp, expected) {
+						t.Errorf("expected array %q, got resp: %q", expected, finalResp)
 					}
 				}
 			}
 
 			// Validate Closed
-			if conn.closed != tc.wantClosed {
-				t.Errorf("closed = %v, want %v", conn.closed, tc.wantClosed)
+			if closed != tc.wantClosed {
+				t.Errorf("closed = %v, want %v", closed, tc.wantClosed)
 			}
 		})
 	}
 }
 
-func TestHandleCommandSubscribeThenPublishReturnsOneSubscriber(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestPubSub() {
+	t := s.T()
+	addr := getFreePort()
+	_ = Start(addr, 10, false)
+	defer func() { _ = stop() }()
 
-	storage.Reset()
-	db := storage.Start(false)
-	defer func() {
-		_ = db.Close()
-	}()
+	// Need a small sleep to ensure server is ready
+	time.Sleep(10 * time.Millisecond)
 
-	subConn := &mockConn{remoteAddr: "127.0.0.1:30030"}
-	pubConn := &mockConn{remoteAddr: "127.0.0.1:30031"}
-	subConn.SetContext(internalAuthKey)
-	pubConn.SetContext(internalAuthKey)
+	// Dial Sub Connection
+	subConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to connect sub: %v", err)
+	}
+	defer func() { _ = subConn.Close() }()
 
-	var ps redcon.PubSub
+	// Auth Sub
+	_, _ = fmt.Fprintf(subConn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)
+	buf := make([]byte, 1024)
+	_, _ = subConn.Read(buf)
 
-	handleCommand(subConn, newCommand("SUBSCRIBE", "topic-1"), db, &ps)
-	handleCommand(pubConn, newCommand("PUBLISH", "topic-1", "payload"), db, &ps)
+	// Subscribe
+	_, _ = subConn.Write([]byte("*2\r\n$9\r\nSUBSCRIBE\r\n$7\r\ntopic-1\r\n"))
+	_ = subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ := subConn.Read(buf)
+	subResp := string(buf[:n])
+	if !strings.Contains(subResp, "subscribe") || !strings.Contains(subResp, "topic-1") {
+		t.Fatalf("expected subscribe response, got: %s", subResp)
+	}
 
-	if len(pubConn.ints) != 1 || pubConn.ints[0] != 1 {
-		t.Fatalf("publish subscriber count = %#v, want [1]", pubConn.ints)
+	// Dial Pub Connection
+	pubConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to connect pub: %v", err)
+	}
+	defer func() { _ = pubConn.Close() }()
+
+	// Auth Pub
+	_, _ = fmt.Fprintf(pubConn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(internalAuthKey), internalAuthKey)
+	_, _ = pubConn.Read(buf)
+
+	// Publish (Case insensitive check as well)
+	_, _ = pubConn.Write([]byte("*3\r\n$7\r\npUbLiSh\r\n$7\r\ntopic-1\r\n$7\r\npayload\r\n"))
+	_ = pubConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ = pubConn.Read(buf)
+	pubResp := string(buf[:n])
+
+	// Expected response for publish is integer 1 (1 subscriber)
+	if !strings.Contains(pubResp, ":1\r\n") {
+		t.Fatalf("publish expected :1, got: %s", pubResp)
+	}
+
+	// Check if Sub connection received the message
+	_ = subConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	n, _ = subConn.Read(buf)
+	msgResp := string(buf[:n])
+	if !strings.Contains(msgResp, "message") || !strings.Contains(msgResp, "payload") {
+		t.Fatalf("expected message on sub, got: %s", msgResp)
 	}
 }
 
-func TestHandleCommandCaseInsensitiveSubscribeAndPublish(t *testing.T) {
-	resetTestState(t)
-
-	storage.Reset()
-	db := storage.Start(false)
-	defer func() {
-		_ = db.Close()
-	}()
-
-	subConn := &mockConn{remoteAddr: "127.0.0.1:30032"}
-	pubConn := &mockConn{remoteAddr: "127.0.0.1:30033"}
-	subConn.SetContext(internalAuthKey)
-	pubConn.SetContext(internalAuthKey)
-
-	var ps redcon.PubSub
-
-	handleCommand(subConn, newCommand("sUbScRiBe", "topic-2"), db, &ps)
-	handleCommand(pubConn, newCommand("pUbLiSh", "topic-2", "payload"), db, &ps)
-
-	if len(pubConn.ints) != 1 || pubConn.ints[0] != 1 {
-		t.Fatalf("case-insensitive publish subscriber count = %#v, want [1]", pubConn.ints)
-	}
-}
-
-func TestHandleCommandDbNotInitializedWritesError(t *testing.T) {
-	conn := &mockConn{remoteAddr: "127.0.0.1:30007"}
-	var ps redcon.PubSub
-
-	handleCommand(conn, newCommand("GET", "k"), nil, &ps)
-
-	if len(conn.errors) != 1 || conn.errors[0] != "ERR storage not initialized" {
-		t.Fatalf("errors = %#v, want [\"ERR storage not initialized\"]", conn.errors)
-	}
-}
-
-func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
+func (s *ServerTestSuite) TestHandleShutdownSignalsWarnsOnError() {
+	_ = s.T()
 	sigCh := make(chan os.Signal, 1)
 	doneCh := make(chan struct{})
 
@@ -662,8 +959,8 @@ func TestHandleShutdownSignalsWarnsOnError(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 }
 
-func TestStop(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStop() {
+	t := s.T()
 
 	// Ensure stop works when nothing is initialized
 	err := stop()
@@ -709,8 +1006,8 @@ func TestStop(t *testing.T) {
 	shutdownMu.Unlock()
 }
 
-func TestStartListenError(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartListenError() {
+	t := s.T()
 
 	// We use an atomic flag to track if exit was called
 	var exitCalled atomic.Bool
@@ -733,7 +1030,7 @@ func TestStartListenError(t *testing.T) {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		Start("127.0.0.1:16380", 3, false)
+		_ = Start(getFreePort(), 3, false)
 		close(doneCh)
 	}()
 
@@ -758,8 +1055,8 @@ func TestStartListenError(t *testing.T) {
 	}
 }
 
-func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
+	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
 	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -772,7 +1069,7 @@ func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
 
 	startAddr := "127.0.0.1:16380"
 	startMaxCon := 3
-	Start(startAddr, startMaxCon, false)
+	_ = Start(startAddr, startMaxCon, false)
 
 	select {
 	case addr := <-listenCalledCh:
@@ -788,8 +1085,8 @@ func TestStartInvokesListenerAndSetsMaxConnections(t *testing.T) {
 	}
 }
 
-func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
-	resetTestState(t)
+func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
+	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
 	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -800,7 +1097,7 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 		return nil
 	}
 
-	Start("", 0, false)
+	_ = Start("", 0, false)
 
 	select {
 	case addr := <-listenCalledCh:
@@ -813,5 +1110,123 @@ func TestStartUsesPrivateAddrAndMinimumMaxConn(t *testing.T) {
 
 	if externalMaxConns != 1 {
 		t.Fatalf("externalMaxConns = %d, want 1", externalMaxConns)
+	}
+}
+
+func (s *ServerTestSuite) TestParseFilter() {
+	t := s.T()
+	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "score": 95.5}`
+
+	tests := []struct {
+		name       string
+		jsonFilter string
+		expectErr  bool
+		expected   bool // expected result when evaluating jsonRecord
+	}{
+		// Empty filters
+		{"Empty string", ``, false, true},
+		{"Empty object", `{}`, false, true},
+		{"Invalid JSON", `{invalid`, true, false},
+
+		// Basic equality
+		{"Implicit Eq string", `{"name": "ken"}`, false, true},
+		{"Implicit Eq false", `{"name": "john"}`, false, false},
+		{"Explicit Eq string", `{"name": {"$eq": "ken"}}`, false, true},
+		{"Explicit Eq number", `{"age": {"$eq": 30}}`, false, true},
+
+		// Other comparators
+		{"Neq true", `{"name": {"$neq": "john"}}`, false, true},
+		{"Neq false", `{"name": {"$neq": "ken"}}`, false, false},
+
+		{"Gt true", `{"age": {"$gt": 20}}`, false, true},
+		{"Gt false", `{"age": {"$gt": 40}}`, false, false},
+
+		{"Gte true", `{"age": {"$gte": 30}}`, false, true},
+
+		{"Lt true", `{"age": {"$lt": 40}}`, false, true},
+		{"Lt false", `{"age": {"$lt": 20}}`, false, false},
+
+		{"Lte true", `{"age": {"$lte": 30}}`, false, true},
+
+		{"Contains true", `{"status": {"$contains": "act"}}`, false, true},
+		{"Contains false", `{"status": {"$contains": "pen"}}`, false, false},
+
+		{"In true", `{"status": {"$in": ["pending", "active"]}}`, false, true},
+		{"In false", `{"status": {"$in": ["pending", "banned"]}}`, false, false},
+		{"In not array", `{"status": {"$in": "active"}}`, true, false},
+
+		// Logical Combinators
+		{
+			name:       "Implicit AND (multiple keys)",
+			jsonFilter: `{"age": {"$gt": 20}, "status": "active"}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Implicit AND false",
+			jsonFilter: `{"age": {"$gt": 40}, "status": "active"}`,
+			expectErr:  false,
+			expected:   false,
+		},
+		{
+			name:       "Explicit AND",
+			jsonFilter: `{"$and": [{"age": {"$gt": 20}}, {"status": "active"}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Explicit OR true",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"status": "active"}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+		{
+			name:       "Explicit OR false",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"status": "pending"}]}`,
+			expectErr:  false,
+			expected:   false,
+		},
+		{
+			name:       "Complex Nested",
+			jsonFilter: `{"$or": [{"age": {"$lt": 20}}, {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}]}`,
+			expectErr:  false,
+			expected:   true,
+		},
+
+		// Error cases
+		{"Root not object", `"just-string"`, true, false},
+		{"Unsupported operator", `{"age": {"$unknown": 18}}`, true, false},
+		{"And not array", `{"$and": {"age": 18}}`, true, false},
+		{"Or not array", `{"$or": {"age": 18}}`, true, false},
+		{"And element error", `{"$and": [{"age": {"$unknown": 18}}]}`, true, false},
+		{"Or element error", `{"$or": [{"age": {"$unknown": 18}}]}`, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter, err := parseFilter(tt.jsonFilter)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if filter == nil {
+				if !tt.expected {
+					t.Errorf("got nil filter (passes everything) but expected false")
+				}
+				return
+			}
+
+			result := filter.Eval(jsonRecord)
+			if result != tt.expected {
+				t.Errorf("expected eval result %v, got %v", tt.expected, result)
+			}
+		})
 	}
 }

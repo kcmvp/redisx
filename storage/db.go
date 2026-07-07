@@ -1,140 +1,290 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/samber/lo"
+	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
+	"github.com/tidwall/gjson"
+
+	"github.com/kcmvp/respx/x"
 )
 
-var (
-	db   DB
-	once sync.Once
-)
+const KeySeparator = ":"
+
+type JsonIndex string
 
 // Schema represents the configuration required to create a JSON index in the backend storage (BuntDB).
 // By defining an index, you enable the respx server to perform highly efficient lookups on specific JSON fields
-// across your stored values using the QueryX command.
+// across your stored values using the BYINDEX/BYKEY commands.
 type Schema interface {
 	// Name returns the unique identifier for the index.
-	// This name is used by the client when executing a QueryX command to specify which index to search against.
+	// This name is used by the client when executing a BYINDEX/BYKEY command to specify which schema to search against.
+	// This name is also used as key prefix, eg if Name() returns "user" the key prefix will be "user:"
 	Name() string
 
-	// Pattern returns the pattern that determines which keys should be included in this index.
-	// For example, returning "user:*" will only index JSON values whose keys start with "user:".
-	// Returning "*" will index all keys in the database.
-	Pattern() string
+	// Prefixes returns the json paths for the key prefix for each entry in this schema.
+	Prefixes() []string
 
-	// Path returns the specific path within the JSON document that should be indexed.
-	// For example, returning "age" or "address.city" will index those specific fields from the JSON values.
-	Path() string
+	Indexes() []JsonIndex
 
-	// Ttl define the TTL of the data in this schema
+	// Ttl define the TTL of the data in this schema, if Ttl() returns 0 the data will be stored forever, otherwise it will be stored for the duration of Ttl()
 	Ttl() time.Duration
 }
 
-func Start(persistent bool, schemas ...Schema) DB {
-	once.Do(func() {
-		var err error
-		var raw *buntdb.DB
+// SchemaBuilder is the interface for fluently building a Schema.
+type SchemaBuilder interface {
+	Schema
+	PrefixAttr(attrs ...string) SchemaBuilder
+	Index(attr string) SchemaBuilder
+}
 
-		if !persistent {
-			raw, err = buntdb.Open(":memory:")
-			if err != nil {
-				slog.Error("failed to open in-memory buntdb", "error", err)
-				os.Exit(1)
-				return
-			}
-		} else {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				slog.Error("failed to resolve user home directory", "error", err)
-				os.Exit(1)
-				return
-			}
+type defaultSchema lo.Tuple4[string, []string, []JsonIndex, time.Duration]
 
-			dataDir := filepath.Join(homeDir, ".respx")
-			if err = os.MkdirAll(dataDir, 0o755); err != nil {
-				slog.Error("failed to create data directory", "path", dataDir, "error", err)
-				os.Exit(1)
-				return
-			}
+func (s *defaultSchema) Name() string         { return s.A }
+func (s *defaultSchema) Prefixes() []string   { return s.B }
+func (s *defaultSchema) Indexes() []JsonIndex { return s.C }
+func (s *defaultSchema) Ttl() time.Duration   { return s.D }
 
-			dbPath := filepath.Join(dataDir, "data.db")
-			raw, err = buntdb.Open(dbPath)
-			if err != nil {
-				slog.Error("failed to open buntdb", "path", dbPath, "error", err)
-				os.Exit(1)
-				return
-			}
+func (s *defaultSchema) PrefixAttr(attrs ...string) SchemaBuilder {
+	s.B = append(s.B, attrs...)
+	return s
+}
+
+func (s *defaultSchema) Index(attr string) SchemaBuilder {
+	s.C = append(s.C, JsonIndex(attr))
+	return s
+}
+
+func JsonSchema(name string, ttl time.Duration) SchemaBuilder {
+	s := defaultSchema(lo.T4(name, []string{}, []JsonIndex{}, ttl))
+	return &s
+}
+
+var (
+	dbInstance DB
+	dbOnce     sync.Once
+	dbMu       sync.RWMutex
+)
+
+// Reset is used for testing purposes to reset the singleton state.
+func Reset() {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	if dbInstance != nil {
+		_ = dbInstance.Close()
+		dbInstance = nil
+	}
+	dbOnce = sync.Once{}
+}
+
+func createIndexes(raw *buntdb.DB, schema Schema) error {
+	var err error
+	lo.ForEachWhile(schema.Indexes(), func(index JsonIndex, _ int) bool {
+		// The key pattern for the index must be restricted to this schema's prefix
+		// e.g., if schema.Name() is "user", pattern should be "user:*" (using KeySeparator)
+		keyPattern := fmt.Sprintf("%s%s*", schema.Name(), KeySeparator)
+
+		valuePath := strings.ToLower(strings.ReplaceAll(string(index), ".", "_"))
+		indexName := fmt.Sprintf("%s_%s", strings.ToLower(schema.Name()), valuePath)
+
+		err = raw.CreateIndex(indexName, keyPattern, buntdb.IndexJSON(string(index)))
+		return err == nil
+	})
+	return err
+}
+
+// If persistent is false, it creates a new in-memory database instance on every call.
+// Otherwise, it initializes and returns a persistent singleton database at the default path.
+func Open(persistent bool, schemas ...Schema) DB {
+	if !persistent {
+		raw, err := buntdb.Open(":memory:")
+		if err != nil {
+			slog.Error("failed to open in-memory buntdb", "error", err)
+			return nil
 		}
-
-		db = &xdb{raw: raw}
 
 		if len(schemas) > 0 {
 			if duplicated := lo.FindDuplicatesBy(schemas, func(idx Schema) string {
 				return idx.Name()
 			}); len(duplicated) > 0 {
 				slog.Error("duplicate schema provided", "schema", duplicated[0])
-				os.Exit(1)
+				_ = raw.Close()
+				return nil
+			}
+			for _, schema := range schemas {
+				if err := createIndexes(raw, schema); err != nil {
+					_ = raw.Close()
+					return nil
+				}
+			}
+		}
+		return &xdb{raw}
+	}
+
+	dbOnce.Do(func() {
+		var err error
+		var raw *buntdb.DB
+
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = os.TempDir()
+		}
+		path := fmt.Sprintf("%s/.respx/data.db", home)
+		dir := filepath.Dir(path)
+		if err = os.MkdirAll(dir, 0o755); err != nil {
+			slog.Error("failed to create data directory", "path", dir, "error", err)
+			return
+		}
+
+		raw, err = buntdb.Open(path)
+		if err != nil {
+			slog.Error("failed to open buntdb", "path", path, "error", err)
+			return
+		}
+
+		if len(schemas) > 0 {
+			if duplicated := lo.FindDuplicatesBy(schemas, func(idx Schema) string {
+				return idx.Name()
+			}); len(duplicated) > 0 {
+				slog.Error("duplicate schema provided", "schema", duplicated[0])
+				_ = raw.Close()
 				return
 			}
 			for _, schema := range schemas {
-				_ = db.Create(schema)
+				if err := createIndexes(raw, schema); err != nil {
+					_ = raw.Close()
+					return
+				}
 			}
 		}
+
+		dbMu.Lock()
+		dbInstance = &xdb{raw}
+		dbMu.Unlock()
 	})
-	return db
+
+	dbMu.RLock()
+	defer dbMu.RUnlock()
+	return dbInstance
 }
 
-// Reset clears the singleton instance. Used only for testing.
-func Reset() {
-	if x, ok := db.(*xdb); ok && x != nil && x.raw != nil {
-		_ = x.raw.Close()
-	}
-	db = nil
-	once = sync.Once{}
-}
+type seal struct{}
 
 type DB interface {
 	Set(key string, value string) error
 	SetWithTtl(key string, value string, ttl time.Duration) error
 	SetNX(key string, value string) (bool, error)
-	Get(key string) (string, error)
+	Get(key string) mo.Result[string]
 	Delete(key string) (bool, error)
-	Keys(pattern string) ([]string, error)
-	Close() error
+	Keys(pattern string) mo.Result[[]string]
+	Save(schema Schema, jsonValue string) mo.Result[string]
+	// ByIndex queries the database using a specific schema index and filter.
+	ByIndex(schemaName string, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string]
 
-	Create(schema Schema) error
-	Raw() any
+	// ByKey queries the database using a key pattern and filter.
+	ByKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string]
+	Close() error
+	mark() seal
 }
 
 type xdb struct {
-	raw *buntdb.DB
+	*buntdb.DB
+}
+
+func (x *xdb) mark() seal {
+	return seal{}
 }
 
 func (x *xdb) Close() error {
-	return x.raw.Close()
+	return x.DB.Close()
 }
 
-func (x *xdb) Raw() any {
-	return x.raw
-}
-
-func (x *xdb) Create(schema Schema) error {
-	err := x.raw.CreateIndex(schema.Name(), schema.Pattern(), lo.If(len(schema.Path()) > 0, buntdb.IndexJSON(schema.Path())).Else(buntdb.IndexString))
-	if err != nil {
-		slog.Error("failed to create schema", "schema", schema.Name(), "error", err)
+func (x *xdb) Save(schema Schema, jsonValue string) mo.Result[string] {
+	if !gjson.Valid(jsonValue) {
+		return mo.Err[string](errors.New("invalid json"))
 	}
-	return err
+
+	key, err := lo.ReduceErr(schema.Prefixes(), func(agg string, prefix string, _ int) (string, error) {
+		rs := gjson.Get(jsonValue, prefix)
+		if !rs.Exists() {
+			return "", fmt.Errorf("json path %s does not exist in json %s", prefix, schema.Name())
+		}
+		return fmt.Sprintf("%s%s%s", agg, KeySeparator, rs.String()), nil
+	}, schema.Name())
+
+	if err != nil {
+		return mo.Err[string](err)
+	}
+
+	if err := x.SetWithTtl(key, jsonValue, schema.Ttl()); err != nil {
+		return mo.Err[string](err)
+	}
+	return mo.Ok(key)
+}
+
+func (xdb *xdb) ByIndex(schemaName string, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+	var results []string
+
+	// Reconstruct the physical index name
+	valuePath := strings.ToLower(strings.ReplaceAll(indexAttr, ".", "_"))
+	indexName := fmt.Sprintf("%s_%s", strings.ToLower(schemaName), valuePath)
+
+	err := xdb.View(func(tx *buntdb.Tx) error {
+		iter := lo.If(desc, tx.Descend).Else(tx.Ascend)
+		err := iter(indexName, func(key, value string) bool {
+			// If no filter is provided, or the filter passes on the full JSON value, add it
+			if filter == nil || filter.Eval(value) {
+				results = append(results, value)
+			}
+			return true
+		})
+
+		return err
+	})
+
+	if err == buntdb.ErrNotFound {
+		return mo.Err[[]string](fmt.Errorf("index %s not found for schema %s", indexAttr, schemaName))
+	}
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(results)
+}
+
+func (xdb *xdb) ByKey(schemaName string, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	var results []string
+
+	keyPattern := fmt.Sprintf("%s%s%s", schemaName, KeySeparator, pattern)
+
+	err := xdb.View(func(tx *buntdb.Tx) error {
+		iter := lo.If(desc, tx.DescendKeys).Else(tx.AscendKeys)
+		return iter(keyPattern, func(key, value string) bool {
+			if filter == nil || filter.Eval(value) {
+				results = append(results, value)
+			}
+			return true
+		})
+	})
+
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(results)
 }
 
 func (x *xdb) Set(key string, value string) error {
-	return x.raw.Update(func(tx *buntdb.Tx) error {
+	return x.Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
@@ -143,7 +293,7 @@ func (x *xdb) Set(key string, value string) error {
 func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 	if ttl > 0 {
 		opt := &buntdb.SetOptions{Expires: true, TTL: ttl}
-		return x.raw.Update(func(tx *buntdb.Tx) error {
+		return x.Update(func(tx *buntdb.Tx) error {
 			_, _, err := tx.Set(key, value, opt)
 			return err
 		})
@@ -155,12 +305,8 @@ func (x *xdb) SetWithTtl(key string, value string, ttl time.Duration) error {
 
 func (x *xdb) SetNX(key string, value string) (bool, error) {
 	var set bool
-	err := x.raw.Update(func(tx *buntdb.Tx) error {
+	err := x.Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
-		if err == nil {
-			set = false
-			return nil
-		}
 		if err == buntdb.ErrNotFound {
 			_, _, err = tx.Set(key, value, nil)
 			if err == nil {
@@ -170,35 +316,45 @@ func (x *xdb) SetNX(key string, value string) (bool, error) {
 		}
 		return err
 	})
-	return set, err
+	if err != nil {
+		return false, err
+	}
+	return set, nil
 }
 
-func (x *xdb) Get(key string) (string, error) {
+func (x *xdb) Get(key string) mo.Result[string] {
 	var val string
-	var err error
-	_ = x.raw.View(func(tx *buntdb.Tx) error {
-		val, err = tx.Get(key)
-		return err
+	err := x.View(func(tx *buntdb.Tx) error {
+		var innerErr error
+		val, innerErr = tx.Get(key)
+		return innerErr
 	})
-	return val, err
+
+	if err != nil {
+		return mo.Err[string](err)
+	}
+	return mo.Ok(val)
 }
+
 func (x *xdb) Delete(key string) (bool, error) {
 	var val string
-	var err error
-	_ = x.raw.Update(func(tx *buntdb.Tx) error {
-		val, err = tx.Delete(key)
-		if err == buntdb.ErrNotFound {
-			err = nil
+	err := x.Update(func(tx *buntdb.Tx) error {
+		var innerErr error
+		val, innerErr = tx.Delete(key)
+		if innerErr == buntdb.ErrNotFound {
 			return nil
 		}
-		return nil
+		return innerErr
 	})
-	return len(val) > 0, err
+	if err != nil {
+		return false, err
+	}
+	return len(val) > 0, nil
 }
 
-func (x *xdb) Keys(pattern string) ([]string, error) {
+func (x *xdb) Keys(pattern string) mo.Result[[]string] {
 	var keys []string
-	err := x.raw.View(func(tx *buntdb.Tx) error {
+	err := x.View(func(tx *buntdb.Tx) error {
 		// Keys uses AscendKeys which supports simple glob matching (*, ?)
 		// In buntdb, AscendKeys iterates over keys matching the pattern
 		return tx.AscendKeys(pattern, func(key, value string) bool {
@@ -206,5 +362,9 @@ func (x *xdb) Keys(pattern string) ([]string, error) {
 			return true
 		})
 	})
-	return keys, err
+
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return mo.Ok(keys)
 }
