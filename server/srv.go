@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kcmvp/respx/internal"
-	"github.com/kcmvp/respx/storage"
-	"github.com/kcmvp/respx/x"
+	"github.com/kcmvp/sd/internal"
+	"github.com/kcmvp/sd/storage"
+	"github.com/kcmvp/sd/x"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"

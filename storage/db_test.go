@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/respx/x"
+	"github.com/kcmvp/sd/x"
 	"github.com/stretchr/testify/assert"
 )
 

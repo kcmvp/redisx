@@ -2,16 +2,16 @@
   Redis compatible server implemented with <a href="https://github.com/tidwall/buntdb">buntdb</a>
   <br/>
   <br/>
-  <a href="https://github.com/kcmvp/respx/blob/main/LICENSE">
+  <a href="https://github.com/kcmvp/sd/blob/main/LICENSE">
     <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/respx"/>
   </a>
-  <a href="https://pkg.go.dev/github.com/kcmvp/respx">
-    <img src="https://pkg.go.dev/badge/github.com/kcmvp/respx.svg" alt="Go Reference"/>
+  <a href="https://pkg.go.dev/github.com/kcmvp/sd">
+    <img src="https://pkg.go.dev/badge/github.com/kcmvp/sd.svg" alt="Go Reference"/>
   </a>
-  <a href="https://goreportcard.com/report/github.com/kcmvp/respx">
-    <img src="https://goreportcard.com/badge/github.com/kcmvp/respx" alt="report"/>
+  <a href="https://goreportcard.com/report/github.com/kcmvp/sd">
+    <img src="https://goreportcard.com/badge/github.com/kcmvp/sd" alt="report"/>
   </a>
-  <a href="https://github.com/kcmvp/respx/blob/main/.github/workflows/ci.yml" rel="nofollow">
+  <a href="https://github.com/kcmvp/sd/blob/main/.github/workflows/ci.yml" rel="nofollow">
      <img src="https://img.shields.io/github/actions/workflow/status/kcmvp/respx/ci.yml?branch=main" alt="Build" />
   </a>
   <a href="https://app.codecov.io/gh/kcmvp/respx" ref="nofollow">
@@ -86,8 +86,8 @@ BYINDEX user email {"email": "ken@example.com"}
 
 ```go
 import (
-    "github.com/kcmvp/respx/client"
-    "github.com/kcmvp/respx/x"
+    "github.com/kcmvp/sd/client"
+    "github.com/kcmvp/sd/x"
 )
 
 res := client.ByIndex("user", "email", x.Eq("email", "ken@example.com"), false)
@@ -157,5 +157,5 @@ res := client.ByIndex("user", "age", x.Or(
 ## Installation
 
 ```bash
-go get github.com/kcmvp/respx
+go get github.com/kcmvp/sd
 ```
