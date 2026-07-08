@@ -1,0 +1,14 @@
+{
+  "user:1": {
+    "id": "1",
+    "age": 20,
+    "name": "A",
+    "int_val": -10,
+    "int32_val": 32,
+    "int64_val": 64,
+    "float32_val": 3.5,
+    "float64_val": 6.28,
+    "string_val": "hello",
+    "bool_val": true
+  }
+}

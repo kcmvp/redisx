@@ -540,7 +540,7 @@ func (s *ClientTestSuite) TestPublishCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestByIndexCommand() {
+func (s *ClientTestSuite) TestSearchIndexCommand() {
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
@@ -585,7 +585,7 @@ func (s *ClientTestSuite) TestByIndexCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := ByIndex(tt.schema, tt.index, tt.filter, tt.desc)
+			res := SearchIndex(tt.schema, tt.index, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -598,7 +598,7 @@ func (s *ClientTestSuite) TestByIndexCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestByKeyCommand() {
+func (s *ClientTestSuite) TestSearchKeyCommand() {
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
@@ -641,7 +641,7 @@ func (s *ClientTestSuite) TestByKeyCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := ByKey(tt.schema, tt.pattern, tt.filter, tt.desc)
+			res := SearchKey(tt.schema, tt.pattern, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())

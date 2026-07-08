@@ -1,0 +1,28 @@
+[
+  {
+    "id": "2",
+    "age": 30,
+    "name": "Bob",
+    "department": "Sales",
+    "is_active": false,
+    "salary": 60000.0,
+    "skills": ["communication"],
+    "address": {
+      "city": "Chicago",
+      "zipcode": "60007"
+    }
+  },
+  {
+    "id": "4",
+    "age": 45,
+    "name": "Diana",
+    "department": "HR",
+    "is_active": true,
+    "salary": 85000.0,
+    "skills": ["management"],
+    "address": {
+      "city": "New York",
+      "zipcode": "10002"
+    }
+  }
+]
