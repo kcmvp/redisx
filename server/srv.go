@@ -25,22 +25,22 @@ import (
 const (
 	privateAddr = "127.0.0.1:6380"
 
-	cmdAuth       = "auth"
-	cmdHello      = "hello"
-	cmdPing       = "ping"
-	cmdQuit       = "quit"
-	cmdSet        = "set"
-	cmdSetEx      = "setex"
-	cmdGet        = "get"
-	cmdSetNX      = "setnx"
-	cmdDel        = "del"
-	cmdKeys       = "keys"
-	cmdByIndex    = "byindex"
-	cmdByKey      = "bykey"
-	cmdPublish    = "publish"
-	cmdSubscribe  = "subscribe"
-	cmdPSubscribe = "psubscribe"
-	cmdClient     = "client"
+	cmdAuth        = "auth"
+	cmdHello       = "hello"
+	cmdPing        = "ping"
+	cmdQuit        = "quit"
+	cmdSet         = "set"
+	cmdSetEx       = "setex"
+	cmdGet         = "get"
+	cmdSetNX       = "setnx"
+	cmdDel         = "del"
+	cmdKeys        = "keys"
+	cmdSearchIndex = "searchindex"
+	cmdSearchKey   = "searchkey"
+	cmdPublish     = "publish"
+	cmdSubscribe   = "subscribe"
+	cmdPSubscribe  = "psubscribe"
+	cmdClient      = "client"
 )
 
 var (
@@ -483,7 +483,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 				conn.WriteBulk([]byte(key))
 			}
 		}
-	case cmdByIndex:
+	case cmdSearchIndex:
 		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
@@ -492,15 +492,14 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 		indexAttr := string(cmd.Args[2])
 		filterJSON := string(cmd.Args[3])
 
-		desc := false
+		var desc bool
 		if len(cmd.Args) == 5 {
 			order := strings.ToUpper(string(cmd.Args[4]))
-			if order == "DESC" {
-				desc = true
-			} else if order != "ASC" {
-				conn.WriteError("ERR invalid order: " + order)
+			if order != "ASC" && order != "DESC" {
+				conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
 				return
 			}
+			desc = order == "DESC"
 		}
 
 		// Parse the MongoDB-style JSON string into an x.Filter
@@ -510,7 +509,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			return
 		}
 
-		res := db.ByIndex(schemaName, indexAttr, filter, desc)
+		res := db.SearchIndex(schemaName, indexAttr, filter, desc)
 		if res.IsError() {
 			if errors.Is(res.Error(), buntdb.ErrNotFound) {
 				conn.WriteArray(0)
@@ -524,7 +523,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 				conn.WriteBulk([]byte(val))
 			}
 		}
-	case cmdByKey:
+	case cmdSearchKey:
 		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
 			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 			return
@@ -533,15 +532,14 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 		pattern := string(cmd.Args[2])
 		filterJSON := string(cmd.Args[3])
 
-		desc := false
+		var desc bool
 		if len(cmd.Args) == 5 {
 			order := strings.ToUpper(string(cmd.Args[4]))
-			if order == "DESC" {
-				desc = true
-			} else if order != "ASC" {
-				conn.WriteError("ERR invalid order: " + order)
+			if order != "ASC" && order != "DESC" {
+				conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
 				return
 			}
+			desc = order == "DESC"
 		}
 
 		filter, err := parseFilter(filterJSON)
@@ -550,7 +548,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 			return
 		}
 
-		res := db.ByKey(schemaName, pattern, filter, desc)
+		res := db.SearchKey(schemaName, pattern, filter, desc)
 		if res.IsError() {
 			if errors.Is(res.Error(), buntdb.ErrNotFound) {
 				conn.WriteArray(0)

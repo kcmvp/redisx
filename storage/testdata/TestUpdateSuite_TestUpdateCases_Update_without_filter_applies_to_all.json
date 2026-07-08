@@ -1,0 +1,20 @@
+{
+  "user:1": {
+    "id": "1",
+    "age": 20,
+    "name": "A",
+    "version": 2
+  },
+  "user:2": {
+    "id": "2",
+    "age": 30,
+    "name": "B",
+    "version": 2
+  },
+  "user:3": {
+    "id": "3",
+    "age": 25,
+    "name": "C",
+    "version": 2
+  }
+}

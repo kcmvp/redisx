@@ -36,14 +36,14 @@
 
 The true power of `respx` lies in its extended document querying capabilities. By treating stored strings as JSON documents and defining schemas with indexes, you can perform complex queries using a declarative DSL.
 
-#### `BYINDEX`
+#### `SEARCHINDEX`
 
 Performs a MongoDB-style query on a specific JSON index.
 
 **Syntax:**
 
 ```text
-BYINDEX <schema_name> <index_attribute> <json_filter> [ASC|DESC]
+SEARCHINDEX <schema_name> <index_attribute> <json_filter> [ASC|DESC]
 ```
 
 - **`schema_name`**: The logical namespace of the data (e.g., `user`).
@@ -51,14 +51,14 @@ BYINDEX <schema_name> <index_attribute> <json_filter> [ASC|DESC]
 - **`json_filter`**: A MongoDB-style JSON string defining the composite filtering conditions.
 - **`[ASC|DESC]`**: Optional order direction. Default is `ASC`.
 
-#### `BYKEY`
+#### `SEARCHKEY`
 
 Performs a MongoDB-style query over keys matching a glob pattern within a schema.
 
 **Syntax:**
 
 ```text
-BYKEY <schema_name> <pattern> <json_filter> [ASC|DESC]
+SEARCHKEY <schema_name> <pattern> <json_filter> [ASC|DESC]
 ```
 
 - **`schema_name`**: The logical namespace of the data (e.g., `user`).
@@ -77,12 +77,12 @@ Find a user whose email is exactly `ken@example.com`.
 **Raw Redis Command:**
 
 ```text
-BYINDEX user email {"email": {"$eq": "ken@example.com"}}
+SEARCHINDEX user email {"email": {"$eq": "ken@example.com"}}
 // or simply
-BYINDEX user email {"email": "ken@example.com"}
+SEARCHINDEX user email {"email": "ken@example.com"}
 ```
 
-**Go Client (`client.ByIndex`):**
+**Go Client (`client.SearchIndex`):**
 
 ```go
 import (
@@ -90,7 +90,7 @@ import (
     "github.com/kcmvp/sd/x"
 )
 
-res := client.ByIndex("user", "email", x.Eq("email", "ken@example.com"), false)
+res := client.SearchIndex("user", "email", x.Eq("email", "ken@example.com"), false)
 users := res.MustGet()
 ```
 
@@ -101,13 +101,13 @@ Find users whose age is greater than 18.
 **Raw Redis Command:**
 
 ```text
-BYINDEX user age {"age": {"$gt": 18}}
+SEARCHINDEX user age {"age": {"$gt": 18}}
 ```
 
 **Go Client:**
 
 ```go
-res := client.ByIndex("user", "age", x.Gt("age", 18), false)
+res := client.SearchIndex("user", "age", x.Gt("age", 18), false)
 ```
 
 ##### 3. Composite Query (Logical AND)
@@ -117,13 +117,13 @@ Find users whose age is greater than 18 AND status is "active".
 **Raw Redis Command:**
 
 ```text
-BYINDEX user age {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}
+SEARCHINDEX user age {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}
 ```
 
 **Go Client:**
 
 ```go
-res := client.ByIndex("user", "age", x.And(
+res := client.SearchIndex("user", "age", x.And(
     x.Gt("age", 18),
     x.Eq("status", "active"),
 ), false)
@@ -136,7 +136,7 @@ Find users who are either (age < 20) OR (age > 18 AND status is "active").
 **Raw Redis Command:**
 
 ```text
-BYINDEX user age {"$or": [
+SEARCHINDEX user age {"$or": [
     {"age": {"$lt": 20}},
     {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}
 ]}
@@ -145,7 +145,7 @@ BYINDEX user age {"$or": [
 **Go Client:**
 
 ```go
-res := client.ByIndex("user", "age", x.Or(
+res := client.SearchIndex("user", "age", x.Or(
     x.Lt("age", 20),
     x.And(
         x.Gt("age", 18),

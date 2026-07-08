@@ -1,12 +1,15 @@
 # respx AI Rules
 
 ## Coding Style
+
 - Always prefer functional programming patterns using `samber/lo` and `samber/mo` where applicable.
 - Avoid using global locks (`sync.Mutex` / `sync.RWMutex`) on critical hot paths; prefer connection-scoped context or atomic operations.
 - Avoid using global variables unless explicitly asked.
 - Always try to use a function instead of creating a new struct
 
 ## Test
+
 - Always use `testify/suite` to organize and manage test lifecycles.
 - Eat own dog food: avoid mocking internal components whenever possible; test against real instances (e.g., real BuntDB, real Server/Client).
 - Strongly prefer Table-Driven Tests (TDT) to cover logical branches and edge cases comprehensively.
+- feature driven(json)

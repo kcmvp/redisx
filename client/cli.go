@@ -358,8 +358,8 @@ func Keys(pattern string) mo.Result[[]string] {
 	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
 }
 
-// ByIndex executes a query on a specific JSON index with the provided filter.
-func ByIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+// SearchIndex executes a query on a specific JSON index with the provided filter.
+func SearchIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if schemaName == "" || indexAttr == "" {
 		return mo.Err[[]string](errors.New("schema name and index attribute are required"))
 	}
@@ -388,8 +388,8 @@ func ByIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result
 		order = "DESC"
 	}
 
-	// The BYINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "BYINDEX", schemaName, indexAttr, filterJSON, order)
+	// The SEARCHINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "SEARCHINDEX", schemaName, indexAttr, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -398,8 +398,8 @@ func ByIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result
 	return mo.Ok(res)
 }
 
-// ByKey executes a query on matching keys with the provided filter.
-func ByKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+// SearchKey executes a query on matching keys with the provided filter.
+func SearchKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if schemaName == "" || pattern == "" {
 		return mo.Err[[]string](errors.New("schema name and pattern are required"))
 	}
@@ -428,8 +428,8 @@ func ByKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]s
 		order = "DESC"
 	}
 
-	// The BYKEY command takes schemaName, pattern, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "BYKEY", schemaName, pattern, filterJSON, order)
+	// The SEARCHKEY command takes schemaName, pattern, the JSON filter string, and optional order
+	cmd := client.Do(ctx, "SEARCHKEY", schemaName, pattern, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
