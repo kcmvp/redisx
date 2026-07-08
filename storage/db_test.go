@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/sd/x"
-	"github.com/kcmvp/sd/x/testutil"
+	"github.com/kcmvp/saos/x"
+	"github.com/kcmvp/saos/x/testutil"
 	"github.com/stretchr/testify/suite"
 )
 

@@ -1,4 +1,4 @@
-module github.com/kcmvp/sd
+module github.com/kcmvp/saos
 
 go 1.25.0
 

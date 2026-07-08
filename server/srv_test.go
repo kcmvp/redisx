@@ -14,7 +14,7 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/kcmvp/sd/storage"
+	"github.com/kcmvp/saos/storage"
 	"github.com/tidwall/redcon"
 )
 
