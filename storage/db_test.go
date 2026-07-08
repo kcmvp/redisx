@@ -8,20 +8,8 @@ import (
 
 	"github.com/kcmvp/sd/x"
 	"github.com/kcmvp/sd/x/testutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 )
-
-func setupTestDB(t *testing.T, schemas ...Schema) DB {
-	Reset()
-	db := Open(false, schemas...)
-	assert.NotNil(t, db)
-	t.Cleanup(func() {
-		_ = db.Close()
-		Reset()
-	})
-	return db
-}
 
 type DBSuite struct {
 	suite.Suite
