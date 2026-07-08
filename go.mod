@@ -1,4 +1,4 @@
-module github.com/kcmvp/respx
+module github.com/kcmvp/sd
 
 go 1.25
 
