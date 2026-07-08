@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/sd/internal"
-	"github.com/kcmvp/sd/server"
-	"github.com/kcmvp/sd/storage"
-	"github.com/kcmvp/sd/x"
+	"github.com/kcmvp/saos/internal"
+	"github.com/kcmvp/saos/server"
+	"github.com/kcmvp/saos/storage"
+	"github.com/kcmvp/saos/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/suite"
 )

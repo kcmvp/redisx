@@ -19,7 +19,7 @@ import (
 	"github.com/tidwall/sjson"
 	_ "modernc.org/sqlite"
 
-	"github.com/kcmvp/sd/x"
+	"github.com/kcmvp/saos/x"
 )
 
 const KeySeparator = ":"
