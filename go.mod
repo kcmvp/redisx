@@ -1,4 +1,4 @@
-module github.com/kcmvp/saos
+module github.com/kcmvp/indx
 
 go 1.25.0
 

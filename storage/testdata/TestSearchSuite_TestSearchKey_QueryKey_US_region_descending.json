@@ -1,4 +1,12 @@
 [
-  {"region": "us", "id": "2", "status": "pending"},
-  {"region": "us", "id": "1", "status": "active"}
+    {
+        "region": "us",
+        "id": "2",
+        "status": "pending"
+    },
+    {
+        "region": "us",
+        "id": "1",
+        "status": "active"
+    }
 ]

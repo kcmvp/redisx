@@ -1,8 +1,8 @@
 {
-  "user:2": {
-    "id": "2",
-    "age": 30,
-    "name": "B",
-    "active": true
-  }
+    "user:2": {
+        "id": "2",
+        "age": 30,
+        "name": "B",
+        "active": true
+    }
 }

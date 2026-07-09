@@ -19,7 +19,7 @@ import (
 	"github.com/tidwall/sjson"
 	_ "modernc.org/sqlite"
 
-	"github.com/kcmvp/saos/x"
+	"github.com/kcmvp/indx/x"
 )
 
 const KeySeparator = ":"
@@ -360,6 +360,24 @@ func (x *xdb) Query(query string, args ...any) ([]string, error) {
 func (x *xdb) Save(schema Schema, jsonValue string) mo.Result[string] {
 	if !gjson.Valid(jsonValue) {
 		return mo.Err[string](errors.New("invalid json"))
+	}
+
+	parsed := gjson.Parse(jsonValue)
+	if !parsed.IsObject() {
+		return mo.Err[string](errors.New("root must be a json object"))
+	}
+
+	var nestedErr error
+	parsed.ForEach(func(key, value gjson.Result) bool {
+		if value.IsObject() || value.IsArray() {
+			nestedErr = errors.New("nested json is not supported")
+			return false
+		}
+		return true
+	})
+
+	if nestedErr != nil {
+		return mo.Err[string](nestedErr)
 	}
 
 	key, err := lo.ReduceErr(schema.Prefixes(), func(agg string, prefix string, _ int) (string, error) {
