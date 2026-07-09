@@ -1,14 +1,14 @@
 {
-  "user:2": {
-    "id": "2",
-    "age": 30,
-    "name": "B",
-    "status": "verified"
-  },
-  "user:3": {
-    "id": "3",
-    "age": 25,
-    "name": "C",
-    "status": "verified"
-  }
+    "user:2": {
+        "id": "2",
+        "age": 30,
+        "name": "B",
+        "status": "verified"
+    },
+    "user:3": {
+        "id": "3",
+        "age": 25,
+        "name": "C",
+        "status": "verified"
+    }
 }

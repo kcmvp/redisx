@@ -1,41 +1,38 @@
 [
-  {
-    "id": "1",
-    "age": 20,
-    "name": "Alice",
-    "department": "Engineering",
-    "is_active": true,
-    "salary": 75000.5,
-    "skills": ["go", "python"],
-    "address": {
-      "city": "New York",
-      "zipcode": "10001"
+    {
+        "id": "1",
+        "age": 20,
+        "name": "Alice",
+        "department": "Engineering",
+        "is_active": true,
+        "salary": 75000.5,
+        "skills_1": "go",
+        "skills_2": "python",
+        "address_city": "New York",
+        "address_zipcode": "10001"
+    },
+    {
+        "id": "3",
+        "age": 25,
+        "name": "Charlie",
+        "department": "Engineering",
+        "is_active": true,
+        "salary": 90000.0,
+        "skills_1": "java",
+        "skills_2": "c++",
+        "skills_3": "go",
+        "address_city": "San Francisco",
+        "address_zipcode": "94105"
+    },
+    {
+        "id": "4",
+        "age": 45,
+        "name": "Diana",
+        "department": "HR",
+        "is_active": true,
+        "salary": 85000.0,
+        "skills_1": "management",
+        "address_city": "New York",
+        "address_zipcode": "10002"
     }
-  },
-  {
-    "id": "3",
-    "age": 25,
-    "name": "Charlie",
-    "department": "Engineering",
-    "is_active": true,
-    "salary": 90000.0,
-    "skills": ["java", "c++", "go"],
-    "address": {
-      "city": "San Francisco",
-      "zipcode": "94105"
-    }
-  },
-  {
-    "id": "4",
-    "age": 45,
-    "name": "Diana",
-    "department": "HR",
-    "is_active": true,
-    "salary": 85000.0,
-    "skills": ["management"],
-    "address": {
-      "city": "New York",
-      "zipcode": "10002"
-    }
-  }
 ]

@@ -3,22 +3,17 @@ package server
 import (
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/kcmvp/saos/internal"
-	"github.com/kcmvp/saos/storage"
-	"github.com/kcmvp/saos/x"
-	"github.com/tidwall/buntdb"
-	"github.com/tidwall/gjson"
+	"github.com/kcmvp/indx/internal"
+	"github.com/kcmvp/indx/storage"
 	"github.com/tidwall/redcon"
 )
 
@@ -35,6 +30,7 @@ const (
 	cmdSetNX       = "setnx"
 	cmdDel         = "del"
 	cmdKeys        = "keys"
+	cmdUpdate      = "update"
 	cmdSearchIndex = "searchindex"
 	cmdSearchKey   = "searchkey"
 	cmdPublish     = "publish"
@@ -42,6 +38,29 @@ const (
 	cmdPSubscribe  = "psubscribe"
 	cmdClient      = "client"
 )
+
+type commandHandler func(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub)
+
+var commandRegistry = map[string]commandHandler{
+	cmdAuth:       authCommand,
+	cmdHello:      helloCommand,
+	cmdClient:     clientCommand,
+	cmdPing:       pingCommand,
+	cmdQuit:       quitCommand,
+	cmdSet:        setCommand,
+	cmdSetEx:      setExCommand,
+	cmdSetNX:      setNxCommand,
+	cmdGet:        getCommand,
+	cmdDel:        delCommand,
+	cmdKeys:       keysCommand,
+	cmdPublish:    publishCommand,
+	cmdSubscribe:  subscribeCommand,
+	cmdPSubscribe: pSubscribeCommand,
+	// x commands
+	cmdUpdate:      updateCommand,
+	cmdSearchIndex: searchIndexCommand,
+	cmdSearchKey:   searchKeyCommand,
+}
 
 var (
 	// internalAuthKey is generated per-process and used only for internal bootstrap auth.
@@ -153,130 +172,6 @@ func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redc
 	return redcon.Serve(ln, handler, accept, closed)
 }
 
-// parseFilter recursively parses a MongoDB-style JSON string into an x.Filter.
-func parseFilter(jsonStr string) (x.Filter, error) {
-	if jsonStr == "" || jsonStr == "{}" {
-		return nil, nil // empty filter passes everything
-	}
-
-	if !gjson.Valid(jsonStr) {
-		return nil, errors.New("invalid JSON filter format")
-	}
-
-	root := gjson.Parse(jsonStr)
-	return parseNode(root)
-}
-
-func parseNode(node gjson.Result) (x.Filter, error) {
-	if node.Type != gjson.JSON {
-		return nil, errors.New("expected JSON object")
-	}
-
-	var filters []x.Filter
-	var parseErr error
-
-	node.ForEach(func(key, value gjson.Result) bool {
-		k := key.String()
-
-		switch k {
-		case "$and":
-			if !value.IsArray() {
-				parseErr = errors.New("$and must be an array")
-				return false
-			}
-			var subFilters []x.Filter
-			value.ForEach(func(_, subNode gjson.Result) bool {
-				f, err := parseNode(subNode)
-				if err != nil {
-					parseErr = err
-					return false
-				}
-				subFilters = append(subFilters, f)
-				return true
-			})
-			if parseErr != nil {
-				return false
-			}
-			filters = append(filters, x.And(subFilters...))
-		case "$or":
-			if !value.IsArray() {
-				parseErr = errors.New("$or must be an array")
-				return false
-			}
-			var subFilters []x.Filter
-			value.ForEach(func(_, subNode gjson.Result) bool {
-				f, err := parseNode(subNode)
-				if err != nil {
-					parseErr = err
-					return false
-				}
-				subFilters = append(subFilters, f)
-				return true
-			})
-			if parseErr != nil {
-				return false
-			}
-			filters = append(filters, x.Or(subFilters...))
-		default:
-			// Field comparison. E.g. "age": {"$gt": 18} or "status": "active"
-			if value.Type == gjson.JSON {
-				// Object with operators
-				value.ForEach(func(opKey, opVal gjson.Result) bool {
-					op := opKey.String()
-					switch op {
-					case "$eq":
-						filters = append(filters, x.Eq(k, opVal.Value()))
-					case "$neq":
-						filters = append(filters, x.Neq(k, opVal.Value()))
-					case "$gt":
-						filters = append(filters, x.Gt(k, opVal.Float()))
-					case "$gte":
-						filters = append(filters, x.Gte(k, opVal.Float()))
-					case "$lt":
-						filters = append(filters, x.Lt(k, opVal.Float()))
-					case "$lte":
-						filters = append(filters, x.Lte(k, opVal.Float()))
-					case "$contains":
-						filters = append(filters, x.Contains(k, opVal.String()))
-					case "$in":
-						if !opVal.IsArray() {
-							parseErr = fmt.Errorf("$in operator requires an array for field %s", k)
-							return false
-						}
-						var inValues []any
-						opVal.ForEach(func(_, v gjson.Result) bool {
-							inValues = append(inValues, v.Value())
-							return true
-						})
-						filters = append(filters, x.In(k, inValues...))
-					default:
-						parseErr = fmt.Errorf("unsupported operator: %s", op)
-						return false
-					}
-					return true
-				})
-			} else {
-				// Implicit $eq. E.g. "status": "active"
-				filters = append(filters, x.Eq(k, value.Value()))
-			}
-		}
-
-		return parseErr == nil
-	})
-
-	if parseErr != nil {
-		return nil, parseErr
-	}
-
-	if len(filters) == 0 {
-		return nil, nil
-	}
-	if len(filters) == 1 {
-		return filters[0], nil
-	}
-	// Implicit AND for multiple keys in the same object
-	return x.And(filters...), nil
-}
 func isServerShutdownErr(err error) bool {
 	if err == nil {
 		return true
@@ -327,260 +222,10 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 		}
 	}
 
-	switch cmdName {
-	default:
+	if handler, ok := commandRegistry[cmdName]; ok {
+		handler(conn, cmd, db, ps)
+	} else {
 		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
-	case cmdAuth:
-		if len(cmd.Args) != 2 {
-			conn.WriteError("ERR authentication failed")
-			slog.Warn("auth format error", "remote", conn.RemoteAddr())
-			_ = conn.Close()
-			return
-		}
-		providedKey := string(cmd.Args[1])
-		if providedKey == internalAuthKey || (authKey != "" && providedKey == authKey) {
-			prevAuth, _ := conn.Context().(string)
-			if providedKey == internalAuthKey && prevAuth != internalAuthKey {
-				connCountMu.Lock()
-				activeExternalConns--
-				connCountMu.Unlock()
-			} else if providedKey != internalAuthKey && prevAuth == internalAuthKey {
-				connCountMu.Lock()
-				activeExternalConns++
-				connCountMu.Unlock()
-			}
-			conn.SetContext(providedKey)
-			conn.WriteString("OK")
-			slog.Info("connection authenticated", "remote", conn.RemoteAddr())
-		} else {
-			conn.WriteError("ERR authentication failed")
-			slog.Warn("auth failed (invalid key)", "remote", conn.RemoteAddr())
-			_ = conn.Close()
-			return
-		}
-	case cmdHello:
-		conn.WriteAny(map[string]any{
-			"server":  "mresp",
-			"version": "1.0.0",
-			"proto":   2,
-			"id":      1,
-			"mode":    "standalone",
-			"role":    "master",
-			"modules": []any{},
-		})
-	case cmdClient:
-		conn.WriteString("OK")
-	case cmdPing:
-		conn.WriteString("PONG")
-	case cmdQuit:
-		conn.WriteString("OK")
-		_ = conn.Close()
-	case cmdSet:
-		if len(cmd.Args) < 3 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-
-		var ttl time.Duration
-		if len(cmd.Args) > 3 {
-			for i := 3; i < len(cmd.Args); i++ {
-				arg := strings.ToUpper(string(cmd.Args[i]))
-				if arg == "EX" && i+1 < len(cmd.Args) {
-					secs, err := strconv.Atoi(string(cmd.Args[i+1]))
-					if err != nil {
-						conn.WriteError("ERR value is not an integer or out of range")
-						return
-					}
-					ttl = time.Duration(secs) * time.Second
-					i++
-				} else if arg == "PX" && i+1 < len(cmd.Args) {
-					msecs, err := strconv.Atoi(string(cmd.Args[i+1]))
-					if err != nil {
-						conn.WriteError("ERR value is not an integer or out of range")
-						return
-					}
-					ttl = time.Duration(msecs) * time.Millisecond
-					i++
-				}
-			}
-		}
-
-		if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[2]), ttl); err != nil {
-			conn.WriteError("ERR " + err.Error())
-			return
-		}
-		conn.WriteString("OK")
-	case cmdSetEx:
-		if len(cmd.Args) != 4 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		secs, err := strconv.Atoi(string(cmd.Args[2]))
-		if err != nil {
-			conn.WriteError("ERR value is not an integer or out of range")
-			return
-		}
-		ttl := time.Duration(secs) * time.Second
-		if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[3]), ttl); err != nil {
-			conn.WriteError("ERR " + err.Error())
-			return
-		}
-		conn.WriteString("OK")
-	case cmdSetNX:
-		if len(cmd.Args) != 3 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		set, err := db.SetNX(string(cmd.Args[1]), string(cmd.Args[2]))
-		if err != nil {
-			conn.WriteError("ERR " + err.Error())
-		} else if set {
-			conn.WriteInt(1)
-		} else {
-			conn.WriteInt(0)
-		}
-	case cmdGet:
-		if len(cmd.Args) != 2 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		res := db.Get(string(cmd.Args[1]))
-		if res.IsError() {
-			if errors.Is(res.Error(), buntdb.ErrNotFound) {
-				conn.WriteNull()
-			} else {
-				conn.WriteError("ERR " + res.Error().Error())
-			}
-		} else {
-			conn.WriteBulk([]byte(res.MustGet()))
-		}
-	case cmdDel:
-		if len(cmd.Args) != 2 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		var deleted bool
-		deleted, err := db.Delete(string(cmd.Args[1]))
-		if err != nil {
-			conn.WriteError("ERR " + err.Error())
-		} else if deleted {
-			conn.WriteInt(1)
-		} else {
-			conn.WriteInt(0)
-		}
-	case cmdKeys:
-		if len(cmd.Args) != 2 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		res := db.Keys(string(cmd.Args[1]))
-		if res.IsError() {
-			conn.WriteError("ERR " + res.Error().Error())
-		} else {
-			keys := res.MustGet()
-			conn.WriteArray(len(keys))
-			for _, key := range keys {
-				conn.WriteBulk([]byte(key))
-			}
-		}
-	case cmdSearchIndex:
-		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		schemaName := string(cmd.Args[1])
-		indexAttr := string(cmd.Args[2])
-		filterJSON := string(cmd.Args[3])
-
-		var desc bool
-		if len(cmd.Args) == 5 {
-			order := strings.ToUpper(string(cmd.Args[4]))
-			if order != "ASC" && order != "DESC" {
-				conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
-				return
-			}
-			desc = order == "DESC"
-		}
-
-		// Parse the MongoDB-style JSON string into an x.Filter
-		filter, err := parseFilter(filterJSON)
-		if err != nil {
-			conn.WriteError("ERR invalid query: " + err.Error())
-			return
-		}
-
-		res := db.SearchIndex(schemaName, indexAttr, filter, desc)
-		if res.IsError() {
-			if errors.Is(res.Error(), buntdb.ErrNotFound) {
-				conn.WriteArray(0)
-			} else {
-				conn.WriteError("ERR " + res.Error().Error())
-			}
-		} else {
-			results := res.MustGet()
-			conn.WriteArray(len(results))
-			for _, val := range results {
-				conn.WriteBulk([]byte(val))
-			}
-		}
-	case cmdSearchKey:
-		if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		schemaName := string(cmd.Args[1])
-		pattern := string(cmd.Args[2])
-		filterJSON := string(cmd.Args[3])
-
-		var desc bool
-		if len(cmd.Args) == 5 {
-			order := strings.ToUpper(string(cmd.Args[4]))
-			if order != "ASC" && order != "DESC" {
-				conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
-				return
-			}
-			desc = order == "DESC"
-		}
-
-		filter, err := parseFilter(filterJSON)
-		if err != nil {
-			conn.WriteError("ERR invalid query: " + err.Error())
-			return
-		}
-
-		res := db.SearchKey(schemaName, pattern, filter, desc)
-		if res.IsError() {
-			if errors.Is(res.Error(), buntdb.ErrNotFound) {
-				conn.WriteArray(0)
-			} else {
-				conn.WriteError("ERR " + res.Error().Error())
-			}
-		} else {
-			results := res.MustGet()
-			conn.WriteArray(len(results))
-			for _, val := range results {
-				conn.WriteBulk([]byte(val))
-			}
-		}
-	case cmdPublish:
-		if len(cmd.Args) != 3 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		conn.WriteInt(ps.Publish(string(cmd.Args[1]), string(cmd.Args[2])))
-	case cmdSubscribe, cmdPSubscribe:
-		if len(cmd.Args) < 2 {
-			conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-			return
-		}
-		command := strings.ToLower(string(cmd.Args[0]))
-		for i := 1; i < len(cmd.Args); i++ {
-			if command == cmdPSubscribe {
-				ps.Psubscribe(conn, string(cmd.Args[i]))
-			} else {
-				ps.Subscribe(conn, string(cmd.Args[i]))
-			}
-		}
 	}
 }
 
