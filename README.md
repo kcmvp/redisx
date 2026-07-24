@@ -2,31 +2,31 @@
   Redis compatible server implemented with <a href="https://github.com/tidwall/buntdb">buntdb</a>
   <br/>
   <br/>
-  <a href="https://github.com/kcmvp/sd/blob/main/LICENSE">
-    <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/respx"/>
+  <a href="https://github.com/kcmvp/redisx/blob/main/LICENSE">
+    <img alt="GitHub" src="https://img.shields.io/github/license/kcmvp/redisx"/>
   </a>
-  <a href="https://pkg.go.dev/github.com/kcmvp/sd">
-    <img src="https://pkg.go.dev/badge/github.com/kcmvp/sd.svg" alt="Go Reference"/>
+  <a href="https://pkg.go.dev/github.com/kcmvp/redisx">
+    <img src="https://pkg.go.dev/badge/github.com/kcmvp/redisx.svg" alt="Go Reference"/>
   </a>
-  <a href="https://goreportcard.com/report/github.com/kcmvp/sd">
-    <img src="https://goreportcard.com/badge/github.com/kcmvp/sd" alt="report"/>
+  <a href="https://goreportcard.com/report/github.com/kcmvp/redisx">
+    <img src="https://goreportcard.com/badge/github.com/kcmvp/redisx" alt="report"/>
   </a>
-  <a href="https://github.com/kcmvp/sd/blob/main/.github/workflows/ci.yml" rel="nofollow">
-     <img src="https://img.shields.io/github/actions/workflow/status/kcmvp/respx/ci.yml?branch=main" alt="Build" />
+  <a href="https://github.com/kcmvp/redisx/blob/main/.github/workflows/ci.yml" rel="nofollow">
+     <img src="https://img.shields.io/github/actions/workflow/status/kcmvp/redisx/ci.yml?branch=main" alt="Build" />
   </a>
-  <a href="https://app.codecov.io/gh/kcmvp/respx" ref="nofollow">
-    <img src ="https://img.shields.io/codecov/c/github/kcmvp/respx" alt="coverage"/>
+  <a href="https://app.codecov.io/gh/kcmvp/redisx" ref="nofollow">
+    <img src ="https://img.shields.io/codecov/c/github/kcmvp/redisx" alt="coverage"/>
   </a>
 
 </p>
 
 ## Features
 
-**respx** is an embedded, high-performance Document DB with a Redis-compatible API. It seamlessly blends standard Redis Key-Value operations with advanced MongoDB-style JSON querying capabilities.
+**redisx** is an embedded, high-performance Document DB with a Redis-compatible API. It seamlessly blends standard Redis Key-Value operations with advanced MongoDB-style JSON querying capabilities.
 
 ### 1. Native Redis Commands
 
-`respx` natively supports a subset of standard Redis commands, allowing you to drop it into existing ecosystems with minimal friction:
+`redisx` natively supports a subset of standard Redis commands, allowing you to drop it into existing ecosystems with minimal friction:
 
 - **Connection Management:** `AUTH`, `HELLO`, `PING`, `QUIT`, `CLIENT`
 - **Key-Value Operations:** `SET`, `SETEX`, `SETNX`, `GET`, `DEL`, `KEYS`
@@ -34,7 +34,7 @@
 
 ### 2. Extend (X) Commands
 
-The true power of `respx` lies in its extended document querying capabilities. By treating stored strings as JSON documents and defining schemas with indexes, you can perform complex queries using a declarative DSL.
+The true power of `redisx` lies in its extended document querying capabilities. By treating stored strings as JSON documents and defining schemas with indexes, you can perform complex queries using a declarative DSL.
 
 #### `SEARCHINDEX`
 
@@ -68,7 +68,7 @@ SEARCHKEY <schema_name> <pattern> <json_filter> [ASC|DESC]
 
 #### Examples & Client Usage
 
-`respx` provides a powerful, fluent Go client that automatically translates your Go code into the underlying JSON query expressions.
+`redisx` provides a powerful, fluent Go client that automatically translates your Go code into the underlying JSON query expressions.
 
 ##### 1. Simple Equality Match
 
@@ -86,8 +86,8 @@ SEARCHINDEX user email {"email": "ken@example.com"}
 
 ```go
 import (
-    "github.com/kcmvp/sd/client"
-    "github.com/kcmvp/sd/x"
+    "github.com/kcmvp/redisx/client"
+    "github.com/kcmvp/redisx/x"
 )
 
 res := client.SearchIndex("user", "email", x.Eq("email", "ken@example.com"), false)
@@ -157,5 +157,5 @@ res := client.SearchIndex("user", "age", x.Or(
 ## Installation
 
 ```bash
-go get github.com/kcmvp/sd
+go get github.com/kcmvp/redisx
 ```

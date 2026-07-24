@@ -8,10 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/indx/internal"
-	"github.com/kcmvp/indx/server"
-	"github.com/kcmvp/indx/storage"
-	"github.com/kcmvp/indx/x"
+	"github.com/kcmvp/redisx/internal"
+	"github.com/kcmvp/redisx/server"
+	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/suite"
 )
@@ -19,9 +18,6 @@ import (
 const clientTestServerAddr = "127.0.0.1:36380"
 const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestMaxConns = 50
-
-var testSchema = storage.JsonSchema("user", 0).PrefixAttr("id").Index("email").Index("age")
-var productSchema = storage.JsonSchema("product", 0).PrefixAttr("id")
 
 func (s *ClientTestSuite) SetupTest() {
 	Disconnect()
@@ -55,7 +51,7 @@ type ClientTestSuite struct {
 func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	s.T().Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
-	server.Start(clientTestServerAddr, clientTestMaxConns, false, testSchema, productSchema)
+	server.Start(clientTestServerAddr, clientTestMaxConns, ":memory:")
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -562,30 +558,28 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 
 	tests := []struct {
 		name      string
-		schema    string
 		index     string
 		filter    x.Filter
 		desc      bool
 		expectErr bool
 		expectLen int
 	}{
-		{"Missing schema", "", "email", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Missing index", "user", "", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Index not exists", "user", "unknown", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Eq string", "user", "email", x.Eq("email", "ken@example.com"), false, false, 1},
-		{"Eq false", "user", "email", x.Eq("email", "nobody@example.com"), false, false, 0},
-		{"Gt number", "user", "age", x.Gt("age", 25), false, false, 2},
-		{"Lt number", "user", "age", x.Lt("age", 35), false, false, 2},
-		{"And true", "user", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
-		{"And false", "user", "age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-		{"Or", "user", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
-		{"Empty filter", "user", "email", nil, false, false, 3},
-		{"Descend test", "user", "age", x.Gt("age", 10), true, false, 3},
+		{"Missing index", "", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Unknown attribute", "unknown", x.Eq("email", "ken@example.com"), false, false, 0},
+		{"Eq string", "email", x.Eq("email", "ken@example.com"), false, false, 1},
+		{"Eq false", "email", x.Eq("email", "nobody@example.com"), false, false, 0},
+		{"Gt number", "age", x.Gt("age", 25), false, false, 2},
+		{"Lt number", "age", x.Lt("age", 35), false, false, 2},
+		{"And true", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
+		{"And false", "age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
+		{"Or", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
+		{"Empty filter", "email", nil, false, false, 3},
+		{"Descend test", "age", x.Gt("age", 10), true, false, 3},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchIndex(tt.schema, tt.index, tt.filter, tt.desc)
+			res := SearchIndex(tt.index, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -620,28 +614,26 @@ func (s *ClientTestSuite) TestSearchKeyCommand() {
 
 	tests := []struct {
 		name      string
-		schema    string
 		pattern   string
 		filter    x.Filter
 		desc      bool
 		expectErr bool
 		expectLen int
 	}{
-		{"Missing schema", "", "*", x.Eq("name", "Apple"), false, true, 0},
-		{"Missing pattern", "product", "", x.Eq("name", "Apple"), false, true, 0},
-		{"Match one", "product", "*", x.Eq("name", "Apple"), false, false, 1},
-		{"Match none by filter", "product", "*", x.Eq("name", "Grape"), false, false, 0},
-		{"Match none by pattern", "product", "99*", x.Eq("name", "Apple"), false, false, 0},
-		{"Gt number", "product", "*", x.Gt("price", 6), false, false, 2},
-		{"Lt number", "product", "*", x.Lt("stock", 150), false, false, 2},
-		{"And true", "product", "*", x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1},
-		{"Empty filter", "product", "*", nil, false, false, 3},
-		{"Descend test", "product", "*", x.Gt("price", 4), true, false, 3},
+		{"Missing pattern", "", x.Eq("name", "Apple"), false, true, 0},
+		{"Match one", "product:*", x.Eq("name", "Apple"), false, false, 1},
+		{"Match none by filter", "product:*", x.Eq("name", "Grape"), false, false, 0},
+		{"Match none by pattern", "99*", x.Eq("name", "Apple"), false, false, 0},
+		{"Gt number", "product:*", x.Gt("price", 6), false, false, 2},
+		{"Lt number", "product:*", x.Lt("stock", 150), false, false, 2},
+		{"And true", "product:*", x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1},
+		{"Empty filter", "product:*", nil, false, false, 3},
+		{"Descend test", "product:*", x.Gt("price", 4), true, false, 3},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchKey(tt.schema, tt.pattern, tt.filter, tt.desc)
+			res := SearchKey(tt.pattern, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())

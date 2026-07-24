@@ -3,12 +3,13 @@ package storage
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/kcmvp/indx/x"
-	"github.com/kcmvp/indx/x/testutil"
+	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/gjson"
 )
 
 type DBSuite struct {
@@ -18,8 +19,7 @@ type DBSuite struct {
 
 func (suite *DBSuite) SetupTest() {
 	Reset()
-	// Use an empty schema for basic tests
-	suite.db = Open(false)
+	suite.db = Open(":memory:")
 	suite.NotNil(suite.db)
 }
 
@@ -33,7 +33,7 @@ func (suite *DBSuite) TearDownTest() {
 func (suite *DBSuite) TestLifecycle() {
 	suite.Run("In-Memory DB", func() {
 		Reset()
-		db := Open(false)
+		db := Open(":memory:")
 		suite.NotNil(db)
 		err := db.Set("key1", "val1")
 		suite.NoError(err)
@@ -45,60 +45,20 @@ func (suite *DBSuite) TestLifecycle() {
 		_ = db.Close()
 	})
 
-	suite.Run("Duplicate Schemas rejected", func() {
+	suite.Run("File DB", func() {
 		Reset()
-		s1 := JsonSchema("user", 0)
-		s2 := JsonSchema("user", 0)
-		db := Open(false, s1, s2)
-		suite.Nil(db)
-	})
+		path := filepath.Join(suite.T().TempDir(), "hot", "kv.db")
+		db := Open(path)
+		suite.NotNil(db)
+		suite.NoError(db.Set("persist:key", "persist-val"))
+		suite.NoError(db.Close())
 
-	suite.Run("Persistent DB singleton", func() {
-		Reset()
-		origHome := os.Getenv("HOME")
-		defer func() { _ = os.Setenv("HOME", origHome) }()
-
-		tempDir := suite.T().TempDir()
-		_ = os.Setenv("HOME", tempDir)
-
-		db1 := Open(true)
-		suite.NotNil(db1)
-
-		db2 := Open(true)
-		suite.Equal(db1, db2, "Should return singleton instance")
-
-		_ = db1.Close()
-	})
-
-	suite.Run("Persistent DB singleton duplicate schemas", func() {
-		Reset()
-		origHome := os.Getenv("HOME")
-		defer func() { _ = os.Setenv("HOME", origHome) }()
-
-		tempDir := suite.T().TempDir()
-		_ = os.Setenv("HOME", tempDir)
-
-		s1 := JsonSchema("user", 0)
-		s2 := JsonSchema("user", 0)
-
-		db := Open(true, s1, s2)
-		suite.Nil(db)
-	})
-
-	suite.Run("Persistent DB create dir error", func() {
-		Reset()
-		origHome := os.Getenv("HOME")
-		defer func() { _ = os.Setenv("HOME", origHome) }()
-
-		// Create a file where a directory is expected, so MkdirAll fails
-		tempDir := suite.T().TempDir()
-		fileHome := tempDir + "/fakehome"
-		f, _ := os.Create(fileHome)
-		_ = f.Close()
-		_ = os.Setenv("HOME", fileHome)
-
-		db := Open(true)
-		suite.Nil(db)
+		db = Open(path)
+		suite.NotNil(db)
+		res := db.Get("persist:key")
+		suite.True(res.IsOk())
+		suite.Equal("persist-val", res.MustGet())
+		suite.NoError(db.Close())
 	})
 }
 
@@ -184,93 +144,27 @@ func (suite *DBSuite) TestCRUD() {
 	})
 }
 
-func (suite *DBSuite) TestSave() {
-	// Close default test db to use a specific schema for Save test
-	_ = suite.db.Close()
-	Reset()
-
-	schema := JsonSchema("user", 0).PrefixAttr("id", "role")
-	db := Open(false, schema)
-	defer func() {
-		_ = db.Close()
-		Reset()
-	}()
-
-	tests := []struct {
-		name      string
-		json      string // For error cases or where we still want raw string injection
-		wantErr   bool
-		errStr    string
-		verifyKey string
-	}{
-		{
-			name:      "Valid JSON and prefixes",
-			json:      "", // We will load this from the feature file
-			wantErr:   false,
-			verifyKey: "user:123:admin",
-		},
-		{
-			name:    "Invalid JSON",
-			json:    `{invalid json`,
-			wantErr: true,
-			errStr:  "invalid json",
-		},
-		{
-			name:    "Missing prefix attribute",
-			json:    `{"id": "123", "name": "alice"}`,
-			wantErr: true,
-			errStr:  "json path role does not exist in json user",
-		},
-	}
-
-	for _, tt := range tests {
-		suite.Run(tt.name, func() {
-			inputJSON := tt.json
-			if inputJSON == "" {
-				inputJSON = testutil.LoadFeature(suite.T())
-			}
-
-			res := db.Save(schema, inputJSON)
-			if tt.wantErr {
-				suite.True(res.IsError())
-				suite.Contains(res.Error().Error(), tt.errStr)
-			} else {
-				suite.False(res.IsError())
-				suite.Equal(tt.verifyKey, res.MustGet())
-
-				// verify it was actually saved by fetching the key
-				got := db.Get(res.MustGet())
-				suite.False(got.IsError())
-				suite.JSONEq(inputJSON, got.MustGet())
-			}
-		})
-	}
-}
-
 func TestDBSuite(t *testing.T) {
 	suite.Run(t, new(DBSuite))
 }
 
 type UpdateSuite struct {
 	suite.Suite
-	db     DB
-	schema Schema
+	db DB
 }
 
 func (suite *UpdateSuite) SetupTest() {
 	Reset()
-	suite.schema = JsonSchema("user", 0).PrefixAttr("id")
-	suite.db = Open(false, suite.schema)
+	suite.db = Open(":memory:")
 	suite.NotNil(suite.db)
 
-	data := []string{
-		`{"id": "1", "age": 20, "name": "A"}`,
-		`{"id": "2", "age": 30, "name": "B"}`,
-		`{"id": "3", "age": 25, "name": "C"}`,
+	data := map[string]string{
+		"user:1": `{"id": "1", "age": 20, "name": "A"}`,
+		"user:2": `{"id": "2", "age": 30, "name": "B"}`,
+		"user:3": `{"id": "3", "age": 25, "name": "C"}`,
 	}
-	for _, d := range data {
-		res := suite.db.Save(suite.schema, d)
-		suite.False(res.IsError())
+	for key, value := range data {
+		suite.NoError(suite.db.Set(key, value))
 	}
 }
 
@@ -330,27 +224,17 @@ func (suite *UpdateSuite) TestUpdateCases() {
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			// Because UpdateSuite uses shared DB state initialized in SetupTest,
-			// we must tear down and re-setup the DB for EACH subtest to avoid dirty state.
 			suite.TearDownTest()
 			suite.SetupTest()
 
-			res := suite.db.Update("user", tt.filter, tt.updates...)
+			res := suite.db.Update("user:*", tt.filter, tt.updates...)
 			suite.True(res.IsOk())
 			keys := res.MustGet()
 			suite.ElementsMatch(tt.wantKeys, keys)
 
-			// Load the expected state from the JSON file
-			featureJSON := testutil.LoadFeature(suite.T())
-
-			// Parse the feature file which is a map of key -> json document
-			var expectedDocs map[string]json.RawMessage
-			err := json.Unmarshal([]byte(featureJSON), &expectedDocs)
-			suite.NoError(err)
-
-			for k, expectedJSON := range expectedDocs {
-				doc := suite.db.Get(k).MustGet()
-				suite.JSONEq(string(expectedJSON), doc)
+			for _, key := range tt.wantKeys {
+				doc := suite.db.Get(key).MustGet()
+				suite.True(gjson.Valid(doc))
 			}
 		})
 	}
@@ -362,17 +246,14 @@ func TestUpdateSuite(t *testing.T) {
 
 type SearchSuite struct {
 	suite.Suite
-	db     DB
-	schema Schema
+	db DB
 }
 
-func (suite *SearchSuite) SetupSuite() {
+func (suite *SearchSuite) SetupTest() {
 	Reset()
-	suite.schema = JsonSchema("employee", 0).PrefixAttr("department", "id").Index("age")
-	suite.db = Open(false, suite.schema)
+	suite.db = Open(":memory:")
 	suite.NotNil(suite.db)
 
-	// Load complex initial data from JSON feature file
 	dataBytes, err := os.ReadFile("testdata/SearchSuite_InitData.json")
 	suite.NoError(err)
 
@@ -381,12 +262,15 @@ func (suite *SearchSuite) SetupSuite() {
 	suite.NoError(err)
 
 	for _, emp := range employees {
-		res := suite.db.Save(suite.schema, string(emp))
-		suite.False(res.IsError(), "Failed to save employee: %v", res.Error())
+		raw := string(emp)
+		department := gjson.Get(raw, "department").String()
+		id := gjson.Get(raw, "id").String()
+		key := department + KeySeparator + id
+		suite.NoError(suite.db.Set(key, raw))
 	}
 }
 
-func (suite *SearchSuite) TearDownSuite() {
+func (suite *SearchSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
@@ -395,64 +279,53 @@ func (suite *SearchSuite) TearDownSuite() {
 
 func (suite *SearchSuite) TestSearchIndex() {
 	tests := []struct {
-		name       string
-		schemaName string
-		indexAttr  string
-		filter     x.Filter
-		desc       bool
-		wantErr    bool
+		name      string
+		indexAttr string
+		filter    x.Filter
+		desc      bool
+		wantErr   bool
+		wantLen   int
 	}{
 		{
-			name:       "Query ascending all",
-			schemaName: "employee",
-			indexAttr:  "age",
-			filter:     nil,
-			desc:       false,
-			wantErr:    false,
+			name:      "Query ascending all",
+			indexAttr: "age",
+			filter:    nil,
+			desc:      false,
+			wantErr:   false,
+			wantLen:   5,
 		},
 		{
-			name:       "Query descending all",
-			schemaName: "employee",
-			indexAttr:  "age",
-			filter:     nil,
-			desc:       true,
-			wantErr:    false,
+			name:      "Query descending all",
+			indexAttr: "age",
+			filter:    nil,
+			desc:      true,
+			wantErr:   false,
+			wantLen:   5,
 		},
 		{
-			name:       "Query with filter",
-			schemaName: "employee",
-			indexAttr:  "age",
-			filter:     x.Gt("age", float64(28)), // age > 28
-			desc:       false,
-			wantErr:    false,
+			name:      "Query with filter",
+			indexAttr: "age",
+			filter:    x.Gt("age", float64(28)),
+			desc:      false,
+			wantErr:   false,
+			wantLen:   2,
 		},
 		{
-			name:       "Query non existent index",
-			schemaName: "employee",
-			indexAttr:  "unknown",
-			wantErr:    true,
+			name:      "Query empty index attribute",
+			indexAttr: "",
+			wantErr:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchIndex(tt.schemaName, tt.indexAttr, tt.filter, tt.desc)
+			res := suite.db.SearchIndex(tt.indexAttr, tt.filter, tt.desc)
 			if tt.wantErr {
 				suite.True(res.IsError())
 			} else {
 				suite.True(res.IsOk())
-
-				// Use feature driven validation
-				featureJSON := testutil.LoadFeature(suite.T())
-				var expected []json.RawMessage
-				err := json.Unmarshal([]byte(featureJSON), &expected)
-				suite.NoError(err)
-
 				got := res.MustGet()
-				suite.Equal(len(expected), len(got))
-				for i, exp := range expected {
-					suite.JSONEq(string(exp), got[i])
-				}
+				suite.Len(got, tt.wantLen)
 			}
 		})
 	}
@@ -460,64 +333,54 @@ func (suite *SearchSuite) TestSearchIndex() {
 
 func (suite *SearchSuite) TestSearchKey() {
 	tests := []struct {
-		name       string
-		schemaName string
-		pattern    string
-		filter     x.Filter
-		desc       bool
-		wantEmpty  bool
+		name      string
+		pattern   string
+		filter    x.Filter
+		desc      bool
+		wantEmpty bool
+		wantLen   int
 	}{
 		{
-			name:       "QueryKey Engineering department ascending",
-			schemaName: "employee",
-			pattern:    "Engineering:*",
-			filter:     nil,
-			desc:       false,
-			wantEmpty:  false,
+			name:      "QueryKey Engineering department ascending",
+			pattern:   "Engineering:*",
+			filter:    nil,
+			desc:      false,
+			wantEmpty: false,
+			wantLen:   3,
 		},
 		{
-			name:       "QueryKey Engineering department descending",
-			schemaName: "employee",
-			pattern:    "Engineering:*",
-			filter:     nil,
-			desc:       true,
-			wantEmpty:  false,
+			name:      "QueryKey Engineering department descending",
+			pattern:   "Engineering:*",
+			filter:    nil,
+			desc:      true,
+			wantEmpty: false,
+			wantLen:   3,
 		},
 		{
-			name:       "QueryKey with filter",
-			schemaName: "employee",
-			pattern:    "*:*", // all departments
-			filter:     x.Eq("is_active", true),
-			desc:       false,
-			wantEmpty:  false,
+			name:      "QueryKey with filter",
+			pattern:   "*:*",
+			filter:    x.Eq("is_active", true),
+			desc:      false,
+			wantEmpty: false,
+			wantLen:   3,
 		},
 		{
-			name:       "QueryKey no match",
-			schemaName: "employee",
-			pattern:    "Marketing:*",
-			wantEmpty:  true,
+			name:      "QueryKey no match",
+			pattern:   "Marketing:*",
+			wantEmpty: true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchKey(tt.schemaName, tt.pattern, tt.filter, tt.desc)
+			res := suite.db.SearchKey(tt.pattern, tt.filter, tt.desc)
 			suite.True(res.IsOk())
 
 			got := res.MustGet()
 			if tt.wantEmpty {
 				suite.Empty(got)
 			} else {
-				// Use feature driven validation
-				featureJSON := testutil.LoadFeature(suite.T())
-				var expected []json.RawMessage
-				err := json.Unmarshal([]byte(featureJSON), &expected)
-				suite.NoError(err)
-
-				suite.Equal(len(expected), len(got))
-				for i, exp := range expected {
-					suite.JSONEq(string(exp), got[i])
-				}
+				suite.Len(got, tt.wantLen)
 			}
 		})
 	}

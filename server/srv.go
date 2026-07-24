@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kcmvp/indx/internal"
-	"github.com/kcmvp/indx/storage"
+	"github.com/kcmvp/redisx/internal"
+	"github.com/kcmvp/redisx/storage"
 	"github.com/tidwall/redcon"
 )
 
@@ -278,11 +278,11 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int, persistent bool, schemas ...storage.Schema) storage.DB {
+func Start(address string, maxConn int, dbPath string) storage.DB {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
-		db := storage.Open(persistent, schemas...)
+		db := storage.Open(dbPath)
 		if db == nil {
 			slog.Error("failed to open storage")
 			if exitFn := getOsExitFn(); exitFn != nil {

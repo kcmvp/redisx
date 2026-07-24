@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/indx/storage"
+	"github.com/kcmvp/redisx/storage"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -31,8 +31,6 @@ func getFreePort() string {
 
 type ServerTestSuite struct {
 	suite.Suite
-	schemas []storage.Schema
-
 	origInternalAuthKey  string
 	origAuthKey          string
 	origExternalMaxConns int
@@ -41,12 +39,6 @@ type ServerTestSuite struct {
 }
 
 func (s *ServerTestSuite) SetupSuite() {
-	s.schemas = []storage.Schema{
-		storage.JsonSchema("user_idx", 0).PrefixAttr("id").Index("age"),
-		storage.JsonSchema("user_key", 0).PrefixAttr("id"),
-		storage.JsonSchema("user_no_idx", 0).PrefixAttr("id"),
-	}
-
 	globalMu.Lock()
 	s.origInternalAuthKey = internalAuthKey
 	s.origAuthKey = authKey
@@ -127,7 +119,7 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 	addr := getFreePort()
 
 	// Start server with externalMaxConns = 1
-	_ = Start(addr, 1, false)
+	_ = Start(addr, 1, ":memory:")
 	defer func() { _ = stop() }()
 
 	time.Sleep(10 * time.Millisecond)
@@ -294,7 +286,7 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("127.0.0.1:0", 0, true, s.schemas...)
+	db := Start("127.0.0.1:0", 0, "/dev/null/kv.db")
 	s.Nil(db)
 	s.True(exitCalled)
 
@@ -316,7 +308,7 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("", 0, false, s.schemas...)
+	db := Start("", 0, ":memory:")
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -435,7 +427,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		_ = Start(getFreePort(), 3, false)
+		_ = Start(getFreePort(), 3, ":memory:")
 		close(doneCh)
 	}()
 
@@ -474,7 +466,7 @@ func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
 
 	startAddr := "127.0.0.1:16380"
 	startMaxCon := 3
-	_ = Start(startAddr, startMaxCon, false)
+	_ = Start(startAddr, startMaxCon, ":memory:")
 
 	select {
 	case addr := <-listenCalledCh:
@@ -502,7 +494,7 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
 		return nil
 	}
 
-	_ = Start("", 0, false)
+	_ = Start("", 0, ":memory:")
 
 	select {
 	case addr := <-listenCalledCh:

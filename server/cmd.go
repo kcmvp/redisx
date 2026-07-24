@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kcmvp/indx/storage"
+	"github.com/kcmvp/redisx/storage"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )

@@ -64,7 +64,7 @@ jobs:
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        slug: kcmvp/respx
+        slug: kcmvp/redisx
 
   # Step 3: Build and lint (depends on test passing)
   build:
@@ -115,4 +115,3 @@ jobs:
     steps:
     - name: CI passed
       run: echo "✅ All CI checks passed!"
-

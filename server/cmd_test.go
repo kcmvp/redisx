@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/indx/storage"
+	"github.com/kcmvp/redisx/storage"
+
+	"sync"
 
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
-	"sync"
 )
 
 type CmdTestSuite struct {
 	suite.Suite
-	addr    string
-	db      storage.DB
-	schemas []storage.Schema
+	addr string
+	db   storage.DB
 
 	origInternalAuthKey  string
 	origAuthKey          string
@@ -29,12 +29,6 @@ type CmdTestSuite struct {
 }
 
 func (s *CmdTestSuite) SetupSuite() {
-	s.schemas = []storage.Schema{
-		storage.JsonSchema("user_idx", 0).PrefixAttr("id").Index("age"),
-		storage.JsonSchema("user_key", 0).PrefixAttr("id"),
-		storage.JsonSchema("user_no_idx", 0).PrefixAttr("id"),
-	}
-
 	globalMu.Lock()
 	s.origInternalAuthKey = internalAuthKey
 	s.origAuthKey = authKey
@@ -88,7 +82,7 @@ func TestCmdSuite(t *testing.T) {
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, 100, false, s.schemas...)
+	s.db = Start(s.addr, 100, ":memory:")
 
 	tests := []struct {
 		name        string
@@ -102,7 +96,6 @@ func (s *CmdTestSuite) TestCmd() {
 		wantArrays  [][]string
 		wantClosed  bool
 		dbInit      bool
-		schemas     []storage.Schema
 		setupDB     func(uid string)
 	}{
 		{
@@ -506,7 +499,7 @@ func (s *CmdTestSuite) TestCmd() {
 func (s *CmdTestSuite) TestPubSub() {
 	t := s.T()
 	addr := getFreePort()
-	_ = Start(addr, 10, false)
+	_ = Start(addr, 10, ":memory:")
 	defer func() { _ = stop() }()
 
 	// Need a small sleep to ensure server is ready

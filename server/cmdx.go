@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kcmvp/indx/storage"
-	"github.com/kcmvp/indx/x"
+	"github.com/kcmvp/redisx/storage"
+	"github.com/kcmvp/redisx/x"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
@@ -138,19 +138,18 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 }
 
 func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
+	if len(cmd.Args) < 3 || len(cmd.Args) > 4 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	schemaName := string(cmd.Args[1])
-	indexAttr := string(cmd.Args[2])
-	filterJSON := string(cmd.Args[3])
+	indexAttr := string(cmd.Args[1])
+	filterJSON := string(cmd.Args[2])
 
 	var desc bool
-	if len(cmd.Args) == 5 {
-		order := strings.ToUpper(string(cmd.Args[4]))
+	if len(cmd.Args) == 4 {
+		order := strings.ToUpper(string(cmd.Args[3]))
 		if order != "ASC" && order != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
+			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
 			return
 		}
 		desc = order == "DESC"
@@ -163,7 +162,7 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps 
 		return
 	}
 
-	res := db.SearchIndex(schemaName, indexAttr, filter, desc)
+	res := db.SearchIndex(indexAttr, filter, desc)
 	if res.IsError() {
 		if errors.Is(res.Error(), buntdb.ErrNotFound) {
 			conn.WriteArray(0)
@@ -180,13 +179,13 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps 
 }
 
 func updateCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub) {
-	// UPDATE schema filter_json update_json
+	// UPDATE pattern filter_json update_json
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 
-	schemaName := string(cmd.Args[1])
+	pattern := string(cmd.Args[1])
 	filterJSON := string(cmd.Args[2])
 	updateJSON := string(cmd.Args[3])
 
@@ -231,7 +230,7 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 		return
 	}
 
-	res := db.Update(schemaName, filter, pairs...)
+	res := db.Update(pattern, filter, pairs...)
 	if res.IsError() {
 		conn.WriteError("ERR " + res.Error().Error())
 	} else {
@@ -244,19 +243,18 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redc
 }
 
 func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 4 || len(cmd.Args) > 5 {
+	if len(cmd.Args) < 3 || len(cmd.Args) > 4 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	schemaName := string(cmd.Args[1])
-	pattern := string(cmd.Args[2])
-	filterJSON := string(cmd.Args[3])
+	pattern := string(cmd.Args[1])
+	filterJSON := string(cmd.Args[2])
 
 	var desc bool
-	if len(cmd.Args) == 5 {
-		order := strings.ToUpper(string(cmd.Args[4]))
+	if len(cmd.Args) == 4 {
+		order := strings.ToUpper(string(cmd.Args[3]))
 		if order != "ASC" && order != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
+			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
 			return
 		}
 		desc = order == "DESC"
@@ -268,7 +266,7 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *r
 		return
 	}
 
-	res := db.SearchKey(schemaName, pattern, filter, desc)
+	res := db.SearchKey(pattern, filter, desc)
 	if res.IsError() {
 		if errors.Is(res.Error(), buntdb.ErrNotFound) {
 			conn.WriteArray(0)

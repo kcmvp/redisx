@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kcmvp/indx/x"
+	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
 	"github.com/samber/mo"
@@ -358,10 +358,10 @@ func Keys(pattern string) mo.Result[[]string] {
 	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
 }
 
-// SearchIndex executes a query on a specific JSON index with the provided filter.
-func SearchIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if schemaName == "" || indexAttr == "" {
-		return mo.Err[[]string](errors.New("schema name and index attribute are required"))
+// SearchIndex executes a query on a specific JSON attribute with the provided filter.
+func SearchIndex(indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if indexAttr == "" {
+		return mo.Err[[]string](errors.New("index attribute is required"))
 	}
 
 	client := getSharedClient()
@@ -388,8 +388,7 @@ func SearchIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Re
 		order = "DESC"
 	}
 
-	// The SEARCHINDEX command takes schemaName, indexAttr, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "SEARCHINDEX", schemaName, indexAttr, filterJSON, order)
+	cmd := client.Do(ctx, "SEARCHINDEX", indexAttr, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -399,9 +398,9 @@ func SearchIndex(schemaName, indexAttr string, filter x.Filter, desc bool) mo.Re
 }
 
 // SearchKey executes a query on matching keys with the provided filter.
-func SearchKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if schemaName == "" || pattern == "" {
-		return mo.Err[[]string](errors.New("schema name and pattern are required"))
+func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if pattern == "" {
+		return mo.Err[[]string](errors.New("pattern is required"))
 	}
 
 	client := getSharedClient()
@@ -428,8 +427,7 @@ func SearchKey(schemaName, pattern string, filter x.Filter, desc bool) mo.Result
 		order = "DESC"
 	}
 
-	// The SEARCHKEY command takes schemaName, pattern, the JSON filter string, and optional order
-	cmd := client.Do(ctx, "SEARCHKEY", schemaName, pattern, filterJSON, order)
+	cmd := client.Do(ctx, "SEARCHKEY", pattern, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)

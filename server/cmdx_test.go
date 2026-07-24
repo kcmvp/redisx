@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/indx/storage"
+	"github.com/kcmvp/redisx/storage"
+
+	"sync"
 
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
-	"sync"
 )
 
 type CmdXTestSuite struct {
 	suite.Suite
-	addr    string
-	db      storage.DB
-	schemas []storage.Schema
+	addr string
+	db   storage.DB
 
 	origInternalAuthKey  string
 	origAuthKey          string
@@ -29,12 +29,6 @@ type CmdXTestSuite struct {
 }
 
 func (s *CmdXTestSuite) SetupSuite() {
-	s.schemas = []storage.Schema{
-		storage.JsonSchema("user_idx", 0).PrefixAttr("id").Index("age"),
-		storage.JsonSchema("user_key", 0).PrefixAttr("id"),
-		storage.JsonSchema("user_no_idx", 0).PrefixAttr("id"),
-	}
-
 	globalMu.Lock()
 	s.origInternalAuthKey = internalAuthKey
 	s.origAuthKey = authKey
@@ -206,7 +200,7 @@ func (s *CmdXTestSuite) TestParseFilter() {
 func (s *CmdXTestSuite) TestCmdX() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, 100, false, s.schemas...)
+	s.db = Start(s.addr, 100, ":memory:")
 
 	tests := []struct {
 		name        string
@@ -220,141 +214,133 @@ func (s *CmdXTestSuite) TestCmdX() {
 		wantArrays  [][]string
 		wantClosed  bool
 		dbInit      bool
-		schemas     []storage.Schema
 		setupDB     func(uid string)
 	}{
 		{
 			name:       "searchindex_wrong_number_of_args_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "user_idx", "age"}},
+			commands:   [][]string{{cmdSearchIndex, "age"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
 		},
 		{
 			name:       "searchindex_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "user_idx", "age", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "age", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "user_idx", "age", "{invalid"}},
+			commands:   [][]string{{cmdSearchIndex, "age", "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchkey_wrong_number_of_args_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user_key", "*"}},
+			commands:   [][]string{{cmdSearchKey, "*"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
 		},
 		{
 			name:       "searchkey_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user_key", "*", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchKey, "*", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchkey_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user_key", "*", "{invalid"}},
+			commands:   [][]string{{cmdSearchKey, "*", "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchindex_wrong_number_of_args",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "schema", "attr"}},
+			commands:   [][]string{{cmdSearchIndex, "attr"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
 		},
 		{
 			name:       "searchindex_invalid_order_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "schema", "attr", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "attr", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "schema", "attr", "{invalid}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, "attr", "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchkey_wrong_number_of_args_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "schema", "pattern"}},
+			commands:   [][]string{{cmdSearchKey, "pattern"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
 		},
 		{
 			name:       "searchkey_invalid_order_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "schema", "pattern", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchKey, "pattern", "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchkey_invalid_json_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "schema", "pattern", "{invalid}", "ASC"}},
+			commands:   [][]string{{cmdSearchKey, "pattern", "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchindex success",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "user_idx", "age", "{}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, "age", "{}", "ASC"}},
 			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
 			setupDB: func(uid string) {
-
-				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
-				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:%s:1", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:%s:2", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
 			},
 		},
 		{
-			name:       "searchindex not found",
+			name:       "searchindex empty result",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "user_no_idx", "unknown", "{}", "ASC"}},
-			wantErrors: []string{"ERR index unknown not found for schema user_no_idx"},
-			setupDB: func(uid string) {
-			},
+			commands:   [][]string{{cmdSearchIndex, "unknown", "{}", "ASC"}},
+			wantArrays: [][]string{{}},
 		},
 		{
 			name:       "update success",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user_idx", `{"id": "1_{id}"}`, `{"name": "updated"}`}},
-			wantArrays: [][]string{{`user_idx:1_{id}`}},
+			commands:   [][]string{{cmdUpdate, "user:*", `{"id": "1_{id}"}`, `{"name": "updated"}`}},
+			wantArrays: [][]string{{`user:1_{id}`}},
 			setupDB: func(uid string) {
-				// use dynamic uid so we don't accidentally update docs from previous tests
-				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"1_%s", "age":20, "name":"old"}`, uid))
-				_ = s.db.Save(s.schemas[0], fmt.Sprintf(`{"id":"2_%s", "age":30, "name":"old"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20, "name":"old"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s", "age":30, "name":"old"}`, uid))
 			},
 		},
 		{
 			name:       "update no valid updates",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user_idx", "{}", `{}`}},
+			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{}`}},
 			wantErrors: []string{"ERR no valid updates provided"},
 		},
 		{
 			name:       "update invalid json",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user_idx", "{}", `{invalid`}},
+			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{invalid`}},
 			wantErrors: []string{"ERR invalid update json format"},
 		},
 		{
 			name:       "searchkey success",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user_key", "*_{id}", "{}", "DESC"}},
+			commands:   [][]string{{cmdSearchKey, "user:*_{id}", "{}", "DESC"}},
 			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
 			setupDB: func(uid string) {
-
-				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"1_%s"}`, uid))
-				_ = s.db.Save(s.schemas[1], fmt.Sprintf(`{"id":"2_%s"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s"}`, uid))
 			},
 		},
 		{
 			name:       "searchkey not found",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user_key", "unknown_{id}:*", "{}"}},
+			commands:   [][]string{{cmdSearchKey, "unknown_{id}:*", "{}"}},
 			wantArrays: [][]string{{}},
-			setupDB: func(uid string) {
-			},
 		},
 	}
 
