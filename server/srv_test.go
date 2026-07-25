@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -10,10 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/redisx/storage"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
+
+const testExternalAuthKey = "external-test-key"
 
 // resetStorage clears the singleton instance in storage package. Used only for testing.
 // We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
@@ -32,8 +34,6 @@ func getFreePort() string {
 type ServerTestSuite struct {
 	suite.Suite
 	origInternalAuthKey  string
-	origAuthKey          string
-	origExternalMaxConns int
 	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
 	origOsExitFn         func(code int)
 }
@@ -41,8 +41,6 @@ type ServerTestSuite struct {
 func (s *ServerTestSuite) SetupSuite() {
 	globalMu.Lock()
 	s.origInternalAuthKey = internalAuthKey
-	s.origAuthKey = authKey
-	s.origExternalMaxConns = externalMaxConns
 	s.origListenAndServeFn = listenAndServeFn
 	s.origOsExitFn = osExitFn
 	globalMu.Unlock()
@@ -51,16 +49,15 @@ func (s *ServerTestSuite) SetupSuite() {
 func (s *ServerTestSuite) SetupTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	storage.Reset()
+	resetStorage()
 
-	connCountMu.Lock()
-	activeExternalConns = 0
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	authKeyMaxConns = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
 
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
-	authKey = "external-test-key"
-	externalMaxConns = 1
 	srvOnce = sync.Once{}
 	listenAndServeFn = redcon.ListenAndServe
 	globalMu.Unlock()
@@ -69,16 +66,15 @@ func (s *ServerTestSuite) SetupTest() {
 func (s *ServerTestSuite) TearDownTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	storage.Reset()
+	resetStorage()
 
-	connCountMu.Lock()
-	activeExternalConns = 0
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	authKeyMaxConns = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
 
 	globalMu.Lock()
 	internalAuthKey = s.origInternalAuthKey
-	authKey = s.origAuthKey
-	externalMaxConns = s.origExternalMaxConns
 	listenAndServeFn = s.origListenAndServeFn
 	osExitFn = s.origOsExitFn
 	srvOnce = sync.Once{}
@@ -114,53 +110,78 @@ func replaceID1D(arr []string, id string) []string {
 	return res
 }
 
+func authOverConn(conn net.Conn, key string) (string, error) {
+	if _, err := fmt.Fprintf(conn, "*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(key), key); err != nil {
+		return "", err
+	}
+
+	buf := make([]byte, 128)
+	_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, err := conn.Read(buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+func seedAuthKeyLimit(t *testing.T, db *DB, key string, limit int) {
+	t.Helper()
+	if err := db.Set(authLimitStoreKey(key), fmt.Sprintf("%d", limit)); err != nil {
+		t.Fatalf("failed to seed auth key limit: %v", err)
+	}
+	if err := loadAuthKeyLimits(db); err != nil {
+		t.Fatalf("failed to reload auth key limits: %v", err)
+	}
+}
+
 func (s *ServerTestSuite) TestConnectionLimits() {
 	t := s.T()
 	addr := getFreePort()
 
-	// Start server with externalMaxConns = 1
-	_ = Start(addr, 1, ":memory:")
+	// Start server with default external auth key limit = 1
+	db := Start(addr, ":memory:")
+	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
 	defer func() { _ = stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Connection 1 should succeed
+	// Connection 1 should authenticate successfully.
 	conn1, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("failed to dial conn1: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
-
-	// Verify it's active
-	connCountMu.Lock()
-	count := activeExternalConns
-	connCountMu.Unlock()
-	if count != 1 {
-		t.Fatalf("activeExternalConns = %d, want 1", count)
+	defer func() { _ = conn1.Close() }()
+	resp, err := authOverConn(conn1, testExternalAuthKey)
+	if err != nil {
+		t.Fatalf("failed to auth conn1: %v", err)
+	}
+	if !strings.Contains(resp, "+OK") {
+		t.Fatalf("conn1 auth response = %q, want +OK", resp)
 	}
 
-	// Connection 2 should be rejected/closed immediately
+	authStateMu.Lock()
+	count := authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
+	if count != 1 {
+		t.Fatalf("authKeyConnCounts[%q] = %d, want 1", testExternalAuthKey, count)
+	}
+
+	// Connection 2 should be rejected during AUTH.
 	conn2, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("failed to dial conn2: %v", err)
 	}
-
-	// We wait a bit to ensure server closed it
-	time.Sleep(10 * time.Millisecond)
-
-	// Read from conn2 should fail
-	_ = conn2.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	_, err = conn2.Read(make([]byte, 1))
-	if err == nil {
-		t.Fatal("expected conn2 to be closed due to limits, but read succeeded")
+	resp, err = authOverConn(conn2, testExternalAuthKey)
+	if err == nil && !strings.Contains(resp, "ERR auth key connection limit exceeded") {
+		t.Fatalf("conn2 auth response = %q, want limit exceeded error", resp)
 	}
 
 	// Count should still be 1
-	connCountMu.Lock()
-	count = activeExternalConns
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	count = authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
 	if count != 1 {
-		t.Fatalf("activeExternalConns after rejected accept = %d, want 1", count)
+		t.Fatalf("authKeyConnCounts[%q] after rejected auth = %d, want 1", testExternalAuthKey, count)
 	}
 
 	// Close connection 1
@@ -170,69 +191,168 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 	time.Sleep(50 * time.Millisecond)
 
 	// Count should be 0
-	connCountMu.Lock()
-	count = activeExternalConns
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	count = authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
 	if count != 0 {
-		t.Fatalf("activeExternalConns after close = %d, want 0", count)
+		t.Fatalf("authKeyConnCounts[%q] after close = %d, want 0", testExternalAuthKey, count)
 	}
 
-	// Now connection 3 should succeed since slot is freed
+	// Now connection 3 should succeed since slot is freed.
 	conn3, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("failed to dial conn3: %v", err)
 	}
 	defer func() { _ = conn3.Close() }()
 
-	time.Sleep(50 * time.Millisecond) // wait for acceptCon to execute
+	resp, err = authOverConn(conn3, testExternalAuthKey)
+	if err != nil {
+		t.Fatalf("failed to auth conn3: %v", err)
+	}
+	if !strings.Contains(resp, "+OK") {
+		t.Fatalf("conn3 auth response = %q, want +OK", resp)
+	}
 
-	connCountMu.Lock()
-	count = activeExternalConns
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	count = authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
 	if count != 1 {
-		t.Fatalf("activeExternalConns = %d, want 1", count)
+		t.Fatalf("authKeyConnCounts[%q] = %d, want 1", testExternalAuthKey, count)
 	}
 }
 
-func (s *ServerTestSuite) TestAuthKeyHelpers() {
-	// Test resolveExternalAuthKey
-	v1 := resolveExternalAuthKey(func(k string) string { return "env-key" })
-	s.Equal("env-key", v1)
+func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
+	t := s.T()
+	addr := getFreePort()
+	db := Start(addr, ":memory:")
+	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
+	defer func() { _ = stop() }()
 
-	v2 := resolveExternalAuthKey(func(k string) string { return "" })
-	s.NotEmpty(v2)
-	s.NotEqual("env-key", v2)
+	time.Sleep(10 * time.Millisecond)
 
-	// Test ensureExternalAuthKey
-	globalMu.Lock()
-	authKey = ""
-	globalMu.Unlock()
-
-	origEnv := os.Getenv("RESPX_AUTH_KEY")
-	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-2")
-	ensureExternalAuthKey()
-	s.Equal("env-key-2", authKey)
-
-	// Second call should not overwrite
-	_ = os.Setenv("RESPX_AUTH_KEY", "env-key-3")
-	ensureExternalAuthKey()
-	s.Equal("env-key-2", authKey)
-
-	// Test ensureExternalAuthKey with empty env var (generates random)
-	globalMu.Lock()
-	authKey = ""
-	globalMu.Unlock()
-	_ = os.Unsetenv("RESPX_AUTH_KEY")
-	ensureExternalAuthKey()
-	s.NotEmpty(authKey)
-	s.NotEqual("env-key-2", authKey)
-	s.NotEqual("env-key-3", authKey)
-
-	if origEnv != "" {
-		_ = os.Setenv("RESPX_AUTH_KEY", origEnv)
-	} else {
-		_ = os.Unsetenv("RESPX_AUTH_KEY")
+	conn1, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn1: %v", err)
 	}
+	defer func() { _ = conn1.Close() }()
+
+	resp, err := authOverConn(conn1, testExternalAuthKey)
+	if err != nil || !strings.Contains(resp, "+OK") {
+		t.Fatalf("conn1 auth response = %q, err = %v", resp, err)
+	}
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn2: %v", err)
+	}
+	defer func() { _ = conn2.Close() }()
+
+	resp, err = authOverConn(conn2, testExternalAuthKey)
+	if err == nil && !strings.Contains(resp, "ERR auth key connection limit exceeded") {
+		t.Fatalf("conn2 auth response = %q, want limit exceeded error", resp)
+	}
+
+	if setErr := db.Set(authLimitStoreKey(testExternalAuthKey), "2"); setErr != nil {
+		t.Fatalf("failed to update auth limit in storage: %v", setErr)
+	}
+
+	conn3, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn3: %v", err)
+	}
+	defer func() { _ = conn3.Close() }()
+
+	resp, err = authOverConn(conn3, testExternalAuthKey)
+	if err != nil || !strings.Contains(resp, "+OK") {
+		t.Fatalf("conn3 auth response = %q, err = %v", resp, err)
+	}
+
+	if setErr := db.Set(authLimitStoreKey(testExternalAuthKey), "1"); setErr != nil {
+		t.Fatalf("failed to shrink auth limit in storage: %v", setErr)
+	}
+
+	conn4, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn4: %v", err)
+	}
+	defer func() { _ = conn4.Close() }()
+
+	resp, err = authOverConn(conn4, testExternalAuthKey)
+	if err == nil && !strings.Contains(resp, "ERR auth key connection limit exceeded") {
+		t.Fatalf("conn4 auth response = %q, want limit exceeded error after shrink", resp)
+	}
+}
+
+func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
+	t := s.T()
+	addr := getFreePort()
+	db := Start(addr, ":memory:")
+	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
+	defer func() { _ = stop() }()
+
+	time.Sleep(10 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	resp, err := authOverConn(conn, testExternalAuthKey)
+	if err != nil || !strings.Contains(resp, "+OK") {
+		t.Fatalf("first auth response = %q, err = %v", resp, err)
+	}
+
+	authStateMu.Lock()
+	count := authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
+	if count != 1 {
+		t.Fatalf("authKeyConnCounts[%q] after first auth = %d, want 1", testExternalAuthKey, count)
+	}
+
+	resp, err = authOverConn(conn, testExternalAuthKey)
+	if err != nil || !strings.Contains(resp, "+OK") {
+		t.Fatalf("second auth response = %q, err = %v", resp, err)
+	}
+
+	authStateMu.Lock()
+	count = authKeyConnCounts[testExternalAuthKey]
+	authStateMu.Unlock()
+	if count != 1 {
+		t.Fatalf("authKeyConnCounts[%q] after second auth on same connection = %d, want 1", testExternalAuthKey, count)
+	}
+}
+
+func (s *ServerTestSuite) TestLoadAuthKeyLimitsSkipsUnavailableKeys() {
+	db := openDB(":memory:")
+	s.Require().NotNil(db)
+	defer func() { _ = db.Close() }()
+
+	s.Require().NoError(db.Set(authLimitStoreKey("valid"), "2"))
+	s.Require().NoError(db.Set(authLimitStoreKey("expired"), ""))
+
+	err := loadAuthKeyLimits(db)
+	s.NoError(err)
+
+	authStateMu.Lock()
+	defer authStateMu.Unlock()
+
+	s.Equal(2, authKeyMaxConns["valid"])
+	_, exists := authKeyMaxConns["expired"]
+	s.False(exists)
+}
+
+func (s *ServerTestSuite) TestRefreshAuthLimitTreatsBadValueAsExpired() {
+	db := openDB(":memory:")
+	s.Require().NotNil(db)
+	defer func() { _ = db.Close() }()
+
+	s.Require().NoError(db.Set(authLimitStoreKey("bad"), ""))
+
+	limit, ok, err := refreshAuthLimit(db, "bad")
+	s.NoError(err)
+	s.False(ok)
+	s.Zero(limit)
 }
 
 func (s *ServerTestSuite) TestListenAndServeWithStop() {
@@ -286,7 +406,7 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("127.0.0.1:0", 0, "/dev/null/kv.db")
+	db := Start("127.0.0.1:0", "/dev/null/kv.db")
 	s.Nil(db)
 	s.True(exitCalled)
 
@@ -308,7 +428,7 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("", 0, ":memory:")
+	db := Start("", ":memory:")
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -427,7 +547,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		_ = Start(getFreePort(), 3, ":memory:")
+		_ = Start(getFreePort(), ":memory:")
 		close(doneCh)
 	}()
 
@@ -452,7 +572,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 	}
 }
 
-func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
+func (s *ServerTestSuite) TestStartInvokesListener() {
 	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
@@ -465,8 +585,7 @@ func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
 	}
 
 	startAddr := "127.0.0.1:16380"
-	startMaxCon := 3
-	_ = Start(startAddr, startMaxCon, ":memory:")
+	_ = Start(startAddr, ":memory:")
 
 	select {
 	case addr := <-listenCalledCh:
@@ -477,12 +596,9 @@ func (s *ServerTestSuite) TestStartInvokesListenerAndSetsMaxConnections() {
 		t.Fatal("Start() should invoke listenAndServeFn")
 	}
 
-	if externalMaxConns != startMaxCon {
-		t.Fatalf("externalMaxConns = %d, want %d", externalMaxConns, startMaxCon)
-	}
 }
 
-func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
+func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	t := s.T()
 
 	listenCalledCh := make(chan string, 1)
@@ -494,7 +610,7 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
 		return nil
 	}
 
-	_ = Start("", 0, ":memory:")
+	_ = Start("", ":memory:")
 
 	select {
 	case addr := <-listenCalledCh:
@@ -503,9 +619,5 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddrAndMinimumMaxConn() {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Start() should invoke listenAndServeFn")
-	}
-
-	if externalMaxConns != 1 {
-		t.Fatalf("externalMaxConns = %d, want 1", externalMaxConns)
 	}
 }

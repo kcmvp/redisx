@@ -1,45 +1,52 @@
 package server
 
 import (
-	"crypto/rand"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
-	"github.com/kcmvp/redisx/storage"
+	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
 const (
-	privateAddr = "127.0.0.1:6380"
+	privateAddr        = "127.0.0.1:6380"
+	authKeyPrefix      = "_auth_:"
+	unlimitedAuthConns = -1
 
-	cmdAuth        = "auth"
-	cmdHello       = "hello"
-	cmdPing        = "ping"
-	cmdQuit        = "quit"
-	cmdSet         = "set"
-	cmdSetEx       = "setex"
-	cmdGet         = "get"
-	cmdSetNX       = "setnx"
-	cmdDel         = "del"
-	cmdKeys        = "keys"
-	cmdUpdate      = "update"
-	cmdSearchIndex = "searchindex"
-	cmdSearchKey   = "searchkey"
-	cmdPublish     = "publish"
-	cmdSubscribe   = "subscribe"
-	cmdPSubscribe  = "psubscribe"
-	cmdClient      = "client"
+	cmdAuth       = "auth"
+	cmdHello      = "hello"
+	cmdPing       = "ping"
+	cmdQuit       = "quit"
+	cmdSet        = "set"
+	cmdSetEx      = "setex"
+	cmdGet        = "get"
+	cmdSetNX      = "setnx"
+	cmdDel        = "del"
+	cmdKeys       = "keys"
+	cmdPublish    = "publish"
+	cmdSubscribe  = "subscribe"
+	cmdPSubscribe = "psubscribe"
+	cmdClient     = "client"
 )
 
-type commandHandler func(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub)
+var (
+	cmdUpdate      = strings.ToLower(proto.CmdUpdate)
+	cmdSearchIndex = strings.ToLower(proto.CmdSearchIndex)
+	cmdSearchKey   = strings.ToLower(proto.CmdSearchKey)
+)
+
+type commandHandler func(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 
 var commandRegistry = map[string]commandHandler{
 	cmdAuth:       authCommand,
@@ -65,25 +72,23 @@ var commandRegistry = map[string]commandHandler{
 var (
 	// internalAuthKey is generated per-process and used only for internal bootstrap auth.
 	internalAuthKey = internal.AuthKey()
-	// authKey is for external client AUTH and can be configured via environment.
-	authKey = ""
 
-	activeExternalConns int
-	connCountMu         sync.Mutex
-	externalMaxConns    = 1
-	serverMu            sync.Mutex
-	serverListener      net.Listener
-	shutdownOnce        sync.Once
-	shutdownMu          sync.Mutex
-	shutdownSignalCh    chan os.Signal
-	shutdownDoneCh      chan struct{}
+	authStateMu       sync.Mutex
+	authKeyMaxConns   = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	serverMu          sync.Mutex
+	serverListener    net.Listener
+	shutdownOnce      sync.Once
+	shutdownMu        sync.Mutex
+	shutdownSignalCh  chan os.Signal
+	shutdownDoneCh    chan struct{}
 
 	globalMu         sync.RWMutex
 	listenAndServeFn = listenAndServeWithStop
 	signalNotifyFn   = signal.Notify
 	signalStopFn     = signal.Stop
 	osExitFn         = os.Exit
-	currentDB        storage.DB
+	currentDB        *DB
 	srvOnce          sync.Once
 )
 
@@ -99,33 +104,118 @@ func getListenAndServeFn() func(string, func(redcon.Conn, redcon.Command), func(
 	return listenAndServeFn
 }
 
-func resolveExternalAuthKey(getenv func(string) string) string {
-	if v := getenv(internal.RespxAuthKeyEnv); v != "" {
-		return v
-	}
-	return rand.Text()
+func authLimitStoreKey(key string) string {
+	return authKeyPrefix + key
 }
 
-func ensureExternalAuthKey() {
-	if authKey != "" {
+func loadAuthKeyLimits(db *DB) error {
+	limits := map[string]int{}
+
+	keysRes := db.Keys(authKeyPrefix + "*")
+	if keysRes.IsError() {
+		return keysRes.Error()
+	}
+
+	for _, storeKey := range keysRes.MustGet() {
+		key := strings.TrimPrefix(storeKey, authKeyPrefix)
+		valRes := db.Get(storeKey)
+		if valRes.IsError() {
+			if errors.Is(valRes.Error(), buntdb.ErrNotFound) {
+				slog.Info("skip expired auth key limit while loading", "auth_key", key)
+				continue
+			}
+			return valRes.Error()
+		}
+
+		limit, err := strconv.Atoi(valRes.MustGet())
+		if err != nil {
+			slog.Info("skip unavailable auth key limit while loading", "auth_key", key)
+			continue
+		}
+		limits[key] = limit
+	}
+
+	authStateMu.Lock()
+	authKeyMaxConns = limits
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
+	return nil
+}
+
+func refreshAuthLimit(db *DB, key string) (int, bool, error) {
+	if key == internalAuthKey {
+		return unlimitedAuthConns, true, nil
+	}
+
+	res := db.Get(authLimitStoreKey(key))
+	if res.IsError() {
+		if errors.Is(res.Error(), buntdb.ErrNotFound) {
+			authStateMu.Lock()
+			delete(authKeyMaxConns, key)
+			authStateMu.Unlock()
+			return 0, false, nil
+		}
+		return 0, false, res.Error()
+	}
+
+	limit, err := strconv.Atoi(res.MustGet())
+	if err != nil {
+		authStateMu.Lock()
+		delete(authKeyMaxConns, key)
+		authStateMu.Unlock()
+		slog.Info("treat unavailable auth key limit as expired", "auth_key", key)
+		return 0, false, nil
+	}
+
+	authStateMu.Lock()
+	authKeyMaxConns[key] = limit
+	authStateMu.Unlock()
+	return limit, true, nil
+}
+
+func releaseAuthConn(key string) {
+	if key == "" || key == internalAuthKey {
 		return
 	}
-	authKey = resolveExternalAuthKey(os.Getenv)
-	if os.Getenv(internal.RespxAuthKeyEnv) == "" {
-		slog.Warn("auth key env is not set, generated random external auth key", "env", internal.RespxAuthKeyEnv)
+
+	authStateMu.Lock()
+	defer authStateMu.Unlock()
+
+	if current := authKeyConnCounts[key]; current > 1 {
+		authKeyConnCounts[key] = current - 1
+	} else {
+		delete(authKeyConnCounts, key)
 	}
+}
+
+func acquireAuthConn(db *DB, key string) error {
+	if key == internalAuthKey {
+		return nil
+	}
+
+	limit, ok, err := refreshAuthLimit(db, key)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("auth key not found")
+	}
+	if limit != unlimitedAuthConns && limit < 0 {
+		return fmt.Errorf("invalid auth limit for key %s", key)
+	}
+
+	authStateMu.Lock()
+	defer authStateMu.Unlock()
+
+	if limit != unlimitedAuthConns && authKeyConnCounts[key] >= limit {
+		return fmt.Errorf("auth key connection limit exceeded")
+	}
+
+	authKeyConnCounts[key]++
+	return nil
 }
 
 func acceptCon(conn redcon.Conn) bool {
-	connCountMu.Lock()
-	if activeExternalConns >= externalMaxConns {
-		connCountMu.Unlock()
-		slog.Warn("reject connection", "remote", conn.RemoteAddr(), "active", activeExternalConns, "external_max_conns", externalMaxConns)
-		return false
-	}
-	activeExternalConns++
-	connCountMu.Unlock()
-
 	conn.SetContext("")
 	return true
 }
@@ -137,17 +227,16 @@ func closeCon(conn redcon.Conn, err error) {
 		prevAuth, _ = ctx.(string)
 	}
 
-	connCountMu.Lock()
-	if ctx != nil && prevAuth != internalAuthKey && activeExternalConns > 0 {
-		activeExternalConns--
-	}
-	current := activeExternalConns
-	connCountMu.Unlock()
+	releaseAuthConn(prevAuth)
+
+	authStateMu.Lock()
+	current := authKeyConnCounts[prevAuth]
+	authStateMu.Unlock()
 
 	if err != nil {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current, "error", err)
+		slog.Info("connection closed", "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current, "error", err)
 	} else {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "active", current)
+		slog.Info("connection closed", "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current)
 	}
 }
 func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
@@ -203,7 +292,7 @@ func watchShutdownSignals() {
 	})
 }
 
-func handleCommand(conn redcon.Conn, cmd redcon.Command, db storage.DB, ps *redcon.PubSub) {
+func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if db == nil {
 		conn.WriteError("ERR storage not initialized")
 		return
@@ -269,6 +358,11 @@ func stop() error {
 		}
 	}
 
+	authStateMu.Lock()
+	authKeyMaxConns = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
+
 	srvOnce = sync.Once{}
 	return err
 }
@@ -278,11 +372,11 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, maxConn int, dbPath string) storage.DB {
+func Start(address string, dbPath string, indexes ...IndexDef) *DB {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
-		db := storage.Open(dbPath)
+		db := openDB(dbPath)
 		if db == nil {
 			slog.Error("failed to open storage")
 			if exitFn := getOsExitFn(); exitFn != nil {
@@ -295,16 +389,33 @@ func Start(address string, maxConn int, dbPath string) storage.DB {
 		currentDB = db
 		globalMu.Unlock()
 
-		ensureExternalAuthKey()
+		if err := loadAuthKeyLimits(db); err != nil {
+			slog.Error("failed to load auth key limits", "error", err)
+			_ = db.Close()
+			globalMu.Lock()
+			currentDB = nil
+			globalMu.Unlock()
+			if exitFn := getOsExitFn(); exitFn != nil {
+				exitFn(1)
+			}
+			return
+		}
+		if err := db.registerIndexes(indexes...); err != nil {
+			slog.Error("failed to register indexes", "error", err)
+			_ = db.Close()
+			globalMu.Lock()
+			currentDB = nil
+			globalMu.Unlock()
+			if exitFn := getOsExitFn(); exitFn != nil {
+				exitFn(1)
+			}
+			return
+		}
 
 		resolvedAddr := address
 		if resolvedAddr == "" {
 			resolvedAddr = privateAddr
 		}
-		if maxConn < 1 {
-			maxConn = 1
-		}
-		externalMaxConns = maxConn
 
 		slog.Info("generated internal bootstrap token")
 		var ps redcon.PubSub

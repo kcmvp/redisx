@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/redisx/storage"
-
 	"sync"
 
 	"github.com/stretchr/testify/suite"
@@ -19,11 +17,9 @@ import (
 type CmdTestSuite struct {
 	suite.Suite
 	addr string
-	db   storage.DB
+	db   *DB
 
 	origInternalAuthKey  string
-	origAuthKey          string
-	origExternalMaxConns int
 	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
 	origOsExitFn         func(code int)
 }
@@ -31,8 +27,6 @@ type CmdTestSuite struct {
 func (s *CmdTestSuite) SetupSuite() {
 	globalMu.Lock()
 	s.origInternalAuthKey = internalAuthKey
-	s.origAuthKey = authKey
-	s.origExternalMaxConns = externalMaxConns
 	s.origListenAndServeFn = listenAndServeFn
 	s.origOsExitFn = osExitFn
 	globalMu.Unlock()
@@ -41,16 +35,15 @@ func (s *CmdTestSuite) SetupSuite() {
 func (s *CmdTestSuite) SetupTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	storage.Reset()
+	resetStorage()
 
-	connCountMu.Lock()
-	activeExternalConns = 0
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	authKeyMaxConns = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
 
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
-	authKey = "external-test-key"
-	externalMaxConns = 1
 	srvOnce = sync.Once{}
 	listenAndServeFn = redcon.ListenAndServe
 	globalMu.Unlock()
@@ -59,16 +52,15 @@ func (s *CmdTestSuite) SetupTest() {
 func (s *CmdTestSuite) TearDownTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	storage.Reset()
+	resetStorage()
 
-	connCountMu.Lock()
-	activeExternalConns = 0
-	connCountMu.Unlock()
+	authStateMu.Lock()
+	authKeyMaxConns = map[string]int{}
+	authKeyConnCounts = map[string]int{}
+	authStateMu.Unlock()
 
 	globalMu.Lock()
 	internalAuthKey = s.origInternalAuthKey
-	authKey = s.origAuthKey
-	externalMaxConns = s.origExternalMaxConns
 	listenAndServeFn = s.origListenAndServeFn
 	osExitFn = s.origOsExitFn
 	srvOnce = sync.Once{}
@@ -82,7 +74,7 @@ func TestCmdSuite(t *testing.T) {
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, 100, ":memory:")
+	s.db = Start(s.addr, ":memory:", Idx("user:*", "age"))
 
 	tests := []struct {
 		name        string
@@ -110,6 +102,19 @@ func (s *CmdTestSuite) TestCmd() {
 			auth:        false,
 			commands:    [][]string{{cmdAuth, internalAuthKey}},
 			wantStrings: []string{"OK"},
+		},
+		{
+			name:        "auth same key is idempotent",
+			auth:        true,
+			commands:    [][]string{{cmdAuth, internalAuthKey}},
+			wantStrings: []string{"OK"},
+		},
+		{
+			name:       "auth different key after login is rejected",
+			auth:       true,
+			commands:   [][]string{{cmdAuth, "wrong-key"}},
+			wantErrors: []string{"ERR connection already authenticated"},
+			wantClosed: true,
 		},
 		{
 			name:       "auth failure closes connection",
@@ -499,7 +504,7 @@ func (s *CmdTestSuite) TestCmd() {
 func (s *CmdTestSuite) TestPubSub() {
 	t := s.T()
 	addr := getFreePort()
-	_ = Start(addr, 10, ":memory:")
+	_ = Start(addr, ":memory:")
 	defer func() { _ = stop() }()
 
 	// Need a small sleep to ensure server is ready
@@ -554,5 +559,341 @@ func (s *CmdTestSuite) TestPubSub() {
 	msgResp := string(buf[:n])
 	if !strings.Contains(msgResp, "message") || !strings.Contains(msgResp, "payload") {
 		t.Fatalf("expected message on sub, got: %s", msgResp)
+	}
+}
+
+// X Commands
+
+func (s *CmdTestSuite) TestParseFilter() {
+	t := s.T()
+	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "score": 95.5}`
+
+	tests := []struct {
+		name       string
+		jsonFilter string
+		expectErr  bool
+		expected   bool
+	}{
+		{"Empty string", ``, false, true},
+		{"Empty object", `{}`, false, true},
+		{"Invalid JSON", `{invalid`, true, false},
+		{"Implicit Eq string", `{"name": "ken"}`, false, true},
+		{"Implicit Eq false", `{"name": "john"}`, false, false},
+		{"Explicit Eq string", `{"name": {"$eq": "ken"}}`, false, true},
+		{"Explicit Eq number", `{"age": {"$eq": 30}}`, false, true},
+		{"Neq true", `{"name": {"$neq": "john"}}`, false, true},
+		{"Neq false", `{"name": {"$neq": "ken"}}`, false, false},
+		{"Gt true", `{"age": {"$gt": 20}}`, false, true},
+		{"Gt false", `{"age": {"$gt": 40}}`, false, false},
+		{"Gte true", `{"age": {"$gte": 30}}`, false, true},
+		{"Lt true", `{"age": {"$lt": 40}}`, false, true},
+		{"Lt false", `{"age": {"$lt": 20}}`, false, false},
+		{"Lte true", `{"age": {"$lte": 30}}`, false, true},
+		{"Contains true", `{"status": {"$contains": "act"}}`, false, true},
+		{"Contains false", `{"status": {"$contains": "pen"}}`, false, false},
+		{"In true", `{"status": {"$in": ["pending", "active"]}}`, false, true},
+		{"In false", `{"status": {"$in": ["pending", "banned"]}}`, false, false},
+		{"In not array", `{"status": {"$in": "active"}}`, true, false},
+		{"Implicit AND (multiple keys)", `{"age": {"$gt": 20}, "status": "active"}`, false, true},
+		{"Implicit AND false", `{"age": {"$gt": 40}, "status": "active"}`, false, false},
+		{"Explicit AND", `{"$and": [{"age": {"$gt": 20}}, {"status": "active"}]}`, false, true},
+		{"Explicit OR true", `{"$or": [{"age": {"$lt": 20}}, {"status": "active"}]}`, false, true},
+		{"Explicit OR false", `{"$or": [{"age": {"$lt": 20}}, {"status": "pending"}]}`, false, false},
+		{"Complex Nested", `{"$or": [{"age": {"$lt": 20}}, {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}]}`, false, true},
+		{"Root not object", `"just-string"`, true, false},
+		{"Unsupported operator", `{"age": {"$unknown": 18}}`, true, false},
+		{"And not array", `{"$and": {"age": 18}}`, true, false},
+		{"Or not array", `{"$or": {"age": 18}}`, true, false},
+		{"And element error", `{"$and": [{"age": {"$unknown": 18}}]}`, true, false},
+		{"Or element error", `{"$or": [{"age": {"$unknown": 18}}]}`, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter, err := parseFilter(tt.jsonFilter)
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if filter == nil {
+				if !tt.expected {
+					t.Errorf("got nil filter (passes everything) but expected false")
+				}
+				return
+			}
+
+			result := filter.Eval(jsonRecord)
+			if result != tt.expected {
+				t.Errorf("expected eval result %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func (s *CmdTestSuite) TestXCmd() {
+	t := s.T()
+	s.addr = getFreePort()
+	s.db = Start(s.addr, ":memory:", Idx("user:*", "age"))
+
+	tests := []struct {
+		name        string
+		auth        bool
+		commands    [][]string
+		wantStrings []string
+		wantBulks   []string
+		wantInts    []int
+		wantNulls   int
+		wantErrors  []string
+		wantArrays  [][]string
+		wantClosed  bool
+		dbInit      bool
+		setupDB     func(uid string)
+	}{
+		{
+			name:       "searchindex_wrong_number_of_args_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "age"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
+		},
+		{
+			name:       "searchindex_invalid_order_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "age", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "searchindex_invalid_json_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "age", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "searchkey_wrong_number_of_args_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "*"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
+		},
+		{
+			name:       "searchkey_invalid_order_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "*", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "searchkey_invalid_json_01",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "*", "{invalid"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "searchindex_wrong_number_of_args",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "attr"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
+		},
+		{
+			name:       "searchindex_invalid_order_02",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "attr", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "searchindex_invalid_json_02",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "attr", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "searchkey_wrong_number_of_args_02",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "pattern"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
+		},
+		{
+			name:       "searchkey_invalid_order_02",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "pattern", "{}", "INVALID"}},
+			wantErrors: []string{"ERR invalid order: INVALID"},
+		},
+		{
+			name:       "searchkey_invalid_json_02",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "pattern", "{invalid}", "ASC"}},
+			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "searchindex success",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "idx_age", "{}", "ASC"}},
+			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set(fmt.Sprintf("user:%s:1", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:%s:2", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+			},
+		},
+		{
+			name:       "searchindex unknown index",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "unknown", "{}", "ASC"}},
+			wantErrors: []string{"ERR index not found: unknown"},
+		},
+		{
+			name:       "update success",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, "user:*", `{"id": "1_{id}"}`, `{"name": "updated"}`}},
+			wantArrays: [][]string{{`user:1_{id}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20, "name":"old"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s", "age":30, "name":"old"}`, uid))
+			},
+		},
+		{
+			name:       "update no valid updates",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{}`}},
+			wantErrors: []string{"ERR no valid updates provided"},
+		},
+		{
+			name:       "update invalid json",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{invalid`}},
+			wantErrors: []string{"ERR invalid update json format"},
+		},
+		{
+			name:       "searchkey success",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "user:*_{id}", "{}", "DESC"}},
+			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s"}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s"}`, uid))
+			},
+		},
+		{
+			name:       "searchkey not found",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "unknown_{id}:*", "{}"}},
+			wantArrays: [][]string{{}},
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			uid := fmt.Sprintf("%d", i)
+			if tc.setupDB != nil {
+				tc.setupDB(uid)
+			}
+
+			conn, err := net.Dial("tcp", s.addr)
+			if err != nil {
+				t.Fatalf("failed to connect to server: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			if tc.auth {
+				b := []byte(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(cmdAuth), cmdAuth, len(internalAuthKey), internalAuthKey))
+				_, _ = conn.Write(b)
+				buf := make([]byte, 1024)
+				_, _ = conn.Read(buf)
+			}
+
+			var finalResp string
+			var closed bool
+
+			for _, args := range replaceID(tc.commands, uid) {
+				var b []byte
+				if len(args) == 0 {
+					b = []byte("*0\r\n")
+				} else {
+					b = append(b, []byte(fmt.Sprintf("*%d\r\n", len(args)))...)
+					for _, arg := range args {
+						b = append(b, []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))...)
+					}
+				}
+				_, err := conn.Write(b)
+				if err != nil {
+					closed = true
+					break
+				}
+
+				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				buf := make([]byte, 4096)
+				n, err := conn.Read(buf)
+				if err != nil {
+					if n > 0 {
+						finalResp += string(buf[:n])
+					}
+					closed = true
+					break
+				}
+				finalResp += string(buf[:n])
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			_, err = conn.Read(make([]byte, 1))
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "reset by peer") {
+					closed = true
+				}
+			}
+
+			for _, e := range replaceID1D(tc.wantErrors, uid) {
+				if !strings.Contains(finalResp, e) {
+					t.Errorf("expected error %q, got resp: %q", e, finalResp)
+				}
+			}
+
+			for _, s := range replaceID1D(tc.wantStrings, uid) {
+				if !strings.Contains(finalResp, "+"+s+"\r\n") {
+					t.Errorf("expected string %q, got resp: %q", s, finalResp)
+				}
+			}
+
+			for _, b := range replaceID1D(tc.wantBulks, uid) {
+				if !strings.Contains(finalResp, fmt.Sprintf("$%d\r\n%s\r\n", len(b), b)) {
+					t.Errorf("expected bulk %q, got resp: %q", b, finalResp)
+				}
+			}
+
+			for _, val := range tc.wantInts {
+				if !strings.Contains(finalResp, fmt.Sprintf(":%d\r\n", val)) {
+					t.Errorf("expected int %d, got resp: %q", val, finalResp)
+				}
+			}
+
+			if tc.wantNulls > 0 {
+				if strings.Count(finalResp, "$-1\r\n") != tc.wantNulls {
+					t.Errorf("expected %d nulls, got resp: %q", tc.wantNulls, finalResp)
+				}
+			}
+
+			if replaceID(tc.wantArrays, uid) != nil {
+				for _, wantArr := range replaceID(tc.wantArrays, uid) {
+					var expected string
+					if len(wantArr) == 0 {
+						expected = "*0\r\n"
+					} else {
+						expected = fmt.Sprintf("*%d\r\n", len(wantArr))
+						for _, item := range wantArr {
+							expected += fmt.Sprintf("$%d\r\n%s\r\n", len(item), item)
+						}
+					}
+					if !strings.Contains(finalResp, expected) {
+						t.Errorf("expected array %q, got resp: %q", expected, finalResp)
+					}
+				}
+			}
+
+			if closed != tc.wantClosed {
+				t.Errorf("closed = %v, want %v", closed, tc.wantClosed)
+			}
+		})
 	}
 }

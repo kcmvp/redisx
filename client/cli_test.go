@@ -8,16 +8,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/gjson"
 )
 
 const clientTestServerAddr = "127.0.0.1:36380"
 const clientTestExternalAuthKey = "client-test-external-key"
-const clientTestMaxConns = 50
+const clientTestAuthLimit = 50
 
 func (s *ClientTestSuite) SetupTest() {
 	Disconnect()
@@ -50,8 +50,14 @@ type ClientTestSuite struct {
 
 func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
-	s.T().Setenv(internal.RespxAuthKeyEnv, clientTestExternalAuthKey)
-	server.Start(clientTestServerAddr, clientTestMaxConns, ":memory:")
+	db := server.Start(
+		clientTestServerAddr,
+		":memory:",
+		server.Idx("user:*", "age"),
+		server.Idx("user:*", "email"),
+	)
+	s.Require().NotNil(db)
+	s.Require().NoError(db.Set("_auth_:"+clientTestExternalAuthKey, "50"))
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -429,7 +435,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 				}()
 
 				var overflowErr error
-				for i := 0; i < clientTestMaxConns+5; i++ {
+				for i := 0; i < clientTestAuthLimit+5; i++ {
 					var c *redis.Client
 					var err error
 					for attempt := 0; attempt < 10; attempt++ {
@@ -446,16 +452,31 @@ func (s *ClientTestSuite) TestConnectCommand() {
 					clients = append(clients, c)
 				}
 				s.Error(overflowErr)
-				// The error message for an intentionally rejected connection can be "EOF" or "connection reset by peer"
-				// depending on the OS and timing of when the socket is closed by the server.
+				// The error message for an intentionally rejected connection can be a transport-level close
+				// or an explicit AUTH error depending on when the server rejects the connection.
 				if overflowErr != nil && tc.wantErrMsg != "" {
 					errMsg := overflowErr.Error()
-					s.True(strings.Contains(errMsg, "EOF") || strings.Contains(errMsg, "connection reset by peer") || strings.Contains(errMsg, tc.wantErrMsg),
-						"Expected error to contain EOF, connection reset by peer, or %q, but got: %s", tc.wantErrMsg, errMsg)
+					s.True(
+						strings.Contains(errMsg, "EOF") ||
+							strings.Contains(errMsg, "connection reset by peer") ||
+							strings.Contains(errMsg, "auth key connection limit exceeded") ||
+							strings.Contains(errMsg, tc.wantErrMsg),
+						"Expected error to contain EOF, connection reset by peer, auth key connection limit exceeded, or %q, but got: %s",
+						tc.wantErrMsg,
+						errMsg,
+					)
 				}
 			}
 		})
 	}
+}
+
+func (s *ClientTestSuite) TestConnectEmbed() {
+	s.SetupTest()
+
+	err := ConnectEmbed(clientTestServerAddr)
+	s.NoError(err)
+	s.ensureConnected()
 }
 
 func (s *ClientTestSuite) TestPublishCommand() {
@@ -565,16 +586,16 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 		expectLen int
 	}{
 		{"Missing index", "", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Unknown attribute", "unknown", x.Eq("email", "ken@example.com"), false, false, 0},
-		{"Eq string", "email", x.Eq("email", "ken@example.com"), false, false, 1},
-		{"Eq false", "email", x.Eq("email", "nobody@example.com"), false, false, 0},
-		{"Gt number", "age", x.Gt("age", 25), false, false, 2},
-		{"Lt number", "age", x.Lt("age", 35), false, false, 2},
-		{"And true", "age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
-		{"And false", "age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-		{"Or", "age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
-		{"Empty filter", "email", nil, false, false, 3},
-		{"Descend test", "age", x.Gt("age", 10), true, false, 3},
+		{"Unknown index", "unknown", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Eq string", "idx_email", x.Eq("email", "ken@example.com"), false, false, 1},
+		{"Eq false", "idx_email", x.Eq("email", "nobody@example.com"), false, false, 0},
+		{"Gt number", "idx_age", x.Gt("age", 25), false, false, 2},
+		{"Lt number", "idx_age", x.Lt("age", 35), false, false, 2},
+		{"And true", "idx_age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
+		{"And false", "idx_age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
+		{"Or", "idx_age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
+		{"Empty filter", "idx_email", nil, false, false, 3},
+		{"Descend test", "idx_age", x.Gt("age", 10), true, false, 3},
 	}
 
 	for _, tt := range tests {
@@ -641,6 +662,91 @@ func (s *ClientTestSuite) TestSearchKeyCommand() {
 				s.False(res.IsError())
 				results := res.MustGet()
 				s.Len(results, tt.expectLen)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestUpdateCommand() {
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	data := []struct {
+		key string
+		val string
+	}{
+		{"user:1", `{"id":"1","status":"pending","age":17}`},
+		{"user:2", `{"id":"2","status":"pending","age":22}`},
+		{"user:3", `{"id":"3","status":"active","age":30}`},
+	}
+
+	for _, d := range data {
+		err := Set(d.key, d.val)
+		s.NoError(err)
+	}
+
+	tests := []struct {
+		name      string
+		pattern   string
+		filter    x.Filter
+		updates   []x.Mutation
+		expectErr bool
+		expectLen int
+		check     func()
+	}{
+		{
+			name:      "missing pattern",
+			pattern:   "",
+			filter:    x.Eq("status", "pending"),
+			updates:   []x.Mutation{x.Set("status", "active")},
+			expectErr: true,
+		},
+		{
+			name:      "missing update values",
+			pattern:   "user:*",
+			filter:    x.Eq("status", "pending"),
+			expectErr: true,
+		},
+		{
+			name:      "update filtered documents",
+			pattern:   "user:*",
+			filter:    x.Eq("status", "pending"),
+			updates:   []x.Mutation{x.Set("status", "active"), x.Set("verified", true), x.Set("profile.age", 18)},
+			expectLen: 2,
+			check: func() {
+				val, err := Get("user:1")
+				s.NoError(err)
+				s.Equal("active", gjson.Get(val, "status").String())
+				s.True(gjson.Get(val, "verified").Bool())
+				s.Equal(float64(18), gjson.Get(val, "profile.age").Float())
+			},
+		},
+		{
+			name:      "update with nil filter",
+			pattern:   "user:*",
+			filter:    nil,
+			updates:   []x.Mutation{x.Set("version", 2)},
+			expectLen: 3,
+			check: func() {
+				val, err := Get("user:3")
+				s.NoError(err)
+				s.Equal(float64(2), gjson.Get(val, "version").Float())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			res := Update(tt.pattern, tt.filter, tt.updates...)
+			if tt.expectErr {
+				s.True(res.IsError())
+				return
+			}
+			s.False(res.IsError())
+			s.Len(res.MustGet(), tt.expectLen)
+			if tt.check != nil {
+				tt.check()
 			}
 		})
 	}

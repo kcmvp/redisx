@@ -3,14 +3,20 @@ package internal
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"sync"
 )
 
-const (
-	RespxAuthKeyEnv = "RESPX_AUTH_KEY"
+var (
+	authKeyOnce sync.Once
+	authKey     string
 )
 
 func AuthKey() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	authKeyOnce.Do(func() {
+		b := make([]byte, 16)
+		_, _ = rand.Read(b)
+		authKey = hex.EncodeToString(b)
+	})
+
+	return authKey
 }

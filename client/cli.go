@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kcmvp/redisx/internal"
+	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
@@ -237,6 +240,11 @@ func Connect(respAddr, authKey string) error {
 	return nil
 }
 
+// ConnectEmbed starts the bridge lifecycle with the shared in-process auth key.
+func ConnectEmbed(respAddr string) error {
+	return Connect(respAddr, internal.AuthKey())
+}
+
 // Disconnect stops the bridge lifecycle and closes the shared client.
 func Disconnect() {
 	_, cancel := getLifecycleCtx()
@@ -358,10 +366,27 @@ func Keys(pattern string) mo.Result[[]string] {
 	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
 }
 
-// SearchIndex executes a query on a specific JSON attribute with the provided filter.
-func SearchIndex(indexAttr string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if indexAttr == "" {
-		return mo.Err[[]string](errors.New("index attribute is required"))
+// SearchIndex executes the RESP X command below on the shared connection:
+//
+//	SEARCHINDEX <index_name> <json_filter> [ASC|DESC]
+//
+// The filter is built from the provided x.Filter and serialized to the MongoDB-
+// style JSON syntax understood by the server.
+//
+// Example:
+//
+//	res := client.SearchIndex(
+//		"age",
+//		x.And(
+//			x.Gte("age", 18),
+//			x.Eq("status", "active"),
+//		),
+//		false,
+//	)
+//	users := res.MustGet()
+func SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if indexName == "" {
+		return mo.Err[[]string](errors.New("index name is required"))
 	}
 
 	client := getSharedClient()
@@ -388,7 +413,7 @@ func SearchIndex(indexAttr string, filter x.Filter, desc bool) mo.Result[[]strin
 		order = "DESC"
 	}
 
-	cmd := client.Do(ctx, "SEARCHINDEX", indexAttr, filterJSON, order)
+	cmd := client.Do(ctx, proto.CmdSearchIndex, indexName, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -397,7 +422,21 @@ func SearchIndex(indexAttr string, filter x.Filter, desc bool) mo.Result[[]strin
 	return mo.Ok(res)
 }
 
-// SearchKey executes a query on matching keys with the provided filter.
+// SearchKey executes the RESP X command below on the shared connection:
+//
+//	SEARCHKEY <pattern> <json_filter> [ASC|DESC]
+//
+// The pattern follows BuntDB glob matching, and the filter is serialized from
+// x.Filter into the server's MongoDB-style JSON query format.
+//
+// Example:
+//
+//	res := client.SearchKey(
+//		"user:*",
+//		x.Eq("region", "us"),
+//		true,
+//	)
+//	users := res.MustGet()
 func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if pattern == "" {
 		return mo.Err[[]string](errors.New("pattern is required"))
@@ -427,7 +466,62 @@ func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 		order = "DESC"
 	}
 
-	cmd := client.Do(ctx, "SEARCHKEY", pattern, filterJSON, order)
+	cmd := client.Do(ctx, proto.CmdSearchKey, pattern, filterJSON, order)
+	res, err := cmd.StringSlice()
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+
+	return mo.Ok(res)
+}
+
+// Update executes the RESP X command below on the shared connection:
+//
+//	UPDATE <pattern> <json_filter> <update_json>
+//
+// The filter is serialized from x.Filter and the update payload is built from
+// x.Mutation values, so callers do not need to handwrite update JSON.
+//
+// Example:
+//
+//	res := client.Update(
+//		"user:*",
+//		x.Eq("status", "pending"),
+//		x.Set("status", "active"),
+//		x.Set("verified", true),
+//	)
+//	updatedKeys := res.MustGet()
+func Update(pattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if pattern == "" {
+		return mo.Err[[]string](errors.New("pattern is required"))
+	}
+	if len(values) == 0 {
+		return mo.Err[[]string](errors.New("no update values provided"))
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return mo.Err[[]string](errors.New("resp client is not connected"))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	filterJSON := "{}"
+	if filter != nil {
+		b, err := filter.MarshalJSON()
+		if err != nil {
+			return mo.Err[[]string](fmt.Errorf("failed to serialize filter: %w", err))
+		}
+		filterJSON = string(b)
+	}
+
+	updateJSON, err := xcmd.MarshalUpdate(values...)
+	if err != nil {
+		return mo.Err[[]string](fmt.Errorf("failed to serialize updates: %w", err))
+	}
+
+	cmd := client.Do(ctx, proto.CmdUpdate, pattern, filterJSON, string(updateJSON))
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)

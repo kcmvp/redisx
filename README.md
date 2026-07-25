@@ -1,5 +1,5 @@
 <p align="center">
-  Redis compatible server implemented with <a href="https://github.com/tidwall/buntdb">buntdb</a>
+  Redis compatible embedded document store
   <br/>
   <br/>
   <a href="https://github.com/kcmvp/redisx/blob/main/LICENSE">
@@ -22,7 +22,7 @@
 
 ## Features
 
-**redisx** is an embedded, high-performance Document DB with a Redis-compatible API. It seamlessly blends standard Redis Key-Value operations with advanced MongoDB-style JSON querying capabilities.
+**redisx** is an embedded, high-performance document store with a Redis-compatible API. It blends standard Redis key-value operations with JSON-aware query and patch commands for JSON documents.
 
 ### 1. Native Redis Commands
 
@@ -34,125 +34,195 @@
 
 ### 2. Extend (X) Commands
 
-The true power of `redisx` lies in its extended document querying capabilities. By treating stored strings as JSON documents and defining schemas with indexes, you can perform complex queries using a declarative DSL.
+The true power of `redisx` lies in its extended document commands. Stored strings can be treated as JSON documents and operated on directly. The current design is schema-less: queries and updates work on key patterns and JSON attributes without predefined schemas.
 
-#### `SEARCHINDEX`
+You can use these commands in two ways:
 
-Performs a MongoDB-style query on a specific JSON index.
+- With a native Redis client, call `SEARCHINDEX`, `SEARCHKEY`, and `UPDATE` directly and pass JSON strings yourself.
+- With the `redisx` Go API, build queries and updates with `x.Filter` and `x.Set(...)`, which gives a more expressive and less error-prone way to describe intent.
 
-**Syntax:**
-
-```text
-SEARCHINDEX <schema_name> <index_attribute> <json_filter> [ASC|DESC]
-```
-
-- **`schema_name`**: The logical namespace of the data (e.g., `user`).
-- **`index_attribute`**: The JSON path used as the driving index for the query (e.g., `email`, `age`).
-- **`json_filter`**: A MongoDB-style JSON string defining the composite filtering conditions.
-- **`[ASC|DESC]`**: Optional order direction. Default is `ASC`.
-
-#### `SEARCHKEY`
-
-Performs a MongoDB-style query over keys matching a glob pattern within a schema.
-
-**Syntax:**
-
-```text
-SEARCHKEY <schema_name> <pattern> <json_filter> [ASC|DESC]
-```
-
-- **`schema_name`**: The logical namespace of the data (e.g., `user`).
-- **`pattern`**: A BuntDB glob pattern to match the keys (e.g., `*`, `123*`).
-- **`json_filter`**: A MongoDB-style JSON string defining the composite filtering conditions.
-- **`[ASC|DESC]`**: Optional order direction. Default is `ASC`.
-
-#### Examples & Client Usage
-
-`redisx` provides a powerful, fluent Go client that automatically translates your Go code into the underlying JSON query expressions.
-
-##### 1. Simple Equality Match
-
-Find a user whose email is exactly `ken@example.com`.
-
-**Raw Redis Command:**
-
-```text
-SEARCHINDEX user email {"email": {"$eq": "ken@example.com"}}
-// or simply
-SEARCHINDEX user email {"email": "ken@example.com"}
-```
-
-**Go Client (`client.SearchIndex`):**
+Go examples below assume:
 
 ```go
 import (
     "github.com/kcmvp/redisx/client"
     "github.com/kcmvp/redisx/x"
 )
-
-res := client.SearchIndex("user", "email", x.Eq("email", "ken@example.com"), false)
-users := res.MustGet()
 ```
 
-##### 2. Range Query (Greater Than)
+#### `SEARCHINDEX`
 
-Find users whose age is greater than 18.
+Performs a MongoDB-style query on a registered index.
 
-**Raw Redis Command:**
+**Syntax:**
 
 ```text
-SEARCHINDEX user age {"age": {"$gt": 18}}
+SEARCHINDEX <index_name> <json_filter> [ASC|DESC]
 ```
 
-**Go Client:**
+- **`index_name`**: The name of an index that must already exist.
+- **`json_filter`**: A MongoDB-style JSON string defining the composite filtering conditions.
+- **`[ASC|DESC]`**: Optional order direction. Default is `ASC`.
 
-```go
-res := client.SearchIndex("user", "age", x.Gt("age", 18), false)
-```
+`SEARCHINDEX` only works with indexes created during server startup. A common
+pattern is to declare them with `server.Idx(...)` or `server.Index(...)` when
+calling `server.Start(...)`.
 
-##### 3. Composite Query (Logical AND)
-
-Find users whose age is greater than 18 AND status is "active".
-
-**Raw Redis Command:**
+**Raw command examples:**
 
 ```text
-SEARCHINDEX user age {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}
+SEARCHINDEX idx_email {"email": "ken@example.com"}
+SEARCHINDEX idx_age {"age": {"$gt": 18}}
+SEARCHINDEX idx_age {"$and": [{"age": {"$gte": 18}}, {"status": "active"}]}
 ```
 
-**Go Client:**
+**Go examples:**
 
 ```go
-res := client.SearchIndex("user", "age", x.And(
-    x.Gt("age", 18),
-    x.Eq("status", "active"),
-), false)
-```
+res := client.SearchIndex("idx_email", x.Eq("email", "ken@example.com"), false)
 
-##### 4. Complex Nested Query (AND + OR)
+res = client.SearchIndex("idx_age", x.Gt("age", 18), false)
 
-Find users who are either (age < 20) OR (age > 18 AND status is "active").
-
-**Raw Redis Command:**
-
-```text
-SEARCHINDEX user age {"$or": [
-    {"age": {"$lt": 20}},
-    {"$and": [{"age": {"$gt": 18}}, {"status": "active"}]}
-]}
-```
-
-**Go Client:**
-
-```go
-res := client.SearchIndex("user", "age", x.Or(
-    x.Lt("age", 20),
+res = client.SearchIndex(
+    "idx_age",
     x.And(
-        x.Gt("age", 18),
+        x.Gte("age", 18),
         x.Eq("status", "active"),
     ),
-), false)
+    false,
+)
 ```
+
+#### `SEARCHKEY`
+
+Performs a MongoDB-style query over keys matching a glob pattern.
+
+**Syntax:**
+
+```text
+SEARCHKEY <pattern> <json_filter> [ASC|DESC]
+```
+
+- **`pattern`**: A glob pattern to match the keys (e.g., `*`, `123*`).
+- **`json_filter`**: A MongoDB-style JSON string defining the composite filtering conditions.
+- **`[ASC|DESC]`**: Optional order direction. Default is `ASC`.
+
+**Raw command examples:**
+
+```text
+SEARCHKEY user:* {"region": "us"}
+SEARCHKEY order:* {"total": {"$gte": 100}} DESC
+```
+
+**Go examples:**
+
+```go
+res := client.SearchKey("user:*", x.Eq("region", "us"), false)
+res = client.SearchKey("order:*", x.Gte("total", 100), true)
+```
+
+#### `UPDATE`
+
+Updates JSON documents matched by key pattern and filter.
+
+**Syntax:**
+
+```text
+UPDATE <pattern> <json_filter> <update_json>
+```
+
+- **`pattern`**: A glob pattern to match the keys to update.
+- **`json_filter`**: A MongoDB-style JSON string defining which JSON documents should be updated.
+- **`update_json`**: A JSON object whose key/value pairs are applied as JSON path updates. Nested objects are supported.
+
+**Raw command examples:**
+
+```text
+UPDATE user:* {"status": "pending"} {"status": "active"}
+UPDATE user:* {"id": "1"} {"profile": {"age": 18}, "verified": true}
+```
+
+**Go examples:**
+
+```go
+res := client.Update(
+    "user:*",
+    x.Eq("status", "pending"),
+    x.Set("status", "active"),
+)
+
+res = client.Update(
+    "user:*",
+    x.Eq("id", "1"),
+    x.Set("profile.age", 18),
+    x.Set("verified", true),
+)
+```
+
+## Usage Modes
+
+`redisx` supports two access modes:
+
+- **Remote access:** connect to the RESP server with the `client` package or any Redis-compatible client.
+- **In-process access:** start the server and use the returned `*server.DB` directly inside the same application.
+
+## Server Startup And Auth
+
+Start the embedded RESP server with:
+
+```go
+db := server.Start(
+    "127.0.0.1:6380",
+    ":memory:",
+    server.Idx("user:*", "age"),
+    server.Idx("user:*", "email"),
+)
+```
+
+- Use `":memory:"` for an in-memory instance. If the server restarts, all data is lost.
+- Use an explicit file path such as `"/tmp/redisx.db"` to persist data on disk. If the server restarts, data is kept.
+- `Start` returns the local `*server.DB` handle, so the same process can also operate on the database directly.
+- Remote clients must authenticate before using any command other than the initial handshake commands.
+- `SEARCHINDEX` requires its target index to be created here during startup.
+
+### Embedded DB Access
+
+For in-process usage, `server.DB` can be used directly:
+
+```go
+import (
+    "github.com/kcmvp/redisx/server"
+    "github.com/kcmvp/redisx/x"
+)
+
+db := server.Start(
+    "127.0.0.1:6380",
+    ":memory:",
+    server.Idx("user:*", "age"),
+)
+
+_ = db.Set("user:1", `{"name":"ken","age":18}`)
+users := db.SearchIndex("idx_age", x.Gte("age", 18), false).MustGet()
+_ = users
+```
+
+All external connections must authenticate with an auth key that already exists in storage. Authentication configuration is stored with the reserved prefix `_auth_:`.
+
+```text
+_auth_:<auth_key> -> <max_connections>
+```
+
+Examples:
+
+```text
+SET _auth_:demo-key 2
+SET _auth_:batch-worker 20
+```
+
+- The value is the maximum number of concurrent connections allowed for that auth key.
+- Limits are refreshed from storage during `AUTH`, so changes take effect for new authentications without restarting the server.
+- If a stored auth limit is expired or unavailable, that auth key is treated as unavailable.
+- `internalAuthKey` is generated per process, is not stored in the database, and is always unlimited.
 
 ## Installation
 

@@ -1,4 +1,4 @@
-package storage
+package server
 
 import (
 	"encoding/json"
@@ -14,12 +14,12 @@ import (
 
 type DBSuite struct {
 	suite.Suite
-	db DB
+	db *DB
 }
 
 func (suite *DBSuite) SetupTest() {
-	Reset()
-	suite.db = Open(":memory:")
+	resetStorage()
+	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
 }
 
@@ -27,13 +27,13 @@ func (suite *DBSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	Reset()
+	resetStorage()
 }
 
 func (suite *DBSuite) TestLifecycle() {
 	suite.Run("In-Memory DB", func() {
-		Reset()
-		db := Open(":memory:")
+		resetStorage()
+		db := openDB(":memory:")
 		suite.NotNil(db)
 		err := db.Set("key1", "val1")
 		suite.NoError(err)
@@ -46,14 +46,14 @@ func (suite *DBSuite) TestLifecycle() {
 	})
 
 	suite.Run("File DB", func() {
-		Reset()
+		resetStorage()
 		path := filepath.Join(suite.T().TempDir(), "hot", "kv.db")
-		db := Open(path)
+		db := openDB(path)
 		suite.NotNil(db)
 		suite.NoError(db.Set("persist:key", "persist-val"))
 		suite.NoError(db.Close())
 
-		db = Open(path)
+		db = openDB(path)
 		suite.NotNil(db)
 		res := db.Get("persist:key")
 		suite.True(res.IsOk())
@@ -150,12 +150,12 @@ func TestDBSuite(t *testing.T) {
 
 type UpdateSuite struct {
 	suite.Suite
-	db DB
+	db *DB
 }
 
 func (suite *UpdateSuite) SetupTest() {
-	Reset()
-	suite.db = Open(":memory:")
+	resetStorage()
+	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
 
 	data := map[string]string{
@@ -172,51 +172,51 @@ func (suite *UpdateSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	Reset()
+	resetStorage()
 }
 
 func (suite *UpdateSuite) TestUpdateCases() {
 	tests := []struct {
 		name     string
 		filter   x.Filter
-		updates  []JsonPair
+		updates  []x.Mutation
 		wantKeys []string
 	}{
 		{
 			name:     "Update existing property",
 			filter:   x.Eq("id", "1"),
-			updates:  []JsonPair{Pair("age", 21)},
+			updates:  []x.Mutation{x.Set("age", 21)},
 			wantKeys: []string{"user:1"},
 		},
 		{
 			name:     "Add new property",
 			filter:   x.Eq("id", "2"),
-			updates:  []JsonPair{Pair("active", true)},
+			updates:  []x.Mutation{x.Set("active", true)},
 			wantKeys: []string{"user:2"},
 		},
 		{
 			name:     "Update multiple documents",
 			filter:   x.Gt("age", float64(24)),
-			updates:  []JsonPair{Pair("status", "verified")},
+			updates:  []x.Mutation{x.Set("status", "verified")},
 			wantKeys: []string{"user:2", "user:3"},
 		},
 		{
 			name:     "Update without filter applies to all",
 			filter:   nil,
-			updates:  []JsonPair{Pair("version", 2)},
+			updates:  []x.Mutation{x.Set("version", 2)},
 			wantKeys: []string{"user:1", "user:2", "user:3"},
 		},
 		{
 			name:   "Update all data types",
 			filter: x.Eq("id", "1"),
-			updates: []JsonPair{
-				Pair("int_val", int(-10)),
-				Pair("int32_val", int32(32)),
-				Pair("int64_val", int64(64)),
-				Pair("float32_val", float32(3.5)),
-				Pair("float64_val", float64(6.28)),
-				Pair("string_val", "hello"),
-				Pair("bool_val", true),
+			updates: []x.Mutation{
+				x.Set("int_val", int(-10)),
+				x.Set("int32_val", int32(32)),
+				x.Set("int64_val", int64(64)),
+				x.Set("float32_val", float32(3.5)),
+				x.Set("float64_val", float64(6.28)),
+				x.Set("string_val", "hello"),
+				x.Set("bool_val", true),
 			},
 			wantKeys: []string{"user:1"},
 		},
@@ -246,13 +246,14 @@ func TestUpdateSuite(t *testing.T) {
 
 type SearchSuite struct {
 	suite.Suite
-	db DB
+	db *DB
 }
 
 func (suite *SearchSuite) SetupTest() {
-	Reset()
-	suite.db = Open(":memory:")
+	resetStorage()
+	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
+	suite.NoError(suite.db.registerIndexes(Idx("*", "age")))
 
 	dataBytes, err := os.ReadFile("testdata/SearchSuite_InitData.json")
 	suite.NoError(err)
@@ -265,7 +266,7 @@ func (suite *SearchSuite) SetupTest() {
 		raw := string(emp)
 		department := gjson.Get(raw, "department").String()
 		id := gjson.Get(raw, "id").String()
-		key := department + KeySeparator + id
+		key := department + keySeparator + id
 		suite.NoError(suite.db.Set(key, raw))
 	}
 }
@@ -274,13 +275,13 @@ func (suite *SearchSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	Reset()
+	resetStorage()
 }
 
 func (suite *SearchSuite) TestSearchIndex() {
 	tests := []struct {
 		name      string
-		indexAttr string
+		indexName string
 		filter    x.Filter
 		desc      bool
 		wantErr   bool
@@ -288,7 +289,7 @@ func (suite *SearchSuite) TestSearchIndex() {
 	}{
 		{
 			name:      "Query ascending all",
-			indexAttr: "age",
+			indexName: "idx_age",
 			filter:    nil,
 			desc:      false,
 			wantErr:   false,
@@ -296,7 +297,7 @@ func (suite *SearchSuite) TestSearchIndex() {
 		},
 		{
 			name:      "Query descending all",
-			indexAttr: "age",
+			indexName: "idx_age",
 			filter:    nil,
 			desc:      true,
 			wantErr:   false,
@@ -304,22 +305,22 @@ func (suite *SearchSuite) TestSearchIndex() {
 		},
 		{
 			name:      "Query with filter",
-			indexAttr: "age",
+			indexName: "idx_age",
 			filter:    x.Gt("age", float64(28)),
 			desc:      false,
 			wantErr:   false,
 			wantLen:   2,
 		},
 		{
-			name:      "Query empty index attribute",
-			indexAttr: "",
+			name:      "Query empty index name",
+			indexName: "",
 			wantErr:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchIndex(tt.indexAttr, tt.filter, tt.desc)
+			res := suite.db.SearchIndex(tt.indexName, tt.filter, tt.desc)
 			if tt.wantErr {
 				suite.True(res.IsError())
 			} else {
