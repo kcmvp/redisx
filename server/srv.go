@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -217,6 +218,49 @@ func acquireAuthConn(db *DB, key string) error {
 func acceptCon(conn redcon.Conn) bool {
 	conn.SetContext("")
 	return true
+}
+
+// PrivateIPs returns all non-loopback private IPs on the current host.
+func PrivateIPs() ([]string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	return collectPrivateIPs(addrs), nil
+}
+
+func collectPrivateIPs(addrs []net.Addr) []string {
+	seen := map[string]struct{}{}
+	ips := make([]string, 0, len(addrs))
+
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		default:
+			continue
+		}
+
+		if ip == nil || ip.IsLoopback() || !ip.IsPrivate() {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+
+		s := ip.String()
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		ips = append(ips, s)
+	}
+
+	sort.Strings(ips)
+	return ips
 }
 
 func closeCon(conn redcon.Conn, err error) {

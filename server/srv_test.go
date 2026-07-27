@@ -85,6 +85,31 @@ func TestServerSuite(t *testing.T) {
 	suite.Run(t, new(ServerTestSuite))
 }
 
+func TestCollectPrivateIPs(t *testing.T) {
+	addrs := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("192.168.1.23"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("10.0.0.8"), Mask: net.CIDRMask(24, 32)},
+		&net.IPAddr{IP: net.ParseIP("10.0.0.8")},
+		&net.IPNet{IP: net.ParseIP("172.16.0.9"), Mask: net.CIDRMask(16, 32)},
+		&net.IPNet{IP: net.ParseIP("8.8.8.8"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("fd00::1"), Mask: net.CIDRMask(64, 128)},
+		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
+	}
+
+	got := collectPrivateIPs(addrs)
+	want := []string{"10.0.0.8", "172.16.0.9", "192.168.1.23", "fd00::1"}
+
+	if len(got) != len(want) {
+		t.Fatalf("collectPrivateIPs() len = %d, want %d; got=%v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("collectPrivateIPs()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
+		}
+	}
+}
+
 func replaceID(arr [][]string, id string) [][]string {
 	if arr == nil {
 		return nil
