@@ -72,6 +72,14 @@ func clearSharedClientIf(target *redis.Client) {
 	kvClientMu.Unlock()
 }
 
+// MemKey returns a key routed to the memory-only storage layer.
+//
+// The returned key uses the reserved "_m_" prefix. If key already uses that
+// prefix, it is returned unchanged.
+func MemKey(key string) string {
+	return internal.MemKey(key)
+}
+
 // Subscribe registers a message handler for a topic and returns a read-only channel.
 func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
@@ -376,7 +384,7 @@ func Keys(pattern string) mo.Result[[]string] {
 // Example:
 //
 //	res := client.SearchIndex(
-//		"age",
+//		"idx_age",
 //		x.And(
 //			x.Gte("age", 18),
 //			x.Eq("status", "active"),

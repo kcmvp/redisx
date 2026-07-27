@@ -166,6 +166,32 @@ res = client.Update(
 - **Remote access:** connect to the RESP server with the `client` package or any Redis-compatible client.
 - **In-process access:** start the server and use the returned `*server.DB` directly inside the same application.
 
+## Storage Layers
+
+`redisx` supports two storage layers inside the same server:
+
+- **Persistent layer:** normal keys are stored here.
+- **Memory-only layer:** keys prefixed with `_m_` are stored here and are not kept after restart.
+
+Routing is explicit and key-based:
+
+- `_m_<key>` -> memory-only
+- any other key -> disk
+
+For Go clients, use `client.MemKey(...)` to build a memory-only key without hardcoding the prefix:
+
+```go
+import "github.com/kcmvp/redisx/client"
+
+if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
+    panic(err)
+}
+defer client.Disconnect()
+
+_ = client.Set("user:1", `{"name":"ken"}`)
+_ = client.Set(client.MemKey("session:1"), `{"online":true}`)
+```
+
 ## Server Startup And Auth
 
 Start the embedded RESP server with:

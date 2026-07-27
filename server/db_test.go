@@ -31,6 +31,12 @@ func (suite *DBSuite) TearDownTest() {
 }
 
 func (suite *DBSuite) TestLifecycle() {
+	suite.Run("Empty path is invalid", func() {
+		resetStorage()
+		db := openDB("")
+		suite.Nil(db)
+	})
+
 	suite.Run("In-Memory DB", func() {
 		resetStorage()
 		db := openDB(":memory:")
@@ -48,6 +54,7 @@ func (suite *DBSuite) TestLifecycle() {
 	suite.Run("File DB", func() {
 		resetStorage()
 		path := filepath.Join(suite.T().TempDir(), "hot", "kv.db")
+		suite.NoError(os.MkdirAll(filepath.Dir(path), 0o755))
 		db := openDB(path)
 		suite.NotNil(db)
 		suite.NoError(db.Set("persist:key", "persist-val"))
@@ -142,6 +149,58 @@ func (suite *DBSuite) TestCRUD() {
 		res = suite.db.Get("ttl_key")
 		suite.True(res.IsError(), "Key should be expired")
 	})
+}
+
+func (suite *DBSuite) TestHybridStorageLayers() {
+	path := filepath.Join(suite.T().TempDir(), "hybrid", "kv.db")
+	suite.NoError(os.MkdirAll(filepath.Dir(path), 0o755))
+	db := openDB(path)
+	suite.NotNil(db)
+	suite.NoError(db.registerIndexes(
+		Index("idx_age", "user:*", "age"),
+		Index("idx_hot_age", "_m_user:*", "age"),
+	))
+
+	suite.NoError(db.Set("user:1", `{"id":"1","age":20,"status":"cold"}`))
+	suite.NoError(db.Set("_m_user:2", `{"id":"2","age":30,"status":"hot"}`))
+	suite.NoError(db.Set("_m_user:3", `{"id":"3","age":25,"status":"hot"}`))
+
+	keys := db.Keys("*user:*")
+	suite.True(keys.IsOk())
+	suite.ElementsMatch([]string{"user:1", "_m_user:2", "_m_user:3"}, keys.MustGet())
+	suite.ElementsMatch([]string{"user:1"}, db.Keys("user:*").MustGet())
+	suite.ElementsMatch([]string{"_m_user:2", "_m_user:3"}, db.Keys("_m_user:*").MustGet())
+
+	res := db.SearchKey("*user:*", nil, false)
+	suite.True(res.IsOk())
+	suite.Len(res.MustGet(), 3)
+
+	updated := db.Update("*user:*", nil, x.Set("status", "active"))
+	suite.True(updated.IsOk())
+	suite.ElementsMatch([]string{"user:1", "_m_user:2", "_m_user:3"}, updated.MustGet())
+	suite.Equal("active", gjson.Get(db.Get("user:1").MustGet(), "status").String())
+	suite.Equal("active", gjson.Get(db.Get("_m_user:2").MustGet(), "status").String())
+
+	diskRes := db.SearchIndex("idx_age", nil, false)
+	suite.True(diskRes.IsOk())
+	suite.Len(diskRes.MustGet(), 1)
+
+	memRes := db.SearchIndex("idx_hot_age", nil, false)
+	suite.True(memRes.IsOk())
+	suite.Len(memRes.MustGet(), 2)
+
+	suite.NoError(db.Close())
+
+	db = openDB(path)
+	suite.NotNil(db)
+	suite.NoError(db.registerIndexes(
+		Index("idx_age", "user:*", "age"),
+		Index("idx_hot_age", "_m_user:*", "age"),
+	))
+	defer func() { _ = db.Close() }()
+
+	suite.True(db.Get("user:1").IsOk())
+	suite.True(db.Get("_m_user:2").IsError())
 }
 
 func TestDBSuite(t *testing.T) {
@@ -253,7 +312,7 @@ func (suite *SearchSuite) SetupTest() {
 	resetStorage()
 	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
-	suite.NoError(suite.db.registerIndexes(Idx("*", "age")))
+	suite.NoError(suite.db.registerIndexes(Idx("user:*", "age")))
 
 	dataBytes, err := os.ReadFile("testdata/SearchSuite_InitData.json")
 	suite.NoError(err)
@@ -266,7 +325,7 @@ func (suite *SearchSuite) SetupTest() {
 		raw := string(emp)
 		department := gjson.Get(raw, "department").String()
 		id := gjson.Get(raw, "id").String()
-		key := department + keySeparator + id
+		key := "user" + keySeparator + department + keySeparator + id
 		suite.NoError(suite.db.Set(key, raw))
 	}
 }
@@ -343,7 +402,7 @@ func (suite *SearchSuite) TestSearchKey() {
 	}{
 		{
 			name:      "QueryKey Engineering department ascending",
-			pattern:   "Engineering:*",
+			pattern:   "user:Engineering:*",
 			filter:    nil,
 			desc:      false,
 			wantEmpty: false,
@@ -351,7 +410,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey Engineering department descending",
-			pattern:   "Engineering:*",
+			pattern:   "user:Engineering:*",
 			filter:    nil,
 			desc:      true,
 			wantEmpty: false,
@@ -359,7 +418,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey with filter",
-			pattern:   "*:*",
+			pattern:   "user:*",
 			filter:    x.Eq("is_active", true),
 			desc:      false,
 			wantEmpty: false,
@@ -367,7 +426,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey no match",
-			pattern:   "Marketing:*",
+			pattern:   "user:Marketing:*",
 			wantEmpty: true,
 		},
 	}
