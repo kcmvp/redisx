@@ -4,11 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/kcmvp/redisx/internal"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
@@ -19,16 +19,27 @@ import (
 
 const keySeparator = ":"
 
+type storageLayer uint8
+
+const (
+	storageDisk storageLayer = iota
+	storageMem
+)
+
 // IndexDef describes one startup index declaration for SEARCHINDEX.
 type IndexDef struct {
-	name    string
-	pattern string
-	path    string
+	// name is the index name used by SEARCHINDEX.
+	name string
+	// keyPattern is the key glob pattern used to select which keys participate
+	// in this index. It supports glob matching such as "*" and "?".
+	keyPattern string
+	// path is the JSON path used as the indexed value.
+	path string
 }
 
 // Index declares one JSON index to be created during server startup.
 func Index(name, keyPattern, jsonPath string) IndexDef {
-	return IndexDef{name: name, pattern: keyPattern, path: jsonPath}
+	return IndexDef{name: name, keyPattern: keyPattern, path: jsonPath}
 }
 
 // Idx declares one JSON index with an auto-generated name.
@@ -47,31 +58,44 @@ func idxName(jsonPath string) string {
 	return "idx_" + replacer.Replace(jsonPath)
 }
 
-// resetStorage is used for testing purposes to reset the storage state.
+// resetStorage resets DB-related process state for tests.
+//
+// The current implementation is intentionally empty because DB instances no
+// longer rely on package-level storage singletons.
 func resetStorage() {
 	// Reset is intentionally a no-op after removing singleton storage state.
 }
 
-// openDB creates a new storage instance.
-// Use ":memory:" for an in-memory DB, otherwise pass an explicit file path.
+// openDB creates one hybrid DB instance backed by:
+//   - one persistent layer opened from path
+//   - one in-memory layer used for keys prefixed with "_m_"
+//
+// Use ":memory:" when the persistent layer should also remain in memory.
+// An empty path is invalid.
 func openDB(path string) *DB {
 	if path == "" {
-		path = ":memory:"
-	}
-	if path != ":memory:" {
-		dir := filepath.Dir(path)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			slog.Error("failed to create data directory", "path", dir, "error", err)
-			return nil
-		}
+		slog.Error("failed to open storage", "error", "db path is required")
+		return nil
 	}
 
-	raw, err := buntdb.Open(path)
+	disk, err := buntdb.Open(path)
 	if err != nil {
 		slog.Error("failed to open buntdb", "path", path, "error", err)
 		return nil
 	}
-	return &DB{kv: raw}
+
+	mem, err := buntdb.Open(":memory:")
+	if err != nil {
+		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
+		_ = disk.Close()
+		return nil
+	}
+
+	return &DB{
+		disk:        disk,
+		mem:         mem,
+		indexLayers: map[string]storageLayer{},
+	}
 }
 
 // DB is a lightweight BuntDB wrapper for the high-frequency operations exposed
@@ -83,13 +107,15 @@ func openDB(path string) *DB {
 //
 // For lower-level or BuntDB-specific operations, use [DB.Raw].
 type DB struct {
-	kv *buntdb.DB
+	disk        *buntdb.DB
+	mem         *buntdb.DB
+	indexLayers map[string]storageLayer
 }
 
-// Raw exposes the underlying BuntDB handle for advanced use cases.
+// Raw exposes the persistent storage layer for advanced use cases.
 //
-// This is useful when your application needs native BuntDB transactions,
-// indexes, or iteration APIs that are intentionally not re-exposed by redisx.
+// This is useful when your application needs direct transactions, indexes,
+// or iteration APIs that are intentionally not re-exposed by redisx.
 //
 // Example:
 //
@@ -99,25 +125,106 @@ type DB struct {
 //		return err
 //	})
 func (x *DB) Raw() *buntdb.DB {
-	return x.kv
+	return x.disk
 }
 
+// RawMem exposes the in-memory storage layer used by keys with the "_m_"
+// prefix.
+//
+// Keys routed to this layer are not persisted across restarts.
+func (x *DB) RawMem() *buntdb.DB {
+	return x.mem
+}
+
+// Close closes both the persistent and in-memory storage layers.
+//
+// The first close error is returned, if any.
 func (x *DB) Close() error {
-	if x.kv == nil {
-		return nil
+	var err error
+	if x.mem != nil {
+		if closeErr := x.mem.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
 	}
-	return x.kv.Close()
+	if x.disk != nil {
+		if closeErr := x.disk.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
-// Update applies JSON path updates to all values matched by a key pattern and
-// an optional filter.
+func isMemKey(key string) bool {
+	return strings.HasPrefix(key, internal.MemKeyPrefix)
+}
+
+func hasLeadingWildcard(keyPattern string) bool {
+	return keyPattern != "" && (keyPattern[0] == '*' || keyPattern[0] == '?')
+}
+
+func layerForKey(key string) storageLayer {
+	if isMemKey(key) {
+		return storageMem
+	}
+	return storageDisk
+}
+
+func layersForPattern(keyPattern string) []storageLayer {
+	if strings.HasPrefix(keyPattern, internal.MemKeyPrefix) {
+		return []storageLayer{storageMem}
+	}
+	if hasLeadingWildcard(keyPattern) {
+		return []storageLayer{storageDisk, storageMem}
+	}
+	return []storageLayer{storageDisk}
+}
+
+func layerForIndexPattern(keyPattern string) (storageLayer, error) {
+	if keyPattern == "" {
+		return storageDisk, errors.New("index key pattern is required")
+	}
+	if hasLeadingWildcard(keyPattern) {
+		return storageDisk, errors.New("index key pattern cannot start with wildcard")
+	}
+	return layerForKey(keyPattern), nil
+}
+
+// store returns the underlying storage handle for layer.
+func (x *DB) store(layer storageLayer) *buntdb.DB {
+	if layer == storageMem {
+		return x.mem
+	}
+	return x.disk
+}
+
+// storeForKey returns the underlying storage handle selected by key.
+func (x *DB) storeForKey(key string) *buntdb.DB {
+	return x.store(layerForKey(key))
+}
+
+type kvPair struct {
+	key   string
+	value string
+}
+
+func appendUnique(items []string, seen map[string]struct{}, value string) []string {
+	if _, ok := seen[value]; ok {
+		return items
+	}
+	seen[value] = struct{}{}
+	return append(items, value)
+}
+
+// Update applies JSON path updates to all values matched by a key glob pattern
+// and an optional filter.
 //
 // The target values must be valid JSON documents. Each x.Mutation is applied with
 // sjson semantics, so the path may address top-level or nested fields.
+// keyPattern uses key glob matching such as "*" and "?".
 //
 // RESP equivalent:
 //
-//	UPDATE <pattern> <json_filter> <update_json>
+//	UPDATE <key_pattern> <json_filter> <update_json>
 //
 // Example:
 //
@@ -131,74 +238,97 @@ func (x *DB) Close() error {
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func (x *DB) Update(pattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if pattern == "" {
+func (x *DB) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if keyPattern == "" {
 		return mo.Err[[]string](errors.New("pattern is required"))
 	}
 	var updatedKeys []string
+	seen := map[string]struct{}{}
 
-	err := x.kv.Update(func(tx *buntdb.Tx) error {
-		var matchedKeys []string
-		err := tx.AscendKeys(pattern, func(key, value string) bool {
-			if filter == nil || filter.Eval(value) {
-				matchedKeys = append(matchedKeys, key)
-			}
-			return true
-		})
+	for _, layer := range layersForPattern(keyPattern) {
+		err := x.store(layer).Update(func(tx *buntdb.Tx) error {
+			var matchedKeys []string
+			err := tx.AscendKeys(keyPattern, func(key, value string) bool {
+				if filter == nil || filter.Eval(value) {
+					matchedKeys = append(matchedKeys, key)
+				}
+				return true
+			})
 
-		if err != nil {
-			return err
-		}
-
-		for _, key := range matchedKeys {
-			val, err := tx.Get(key)
 			if err != nil {
 				return err
 			}
 
-			newVal := val
-			for _, vp := range values {
-				newVal, err = sjson.Set(newVal, vp.Path(), vp.Value())
+			for _, key := range matchedKeys {
+				val, err := tx.Get(key)
 				if err != nil {
-					err = fmt.Errorf("failed to set %s: %w", vp.Path(), err)
-					slog.Error("failed to update document", "key", key, "error", err)
 					return err
 				}
+
+				newVal := val
+				for _, vp := range values {
+					newVal, err = sjson.Set(newVal, vp.Path(), vp.Value())
+					if err != nil {
+						err = fmt.Errorf("failed to set %s: %w", vp.Path(), err)
+						slog.Error("failed to update document", "key", key, "error", err)
+						return err
+					}
+				}
+
+				if newVal != val {
+					_, _, err = tx.Set(key, newVal, nil)
+					if err != nil {
+						return err
+					}
+				}
+				updatedKeys = appendUnique(updatedKeys, seen, key)
 			}
 
-			if newVal != val {
-				_, _, err = tx.Set(key, newVal, nil)
-				if err != nil {
-					return err
-				}
-			}
-			updatedKeys = append(updatedKeys, key)
+			return nil
+		})
+		if err != nil {
+			return mo.Err[[]string](err)
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		return mo.Err[[]string](err)
 	}
 
+	sort.Strings(updatedKeys)
 	return mo.Ok(updatedKeys)
 }
 
+// registerIndexes creates all declared SEARCHINDEX indexes on the correct
+// storage layer.
+//
+// Routing rules:
+//   - key patterns starting with "_m_" are created on the in-memory layer
+//   - all other patterns are created on the persistent layer
+//
+// Index key patterns must not start with "*" or "?" because the target layer
+// must be decided at startup time without scanning both layers.
 func (x *DB) registerIndexes(defs ...IndexDef) error {
+	if x.indexLayers == nil {
+		x.indexLayers = map[string]storageLayer{}
+	}
 	for _, def := range defs {
 		if def.name == "" {
 			return errors.New("index name is required")
 		}
-		if def.pattern == "" {
+		if def.keyPattern == "" {
 			return errors.New("index key pattern is required")
 		}
 		if def.path == "" {
 			return errors.New("index json path is required")
 		}
-		if err := x.kv.CreateIndex(def.name, def.pattern, buntdb.IndexJSON(def.path)); err != nil {
+		layer, err := layerForIndexPattern(def.keyPattern)
+		if err != nil {
 			return err
 		}
+		if _, exists := x.indexLayers[def.name]; exists {
+			return fmt.Errorf("index already declared: %s", def.name)
+		}
+		if err := x.store(layer).CreateIndex(def.name, def.keyPattern, buntdb.IndexJSON(def.path)); err != nil {
+			return err
+		}
+		x.indexLayers[def.name] = layer
 	}
 
 	return nil
@@ -232,9 +362,13 @@ func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Resu
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
 	}
+	layer, ok := xdb.indexLayers[indexName]
+	if !ok {
+		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
+	}
 
 	var results []string
-	err := xdb.kv.View(func(tx *buntdb.Tx) error {
+	err := xdb.store(layer).View(func(tx *buntdb.Tx) error {
 		iter := tx.Ascend
 		if desc {
 			iter = tx.Descend
@@ -259,14 +393,14 @@ func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Resu
 	return mo.Ok(results)
 }
 
-// SearchKey matches keys by glob pattern, applies the optional filter to each
-// JSON value, and returns the matched JSON documents in key order.
+// SearchKey matches keys by key glob pattern, applies the optional filter to
+// each JSON value, and returns the matched JSON documents in key order.
 //
-// The pattern uses BuntDB key glob semantics such as "*" and "?".
+// keyPattern uses key glob matching such as "*" and "?".
 //
 // RESP equivalent:
 //
-//	SEARCHKEY <pattern> <json_filter> [ASC|DESC]
+//	SEARCHKEY <key_pattern> <json_filter> [ASC|DESC]
 //
 // Example:
 //
@@ -276,47 +410,68 @@ func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Resu
 //		true,
 //	)
 //	users := res.MustGet()
-func (xdb *DB) SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if pattern == "" {
+func (xdb *DB) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if keyPattern == "" {
 		return mo.Err[[]string](errors.New("pattern is required"))
 	}
-	var results []string
-
-	err := xdb.kv.View(func(tx *buntdb.Tx) error {
-		if desc {
-			return tx.DescendKeys(pattern, func(key, value string) bool {
+	var entries []kvPair
+	for _, layer := range layersForPattern(keyPattern) {
+		err := xdb.store(layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(keyPattern, func(key, value string) bool {
 				if filter == nil || filter.Eval(value) {
-					results = append(results, value)
+					entries = append(entries, kvPair{key: key, value: value})
 				}
 				return true
 			})
-		}
-		return tx.AscendKeys(pattern, func(key, value string) bool {
-			if filter == nil || filter.Eval(value) {
-				results = append(results, value)
-			}
-			return true
 		})
-	})
-
-	if err != nil {
-		return mo.Err[[]string](err)
+		if err != nil {
+			return mo.Err[[]string](err)
+		}
 	}
 
+	sort.Slice(entries, func(i, j int) bool {
+		if desc {
+			return entries[i].key > entries[j].key
+		}
+		return entries[i].key < entries[j].key
+	})
+
+	results := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		results = append(results, entry.value)
+	}
 	return mo.Ok(results)
 }
 
+// Set stores one string value under key.
+//
+// Routing rules:
+//   - keys prefixed with "_m_" are stored in the in-memory layer
+//   - all other keys are stored in the persistent layer
+//
+// RESP equivalent:
+//
+//	SET <key> <value>
 func (x *DB) Set(key string, value string) error {
-	return x.kv.Update(func(tx *buntdb.Tx) error {
+	return x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
 }
 
+// SetWithTtl stores one string value under key with an optional TTL.
+//
+// A positive ttl makes the key expire automatically. A zero or negative ttl
+// behaves the same as [DB.Set].
+//
+// RESP equivalents:
+//
+//	SET <key> <value> EX <seconds>
+//	SETEX <key> <seconds> <value>
 func (x *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
 	if ttl > 0 {
 		opt := &buntdb.SetOptions{Expires: true, TTL: ttl}
-		return x.kv.Update(func(tx *buntdb.Tx) error {
+		return x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
 			_, _, err := tx.Set(key, value, opt)
 			return err
 		})
@@ -326,9 +481,16 @@ func (x *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
 	}
 }
 
+// SetNX stores value only when key does not already exist.
+//
+// The returned boolean reports whether the write happened.
+//
+// RESP equivalent:
+//
+//	SETNX <key> <value>
 func (x *DB) SetNX(key string, value string) (bool, error) {
 	var set bool
-	err := x.kv.Update(func(tx *buntdb.Tx) error {
+	err := x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == buntdb.ErrNotFound {
 			_, _, err = tx.Set(key, value, nil)
@@ -345,9 +507,16 @@ func (x *DB) SetNX(key string, value string) (bool, error) {
 	return set, nil
 }
 
+// Get returns the string value stored under key.
+//
+// A missing key is returned as an error result.
+//
+// RESP equivalent:
+//
+//	GET <key>
 func (x *DB) Get(key string) mo.Result[string] {
 	var val string
-	err := x.kv.View(func(tx *buntdb.Tx) error {
+	err := x.storeForKey(key).View(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Get(key)
 		return innerErr
@@ -359,9 +528,16 @@ func (x *DB) Get(key string) mo.Result[string] {
 	return mo.Ok(val)
 }
 
+// Delete removes key from its routed storage layer.
+//
+// The returned boolean reports whether the key existed.
+//
+// RESP equivalent:
+//
+//	DEL <key>
 func (x *DB) Delete(key string) (bool, error) {
 	var val string
-	err := x.kv.Update(func(tx *buntdb.Tx) error {
+	err := x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Delete(key)
 		if innerErr == buntdb.ErrNotFound {
@@ -375,19 +551,32 @@ func (x *DB) Delete(key string) (bool, error) {
 	return len(val) > 0, nil
 }
 
-func (x *DB) Keys(pattern string) mo.Result[[]string] {
+// Keys returns all keys matching keyPattern across the relevant storage layers.
+//
+// Routing rules:
+//   - patterns starting with "_m_" only scan the in-memory layer
+//   - patterns starting with any other concrete prefix only scan the persistent layer
+//   - patterns starting with "*" or "?" scan both layers and merge the results
+//
+// keyPattern uses key glob matching such as "*" and "?".
+//
+// RESP equivalent:
+//
+//	KEYS <key_pattern>
+func (x *DB) Keys(keyPattern string) mo.Result[[]string] {
 	var keys []string
-	err := x.kv.View(func(tx *buntdb.Tx) error {
-		// Keys uses AscendKeys which supports simple glob matching (*, ?)
-		// In buntdb, AscendKeys iterates over keys matching the pattern
-		return tx.AscendKeys(pattern, func(key, value string) bool {
-			keys = append(keys, key)
-			return true
+	seen := map[string]struct{}{}
+	for _, layer := range layersForPattern(keyPattern) {
+		err := x.store(layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(keyPattern, func(key, value string) bool {
+				keys = appendUnique(keys, seen, key)
+				return true
+			})
 		})
-	})
-
-	if err != nil {
-		return mo.Err[[]string](err)
+		if err != nil {
+			return mo.Err[[]string](err)
+		}
 	}
+	sort.Strings(keys)
 	return mo.Ok(keys)
 }

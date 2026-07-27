@@ -3,8 +3,11 @@ package internal
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"sync"
 )
+
+const MemKeyPrefix = "_m_"
 
 var (
 	authKeyOnce sync.Once
@@ -19,4 +22,11 @@ func AuthKey() string {
 	})
 
 	return authKey
+}
+
+func MemKey(key string) string {
+	if strings.HasPrefix(key, MemKeyPrefix) {
+		return key
+	}
+	return MemKeyPrefix + key
 }

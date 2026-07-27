@@ -74,6 +74,11 @@ func TestClientSuite(t *testing.T) {
 	suite.Run(t, new(ClientTestSuite))
 }
 
+func (s *ClientTestSuite) TestMemKey() {
+	s.Equal("_m_user:1", MemKey("user:1"))
+	s.Equal("_m_user:1", MemKey("_m_user:1"))
+}
+
 // ensureConnected waits until the shared client is fully connected
 func (s *ClientTestSuite) ensureConnected() {
 	for i := 0; i < 30; i++ {
