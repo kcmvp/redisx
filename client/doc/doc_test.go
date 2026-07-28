@@ -54,6 +54,7 @@ func (u UserDoc) Prefix() string     { return "user:" }
 func (u UserDoc) Key() string        { return gjson.Get(string(u), "id").String() }
 func (u UserDoc) Value() string      { return string(u) }
 func (u UserDoc) TTL() time.Duration { return time.Hour }
+func (u UserDoc) StorageKey() string { return u.Prefix() + u.Key() }
 
 func (s *DocTestSuite) TestGenericDocMethods() {
 	jsonStr := `{"id": "200", "name": "Test", "age": 30}`

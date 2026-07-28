@@ -6,33 +6,28 @@ import (
 	"github.com/samber/mo"
 )
 
-func fullKey[D x.Document](d D) string {
-	return d.Prefix() + d.Key()
-}
-
-// Get retrieves the value for the given document using the shared resp client.
 func Get[D x.Document](d D) (string, error) {
-	return client.Get(fullKey(d))
+	return client.Get(d.StorageKey())
 }
 
 // SetWithTTL stores the document's value for the given document key with its TTL.
 func SetWithTTL[D x.Document](d D) error {
-	return client.SetWithTTL(fullKey(d), d.Value(), d.TTL())
+	return client.SetWithTTL(d.StorageKey(), d.Value(), d.TTL())
 }
 
 // Set stores the document's value for the given document key without TTL.
 func Set[D x.Document](d D) error {
-	return client.Set(fullKey(d), d.Value())
+	return client.Set(d.StorageKey(), d.Value())
 }
 
 // SetNX stores the document's value for the given document key only if the key does not exist.
 func SetNX[D x.Document](d D) (bool, error) {
-	return client.SetNX(fullKey(d), d.Value())
+	return client.SetNX(d.StorageKey(), d.Value())
 }
 
 // Delete removes the specified document.
 func Delete[D x.Document](d D) (bool, error) {
-	return client.Delete(fullKey(d))
+	return client.Delete(d.StorageKey())
 }
 
 // Keys returns all keys matching the document's prefix and the given sub-pattern.
