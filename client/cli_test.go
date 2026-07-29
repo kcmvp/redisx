@@ -10,6 +10,7 @@ import (
 
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/gjson"
@@ -19,11 +20,19 @@ const clientTestServerAddr = "127.0.0.1:36380"
 const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestAuthLimit = 50
 
+type testUserDoc string
+
+func (testUserDoc) Namespace() string  { return "user" }
+func (testUserDoc) Mem() bool          { return false }
+func (testUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u testUserDoc) RawJSON() string  { return string(u) }
+func (testUserDoc) TTL() time.Duration { return 0 }
+
 func (s *ClientTestSuite) SetupTest() {
 	Disconnect()
 
 	handlersMu.Lock()
-	handlersByTopic = make(map[string]chan *ReceivedMessage)
+	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
 	handlersMu.Unlock()
 
 	kvClientMu.Lock()
@@ -38,8 +47,8 @@ func (s *ClientTestSuite) SetupTest() {
 	for len(pubChan) > 0 {
 		<-pubChan
 	}
-	for len(subReqCh) > 0 {
-		<-subReqCh
+	for len(subscribeReqCh) > 0 {
+		<-subscribeReqCh
 	}
 	atomic.StoreUint64(&pipeDrops, 0)
 }
@@ -53,11 +62,11 @@ func (s *ClientTestSuite) SetupSuite() {
 	db := server.Start(
 		clientTestServerAddr,
 		":memory:",
-		server.Idx("user:*", "age"),
-		server.Idx("user:*", "email"),
+		x.Idx[testUserDoc]("age", "*", "age"),
+		x.Idx[testUserDoc]("email", "*", "email"),
 	)
 	s.Require().NotNil(db)
-	s.Require().NoError(db.Set("_auth_:"+clientTestExternalAuthKey, "50"))
+	s.Require().NoError(db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50"))
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -75,8 +84,8 @@ func TestClientSuite(t *testing.T) {
 }
 
 func (s *ClientTestSuite) TestMemKey() {
-	s.Equal("_m_user:1", MemKey("user:1"))
-	s.Equal("_m_user:1", MemKey("_m_user:1"))
+	s.Equal("_m_user:1", x.MemKey("user:1"))
+	s.Equal("_m_user:1", x.MemKey("_m_user:1"))
 }
 
 // ensureConnected waits until the shared client is fully connected
@@ -141,15 +150,15 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 
 			if tc.checkStored {
 				handlersMu.RLock()
-				stored := handlersByTopic[tc.topic]
+				stored := deliveryChByTopic[tc.topic]
 				handlersMu.RUnlock()
 				s.NotNil(stored)
 
 				select {
-				case topic := <-subReqCh:
+				case topic := <-subscribeReqCh:
 					s.Equal(tc.topic, topic)
 				default:
-					s.FailNow("subReqCh should contain one subscription request")
+					s.FailNow("subscribeReqCh should contain one subscription request")
 				}
 			}
 		})
@@ -271,34 +280,34 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.ensureConnected()
 
 		// Test SetNX
-		ok, err := SetNX("nx_key", "val1")
+		ok, err := SetNX("key_nx", "val1")
 		s.NoError(err)
 		s.True(ok)
 
-		ok, err = SetNX("nx_key", "val2")
+		ok, err = SetNX("key_nx", "val2")
 		s.NoError(err)
 		s.False(ok)
 
-		v, err := Get("nx_key")
+		v, err := Get("key_nx")
 		s.NoError(err)
 		s.Equal("val1", v)
 
 		// Test Keys
-		_ = Set("another_key", "val")
-		keysRes := Keys("*_key")
+		_ = Set("key_another", "val")
+		keysRes := Keys("key_*")
 		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"nx_key", "another_key"}, keysRes.MustGet())
+		s.ElementsMatch([]string{"key_nx", "key_another"}, keysRes.MustGet())
 
 		// Test Delete
-		deleted, err := Delete("nx_key")
+		deleted, err := Delete("key_nx")
 		s.NoError(err)
 		s.True(deleted)
 
-		keysRes = Keys("*_key")
+		keysRes = Keys("key_*")
 		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"another_key"}, keysRes.MustGet())
+		s.ElementsMatch([]string{"key_another"}, keysRes.MustGet())
 
-		deleted, err = Delete("another_key")
+		deleted, err = Delete("key_another")
 		s.NoError(err)
 		s.True(deleted)
 	})
@@ -583,29 +592,31 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 	}
 
 	tests := []struct {
-		name      string
-		index     string
-		filter    x.Filter
-		desc      bool
-		expectErr bool
-		expectLen int
+		name       string
+		index      string
+		keyPattern string
+		filter     x.Filter
+		desc       bool
+		expectErr  bool
+		expectLen  int
 	}{
-		{"Missing index", "", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Unknown index", "unknown", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Eq string", "idx_email", x.Eq("email", "ken@example.com"), false, false, 1},
-		{"Eq false", "idx_email", x.Eq("email", "nobody@example.com"), false, false, 0},
-		{"Gt number", "idx_age", x.Gt("age", 25), false, false, 2},
-		{"Lt number", "idx_age", x.Lt("age", 35), false, false, 2},
-		{"And true", "idx_age", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
-		{"And false", "idx_age", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-		{"Or", "idx_age", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
-		{"Empty filter", "idx_email", nil, false, false, 3},
-		{"Descend test", "idx_age", x.Gt("age", 10), true, false, 3},
+		{"Missing index", "", "user:*", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Unknown index", "unknown", "user:*", x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Eq string", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", x.Eq("email", "ken@example.com"), false, false, 1},
+		{"Eq false", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", x.Eq("email", "nobody@example.com"), false, false, 0},
+		{"Gt number", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Gt("age", 25), false, false, 2},
+		{"Lt number", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Lt("age", 35), false, false, 2},
+		{"And true", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
+		{"And false", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
+		{"Or", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
+		{"Empty filter", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", nil, false, false, 3},
+		{"Key pattern narrows index scan", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:2", nil, false, false, 1},
+		{"Descend test", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Gt("age", 10), true, false, 3},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchIndex(tt.index, tt.filter, tt.desc)
+			res := SearchIndex(tt.index, tt.keyPattern, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -864,7 +875,7 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 				runtimeHandler := make(chan *ReceivedMessage, 1)
 
 				handlersMu.Lock()
-				handlersByTopic["initial-topic"] = initialHandler
+				deliveryChByTopic["initial-topic"] = initialHandler
 				handlersMu.Unlock()
 
 				ctx, cancel := context.WithCancel(context.Background())
@@ -886,9 +897,9 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 				}
 
 				handlersMu.Lock()
-				handlersByTopic["runtime-topic"] = runtimeHandler
+				deliveryChByTopic["runtime-topic"] = runtimeHandler
 				handlersMu.Unlock()
-				subReqCh <- "runtime-topic"
+				subscribeReqCh <- "runtime-topic"
 
 				deadline := time.After(2 * time.Second)
 				tick := time.NewTicker(30 * time.Millisecond)
@@ -913,6 +924,77 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 					s.NoError(err)
 				case <-time.After(2 * time.Second):
 					s.FailNow("consume() did not exit after cancel")
+				}
+			},
+		},
+		{
+			"ConsumePreservesSubscriptionsAcrossRestart",
+			func() {
+				client1, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client1.Close() })
+
+				handler := make(chan *ReceivedMessage, 2)
+
+				handlersMu.Lock()
+				deliveryChByTopic["restart-topic"] = handler
+				handlersMu.Unlock()
+
+				ctx1, cancel1 := context.WithCancel(context.Background())
+				errCh1 := make(chan error, 1)
+				go func() {
+					errCh1 <- consume(ctx1, client1)
+				}()
+
+				time.Sleep(80 * time.Millisecond)
+				publishErr := client1.Publish(context.Background(), "restart-topic", "first").Err()
+				s.NoError(publishErr)
+				select {
+				case got := <-handler:
+					s.Equal("restart-topic", got.Channel)
+					s.Equal("first", got.Payload)
+				case <-time.After(2 * time.Second):
+					s.FailNow("timeout waiting first restart-topic message")
+				}
+
+				cancel1()
+				select {
+				case err := <-errCh1:
+					s.NoError(err)
+				case <-time.After(2 * time.Second):
+					s.FailNow("first consume() did not exit after cancel")
+				}
+
+				handlersMu.RLock()
+				stored := deliveryChByTopic["restart-topic"]
+				handlersMu.RUnlock()
+				s.Equal(handler, stored)
+
+				client2, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client2.Close() })
+
+				ctx2, cancel2 := context.WithCancel(context.Background())
+				errCh2 := make(chan error, 1)
+				go func() {
+					errCh2 <- consume(ctx2, client2)
+				}()
+
+				time.Sleep(80 * time.Millisecond)
+				publishErr = client2.Publish(context.Background(), "restart-topic", "second").Err()
+				s.NoError(publishErr)
+				select {
+				case got := <-handler:
+					s.Equal("restart-topic", got.Channel)
+					s.Equal("second", got.Payload)
+				case <-time.After(2 * time.Second):
+					s.FailNow("timeout waiting second restart-topic message")
+				}
+
+				cancel2()
+				select {
+				case err := <-errCh2:
+					s.NoError(err)
+				case <-time.After(2 * time.Second):
+					s.FailNow("second consume() did not exit after cancel")
 				}
 			},
 		},

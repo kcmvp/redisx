@@ -37,17 +37,31 @@ type outgoingMessage struct {
 }
 
 var (
-	pubChan   = make(chan outgoingMessage, bufferSize)
-	pipeDrops uint64
-	subReqCh  = make(chan string, bufferSize)
+	pubChan        = make(chan outgoingMessage, bufferSize)
+	pipeDrops      uint64
+	subscribeReqCh = make(chan string, bufferSize)
 
-	handlersMu      sync.RWMutex
-	handlersByTopic = make(map[string]chan *ReceivedMessage)
+	handlersMu        sync.RWMutex
+	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
 
 	kvClientMu sync.RWMutex
 	kvClient   *redis.Client
 	cliOnce    sync.Once
 )
+
+// resetHandlers closes all registered subscription channels and clears the
+// topic registry. This is reserved for explicit full shutdown paths such as
+// Disconnect, not for transient consumer restarts during reconnect.
+func resetHandlers() {
+	handlersMu.Lock()
+	for _, ch := range deliveryChByTopic {
+		if ch != nil {
+			close(ch)
+		}
+	}
+	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+	handlersMu.Unlock()
+}
 
 func setSharedClient(client *redis.Client) *redis.Client {
 	kvClientMu.Lock()
@@ -72,34 +86,45 @@ func clearSharedClientIf(target *redis.Client) {
 	kvClientMu.Unlock()
 }
 
-// MemKey returns a key routed to the memory-only storage layer.
+// Subscribe registers one local delivery channel for a topic and returns that
+// read-only channel to the caller.
 //
-// The returned key uses the reserved "_m_" prefix. If key already uses that
-// prefix, it is returned unchanged.
-func MemKey(key string) string {
-	return internal.MemKey(key)
-}
-
-// Subscribe registers a message handler for a topic and returns a read-only channel.
+// Internally it does two things:
+//   - stores the topic -> channel mapping in deliveryChByTopic so incoming
+//     messages can be dispatched locally
+//   - enqueues a request on subscribeReqCh so the background consumer can
+//     sync the remote SUBSCRIBE state for newly added topics
+//
+// Callers consume messages from the returned channel. Duplicate topic
+// registration is rejected.
 func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
 		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
 	}
 
 	handlersMu.Lock()
-	if _, exists := handlersByTopic[topic]; exists {
+	if _, exists := deliveryChByTopic[topic]; exists {
 		handlersMu.Unlock()
 		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
 	}
 	ch := make(chan *ReceivedMessage, bufferSize)
-	handlersByTopic[topic] = ch
+	deliveryChByTopic[topic] = ch
 	handlersMu.Unlock()
 
 	select {
-	case subReqCh <- topic:
+	case subscribeReqCh <- topic:
 	default:
+		slog.Warn(
+			"subscribe request dropped before remote subscribe",
+			"topic", topic,
+			"queue_len", len(subscribeReqCh),
+			"queue_cap", cap(subscribeReqCh),
+		)
 	}
 
+	// Potential issue: if the subscribe request is dropped above, the local
+	// topic -> channel mapping still exists, but the remote SUBSCRIBE is not
+	// issued for the current consumer lifecycle.
 	return mo.Ok[<-chan *ReceivedMessage](ch)
 }
 
@@ -253,7 +278,14 @@ func ConnectEmbed(respAddr string) error {
 	return Connect(respAddr, internal.AuthKey())
 }
 
-// Disconnect stops the bridge lifecycle and closes the shared client.
+// Disconnect stops the current bridge lifecycle and closes the shared client.
+//
+// Note: this is currently treated as a best-effort shutdown helper for tests
+// and examples. It does not reset cliOnce, so calling Connect again after
+// Disconnect does not start a brand new lifecycle.
+//
+// If production usage later requires a full stop-then-restart flow, revisit
+// the lifecycle state model here instead of relying on the current behavior.
 func Disconnect() {
 	_, cancel := getLifecycleCtx()
 
@@ -265,6 +297,7 @@ func Disconnect() {
 		_ = client.Close()
 		clearSharedClientIf(client)
 	}
+	resetHandlers()
 }
 
 // Get retrieves the value for the given key using the shared resp client.
@@ -339,6 +372,28 @@ func SetNX(key, value string) (bool, error) {
 	return res == 1, err
 }
 
+// SetNXWithTTL stores a value for the given key only if the key does not
+// exist, and applies the provided TTL when it is positive.
+func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return SetNX(key, value)
+	}
+
+	if key == "" {
+		return false, nil
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return false, errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.SetNX(ctx, key, value, ttl).Result()
+}
+
 // Delete removes the specified key using the shared resp client.
 func Delete(key string) (bool, error) {
 	if key == "" {
@@ -357,9 +412,9 @@ func Delete(key string) (bool, error) {
 	return res > 0, err
 }
 
-// Keys returns all keys matching the given pattern.
-func Keys(pattern string) mo.Result[[]string] {
-	if pattern == "" {
+// Keys returns all keys matching the given key pattern.
+func Keys(keyPattern string) mo.Result[[]string] {
+	if keyPattern == "" {
 		return mo.Ok([]string{})
 	}
 
@@ -371,20 +426,22 @@ func Keys(pattern string) mo.Result[[]string] {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	return mo.TupleToResult(client.Keys(ctx, pattern).Result())
+	return mo.TupleToResult(client.Keys(ctx, keyPattern).Result())
 }
 
 // SearchIndex executes the RESP X command below on the shared connection:
 //
-//	SEARCHINDEX <index_name> <json_filter> [ASC|DESC]
+//	SEARCHINDEX <index_name> <key_pattern> <json_filter> [ASC|DESC]
 //
-// The filter is built from the provided x.Filter and serialized to the MongoDB-
-// style JSON syntax understood by the server.
+// The key pattern follows BuntDB glob matching, and the filter is serialized
+// from the provided x.Filter into the MongoDB-style JSON syntax understood by
+// the server.
 //
 // Example:
 //
 //	res := client.SearchIndex(
 //		"idx_age",
+//		"user:*",
 //		x.And(
 //			x.Gte("age", 18),
 //			x.Eq("status", "active"),
@@ -392,9 +449,12 @@ func Keys(pattern string) mo.Result[[]string] {
 //		false,
 //	)
 //	users := res.MustGet()
-func SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]string] {
+func SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
+	}
+	if keyPattern == "" {
+		return mo.Err[[]string](errors.New("key pattern is required"))
 	}
 
 	client := getSharedClient()
@@ -421,7 +481,7 @@ func SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]strin
 		order = "DESC"
 	}
 
-	cmd := client.Do(ctx, proto.CmdSearchIndex, indexName, filterJSON, order)
+	cmd := client.Do(ctx, proto.CmdSearchIndex, indexName, keyPattern, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -432,9 +492,9 @@ func SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]strin
 
 // SearchKey executes the RESP X command below on the shared connection:
 //
-//	SEARCHKEY <pattern> <json_filter> [ASC|DESC]
+//	SEARCHKEY <key_pattern> <json_filter> [ASC|DESC]
 //
-// The pattern follows BuntDB glob matching, and the filter is serialized from
+// The key pattern follows BuntDB glob matching, and the filter is serialized from
 // x.Filter into the server's MongoDB-style JSON query format.
 //
 // Example:
@@ -445,9 +505,9 @@ func SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]strin
 //		true,
 //	)
 //	users := res.MustGet()
-func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if pattern == "" {
-		return mo.Err[[]string](errors.New("pattern is required"))
+func SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	if keyPattern == "" {
+		return mo.Err[[]string](errors.New("key pattern is required"))
 	}
 
 	client := getSharedClient()
@@ -474,7 +534,7 @@ func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 		order = "DESC"
 	}
 
-	cmd := client.Do(ctx, proto.CmdSearchKey, pattern, filterJSON, order)
+	cmd := client.Do(ctx, proto.CmdSearchKey, keyPattern, filterJSON, order)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -485,7 +545,7 @@ func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 
 // Update executes the RESP X command below on the shared connection:
 //
-//	UPDATE <pattern> <json_filter> <update_json>
+//	UPDATE <key_pattern> <json_filter> <update_json>
 //
 // The filter is serialized from x.Filter and the update payload is built from
 // x.Mutation values, so callers do not need to handwrite update JSON.
@@ -499,9 +559,9 @@ func SearchKey(pattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func Update(pattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if pattern == "" {
-		return mo.Err[[]string](errors.New("pattern is required"))
+func Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if keyPattern == "" {
+		return mo.Err[[]string](errors.New("key pattern is required"))
 	}
 	if len(values) == 0 {
 		return mo.Err[[]string](errors.New("no update values provided"))
@@ -529,7 +589,7 @@ func Update(pattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]s
 		return mo.Err[[]string](fmt.Errorf("failed to serialize updates: %w", err))
 	}
 
-	cmd := client.Do(ctx, proto.CmdUpdate, pattern, filterJSON, string(updateJSON))
+	cmd := client.Do(ctx, proto.CmdUpdate, keyPattern, filterJSON, string(updateJSON))
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
@@ -632,12 +692,14 @@ func produce(ctx context.Context, client *redis.Client) error {
 	}
 }
 
-// consume subscribes by registered handler topics and dispatches messages.
+// consume rebuilds remote subscriptions from deliveryChByTopic, applies
+// incremental subscription requests from subscribeReqCh, and dispatches
+// incoming messages to the registered local handlers.
 func consume(ctx context.Context, client *redis.Client) error {
 	consumerTopics := make(map[string]struct{})
 
 	handlersMu.RLock()
-	for topic := range handlersByTopic {
+	for topic := range deliveryChByTopic {
 		if topic != "" {
 			consumerTopics[topic] = struct{}{}
 		}
@@ -645,10 +707,10 @@ func consume(ctx context.Context, client *redis.Client) error {
 	handlersMu.RUnlock()
 
 	var consumer *redis.PubSub
-	var ch <-chan *redis.Message
+	var remoteMsgCh <-chan *redis.Message
 	subscribed := make(map[string]struct{}, len(consumerTopics))
 
-	subscribeTopic := func(topic string) error {
+	remoteSubscription := func(topic string) error {
 		if topic == "" {
 			return nil
 		}
@@ -662,7 +724,7 @@ func consume(ctx context.Context, client *redis.Client) error {
 				slog.Warn("mresp subscribe receive error", "error", err)
 				return err
 			}
-			ch = consumer.Channel()
+			remoteMsgCh = consumer.Channel()
 			subscribed[topic] = struct{}{}
 			return nil
 		}
@@ -680,21 +742,12 @@ func consume(ctx context.Context, client *redis.Client) error {
 				slog.Warn("mresp close consumer failed", "error", err)
 			}
 		}
-
-		// Close all registered handler channels when the consumer exits
-		handlersMu.Lock()
-		for _, ch := range handlersByTopic {
-			if ch != nil {
-				close(ch)
-			}
-		}
-		// Clear the map so any new Connect/lifecycle start starts fresh
-		handlersByTopic = make(map[string]chan *ReceivedMessage)
-		handlersMu.Unlock()
 	}()
 
+	// Rebuild all already-registered subscriptions on each fresh consumer
+	// lifecycle, including reconnects.
 	for topic := range consumerTopics {
-		if err := subscribeTopic(topic); err != nil {
+		if err := remoteSubscription(topic); err != nil {
 			return err
 		}
 	}
@@ -703,16 +756,17 @@ func consume(ctx context.Context, client *redis.Client) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case topic := <-subReqCh:
-			if err := subscribeTopic(topic); err != nil {
+		// Handle newly registered subscriptions after this consumer started.
+		case topic := <-subscribeReqCh:
+			if err := remoteSubscription(topic); err != nil {
 				return err
 			}
-		case msg, ok := <-ch:
+		case msg, ok := <-remoteMsgCh:
 			if !ok {
 				return fmt.Errorf("subscribe channel closed")
 			}
 			handlersMu.RLock()
-			h := handlersByTopic[msg.Channel]
+			h := deliveryChByTopic[msg.Channel]
 			handlersMu.RUnlock()
 			if h == nil {
 				continue

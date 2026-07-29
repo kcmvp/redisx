@@ -10,6 +10,8 @@ import (
 
 	"sync"
 
+	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -35,7 +37,6 @@ func (s *CmdTestSuite) SetupSuite() {
 func (s *CmdTestSuite) SetupTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	resetStorage()
 
 	authStateMu.Lock()
 	authKeyMaxConns = map[string]int{}
@@ -52,7 +53,6 @@ func (s *CmdTestSuite) SetupTest() {
 func (s *CmdTestSuite) TearDownTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	resetStorage()
 
 	authStateMu.Lock()
 	authKeyMaxConns = map[string]int{}
@@ -74,7 +74,7 @@ func TestCmdSuite(t *testing.T) {
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, ":memory:", Idx("user:*", "age"))
+	s.db = Start(s.addr, ":memory:", x.Idx[testUserDoc]("age", "*", "age"))
 
 	tests := []struct {
 		name        string
@@ -202,6 +202,33 @@ func (s *CmdTestSuite) TestCmd() {
 			auth:       true,
 			commands:   [][]string{{cmdKeys, "nonexistent*"}},
 			wantArrays: [][]string{{}},
+		},
+		{
+			name:       "keys_forbidden_star",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "*"}},
+			wantErrors: []string{"ERR forbidden key pattern"},
+		},
+		{
+			name:       "keys_forbidden_leading_wildcard",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "*_key"}},
+			wantErrors: []string{"ERR forbidden key pattern"},
+		},
+		{
+			name:       "keys_forbidden_reserved_namespace",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "_au*"}},
+			wantErrors: []string{"ERR forbidden key pattern"},
+		},
+		{
+			name:     "keys_allow_mem_namespace",
+			auth:     true,
+			commands: [][]string{{cmdSet, contract.MemKeyPrefix + "k_{id}", "v"}, {cmdKeys, contract.MemKeyPrefix + "*"}},
+			wantStrings: []string{
+				"OK",
+			},
+			wantArrays: [][]string{{contract.MemKeyPrefix + "k_{id}"}},
 		},
 		{
 			name:     "del non-existent",
@@ -640,7 +667,7 @@ func (s *CmdTestSuite) TestParseFilter() {
 func (s *CmdTestSuite) TestXCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, ":memory:", Idx("user:*", "age"))
+	s.db = Start(s.addr, ":memory:", x.Idx[testUserDoc]("age", "*", "age"))
 
 	tests := []struct {
 		name        string
@@ -729,9 +756,15 @@ func (s *CmdTestSuite) TestXCmd() {
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
+			name:       "searchkey_forbidden_cross_layer_pattern",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "*user:*", "{}", "ASC"}},
+			wantErrors: []string{"ERR key pattern cannot start with wildcard"},
+		},
+		{
 			name:       "searchindex success",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "idx_age", "{}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", "{}", "ASC"}},
 			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
 			setupDB: func(uid string) {
 				_ = s.db.Set(fmt.Sprintf("user:%s:1", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))

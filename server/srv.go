@@ -16,13 +16,14 @@ import (
 
 	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
 const (
 	privateAddr        = "127.0.0.1:6380"
-	authKeyPrefix      = "_auth_:"
 	unlimitedAuthConns = -1
 	cmdAuth            = "auth"
 	cmdHello           = "hello"
@@ -105,19 +106,19 @@ func getListenAndServeFn() func(string, func(redcon.Conn, redcon.Command), func(
 }
 
 func authLimitStoreKey(key string) string {
-	return authKeyPrefix + key
+	return contract.AuthKeyPrefix + contract.StorageKeySeparator + key
 }
 
 func loadAuthKeyLimits(db *DB) error {
 	limits := map[string]int{}
 
-	keysRes := db.Keys(authKeyPrefix + "*")
+	keysRes := db.Keys(contract.AuthKeyPrefix + contract.StorageKeySeparator + "*")
 	if keysRes.IsError() {
 		return keysRes.Error()
 	}
 
 	for _, storeKey := range keysRes.MustGet() {
-		key := strings.TrimPrefix(storeKey, authKeyPrefix)
+		key := strings.TrimPrefix(storeKey, contract.AuthKeyPrefix+contract.StorageKeySeparator)
 		valRes := db.Get(storeKey)
 		if valRes.IsError() {
 			if errors.Is(valRes.Error(), buntdb.ErrNotFound) {
@@ -415,7 +416,7 @@ func stop() error {
 // to the port, as the server runs in a background goroutine.
 // The service itself is long-running and will remain active until interrupted by
 // a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, dbPath string, indexes ...IndexDef) *DB {
+func Start(address string, dbPath string, indexes ...x.Index) *DB {
 	watchShutdownSignals()
 
 	srvOnce.Do(func() {
