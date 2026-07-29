@@ -10,6 +10,7 @@ import (
 
 	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
@@ -90,6 +91,7 @@ func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 	}
 
 	var ttl time.Duration
+	var nx bool
 	if len(cmd.Args) > 3 {
 		for i := 3; i < len(cmd.Args); i++ {
 			arg := strings.ToUpper(string(cmd.Args[i]))
@@ -109,8 +111,24 @@ func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 				}
 				ttl = time.Duration(msecs) * time.Millisecond
 				i++
+			} else if arg == "NX" {
+				nx = true
 			}
 		}
+	}
+
+	if nx {
+		set, err := db.SetNXWithTtl(string(cmd.Args[1]), string(cmd.Args[2]), ttl)
+		if err != nil {
+			conn.WriteError("ERR " + err.Error())
+			return
+		}
+		if set {
+			conn.WriteString("OK")
+		} else {
+			conn.WriteNull()
+		}
+		return
 	}
 
 	if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[2]), ttl); err != nil {
@@ -191,7 +209,18 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	res := db.Keys(string(cmd.Args[1]))
+
+	keyPattern := string(cmd.Args[1])
+	if hasLeadingWildcard(keyPattern) {
+		conn.WriteError("ERR forbidden key pattern")
+		return
+	}
+	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemKeyPrefix) {
+		conn.WriteError("ERR forbidden key pattern")
+		return
+	}
+
+	res := db.Keys(keyPattern)
 	if res.IsError() {
 		conn.WriteError("ERR " + res.Error().Error())
 	} else {
@@ -359,18 +388,38 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 }
 
 func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 3 || len(cmd.Args) > 4 {
+	if len(cmd.Args) < 3 || len(cmd.Args) > 5 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 	indexName := string(cmd.Args[1])
-	filterJSON := string(cmd.Args[2])
+	keyPattern := "*"
+	filterJSON := ""
+	orderArg := ""
+
+	switch len(cmd.Args) {
+	case 3:
+		filterJSON = string(cmd.Args[2])
+	case 4:
+		third := string(cmd.Args[2])
+		if strings.HasPrefix(strings.TrimSpace(third), "{") {
+			filterJSON = third
+			orderArg = string(cmd.Args[3])
+		} else {
+			keyPattern = third
+			filterJSON = string(cmd.Args[3])
+		}
+	case 5:
+		keyPattern = string(cmd.Args[2])
+		filterJSON = string(cmd.Args[3])
+		orderArg = string(cmd.Args[4])
+	}
 
 	var desc bool
-	if len(cmd.Args) == 4 {
-		order := strings.ToUpper(string(cmd.Args[3]))
+	if orderArg != "" {
+		order := strings.ToUpper(orderArg)
 		if order != "ASC" && order != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
+			conn.WriteError("ERR invalid order: " + orderArg)
 			return
 		}
 		desc = order == "DESC"
@@ -382,7 +431,7 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 		return
 	}
 
-	res := db.SearchIndex(indexName, filter, desc)
+	res := db.SearchIndex(indexName, keyPattern, filter, desc)
 	if res.IsError() {
 		if errors.Is(res.Error(), buntdb.ErrNotFound) {
 			conn.WriteArray(0)

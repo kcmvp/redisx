@@ -8,9 +8,36 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 )
+
+type testUserDoc string
+
+func (testUserDoc) Namespace() string  { return "user" }
+func (testUserDoc) Mem() bool          { return false }
+func (testUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u testUserDoc) RawJSON() string  { return string(u) }
+func (testUserDoc) TTL() time.Duration { return time.Hour }
+
+type testMemUserDoc string
+
+func (testMemUserDoc) Namespace() string  { return "user" }
+func (testMemUserDoc) Mem() bool          { return true }
+func (testMemUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u testMemUserDoc) RawJSON() string  { return string(u) }
+func (testMemUserDoc) TTL() time.Duration { return 0 }
+
+type expiringUserDoc string
+
+func (expiringUserDoc) Namespace() string  { return "expuser" }
+func (expiringUserDoc) Mem() bool          { return false }
+func (expiringUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u expiringUserDoc) RawJSON() string  { return string(u) }
+func (expiringUserDoc) TTL() time.Duration { return 40 * time.Millisecond }
 
 type DBSuite struct {
 	suite.Suite
@@ -18,7 +45,6 @@ type DBSuite struct {
 }
 
 func (suite *DBSuite) SetupTest() {
-	resetStorage()
 	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
 }
@@ -27,18 +53,15 @@ func (suite *DBSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	resetStorage()
 }
 
 func (suite *DBSuite) TestLifecycle() {
 	suite.Run("Empty path is invalid", func() {
-		resetStorage()
 		db := openDB("")
 		suite.Nil(db)
 	})
 
 	suite.Run("In-Memory DB", func() {
-		resetStorage()
 		db := openDB(":memory:")
 		suite.NotNil(db)
 		err := db.Set("key1", "val1")
@@ -52,7 +75,6 @@ func (suite *DBSuite) TestLifecycle() {
 	})
 
 	suite.Run("File DB", func() {
-		resetStorage()
 		path := filepath.Join(suite.T().TempDir(), "hot", "kv.db")
 		suite.NoError(os.MkdirAll(filepath.Dir(path), 0o755))
 		db := openDB(path)
@@ -157,8 +179,8 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	db := openDB(path)
 	suite.NotNil(db)
 	suite.NoError(db.registerIndexes(
-		Index("idx_age", "user:*", "age"),
-		Index("idx_hot_age", "_m_user:*", "age"),
+		x.Idx[testUserDoc]("age", "*", "age"),
+		x.Idx[testMemUserDoc]("age", "*", "age"),
 	))
 
 	suite.NoError(db.Set("user:1", `{"id":"1","age":20,"status":"cold"}`))
@@ -166,36 +188,44 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	suite.NoError(db.Set("_m_user:3", `{"id":"3","age":25,"status":"hot"}`))
 
 	keys := db.Keys("*user:*")
-	suite.True(keys.IsOk())
-	suite.ElementsMatch([]string{"user:1", "_m_user:2", "_m_user:3"}, keys.MustGet())
+	suite.True(keys.IsError())
+	suite.Contains(keys.Error().Error(), "cannot start with wildcard")
 	suite.ElementsMatch([]string{"user:1"}, db.Keys("user:*").MustGet())
 	suite.ElementsMatch([]string{"_m_user:2", "_m_user:3"}, db.Keys("_m_user:*").MustGet())
 
 	res := db.SearchKey("*user:*", nil, false)
-	suite.True(res.IsOk())
-	suite.Len(res.MustGet(), 3)
+	suite.True(res.IsError())
+	suite.Contains(res.Error().Error(), "cannot start with wildcard")
 
 	updated := db.Update("*user:*", nil, x.Set("status", "active"))
-	suite.True(updated.IsOk())
-	suite.ElementsMatch([]string{"user:1", "_m_user:2", "_m_user:3"}, updated.MustGet())
-	suite.Equal("active", gjson.Get(db.Get("user:1").MustGet(), "status").String())
-	suite.Equal("active", gjson.Get(db.Get("_m_user:2").MustGet(), "status").String())
+	suite.True(updated.IsError())
+	suite.Contains(updated.Error().Error(), "cannot start with wildcard")
+	suite.Equal("cold", gjson.Get(db.Get("user:1").MustGet(), "status").String())
+	suite.Equal("hot", gjson.Get(db.Get("_m_user:2").MustGet(), "status").String())
 
-	diskRes := db.SearchIndex("idx_age", nil, false)
+	diskRes := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", nil, false)
 	suite.True(diskRes.IsOk())
 	suite.Len(diskRes.MustGet(), 1)
 
-	memRes := db.SearchIndex("idx_hot_age", nil, false)
+	memRes := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), "_m_user:*", nil, false)
 	suite.True(memRes.IsOk())
 	suite.Len(memRes.MustGet(), 2)
+
+	mismatchDisk := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), "_m_user:*", nil, false)
+	suite.True(mismatchDisk.IsError())
+	suite.Contains(mismatchDisk.Error().Error(), "different storage layer")
+
+	mismatchMem := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), "user:*", nil, false)
+	suite.True(mismatchMem.IsError())
+	suite.Contains(mismatchMem.Error().Error(), "different storage layer")
 
 	suite.NoError(db.Close())
 
 	db = openDB(path)
 	suite.NotNil(db)
 	suite.NoError(db.registerIndexes(
-		Index("idx_age", "user:*", "age"),
-		Index("idx_hot_age", "_m_user:*", "age"),
+		x.Idx[testUserDoc]("age", "*", "age"),
+		x.Idx[testMemUserDoc]("age", "*", "age"),
 	))
 	defer func() { _ = db.Close() }()
 
@@ -207,13 +237,119 @@ func TestDBSuite(t *testing.T) {
 	suite.Run(t, new(DBSuite))
 }
 
+func TestDBX(t *testing.T) {
+	db := openDB(":memory:")
+	require.NotNil(t, db)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age")))
+
+	raw := `{"id":"200","name":"Test","age":30}`
+	d := testUserDoc(raw)
+
+	dbx := As[testUserDoc](db)
+
+	err := dbx.Set(d)
+	require.NoError(t, err)
+
+	key, err := x.StorageKey(d)
+	require.NoError(t, err)
+
+	got, err := dbx.Get("200")
+	require.NoError(t, err)
+	require.Equal(t, d, got)
+
+	ok, err := dbx.SetNX(d)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	keysRes := dbx.Keys("*")
+	require.NoError(t, keysRes.Error())
+	require.Contains(t, keysRes.MustGet(), key)
+
+	searchRes := dbx.SearchKey("*", x.Eq("age", float64(30)), false)
+	require.NoError(t, searchRes.Error())
+	require.Contains(t, searchRes.MustGet(), testUserDoc(raw))
+
+	idxRes := dbx.SearchIndex("age", "*", x.Eq("age", float64(30)), false)
+	require.NoError(t, idxRes.Error())
+	require.Contains(t, idxRes.MustGet(), testUserDoc(raw))
+
+	badIdxRes := dbx.SearchIndex("age", "user:*", x.Eq("age", float64(30)), false)
+	require.Error(t, badIdxRes.Error())
+	require.Contains(t, badIdxRes.Error().Error(), "document-scoped")
+
+	badFullIdxNameRes := dbx.SearchIndex("user_age", "*", x.Eq("age", float64(30)), false)
+	require.Error(t, badFullIdxNameRes.Error())
+	require.Contains(t, badFullIdxNameRes.Error().Error(), "fully-qualified index name")
+
+	updRes := dbx.Update("*", x.Eq("age", float64(30)), x.Set("age", 31))
+	require.NoError(t, updRes.Error())
+	require.Contains(t, updRes.MustGet(), key)
+
+	valRes := db.Get(key)
+	require.NoError(t, valRes.Error())
+	require.Contains(t, valRes.MustGet(), `"age":31`)
+
+	del, err := dbx.Delete(testUserDoc(`{"id":"200"}`))
+	require.NoError(t, err)
+	require.True(t, del)
+}
+
+func TestDBXTypedWritesRespectDocumentTTL(t *testing.T) {
+	db := openDB(":memory:")
+	require.NotNil(t, db)
+	t.Cleanup(func() { _ = db.Close() })
+
+	dbx := As[expiringUserDoc](db)
+
+	first := expiringUserDoc(`{"id":"1","name":"alpha"}`)
+	require.NoError(t, dbx.Set(first))
+
+	firstKey, err := x.StorageKey(first)
+	require.NoError(t, err)
+	requireTTLPositive(t, db, firstKey)
+
+	second := expiringUserDoc(`{"id":"2","name":"beta"}`)
+	ok, err := dbx.SetNX(second)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	secondKey, err := x.StorageKey(second)
+	require.NoError(t, err)
+	requireTTLPositive(t, db, secondKey)
+
+	updRes := dbx.Update("*", x.Eq("id", "1"), x.Set("name", "updated"))
+	require.NoError(t, updRes.Error())
+	require.Contains(t, updRes.MustGet(), firstKey)
+	requireTTLPositive(t, db, firstKey)
+
+	time.Sleep(80 * time.Millisecond)
+
+	_, err = dbx.Get("1")
+	require.Error(t, err)
+	_, err = dbx.Get("2")
+	require.Error(t, err)
+}
+
+func requireTTLPositive(t *testing.T, db *DB, key string) {
+	t.Helper()
+
+	var ttl time.Duration
+	err := db.store(layerForKey(key)).View(func(tx *buntdb.Tx) error {
+		var ttlErr error
+		ttl, ttlErr = tx.TTL(key)
+		return ttlErr
+	})
+	require.NoError(t, err)
+	require.Greater(t, ttl, time.Duration(0))
+}
+
 type UpdateSuite struct {
 	suite.Suite
 	db *DB
 }
 
 func (suite *UpdateSuite) SetupTest() {
-	resetStorage()
 	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
 
@@ -231,7 +367,6 @@ func (suite *UpdateSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	resetStorage()
 }
 
 func (suite *UpdateSuite) TestUpdateCases() {
@@ -309,10 +444,9 @@ type SearchSuite struct {
 }
 
 func (suite *SearchSuite) SetupTest() {
-	resetStorage()
 	suite.db = openDB(":memory:")
 	suite.NotNil(suite.db)
-	suite.NoError(suite.db.registerIndexes(Idx("user:*", "age")))
+	suite.NoError(suite.db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age")))
 
 	dataBytes, err := os.ReadFile("testdata/SearchSuite_InitData.json")
 	suite.NoError(err)
@@ -325,7 +459,7 @@ func (suite *SearchSuite) SetupTest() {
 		raw := string(emp)
 		department := gjson.Get(raw, "department").String()
 		id := gjson.Get(raw, "id").String()
-		key := "user" + keySeparator + department + keySeparator + id
+		key := "user" + contract.StorageKeySeparator + department + contract.StorageKeySeparator + id
 		suite.NoError(suite.db.Set(key, raw))
 	}
 }
@@ -334,52 +468,65 @@ func (suite *SearchSuite) TearDownTest() {
 	if suite.db != nil {
 		_ = suite.db.Close()
 	}
-	resetStorage()
 }
 
 func (suite *SearchSuite) TestSearchIndex() {
 	tests := []struct {
-		name      string
-		indexName string
-		filter    x.Filter
-		desc      bool
-		wantErr   bool
-		wantLen   int
+		name       string
+		indexName  string
+		keyPattern string
+		filter     x.Filter
+		desc       bool
+		wantErr    bool
+		wantLen    int
 	}{
 		{
-			name:      "Query ascending all",
-			indexName: "idx_age",
-			filter:    nil,
-			desc:      false,
-			wantErr:   false,
-			wantLen:   5,
+			name:       "Query ascending all",
+			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
+			keyPattern: "user:*",
+			filter:     nil,
+			desc:       false,
+			wantErr:    false,
+			wantLen:    5,
 		},
 		{
-			name:      "Query descending all",
-			indexName: "idx_age",
-			filter:    nil,
-			desc:      true,
-			wantErr:   false,
-			wantLen:   5,
+			name:       "Query descending all",
+			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
+			keyPattern: "user:*",
+			filter:     nil,
+			desc:       true,
+			wantErr:    false,
+			wantLen:    5,
 		},
 		{
-			name:      "Query with filter",
-			indexName: "idx_age",
-			filter:    x.Gt("age", float64(28)),
-			desc:      false,
-			wantErr:   false,
-			wantLen:   2,
+			name:       "Query with filter",
+			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
+			keyPattern: "user:*",
+			filter:     x.Gt("age", float64(28)),
+			desc:       false,
+			wantErr:    false,
+			wantLen:    2,
 		},
 		{
-			name:      "Query empty index name",
-			indexName: "",
-			wantErr:   true,
+			name:       "Query with key pattern filter",
+			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
+			keyPattern: "user:Engineering:*",
+			filter:     nil,
+			desc:       false,
+			wantErr:    false,
+			wantLen:    3,
+		},
+		{
+			name:       "Query empty index name",
+			indexName:  "",
+			keyPattern: "user:*",
+			wantErr:    true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchIndex(tt.indexName, tt.filter, tt.desc)
+			res := suite.db.SearchIndex(tt.indexName, tt.keyPattern, tt.filter, tt.desc)
 			if tt.wantErr {
 				suite.True(res.IsError())
 			} else {
@@ -397,6 +544,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		pattern   string
 		filter    x.Filter
 		desc      bool
+		wantErr   bool
 		wantEmpty bool
 		wantLen   int
 	}{
@@ -429,11 +577,21 @@ func (suite *SearchSuite) TestSearchKey() {
 			pattern:   "user:Marketing:*",
 			wantEmpty: true,
 		},
+		{
+			name:    "QueryKey rejects cross-layer wildcard",
+			pattern: "*user:*",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
 			res := suite.db.SearchKey(tt.pattern, tt.filter, tt.desc)
+			if tt.wantErr {
+				suite.True(res.IsError())
+				suite.Contains(res.Error().Error(), "cannot start with wildcard")
+				return
+			}
 			suite.True(res.IsOk())
 
 			got := res.MustGet()

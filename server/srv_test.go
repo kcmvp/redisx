@@ -17,9 +17,6 @@ import (
 
 const testExternalAuthKey = "external-test-key"
 
-// resetStorage clears the singleton instance in storage package. Used only for testing.
-// We access the unexported function via go:linkname, or we can just not reset it here and test it differently.
-// Since we can't easily call the private `reset` in storage, we just restart the DB with memory flag.
 func getFreePort() string {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -49,7 +46,6 @@ func (s *ServerTestSuite) SetupSuite() {
 func (s *ServerTestSuite) SetupTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	resetStorage()
 
 	authStateMu.Lock()
 	authKeyMaxConns = map[string]int{}
@@ -66,7 +62,6 @@ func (s *ServerTestSuite) SetupTest() {
 func (s *ServerTestSuite) TearDownTest() {
 	_ = stop()
 	time.Sleep(5 * time.Millisecond)
-	resetStorage()
 
 	authStateMu.Lock()
 	authKeyMaxConns = map[string]int{}

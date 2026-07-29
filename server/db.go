@@ -15,9 +15,8 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/x/contract"
 )
-
-const keySeparator = ":"
 
 type storageLayer uint8
 
@@ -26,45 +25,7 @@ const (
 	storageMem
 )
 
-// IndexDef describes one startup index declaration for SEARCHINDEX.
-type IndexDef struct {
-	// name is the index name used by SEARCHINDEX.
-	name string
-	// keyPattern is the key glob pattern used to select which keys participate
-	// in this index. It supports glob matching such as "*" and "?".
-	keyPattern string
-	// path is the JSON path used as the indexed value.
-	path string
-}
-
-// Index declares one JSON index to be created during server startup.
-func Index(name, keyPattern, jsonPath string) IndexDef {
-	return IndexDef{name: name, keyPattern: keyPattern, path: jsonPath}
-}
-
-// Idx declares one JSON index with an auto-generated name.
-//
-// The generated name uses the "idx_" prefix and derives the suffix from the
-// JSON path. For example:
-//
-//	Idx("user:*", "age")         -> "idx_age"
-//	Idx("user:*", "profile.age") -> "idx_profile_age"
-func Idx(keyPattern, jsonPath string) IndexDef {
-	return Index(idxName(jsonPath), keyPattern, jsonPath)
-}
-
-func idxName(jsonPath string) string {
-	replacer := strings.NewReplacer(".", "_")
-	return "idx_" + replacer.Replace(jsonPath)
-}
-
-// resetStorage resets DB-related process state for tests.
-//
-// The current implementation is intentionally empty because DB instances no
-// longer rely on package-level storage singletons.
-func resetStorage() {
-	// Reset is intentionally a no-op after removing singleton storage state.
-}
+// SECTION: Open
 
 // openDB creates one hybrid DB instance backed by:
 //   - one persistent layer opened from path
@@ -112,6 +73,14 @@ type DB struct {
 	indexLayers map[string]storageLayer
 }
 
+// DBX binds one document type to an existing DB.
+//
+// It keeps the DB-side API symmetric with client/doc while avoiding passing the
+// same DB value on every call.
+type DBX[D internal.RawDocument] DB
+
+// SECTION: Core DB
+
 // Raw exposes the persistent storage layer for advanced use cases.
 //
 // This is useful when your application needs direct transactions, indexes,
@@ -124,38 +93,51 @@ type DB struct {
 //		_, _, err := tx.Set("native:key", "value", nil)
 //		return err
 //	})
-func (x *DB) Raw() *buntdb.DB {
-	return x.disk
+func (db *DB) Raw() *buntdb.DB {
+	return db.disk
 }
 
 // RawMem exposes the in-memory storage layer used by keys with the "_m_"
 // prefix.
 //
 // Keys routed to this layer are not persisted across restarts.
-func (x *DB) RawMem() *buntdb.DB {
-	return x.mem
+func (db *DB) RawMem() *buntdb.DB {
+	return db.mem
 }
 
 // Close closes both the persistent and in-memory storage layers.
 //
 // The first close error is returned, if any.
-func (x *DB) Close() error {
-	var err error
-	if x.mem != nil {
-		if closeErr := x.mem.Close(); closeErr != nil && err == nil {
-			err = closeErr
+func (db *DB) Close() error {
+	var firstErr error
+	if db.mem != nil {
+		closeErr := db.mem.Close()
+		if closeErr != nil {
+			firstErr = closeErr
 		}
 	}
-	if x.disk != nil {
-		if closeErr := x.disk.Close(); closeErr != nil && err == nil {
-			err = closeErr
+	if db.disk != nil {
+		closeErr := db.disk.Close()
+		if closeErr != nil && firstErr == nil {
+			firstErr = closeErr
 		}
 	}
-	return err
+	return firstErr
 }
 
+// TODO(Go 1.27): when generic methods are available in the project toolchain,
+// fold this helper into (*DB).As[D]() so the typed view is exposed directly
+// from DB instead of a package-level helper.
+//
+// As returns a typed view over db without creating a new wrapper object.
+func As[D internal.RawDocument](db *DB) *DBX[D] {
+	return (*DBX[D])(db)
+}
+
+// SECTION: Storage Routing
+
 func isMemKey(key string) bool {
-	return strings.HasPrefix(key, internal.MemKeyPrefix)
+	return strings.HasPrefix(key, contract.MemKeyPrefix)
 }
 
 func hasLeadingWildcard(keyPattern string) bool {
@@ -169,37 +151,36 @@ func layerForKey(key string) storageLayer {
 	return storageDisk
 }
 
-func layersForPattern(keyPattern string) []storageLayer {
-	if strings.HasPrefix(keyPattern, internal.MemKeyPrefix) {
-		return []storageLayer{storageMem}
-	}
-	if hasLeadingWildcard(keyPattern) {
-		return []storageLayer{storageDisk, storageMem}
-	}
-	return []storageLayer{storageDisk}
-}
-
-func layerForIndexPattern(keyPattern string) (storageLayer, error) {
+// resolvePatternLayer parses one full storage-key pattern and reports whether
+// the pattern itself constrains the operation to a concrete storage layer.
+//
+// It answers the single routing question shared by all key/index operations:
+// can this pattern alone determine the target layer?
+//
+// The return values mean:
+//   - layer: the resolved layer when constrained is true
+//   - constrained: whether keyPattern itself pins the operation to one layer
+//   - error: syntactic validation failure such as an empty pattern
+//
+// A leading wildcard does not identify one layer, so it is treated as
+// unconstrained rather than as an error. Callers that require a single layer
+// must reject constrained == false themselves.
+func resolvePatternLayer(keyPattern string) (storageLayer, bool, error) {
 	if keyPattern == "" {
-		return storageDisk, errors.New("index key pattern is required")
+		return storageDisk, false, errors.New("key pattern is required")
 	}
 	if hasLeadingWildcard(keyPattern) {
-		return storageDisk, errors.New("index key pattern cannot start with wildcard")
+		return storageDisk, false, nil
 	}
-	return layerForKey(keyPattern), nil
+	return layerForKey(keyPattern), true, nil
 }
 
 // store returns the underlying storage handle for layer.
-func (x *DB) store(layer storageLayer) *buntdb.DB {
+func (db *DB) store(layer storageLayer) *buntdb.DB {
 	if layer == storageMem {
-		return x.mem
+		return db.mem
 	}
-	return x.disk
-}
-
-// storeForKey returns the underlying storage handle selected by key.
-func (x *DB) storeForKey(key string) *buntdb.DB {
-	return x.store(layerForKey(key))
+	return db.disk
 }
 
 type kvPair struct {
@@ -207,20 +188,19 @@ type kvPair struct {
 	value string
 }
 
-func appendUnique(items []string, seen map[string]struct{}, value string) []string {
-	if _, ok := seen[value]; ok {
-		return items
+func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
+	if ttl <= 0 {
+		return nil
 	}
-	seen[value] = struct{}{}
-	return append(items, value)
+	return &buntdb.SetOptions{Expires: true, TTL: ttl}
 }
 
-// Update applies JSON path updates to all values matched by a key glob pattern
-// and an optional filter.
-//
-// The target values must be valid JSON documents. Each x.Mutation is applied with
-// sjson semantics, so the path may address top-level or nested fields.
-// keyPattern uses key glob matching such as "*" and "?".
+// SECTION: Query And Update
+
+// The target values must be valid JSON documents. Each x.Mutation is applied
+// with sjson semantics, so the path may address top-level or nested fields.
+// keyPattern must be one full storage-key pattern, using key glob matching such
+// as "*" and "?".
 //
 // RESP equivalent:
 //
@@ -238,57 +218,61 @@ func appendUnique(items []string, seen map[string]struct{}, value string) []stri
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func (x *DB) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("pattern is required"))
+func (db *DB) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	layer, constrained, err := resolvePatternLayer(keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	if !constrained {
+		return mo.Err[[]string](errors.New("key pattern cannot start with wildcard"))
 	}
 	var updatedKeys []string
-	seen := map[string]struct{}{}
+	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
+		var matchedKeys []string
+		scanErr := tx.AscendKeys(keyPattern, func(key, value string) bool {
+			if filter == nil || filter.Eval(value) {
+				matchedKeys = append(matchedKeys, key)
+			}
+			return true
+		})
 
-	for _, layer := range layersForPattern(keyPattern) {
-		err := x.store(layer).Update(func(tx *buntdb.Tx) error {
-			var matchedKeys []string
-			err := tx.AscendKeys(keyPattern, func(key, value string) bool {
-				if filter == nil || filter.Eval(value) {
-					matchedKeys = append(matchedKeys, key)
-				}
-				return true
-			})
+		if scanErr != nil {
+			return scanErr
+		}
 
-			if err != nil {
-				return err
+		for _, key := range matchedKeys {
+			val, getErr := tx.Get(key)
+			if getErr != nil {
+				return getErr
+			}
+			ttl, ttlErr := tx.TTL(key)
+			if ttlErr != nil && !errors.Is(ttlErr, buntdb.ErrNotFound) {
+				return ttlErr
 			}
 
-			for _, key := range matchedKeys {
-				val, err := tx.Get(key)
+			newVal := val
+			for _, vp := range values {
+				newVal, err = sjson.Set(newVal, vp.Path(), vp.Value())
+				if err != nil {
+					err = fmt.Errorf("failed to set %s: %w", vp.Path(), err)
+					slog.Error("failed to update document", "key", key, "error", err)
+					return err
+				}
+			}
+
+			if newVal != val {
+				_, _, err = tx.Set(key, newVal, setOptionsForTTL(ttl))
 				if err != nil {
 					return err
 				}
-
-				newVal := val
-				for _, vp := range values {
-					newVal, err = sjson.Set(newVal, vp.Path(), vp.Value())
-					if err != nil {
-						err = fmt.Errorf("failed to set %s: %w", vp.Path(), err)
-						slog.Error("failed to update document", "key", key, "error", err)
-						return err
-					}
-				}
-
-				if newVal != val {
-					_, _, err = tx.Set(key, newVal, nil)
-					if err != nil {
-						return err
-					}
-				}
-				updatedKeys = appendUnique(updatedKeys, seen, key)
 			}
-
-			return nil
-		})
-		if err != nil {
-			return mo.Err[[]string](err)
+			updatedKeys = append(updatedKeys, key)
 		}
+
+		return nil
+	})
+	if err != nil {
+		return mo.Err[[]string](err)
 	}
 
 	sort.Strings(updatedKeys)
@@ -304,40 +288,48 @@ func (x *DB) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo
 //
 // Index key patterns must not start with "*" or "?" because the target layer
 // must be decided at startup time without scanning both layers.
-func (x *DB) registerIndexes(defs ...IndexDef) error {
-	if x.indexLayers == nil {
-		x.indexLayers = map[string]storageLayer{}
+func (db *DB) registerIndexes(defs ...x.Index) error {
+	if db.indexLayers == nil {
+		db.indexLayers = map[string]storageLayer{}
 	}
 	for _, def := range defs {
-		if def.name == "" {
+		if def.Name() == "" {
 			return errors.New("index name is required")
 		}
-		if def.keyPattern == "" {
+		if def.KeyPattern() == "" {
 			return errors.New("index key pattern is required")
 		}
-		if def.path == "" {
+		if def.Path() == "" {
 			return errors.New("index json path is required")
 		}
-		layer, err := layerForIndexPattern(def.keyPattern)
+		layer, constrained, err := resolvePatternLayer(def.KeyPattern())
 		if err != nil {
+			return fmt.Errorf("index %w", err)
+		}
+		if !constrained {
+			return errors.New("index key pattern cannot start with wildcard")
+		}
+		if _, exists := db.indexLayers[def.Name()]; exists {
+			return fmt.Errorf("index already declared: %s", def.Name())
+		}
+		if err := db.store(layer).CreateIndex(def.Name(), def.KeyPattern(), buntdb.IndexJSON(def.Path())); err != nil {
 			return err
 		}
-		if _, exists := x.indexLayers[def.name]; exists {
-			return fmt.Errorf("index already declared: %s", def.name)
-		}
-		if err := x.store(layer).CreateIndex(def.name, def.keyPattern, buntdb.IndexJSON(def.path)); err != nil {
-			return err
-		}
-		x.indexLayers[def.name] = layer
+		db.indexLayers[def.Name()] = layer
 	}
 
 	return nil
 }
 
-// SearchIndex scans a registered index, applies the optional filter, and
-// returns the matched JSON documents ordered by that index.
+// SearchIndex scans one registered full index name on its bound storage layer,
+// narrows results by one full storage-key pattern, applies the optional filter,
+// and returns the matched JSON documents ordered by that index.
 //
-// The index must be declared during server startup with Index(...) or Idx(...).
+// The index must be declared during server startup with x.Idx[D](...). The
+// indexName argument must be the internal full index name, while keyPattern
+// must be one full storage-key pattern. indexName chooses the storage layer
+// first; keyPattern only narrows matches within that layer. A concrete
+// keyPattern that points at a different layer is rejected.
 //
 // Ordering rules:
 //   - ascending when desc is false
@@ -345,35 +337,49 @@ func (x *DB) registerIndexes(defs ...IndexDef) error {
 //
 // RESP equivalent:
 //
-//	SEARCHINDEX <index_name> <json_filter> [ASC|DESC]
+//	SEARCHINDEX <index_name> <key_pattern> <json_filter> [ASC|DESC]
 //
 // Example:
 //
-//			res := db.SearchIndex(
-//	             "idx_age",
-//				x.And(
-//					x.Gte("age", 18),
-//					x.Eq("status", "active"),
-//				),
-//				false,
-//			)
-//		     users := res.MustGet()
-func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Result[[]string] {
+//	res := db.SearchIndex(
+//		"idx_user_age",
+//		"user:*",
+//		x.And(
+//			x.Gte("age", 18),
+//			x.Eq("status", "active"),
+//		),
+//		false,
+//	)
+//	users := res.MustGet()
+func (db *DB) SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
 	}
-	layer, ok := xdb.indexLayers[indexName]
+	if keyPattern == "" {
+		return mo.Err[[]string](errors.New("key pattern is required"))
+	}
+	layer, ok := db.indexLayers[indexName]
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 	}
+	patternLayer, constrained, err := resolvePatternLayer(keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	if constrained && patternLayer != layer {
+		return mo.Err[[]string](fmt.Errorf("key pattern targets a different storage layer than index %s", indexName))
+	}
 
 	var results []string
-	err := xdb.store(layer).View(func(tx *buntdb.Tx) error {
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
 		iter := tx.Ascend
 		if desc {
 			iter = tx.Descend
 		}
 		return iter(indexName, func(key, value string) bool {
+			if !buntdb.Match(key, keyPattern) {
+				return true
+			}
 			if !gjson.Valid(value) {
 				return true
 			}
@@ -393,8 +399,9 @@ func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Resu
 	return mo.Ok(results)
 }
 
-// SearchKey matches keys by key glob pattern, applies the optional filter to
-// each JSON value, and returns the matched JSON documents in key order.
+// SearchKey resolves one full storage-key pattern to one storage layer first,
+// then scans matching keys in that layer, applies the optional filter to each
+// JSON value, and returns the matched JSON documents in key order.
 //
 // keyPattern uses key glob matching such as "*" and "?".
 //
@@ -410,23 +417,25 @@ func (xdb *DB) SearchIndex(indexName string, filter x.Filter, desc bool) mo.Resu
 //		true,
 //	)
 //	users := res.MustGet()
-func (xdb *DB) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("pattern is required"))
+func (db *DB) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+	layer, constrained, err := resolvePatternLayer(keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	if !constrained {
+		return mo.Err[[]string](errors.New("key pattern cannot start with wildcard"))
 	}
 	var entries []kvPair
-	for _, layer := range layersForPattern(keyPattern) {
-		err := xdb.store(layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(keyPattern, func(key, value string) bool {
-				if filter == nil || filter.Eval(value) {
-					entries = append(entries, kvPair{key: key, value: value})
-				}
-				return true
-			})
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
+		return tx.AscendKeys(keyPattern, func(key, value string) bool {
+			if filter == nil || filter.Eval(value) {
+				entries = append(entries, kvPair{key: key, value: value})
+			}
+			return true
 		})
-		if err != nil {
-			return mo.Err[[]string](err)
-		}
+	})
+	if err != nil {
+		return mo.Err[[]string](err)
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -443,17 +452,21 @@ func (xdb *DB) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Resul
 	return mo.Ok(results)
 }
 
+// SECTION: Key Value
+
 // Set stores one string value under key.
 //
 // Routing rules:
 //   - keys prefixed with "_m_" are stored in the in-memory layer
 //   - all other keys are stored in the persistent layer
 //
+// key must be the full storage key.
+//
 // RESP equivalent:
 //
 //	SET <key> <value>
-func (x *DB) Set(key string, value string) error {
-	return x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
+func (db *DB) Set(key string, value string) error {
+	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
@@ -464,36 +477,49 @@ func (x *DB) Set(key string, value string) error {
 // A positive ttl makes the key expire automatically. A zero or negative ttl
 // behaves the same as [DB.Set].
 //
+// key must be the full storage key.
+//
 // RESP equivalents:
 //
 //	SET <key> <value> EX <seconds>
 //	SETEX <key> <seconds> <value>
-func (x *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
-	if ttl > 0 {
-		opt := &buntdb.SetOptions{Expires: true, TTL: ttl}
-		return x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
-			_, _, err := tx.Set(key, value, opt)
-			return err
-		})
-
-	} else {
-		return x.Set(key, value)
+func (db *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
+	opt := setOptionsForTTL(ttl)
+	if opt == nil {
+		return db.Set(key, value)
 	}
+	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set(key, value, opt)
+		return err
+	})
 }
 
 // SetNX stores value only when key does not already exist.
 //
 // The returned boolean reports whether the write happened.
 //
+// key must be the full storage key.
+//
 // RESP equivalent:
 //
 //	SETNX <key> <value>
-func (x *DB) SetNX(key string, value string) (bool, error) {
+func (db *DB) SetNX(key string, value string) (bool, error) {
+	return db.SetNXWithTtl(key, value, 0)
+}
+
+// SetNXWithTtl stores value only when key does not already exist, and applies
+// the provided TTL when it is positive.
+//
+// The returned boolean reports whether the write happened.
+//
+// key must be the full storage key.
+func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, error) {
 	var set bool
-	err := x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
+	opt := setOptionsForTTL(ttl)
+	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == buntdb.ErrNotFound {
-			_, _, err = tx.Set(key, value, nil)
+			_, _, err = tx.Set(key, value, opt)
 			if err == nil {
 				set = true
 			}
@@ -511,12 +537,14 @@ func (x *DB) SetNX(key string, value string) (bool, error) {
 //
 // A missing key is returned as an error result.
 //
+// key must be the full storage key.
+//
 // RESP equivalent:
 //
 //	GET <key>
-func (x *DB) Get(key string) mo.Result[string] {
+func (db *DB) Get(key string) mo.Result[string] {
 	var val string
-	err := x.storeForKey(key).View(func(tx *buntdb.Tx) error {
+	err := db.store(layerForKey(key)).View(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Get(key)
 		return innerErr
@@ -532,12 +560,14 @@ func (x *DB) Get(key string) mo.Result[string] {
 //
 // The returned boolean reports whether the key existed.
 //
+// key must be the full storage key.
+//
 // RESP equivalent:
 //
 //	DEL <key>
-func (x *DB) Delete(key string) (bool, error) {
+func (db *DB) Delete(key string) (bool, error) {
 	var val string
-	err := x.storeForKey(key).Update(func(tx *buntdb.Tx) error {
+	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Delete(key)
 		if innerErr == buntdb.ErrNotFound {
@@ -551,32 +581,154 @@ func (x *DB) Delete(key string) (bool, error) {
 	return len(val) > 0, nil
 }
 
-// Keys returns all keys matching keyPattern across the relevant storage layers.
-//
-// Routing rules:
-//   - patterns starting with "_m_" only scan the in-memory layer
-//   - patterns starting with any other concrete prefix only scan the persistent layer
-//   - patterns starting with "*" or "?" scan both layers and merge the results
+// Keys resolves one full storage-key pattern to one storage layer first, then
+// returns all matching keys from that layer.
 //
 // keyPattern uses key glob matching such as "*" and "?".
 //
 // RESP equivalent:
 //
 //	KEYS <key_pattern>
-func (x *DB) Keys(keyPattern string) mo.Result[[]string] {
+func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
+	layer, constrained, err := resolvePatternLayer(keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	if !constrained {
+		return mo.Err[[]string](errors.New("key pattern cannot start with wildcard"))
+	}
 	var keys []string
-	seen := map[string]struct{}{}
-	for _, layer := range layersForPattern(keyPattern) {
-		err := x.store(layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(keyPattern, func(key, value string) bool {
-				keys = appendUnique(keys, seen, key)
-				return true
-			})
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
+		return tx.AscendKeys(keyPattern, func(key, value string) bool {
+			keys = append(keys, key)
+			return true
 		})
-		if err != nil {
-			return mo.Err[[]string](err)
-		}
+	})
+	if err != nil {
+		return mo.Err[[]string](err)
 	}
 	sort.Strings(keys)
 	return mo.Ok(keys)
+}
+
+// SECTION: Typed Document View
+
+// Get loads one document by its document-level key value.
+//
+// The input key is the resolved JSON-layer key value, not the final storage
+// key. The storage namespace is derived from D automatically.
+func (dbx *DBX[D]) Get(key string) (D, error) {
+	var zero D
+	if dbx == nil {
+		return zero, errors.New("db is nil")
+	}
+
+	res := (*DB)(dbx).Get(x.StorageKeyValue[D](key))
+	if res.IsError() {
+		return zero, res.Error()
+	}
+	return D(res.MustGet()), nil
+}
+
+// Set stores one document using its derived storage key and document TTL.
+func (dbx *DBX[D]) Set(d D) error {
+	if dbx == nil {
+		return errors.New("db is nil")
+	}
+
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return err
+	}
+	return (*DB)(dbx).SetWithTtl(key, d.RawJSON(), d.TTL())
+}
+
+// SetNX stores one document only when its key does not already exist, using
+// the document TTL.
+func (dbx *DBX[D]) SetNX(d D) (bool, error) {
+	if dbx == nil {
+		return false, errors.New("db is nil")
+	}
+
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return (*DB)(dbx).SetNXWithTtl(key, d.RawJSON(), d.TTL())
+}
+
+// Delete removes one document by its derived storage key.
+func (dbx *DBX[D]) Delete(d D) (bool, error) {
+	if dbx == nil {
+		return false, errors.New("db is nil")
+	}
+
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return (*DB)(dbx).Delete(key)
+}
+
+// Keys returns keys matching the document namespace and key sub-pattern.
+func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
+	if dbx == nil {
+		return mo.Err[[]string](errors.New("db is nil"))
+	}
+	return (*DB)(dbx).Keys(x.StorageKeyValue[D](keyPattern))
+}
+
+// SearchIndex delegates to the underlying DB index search.
+func (dbx *DBX[D]) SearchIndex(idxName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+	if dbx == nil {
+		return mo.Err[[]D](errors.New("db is nil"))
+	}
+
+	fullIdxName, err := internal.ValidateIdxName[D](idxName)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := (*DB)(dbx).SearchIndex(fullIdxName, fullKeyPattern, filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+// SearchKey returns documents matching the prefixed key pattern and filter.
+func (dbx *DBX[D]) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+	if dbx == nil {
+		return mo.Err[[]D](errors.New("db is nil"))
+	}
+	res := (*DB)(dbx).SearchKey(x.StorageKeyValue[D](keyPattern), filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+// Update applies mutations to documents matching the prefixed key pattern.
+func (dbx *DBX[D]) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if dbx == nil {
+		return mo.Err[[]string](errors.New("db is nil"))
+	}
+	return (*DB)(dbx).Update(x.StorageKeyValue[D](keyPattern), filter, values...)
 }
