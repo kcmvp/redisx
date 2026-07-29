@@ -77,7 +77,7 @@ type DB struct {
 //
 // It keeps the DB-side API symmetric with client/doc while avoiding passing the
 // same DB value on every call.
-type DBX[D internal.RawDocument] DB
+type DBX[D x.Document] DB
 
 // SECTION: Core DB
 
@@ -130,7 +130,7 @@ func (db *DB) Close() error {
 // from DB instead of a package-level helper.
 //
 // As returns a typed view over db without creating a new wrapper object.
-func As[D internal.RawDocument](db *DB) *DBX[D] {
+func As[D x.Document](db *DB) *DBX[D] {
 	return (*DBX[D])(db)
 }
 

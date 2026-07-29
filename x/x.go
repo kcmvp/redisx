@@ -255,7 +255,11 @@ func Set[T ScalarType](path string, value T) Mutation {
 //	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
 //	func (u UserDoc) RawJSON() string  { return string(u) }
 //	func (UserDoc) TTL() time.Duration { return time.Hour }
+//
+// Documents are JSON string aliases. The `~string` constraint guarantees typed
+// helpers can cast loaded raw JSON payloads back to the concrete document type.
 type Document interface {
+	~string
 	// Namespace returns the storage namespace for this document type,
 	// such as "user".
 	//
