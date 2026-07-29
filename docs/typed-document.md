@@ -9,7 +9,7 @@ This keeps `server.DB` as a minimal key-value core, while letting higher-level c
 
 ## Define a document type
 
-Documents are represented as JSON strings. A document type is typically a `string` alias that implements `x.Document` metadata:
+Documents are represented as JSON strings. A document type is typically a `string` alias that implements `x.Document`:
 
 ```go
 type UserDoc string
@@ -67,9 +67,13 @@ _ = doc
 `D` is constrained by:
 
 ```go
-type rawDocument interface {
-    x.Document
+type x.Document interface {
     ~string
+    Namespace() string
+    Mem() bool
+    KeyAttrs() []string
+    RawJSON() string
+    TTL() time.Duration
 }
 ```
 

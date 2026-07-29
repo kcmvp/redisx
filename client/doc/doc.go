@@ -11,7 +11,7 @@ import (
 //
 // The input key is the resolved JSON-layer key value, not the final storage
 // key. The storage namespace is derived from D automatically.
-func Get[D internal.RawDocument](key string) (D, error) {
+func Get[D x.Document](key string) (D, error) {
 	var zero D
 	raw, err := client.Get(x.StorageKeyValue[D](key))
 	if err != nil {
@@ -22,7 +22,7 @@ func Get[D internal.RawDocument](key string) (D, error) {
 
 // Set stores the document raw JSON using the key resolved from the document
 // itself, with the document TTL.
-func Set[D internal.RawDocument](d D) error {
+func Set[D x.Document](d D) error {
 	key, err := x.StorageKey(d)
 	if err != nil {
 		return err
@@ -32,7 +32,7 @@ func Set[D internal.RawDocument](d D) error {
 
 // SetNX stores the document raw JSON only when its resolved storage key does
 // not already exist, with the document TTL.
-func SetNX[D internal.RawDocument](d D) (bool, error) {
+func SetNX[D x.Document](d D) (bool, error) {
 	key, err := x.StorageKey(d)
 	if err != nil {
 		return false, err
@@ -41,7 +41,7 @@ func SetNX[D internal.RawDocument](d D) (bool, error) {
 }
 
 // Delete removes the document resolved from its key attributes.
-func Delete[D internal.RawDocument](d D) (bool, error) {
+func Delete[D x.Document](d D) (bool, error) {
 	key, err := x.StorageKey(d)
 	if err != nil {
 		return false, err
@@ -50,7 +50,7 @@ func Delete[D internal.RawDocument](d D) (bool, error) {
 }
 
 // Keys returns all keys matching the document type prefix and sub-pattern.
-func Keys[D internal.RawDocument](keyPattern string) mo.Result[[]string] {
+func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 	return client.Keys(x.StorageKeyValue[D](keyPattern))
 }
 
@@ -67,7 +67,7 @@ func Keys[D internal.RawDocument](keyPattern string) mo.Result[[]string] {
 // not an already-prefixed full index name such as "user_age". keyPattern must
 // likewise be a document-scoped sub-pattern, not an already-prefixed storage
 // pattern such as "user:*".
-func SearchIndex[D internal.RawDocument](idxName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+func SearchIndex[D x.Document](idxName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
 	fullIdxName, err := internal.ValidateIdxName[D](idxName)
 	if err != nil {
 		return mo.Err[[]D](err)
@@ -92,7 +92,7 @@ func SearchIndex[D internal.RawDocument](idxName string, keyPattern string, filt
 }
 
 // SearchKey executes SEARCHKEY using the document type prefix and sub-pattern.
-func SearchKey[D internal.RawDocument](keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+func SearchKey[D x.Document](keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
 	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
 	if err != nil {
 		return mo.Err[[]D](err)
@@ -112,6 +112,6 @@ func SearchKey[D internal.RawDocument](keyPattern string, filter x.Filter, desc 
 }
 
 // Update executes UPDATE using the document type prefix and sub-pattern.
-func Update[D internal.RawDocument](keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+func Update[D x.Document](keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	return client.Update(x.StorageKeyValue[D](keyPattern), filter, values...)
 }

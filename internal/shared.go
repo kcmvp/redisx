@@ -26,18 +26,10 @@ func AuthKey() string {
 	return authKey
 }
 
-// RawDocument is the shared typed-document constraint used by internal helpers.
-// It stays inside the module to avoid leaking helper-level generic constraints
-// into the public x contract surface.
-type RawDocument interface {
-	x.Document
-	~string
-}
-
 // ValidateKeyPattern resolves one document-scoped key pattern into its full
 // storage pattern. It rejects already-prefixed storage patterns because the
 // document type itself already determines the namespace prefix.
-func ValidateKeyPattern[D RawDocument](keyPattern string) (string, error) {
+func ValidateKeyPattern[D x.Document](keyPattern string) (string, error) {
 	fullNamespace := x.StorageKeyValue[D]("")
 	fullPrefix := fullNamespace + contract.StorageKeySeparator
 	if keyPattern == fullNamespace || strings.HasPrefix(keyPattern, fullPrefix) {
@@ -49,7 +41,7 @@ func ValidateKeyPattern[D RawDocument](keyPattern string) (string, error) {
 // ValidateIdxName resolves one logical document index name into its full
 // runtime name. It rejects already-prefixed index names because the document
 // type itself already determines the namespace prefix.
-func ValidateIdxName[D RawDocument](idxName string) (string, error) {
+func ValidateIdxName[D x.Document](idxName string) (string, error) {
 	if idxName == "" {
 		return "", fmt.Errorf("index name is required")
 	}
