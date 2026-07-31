@@ -122,6 +122,14 @@ func (noKeyAttrDoc) KeyAttrs() []string { return nil }
 func (u noKeyAttrDoc) RawJSON() string  { return string(u) }
 func (noKeyAttrDoc) TTL() time.Duration { return time.Hour }
 
+type boolKeyDoc string
+
+func (boolKeyDoc) Namespace() string  { return "flagdoc" }
+func (boolKeyDoc) Mem() bool          { return false }
+func (boolKeyDoc) KeyAttrs() []string { return []string{"enabled"} }
+func (u boolKeyDoc) RawJSON() string  { return string(u) }
+func (boolKeyDoc) TTL() time.Duration { return time.Hour }
+
 func resetDocumentRegistry() {
 	documentRegistry = sync.Map{}
 	documentTypeRegistry = sync.Map{}
@@ -407,6 +415,20 @@ func TestStorageKey(t *testing.T) {
 			},
 			want: "plain",
 		},
+			{
+				name: "normalizes true bool key attr to one",
+				run: func() (string, error) {
+					return StorageKey(boolKeyDoc(`{"enabled":true}`))
+				},
+				want: "flagdoc:1",
+			},
+			{
+				name: "normalizes false bool key attr to zero",
+				run: func() (string, error) {
+					return StorageKey(boolKeyDoc(`{"enabled":false}`))
+				},
+				want: "flagdoc:0",
+			},
 		{
 			name: "rejects empty key attr path",
 			run: func() (string, error) {
