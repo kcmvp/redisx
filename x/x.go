@@ -375,7 +375,8 @@ func requireRegistered[D Document]() documentMeta {
 //
 // Each path declared by [Document.KeyAttrs] must exist in [Document.RawJSON].
 // When multiple attributes are declared, their resolved values are joined with
-// ":" to form the key value part.
+// ":" to form the key value part. Boolean key attrs are normalized to "1" and
+// "0" so generated keys stay compact and stable.
 func StorageKey[D Document](d D) (string, error) {
 	paths := d.KeyAttrs()
 	if len(paths) == 0 {
@@ -393,10 +394,20 @@ func StorageKey[D Document](d D) (string, error) {
 			return "", fmt.Errorf("missing key attr: %s", path)
 		}
 
-		parts = append(parts, result.String())
+		parts = append(parts, keyAttrString(result))
 	}
 
 	return StorageKeyValue[D](strings.Join(parts, contract.StorageKeySeparator)), nil
+}
+
+func keyAttrString(result gjson.Result) string {
+	if result.Type == gjson.True {
+		return "1"
+	}
+	if result.Type == gjson.False {
+		return "0"
+	}
+	return result.String()
 }
 
 // StorageKeyValue joins a resolved key value with the document namespace
