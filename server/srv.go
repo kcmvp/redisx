@@ -411,11 +411,21 @@ func stop() error {
 	return err
 }
 
-// Start initializes and starts the Redis-compatible server on the given address.
-// This function returns immediately after the server has successfully started binding
-// to the port, as the server runs in a background goroutine.
-// The service itself is long-running and will remain active until interrupted by
-// a system signal (SIGINT/SIGTERM) or a programmatic shutdown.
+// Start initializes and starts the Redis-compatible server on the given
+// address.
+//
+// redisx always opens two underlying BuntDB instances:
+//   - one primary layer from dbPath
+//   - one dedicated memory-only layer for keys prefixed with "_m_"
+//
+// dbPath configures only the primary layer. Use one real file path such as
+// "/tmp/redisx.db" for on-disk persistence, or use BuntDB's special value
+// ":memory:" when the primary layer should also remain in memory.
+//
+// This function returns immediately after the server has successfully started
+// binding to the port, as the server runs in a background goroutine. The
+// service itself is long-running and will remain active until interrupted by a
+// system signal (SIGINT/SIGTERM) or a programmatic shutdown.
 func Start(address string, dbPath string, indexes ...x.Index) *DB {
 	watchShutdownSignals()
 
