@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,9 +60,10 @@ type ClientTestSuite struct {
 
 func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
+	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
 	db := server.Start(
 		clientTestServerAddr,
-		":memory:",
+		dbPath,
 		x.Idx[testUserDoc]("age", "*", "age"),
 		x.Idx[testUserDoc]("email", "*", "email"),
 	)

@@ -1,6 +1,7 @@
 package doc
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -22,9 +23,10 @@ const docTestServerAddr = "127.0.0.1:36382"
 
 func (s *DocTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
+	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
 	db := server.Start(
 		docTestServerAddr,
-		":memory:",
+		dbPath,
 		x.Idx[UserDoc]("age", "*", "age"),
 	)
 	s.Require().NotNil(db)

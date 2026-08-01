@@ -100,8 +100,8 @@ If your values are JSON documents, both modes also support the typed `x.Document
 
 The `dbPath` argument only configures the primary layer:
 
-- use a real file path such as `"/tmp/redisx.db"` for a disk-backed primary layer
-- use BuntDB's special path `":memory:"` for an in-memory primary layer
+- use a real database file path such as `"/tmp/redisx.db"`
+- `":memory:"` is rejected because redisx already has a dedicated memory-only layer
 
 Routing is explicit and key-based:
 
@@ -122,6 +122,8 @@ Start the embedded RESP server with:
 
 ```go
 import (
+    "os"
+    "path/filepath"
     "time"
 
     "github.com/kcmvp/redisx/server"
@@ -136,9 +138,12 @@ func (UserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u UserDoc) RawJSON() string  { return string(u) }
 func (UserDoc) TTL() time.Duration { return 0 }
 
+home, _ := os.UserHomeDir()
+dbPath := filepath.Join(home, ".redisx", "test.db")
+
 db := server.Start(
     "127.0.0.1:6380",
-    ":memory:",
+    dbPath,
     x.Idx[UserDoc]("age", "*", "age"),
     x.Idx[UserDoc]("email", "*", "email"),
 )
@@ -146,8 +151,11 @@ db := server.Start(
 
 - The second argument is passed through to `buntdb.Open(path)`.
 - `redisx` always opens a second dedicated memory-only layer for `_m_` keys.
-- Use BuntDB's special path `":memory:"` when the primary layer should also remain in memory. If the server restarts, all primary-layer data is lost.
-- Use an explicit file path such as `"/tmp/redisx.db"` when the primary layer should persist on disk. If the server restarts, that primary-layer data is kept.
+- Use an explicit database file path such as `"/tmp/redisx.db"` for the primary layer.
+- `":memory:"` is rejected as `dbPath`; the `_m_` layer is already the in-memory layer.
+- Missing parent directories are created automatically, and the database file is created on first start if it does not already exist.
+- `dbPath` itself must still be a file path, not a directory.
+- Do not pass `"~/.redisx/test.db"` literally. `redisx` does not expand `~`; build an explicit path yourself.
 - `Start` returns the local `*server.DB` handle, so the same process can also operate on the database directly.
 - `SEARCHINDEX` requires its target index to be created here during startup.
 

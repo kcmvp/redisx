@@ -418,9 +418,12 @@ func stop() error {
 //   - one primary layer from dbPath
 //   - one dedicated memory-only layer for keys prefixed with "_m_"
 //
-// dbPath configures only the primary layer. Use one real file path such as
-// "/tmp/redisx.db" for on-disk persistence, or use BuntDB's special value
-// ":memory:" when the primary layer should also remain in memory.
+// dbPath configures only the primary layer. Use one real database file path
+// such as "/tmp/redisx.db" for on-disk persistence. Missing parent
+// directories are created automatically, and the database file itself is
+// created on first open when it does not already exist. Directory paths are
+// rejected. The special value ":memory:" is also rejected because redisx
+// already has a dedicated memory-only layer for "_m_" keys.
 //
 // This function returns immediately after the server has successfully started
 // binding to the port, as the server runs in a background goroutine. The

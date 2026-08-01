@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,7 @@ type DBSuite struct {
 }
 
 func (suite *DBSuite) SetupTest() {
-	suite.db = openDB(":memory:")
+	suite.db = openDB(testutil.DBPath(suite.T()))
 	suite.NotNil(suite.db)
 }
 
@@ -62,7 +63,7 @@ func (suite *DBSuite) TestLifecycle() {
 	})
 
 	suite.Run("In-Memory DB", func() {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(suite.T()))
 		suite.NotNil(db)
 		err := db.Set("key1", "val1")
 		suite.NoError(err)
@@ -76,7 +77,6 @@ func (suite *DBSuite) TestLifecycle() {
 
 	suite.Run("File DB", func() {
 		path := filepath.Join(suite.T().TempDir(), "hot", "kv.db")
-		suite.NoError(os.MkdirAll(filepath.Dir(path), 0o755))
 		db := openDB(path)
 		suite.NotNil(db)
 		suite.NoError(db.Set("persist:key", "persist-val"))
@@ -88,6 +88,32 @@ func (suite *DBSuite) TestLifecycle() {
 		suite.True(res.IsOk())
 		suite.Equal("persist-val", res.MustGet())
 		suite.NoError(db.Close())
+	})
+
+	suite.Run("Creates missing parent directory", func() {
+		base := suite.T().TempDir()
+		path := filepath.Join(base, "nested", "deeper", "kv.db")
+
+		db := openDB(path)
+		suite.NotNil(db)
+		suite.NoError(db.Close())
+
+		info, err := os.Stat(filepath.Dir(path))
+		suite.NoError(err)
+		suite.True(info.IsDir())
+	})
+
+	suite.Run("Directory path is invalid", func() {
+		dir := filepath.Join(suite.T().TempDir(), "dbdir")
+		suite.NoError(os.MkdirAll(dir, 0o755))
+
+		db := openDB(dir)
+		suite.Nil(db)
+	})
+
+	suite.Run(`Special ":memory:" path is invalid`, func() {
+		db := openDB(":memory:")
+		suite.Nil(db)
 	})
 }
 
@@ -283,7 +309,7 @@ func TestDBSuite(t *testing.T) {
 }
 
 func TestDBX(t *testing.T) {
-	db := openDB(":memory:")
+	db := openDB(testutil.DBPath(t))
 	require.NotNil(t, db)
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age")))
@@ -349,7 +375,7 @@ func TestDBX(t *testing.T) {
 }
 
 func TestDBXTypedWritesRespectDocumentTTL(t *testing.T) {
-	db := openDB(":memory:")
+	db := openDB(testutil.DBPath(t))
 	require.NotNil(t, db)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -403,7 +429,7 @@ type UpdateSuite struct {
 }
 
 func (suite *UpdateSuite) SetupTest() {
-	suite.db = openDB(":memory:")
+	suite.db = openDB(testutil.DBPath(suite.T()))
 	suite.NotNil(suite.db)
 
 	data := map[string]string{
@@ -493,7 +519,7 @@ func TestUpdateSuite(t *testing.T) {
 
 func TestDBUpdateEdgeCases(t *testing.T) {
 	t.Run("rejects empty pattern", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 
@@ -503,7 +529,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 	})
 
 	t.Run("rejects leading wildcard pattern", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 
@@ -513,7 +539,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 	})
 
 	t.Run("returns empty when no documents match", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 		require.NoError(t, db.Set("user:1", `{"id":"1","status":"pending"}`))
@@ -527,7 +553,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 	})
 
 	t.Run("returns matched key even when update is no-op", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 		require.NoError(t, db.Set("user:1", `{"id":"1","status":"active"}`))
@@ -542,7 +568,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 	})
 
 	t.Run("preserves ttl on updated keys", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 		require.NoError(t, db.SetWithTtl("user:1", `{"id":"1","status":"pending"}`, 200*time.Millisecond))
@@ -559,7 +585,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 	})
 
 	t.Run("returns error and leaves data unchanged when one mutation path is invalid", func(t *testing.T) {
-		db := openDB(":memory:")
+		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 		require.NoError(t, db.Set("user:1", `{"id":"1","status":"pending"}`))
@@ -581,7 +607,7 @@ type SearchSuite struct {
 }
 
 func (suite *SearchSuite) SetupTest() {
-	suite.db = openDB(":memory:")
+	suite.db = openDB(testutil.DBPath(suite.T()))
 	suite.NotNil(suite.db)
 	suite.NoError(suite.db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age")))
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -159,7 +160,7 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 	addr := getFreePort()
 
 	// Start server with default external auth key limit = 1
-	db := Start(addr, ":memory:")
+	db := Start(addr, testutil.DBPath(t))
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
 	defer func() { _ = stop() }()
 
@@ -244,7 +245,7 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 	t := s.T()
 	addr := getFreePort()
-	db := Start(addr, ":memory:")
+	db := Start(addr, testutil.DBPath(t))
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
 	defer func() { _ = stop() }()
 
@@ -306,7 +307,7 @@ func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 	t := s.T()
 	addr := getFreePort()
-	db := Start(addr, ":memory:")
+	db := Start(addr, testutil.DBPath(t))
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
 	defer func() { _ = stop() }()
 
@@ -344,7 +345,7 @@ func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 }
 
 func (s *ServerTestSuite) TestLoadAuthKeyLimitsSkipsUnavailableKeys() {
-	db := openDB(":memory:")
+	db := openDB(testutil.DBPath(s.T()))
 	s.Require().NotNil(db)
 	defer func() { _ = db.Close() }()
 
@@ -363,7 +364,7 @@ func (s *ServerTestSuite) TestLoadAuthKeyLimitsSkipsUnavailableKeys() {
 }
 
 func (s *ServerTestSuite) TestRefreshAuthLimitTreatsBadValueAsExpired() {
-	db := openDB(":memory:")
+	db := openDB(testutil.DBPath(s.T()))
 	s.Require().NotNil(db)
 	defer func() { _ = db.Close() }()
 
@@ -448,7 +449,7 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("", ":memory:")
+	db := Start("", testutil.DBPath(s.T()))
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -567,7 +568,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		_ = Start(getFreePort(), ":memory:")
+		_ = Start(getFreePort(), testutil.DBPath(t))
 		close(doneCh)
 	}()
 
@@ -605,7 +606,7 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 	}
 
 	startAddr := "127.0.0.1:16380"
-	_ = Start(startAddr, ":memory:")
+	_ = Start(startAddr, testutil.DBPath(t))
 
 	select {
 	case addr := <-listenCalledCh:
@@ -630,7 +631,7 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 		return nil
 	}
 
-	_ = Start("", ":memory:")
+	_ = Start("", testutil.DBPath(t))
 
 	select {
 	case addr := <-listenCalledCh:
