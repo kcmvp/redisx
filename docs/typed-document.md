@@ -104,6 +104,14 @@ For document-scoped methods that accept a `keyPattern` (`Keys`, `SearchKey`, `Up
 
 This avoids hardcoding the `"user"` namespace at call sites.
 
+Typed helpers reject already-prefixed storage patterns such as `user:*`, because
+the document type already determines the namespace prefix.
+
+For `SearchIndex`, the same rule applies to both inputs:
+
+- `idxName` is one logical name such as `age`, not one full runtime name such as `user_age`
+- `keyPattern` is one document-scoped sub-pattern such as `*`, not one full storage pattern such as `user:*`
+
 ## Practical notes
 
 - `Get(key)` accepts the document-level key value, not the prefixed storage key. For `UserDoc`, pass `"200"` instead of `"user:200"`.

@@ -675,7 +675,11 @@ func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
 	if dbx == nil {
 		return mo.Err[[]string](errors.New("db is nil"))
 	}
-	return (*DB)(dbx).Keys(x.StorageKeyValue[D](keyPattern))
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return (*DB)(dbx).Keys(fullKeyPattern)
 }
 
 // SearchIndex delegates to the underlying DB index search.
@@ -712,7 +716,12 @@ func (dbx *DBX[D]) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.R
 	if dbx == nil {
 		return mo.Err[[]D](errors.New("db is nil"))
 	}
-	res := (*DB)(dbx).SearchKey(x.StorageKeyValue[D](keyPattern), filter, desc)
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := (*DB)(dbx).SearchKey(fullKeyPattern, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}
@@ -730,5 +739,9 @@ func (dbx *DBX[D]) Update(keyPattern string, filter x.Filter, values ...x.Mutati
 	if dbx == nil {
 		return mo.Err[[]string](errors.New("db is nil"))
 	}
-	return (*DB)(dbx).Update(x.StorageKeyValue[D](keyPattern), filter, values...)
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return (*DB)(dbx).Update(fullKeyPattern, filter, values...)
 }

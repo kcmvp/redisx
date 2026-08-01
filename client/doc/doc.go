@@ -51,7 +51,11 @@ func Delete[D x.Document](d D) (bool, error) {
 
 // Keys returns all keys matching the document type prefix and sub-pattern.
 func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
-	return client.Keys(x.StorageKeyValue[D](keyPattern))
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return client.Keys(fullKeyPattern)
 }
 
 // SearchIndex executes SEARCHINDEX using one logical document index name,
@@ -113,5 +117,9 @@ func SearchKey[D x.Document](keyPattern string, filter x.Filter, desc bool) mo.R
 
 // Update executes UPDATE using the document type prefix and sub-pattern.
 func Update[D x.Document](keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	return client.Update(x.StorageKeyValue[D](keyPattern), filter, values...)
+	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return client.Update(fullKeyPattern, filter, values...)
 }

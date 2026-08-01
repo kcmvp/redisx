@@ -139,6 +139,18 @@ func (s *DocTestSuite) TestSearchKeyRejectsPrefixedStoragePattern() {
 	s.Contains(res.Error().Error(), "document-scoped")
 }
 
+func (s *DocTestSuite) TestKeysRejectsPrefixedStoragePattern() {
+	res := Keys[UserDoc]("user:*")
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
+func (s *DocTestSuite) TestUpdateRejectsPrefixedStoragePattern() {
+	res := Update[UserDoc]("user:*", nil, x.Set("name", "updated"))
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
 func (s *DocTestSuite) TestSearchIndexRejectsFullIdxName() {
 	res := SearchIndex[UserDoc]("user_age", "*", nil, false)
 	s.Require().True(res.IsError())

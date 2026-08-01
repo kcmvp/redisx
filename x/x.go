@@ -237,14 +237,14 @@ func Set[T ScalarType](path string, value T) Mutation {
 
 // SECTION: Document And Index
 
-// Document declares only document metadata.
+// Document declares the metadata contract for one JSON document type.
 //
-// It describes:
-//   - the key namespace prefix used by this document type
-//   - which JSON attributes are used to build the storage key
-//   - the default TTL used by higher-level write helpers
-//   - the raw JSON payload used by helpers that need to resolve a storage key
-//     directly from the document
+// It defines:
+//   - the storage key prefix
+//   - the storage layer
+//   - which JSON attributes form the key suffix
+//   - the raw JSON used to derive one concrete key
+//   - the default TTL used by typed writes
 //
 // Example:
 //
@@ -260,37 +260,34 @@ func Set[T ScalarType](path string, value T) Mutation {
 // helpers can cast loaded raw JSON payloads back to the concrete document type.
 type Document interface {
 	~string
-	// Namespace returns the storage namespace for this document type,
-	// such as "user".
+	// Namespace returns the key prefix of this document type, such as "user".
 	//
-	// The returned namespace is treated as stable metadata of the document type
-	// itself. It is used by [StorageKeyValue] to construct the final storage key.
+	// Final keys are stored as:
+	//
+	//	namespace:key_suffix
+	//
+	// Keep it short, because it is repeated in every stored key.
 	Namespace() string
-	// Mem reports where this document type is stored.
+	// Mem reports whether this document type lives in the memory-only layer.
 	//
-	// When it returns false, the document is stored in the regular persistent
-	// namespace.
+	// When true, the final key is automatically prefixed with "_m_" before
+	// [Document.Namespace], so:
 	//
-	// When it returns true, the document is stored in the in-memory namespace,
-	// and [StorageKeyValue] automatically prepends [contract.MemKeyPrefix]
-	// before [Document.Namespace].
+	//	user:1   -> _m_user:1
 	Mem() bool
-	// KeyAttrs returns the ordered JSON attribute paths used to derive the key
-	// value from [Document.RawJSON], such as []string{"tenant", "id"}.
+	// KeyAttrs returns the ordered JSON paths used to derive the key suffix from
+	// [Document.RawJSON], such as []string{"tenant", "id"}.
 	//
-	// The order is significant. When multiple attributes are declared, their
-	// resolved values are joined in order with ":" to form the key value part.
+	// Their resolved values are joined with ":" in order.
 	KeyAttrs() []string
-	// RawJSON returns the raw JSON payload represented by this document value.
+	// RawJSON returns the raw JSON payload of this document value.
 	//
-	// [StorageKey] reads this payload together with [Document.KeyAttrs] to
-	// resolve the final storage key for the current document instance.
+	// [StorageKey] reads it together with [Document.KeyAttrs] to build one full
+	// storage key for the current document instance.
 	RawJSON() string
-	// TTL returns the default TTL metadata used by higher-level document write
-	// helpers.
+	// TTL returns the default TTL used by typed write helpers.
 	//
-	// The TTL is not involved in key derivation. It only describes the default
-	// expiration policy of this document type.
+	// It does not participate in key derivation.
 	TTL() time.Duration
 }
 
@@ -394,13 +391,17 @@ func StorageKey[D Document](d D) (string, error) {
 			return "", fmt.Errorf("missing key attr: %s", path)
 		}
 
-		parts = append(parts, keyAttrString(result))
+		parts = append(parts, keyAttrValue(result))
 	}
 
 	return StorageKeyValue[D](strings.Join(parts, contract.StorageKeySeparator)), nil
 }
 
-func keyAttrString(result gjson.Result) string {
+// keyAttrValue normalizes one extracted key attr into its storage-key form.
+//
+// Booleans are encoded as "1" and "0" to keep generated keys compact and
+// stable.
+func keyAttrValue(result gjson.Result) string {
 	if result.Type == gjson.True {
 		return "1"
 	}
@@ -431,20 +432,28 @@ func MemKey(key string) string {
 	return contract.MemKeyPrefix + key
 }
 
+// Index describes one registered JSON index definition.
+//
+// It contains the fully-qualified runtime index name, the full storage-key
+// pattern it applies to, and the normalized JSON path used by the backend
+// index.
 type Index struct {
 	name       string
 	keyPattern string
 	path       string
 }
 
+// Name returns the fully-qualified runtime index name.
 func (d Index) Name() string {
 	return d.name
 }
 
+// KeyPattern returns the full storage-key pattern bound to this index.
 func (d Index) KeyPattern() string {
 	return d.keyPattern
 }
 
+// Path returns the normalized JSON path used by the backend index.
 func (d Index) Path() string {
 	return d.path
 }
