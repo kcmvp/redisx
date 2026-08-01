@@ -250,6 +250,61 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 }
 
 func (s *ClientTestSuite) TestCrudCommands() {
+	s.Run("SetNXWithTTL not connected", func() {
+		s.SetupTest()
+		ok, err := SetNXWithTTL("k", "v", time.Second)
+		s.Error(err)
+		s.Contains(err.Error(), "resp client is not connected")
+		s.False(ok)
+	})
+
+	s.Run("SetNXWithTTL empty key", func() {
+		s.SetupTest()
+		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+		s.NoError(err)
+		s.ensureConnected()
+
+		ok, err := SetNXWithTTL("", "v", time.Second)
+		s.NoError(err)
+		s.False(ok)
+	})
+
+	s.Run("SetNXWithTTL falls back when ttl is non-positive", func() {
+		s.SetupTest()
+		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+		s.NoError(err)
+		s.ensureConnected()
+
+		ok, err := SetNXWithTTL("setnx-fallback", "v1", 0)
+		s.NoError(err)
+		s.True(ok)
+
+		ok, err = SetNXWithTTL("setnx-fallback", "v2", 0)
+		s.NoError(err)
+		s.False(ok)
+	})
+
+	s.Run("SetNXWithTTL success and expire", func() {
+		s.SetupTest()
+		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+		s.NoError(err)
+		s.ensureConnected()
+
+		ok, err := SetNXWithTTL("setnx-ttl", "ttl-value", 100*time.Millisecond)
+		s.NoError(err)
+		s.True(ok)
+
+		val, err := Get("setnx-ttl")
+		s.NoError(err)
+		s.Equal("ttl-value", val)
+
+		time.Sleep(200 * time.Millisecond)
+
+		_, err = Get("setnx-ttl")
+		s.Error(err)
+		s.Contains(err.Error(), "redis: nil")
+	})
+
 	s.Run("SetNX not connected", func() {
 		s.SetupTest()
 		ok, err := SetNX("k", "v")

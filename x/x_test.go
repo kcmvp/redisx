@@ -1,6 +1,7 @@
 package x
 
 import (
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -217,6 +218,44 @@ func TestCombinators(t *testing.T) {
 	}
 }
 
+func TestFilterMarshalJSON(t *testing.T) {
+	tests := []struct {
+		name   string
+		filter Filter
+		want   string
+	}{
+		{
+			name:   "marshals comparator",
+			filter: Eq("status", "active"),
+			want:   `{"status":{"$eq":"active"}}`,
+		},
+		{
+			name:   "marshals combinator",
+			filter: And(Gte("age", 18), Eq("status", "active")),
+			want:   `{"$and":[{"age":{"$gte":18}},{"status":{"$eq":"active"}}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw, err := tt.filter.MarshalJSON()
+			require.NoError(t, err)
+			require.JSONEq(t, tt.want, string(raw))
+		})
+	}
+}
+
+func TestSetMutation(t *testing.T) {
+	mutation := Set("profile.age", 18)
+
+	require.Equal(t, "profile.age", mutation.Path())
+	require.Equal(t, 18, mutation.Value())
+
+	raw, err := json.Marshal(mutation.Value())
+	require.NoError(t, err)
+	require.Equal(t, "18", string(raw))
+}
+
 func TestStorageKeyValue(t *testing.T) {
 	tests := []struct {
 		name string
@@ -415,20 +454,20 @@ func TestStorageKey(t *testing.T) {
 			},
 			want: "plain",
 		},
-			{
-				name: "normalizes true bool key attr to one",
-				run: func() (string, error) {
-					return StorageKey(boolKeyDoc(`{"enabled":true}`))
-				},
-				want: "flagdoc:1",
+		{
+			name: "normalizes true bool key attr to one",
+			run: func() (string, error) {
+				return StorageKey(boolKeyDoc(`{"enabled":true}`))
 			},
-			{
-				name: "normalizes false bool key attr to zero",
-				run: func() (string, error) {
-					return StorageKey(boolKeyDoc(`{"enabled":false}`))
-				},
-				want: "flagdoc:0",
+			want: "flagdoc:1",
+		},
+		{
+			name: "normalizes false bool key attr to zero",
+			run: func() (string, error) {
+				return StorageKey(boolKeyDoc(`{"enabled":false}`))
 			},
+			want: "flagdoc:0",
+		},
 		{
 			name: "rejects empty key attr path",
 			run: func() (string, error) {

@@ -91,6 +91,51 @@ func (suite *DBSuite) TestLifecycle() {
 	})
 }
 
+func (suite *DBSuite) TestRawHandlesExposeBothLayers() {
+	suite.NotNil(suite.db.Raw())
+	suite.NotNil(suite.db.RawMem())
+	suite.NotSame(suite.db.Raw(), suite.db.RawMem())
+
+	suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set("disk:key", "disk", nil)
+		return err
+	}))
+	suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+		_, _, err := tx.Set("_m_mem:key", "mem", nil)
+		return err
+	}))
+
+	suite.Equal("disk", suite.db.Get("disk:key").MustGet())
+	suite.Equal("mem", suite.db.Get("_m_mem:key").MustGet())
+}
+
+func (suite *DBSuite) TestRegisterIndexes() {
+	suite.Run("initializes nil index layer map", func() {
+		suite.db.indexLayers = nil
+		err := suite.db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age"))
+		suite.NoError(err)
+		suite.Equal(storageDisk, suite.db.indexLayers[x.Idx[testUserDoc]("age", "*", "age").Name()])
+	})
+
+	suite.Run("registers memory layer index", func() {
+		err := suite.db.registerIndexes(x.Idx[testMemUserDoc]("age", "*", "age"))
+		suite.NoError(err)
+		suite.Equal(storageMem, suite.db.indexLayers[x.Idx[testMemUserDoc]("age", "*", "age").Name()])
+	})
+
+	suite.Run("rejects empty index name", func() {
+		err := suite.db.registerIndexes(x.Index{})
+		suite.EqualError(err, "index name is required")
+	})
+
+	suite.Run("rejects duplicate index declaration", func() {
+		idx := x.Idx[testUserDoc]("dup", "*", "age")
+		suite.NoError(suite.db.registerIndexes(idx))
+		err := suite.db.registerIndexes(idx)
+		suite.EqualError(err, "index already declared: user_dup")
+	})
+}
+
 func (suite *DBSuite) TestCRUD() {
 	suite.Run("Set and Get", func() {
 		tests := []struct {
@@ -266,6 +311,10 @@ func TestDBX(t *testing.T) {
 	require.NoError(t, keysRes.Error())
 	require.Contains(t, keysRes.MustGet(), key)
 
+	badKeysRes := dbx.Keys("user:*")
+	require.Error(t, badKeysRes.Error())
+	require.Contains(t, badKeysRes.Error().Error(), "document-scoped")
+
 	searchRes := dbx.SearchKey("*", x.Eq("age", float64(30)), false)
 	require.NoError(t, searchRes.Error())
 	require.Contains(t, searchRes.MustGet(), testUserDoc(raw))
@@ -285,6 +334,10 @@ func TestDBX(t *testing.T) {
 	updRes := dbx.Update("*", x.Eq("age", float64(30)), x.Set("age", 31))
 	require.NoError(t, updRes.Error())
 	require.Contains(t, updRes.MustGet(), key)
+
+	badUpdRes := dbx.Update("user:*", nil, x.Set("name", "updated"))
+	require.Error(t, badUpdRes.Error())
+	require.Contains(t, badUpdRes.Error().Error(), "document-scoped")
 
 	valRes := db.Get(key)
 	require.NoError(t, valRes.Error())
@@ -436,6 +489,90 @@ func (suite *UpdateSuite) TestUpdateCases() {
 
 func TestUpdateSuite(t *testing.T) {
 	suite.Run(t, new(UpdateSuite))
+}
+
+func TestDBUpdateEdgeCases(t *testing.T) {
+	t.Run("rejects empty pattern", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+
+		res := db.Update("", nil, x.Set("status", "active"))
+		require.Error(t, res.Error())
+		require.Contains(t, res.Error().Error(), "key pattern is required")
+	})
+
+	t.Run("rejects leading wildcard pattern", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+
+		res := db.Update("*user:*", nil, x.Set("status", "active"))
+		require.Error(t, res.Error())
+		require.Contains(t, res.Error().Error(), "cannot start with wildcard")
+	})
+
+	t.Run("returns empty when no documents match", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+		require.NoError(t, db.Set("user:1", `{"id":"1","status":"pending"}`))
+
+		res := db.Update("user:*", x.Eq("status", "active"), x.Set("status", "reviewed"))
+		require.NoError(t, res.Error())
+		require.Empty(t, res.MustGet())
+
+		val := db.Get("user:1").MustGet()
+		require.Equal(t, "pending", gjson.Get(val, "status").String())
+	})
+
+	t.Run("returns matched key even when update is no-op", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+		require.NoError(t, db.Set("user:1", `{"id":"1","status":"active"}`))
+
+		before := db.Get("user:1").MustGet()
+		res := db.Update("user:*", x.Eq("id", "1"), x.Set("status", "active"))
+		require.NoError(t, res.Error())
+		require.Equal(t, []string{"user:1"}, res.MustGet())
+
+		after := db.Get("user:1").MustGet()
+		require.Equal(t, before, after)
+	})
+
+	t.Run("preserves ttl on updated keys", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+		require.NoError(t, db.SetWithTtl("user:1", `{"id":"1","status":"pending"}`, 200*time.Millisecond))
+
+		requireTTLPositive(t, db, "user:1")
+
+		res := db.Update("user:*", x.Eq("id", "1"), x.Set("status", "active"))
+		require.NoError(t, res.Error())
+		require.Equal(t, []string{"user:1"}, res.MustGet())
+		requireTTLPositive(t, db, "user:1")
+
+		val := db.Get("user:1").MustGet()
+		require.Equal(t, "active", gjson.Get(val, "status").String())
+	})
+
+	t.Run("returns error and leaves data unchanged when one mutation path is invalid", func(t *testing.T) {
+		db := openDB(":memory:")
+		require.NotNil(t, db)
+		t.Cleanup(func() { _ = db.Close() })
+		require.NoError(t, db.Set("user:1", `{"id":"1","status":"pending"}`))
+
+		before := db.Get("user:1").MustGet()
+
+		res := db.Update("user:*", nil, x.Set("", "active"))
+		require.Error(t, res.Error())
+		require.Contains(t, res.Error().Error(), "failed to set ")
+
+		after := db.Get("user:1").MustGet()
+		require.Equal(t, before, after)
+	})
 }
 
 type SearchSuite struct {
