@@ -92,13 +92,21 @@ If your values are JSON documents, both modes also support the typed `x.Document
 
 `redisx` supports two storage layers inside the same server:
 
-- **Persistent layer:** normal keys are stored here.
+- **Primary layer:** normal keys are stored here. It is backed by the `dbPath`
+  you pass to `server.Start(...)`.
 - **Memory-only layer:** keys prefixed with `_m_` are stored here and are not kept after restart.
+
+`redisx` always opens both layers at the same time.
+
+The `dbPath` argument only configures the primary layer:
+
+- use a real file path such as `"/tmp/redisx.db"` for a disk-backed primary layer
+- use BuntDB's special path `":memory:"` for an in-memory primary layer
 
 Routing is explicit and key-based:
 
 - `_m_<key>` -> memory-only
-- any other key -> disk
+- any other key -> primary layer
 
 Pattern-based scan commands do not cross layers implicitly:
 
@@ -136,8 +144,10 @@ db := server.Start(
 )
 ```
 
-- Use `":memory:"` for an in-memory instance. If the server restarts, all data is lost.
-- Use an explicit file path such as `"/tmp/redisx.db"` to persist data on disk. If the server restarts, data is kept.
+- The second argument is passed through to `buntdb.Open(path)`.
+- `redisx` always opens a second dedicated memory-only layer for `_m_` keys.
+- Use BuntDB's special path `":memory:"` when the primary layer should also remain in memory. If the server restarts, all primary-layer data is lost.
+- Use an explicit file path such as `"/tmp/redisx.db"` when the primary layer should persist on disk. If the server restarts, that primary-layer data is kept.
 - `Start` returns the local `*server.DB` handle, so the same process can also operate on the database directly.
 - `SEARCHINDEX` requires its target index to be created here during startup.
 

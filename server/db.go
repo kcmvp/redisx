@@ -28,11 +28,14 @@ const (
 // SECTION: Open
 
 // openDB creates one hybrid DB instance backed by:
-//   - one persistent layer opened from path
-//   - one in-memory layer used for keys prefixed with "_m_"
+//   - one primary layer opened from path
+//   - one dedicated memory-only layer used by keys prefixed with "_m_"
 //
-// Use ":memory:" when the persistent layer should also remain in memory.
-// An empty path is invalid.
+// path is passed through to buntdb.Open(path).
+//
+// Use one real file path such as "/tmp/redisx.db" when the primary layer
+// should persist on disk, or use BuntDB's special value ":memory:" when the
+// primary layer should also remain in memory. An empty path is invalid.
 func openDB(path string) *DB {
 	if path == "" {
 		slog.Error("failed to open storage", "error", "db path is required")
@@ -59,12 +62,16 @@ func openDB(path string) *DB {
 	}
 }
 
-// DB is a lightweight BuntDB wrapper for the high-frequency operations exposed
-// by redisx.
+// DB is a lightweight two-layer BuntDB wrapper for the high-frequency
+// operations exposed by redisx.
 //
 // It is designed for two in-process use cases:
 //   - direct embedded access from the same application
 //   - the backing implementation behind RESP X commands
+//
+// redisx always opens two underlying BuntDB instances:
+//   - one primary layer from dbPath
+//   - one dedicated memory-only layer for keys prefixed with "_m_"
 //
 // For lower-level or BuntDB-specific operations, use [DB.Raw].
 type DB struct {
@@ -81,10 +88,13 @@ type DBX[D x.Document] DB
 
 // SECTION: Core DB
 
-// Raw exposes the persistent storage layer for advanced use cases.
+// Raw exposes the primary storage layer for advanced use cases.
 //
 // This is useful when your application needs direct transactions, indexes,
 // or iteration APIs that are intentionally not re-exposed by redisx.
+//
+// This is the layer opened from dbPath. It is disk-backed unless dbPath was
+// BuntDB's special value ":memory:".
 //
 // Example:
 //
