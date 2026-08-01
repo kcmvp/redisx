@@ -14,6 +14,8 @@ Assume the server is started like this:
 
 ```go
 import (
+    "os"
+    "path/filepath"
     "time"
 
     "github.com/kcmvp/redisx/server"
@@ -28,9 +30,12 @@ func (UserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u UserDoc) RawJSON() string  { return string(u) }
 func (UserDoc) TTL() time.Duration { return time.Hour }
 
+home, _ := os.UserHomeDir()
+dbPath := filepath.Join(home, ".redisx", "howto.db")
+
 db := server.Start(
     "127.0.0.1:6380",
-    ":memory:",
+    dbPath,
     x.Idx[UserDoc]("age", "*", "age"),
     x.Idx[UserDoc]("email", "*", "email"),
 )

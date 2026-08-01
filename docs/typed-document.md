@@ -47,7 +47,7 @@ Read-side key derivation is done by `x.StorageKeyValue[D](key)`:
 Use `server.As[D]` to obtain a typed view over an existing `*server.DB`:
 
 ```go
-db := server.Start("127.0.0.1:6380", ":memory:")
+db := server.Start("127.0.0.1:6380", "/tmp/redisx.db")
 dbx := server.As[UserDoc](db)
 
 _ = dbx.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))

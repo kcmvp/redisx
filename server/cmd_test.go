@@ -10,6 +10,7 @@ import (
 
 	"sync"
 
+	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/suite"
@@ -74,7 +75,7 @@ func TestCmdSuite(t *testing.T) {
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, ":memory:", x.Idx[testUserDoc]("age", "*", "age"))
+	s.db = Start(s.addr, testutil.DBPath(t), x.Idx[testUserDoc]("age", "*", "age"))
 
 	tests := []struct {
 		name        string
@@ -531,7 +532,7 @@ func (s *CmdTestSuite) TestCmd() {
 func (s *CmdTestSuite) TestPubSub() {
 	t := s.T()
 	addr := getFreePort()
-	_ = Start(addr, ":memory:")
+	_ = Start(addr, testutil.DBPath(t))
 	defer func() { _ = stop() }()
 
 	// Need a small sleep to ensure server is ready
@@ -667,7 +668,7 @@ func (s *CmdTestSuite) TestParseFilter() {
 func (s *CmdTestSuite) TestXCmd() {
 	t := s.T()
 	s.addr = getFreePort()
-	s.db = Start(s.addr, ":memory:", x.Idx[testUserDoc]("age", "*", "age"))
+	s.db = Start(s.addr, testutil.DBPath(s.T()), x.Idx[testUserDoc]("age", "*", "age"))
 
 	tests := []struct {
 		name        string

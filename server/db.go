@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -33,12 +35,27 @@ const (
 //
 // path is passed through to buntdb.Open(path).
 //
-// Use one real file path such as "/tmp/redisx.db" when the primary layer
-// should persist on disk, or use BuntDB's special value ":memory:" when the
-// primary layer should also remain in memory. An empty path is invalid.
+// Use one real database file path such as "/tmp/redisx.db". The special value
+// ":memory:" is rejected because redisx already opens its own dedicated
+// memory-only layer for keys prefixed with "_m_". For filesystem paths,
+// missing parent directories are created automatically, and the database file
+// itself is created on first open when it does not already exist. An empty
+// path is invalid. Directory paths are rejected.
 func openDB(path string) *DB {
 	if path == "" {
 		slog.Error("failed to open storage", "error", "db path is required")
+		return nil
+	}
+	if path == ":memory:" {
+		slog.Error("failed to open storage", "path", path, "error", `db path must be a file path; ":memory:" is reserved for buntdb in-memory mode`)
+		return nil
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		slog.Error("failed to open storage", "path", path, "error", "db path must be a file path, not a directory")
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Error("failed to create db directory", "path", path, "error", err)
 		return nil
 	}
 
@@ -93,8 +110,7 @@ type DBX[D x.Document] DB
 // This is useful when your application needs direct transactions, indexes,
 // or iteration APIs that are intentionally not re-exposed by redisx.
 //
-// This is the layer opened from dbPath. It is disk-backed unless dbPath was
-// BuntDB's special value ":memory:".
+// This is the layer opened from dbPath.
 //
 // Example:
 //
