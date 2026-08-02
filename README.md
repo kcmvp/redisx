@@ -195,6 +195,11 @@ It includes:
 - JSON query and update commands
 - typed JSON document API end-to-end examples
 
+## Stream Ingest
+
+For websocket stream ingestion into `redisx` document workflows, see
+[ingest/stream/stream.md](ingest/stream/stream.md).
+
 ## Installation
 
 ```bash
