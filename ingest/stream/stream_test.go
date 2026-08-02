@@ -152,6 +152,7 @@ func TestStreamSubscribeAndUnsubscribe(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for websocket connection")
 	}
+	waitForConn(t, s)
 
 	if err := s.Subscribe("ethusdt@trade", "btcusdt@trade", "ethusdt@trade"); err != nil {
 		t.Fatalf("subscribe failed: %v", err)
@@ -405,6 +406,31 @@ func waitInstruction(t *testing.T, instructions <-chan recordedInstruction) reco
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for subscription instruction")
 		return recordedInstruction{}
+	}
+}
+
+func waitForConn[D interface {
+	~string
+	Namespace() string
+	Mem() bool
+	KeyAttrs() []string
+	RawJSON() string
+	TTL() time.Duration
+}](t *testing.T, s *Stream[D]) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.RLock()
+		connected := s.conn != nil
+		s.mu.RUnlock()
+		if connected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for live stream connection")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
