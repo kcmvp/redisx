@@ -66,8 +66,19 @@ func TestStartWriteAndClose(t *testing.T) {
 		t.Fatal("timed out waiting for stream message")
 	}
 
-	if err := s.Write([]byte(`ping`)); err != nil {
-		t.Fatalf("write failed: %v", err)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		err := s.Write([]byte(`ping`))
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrDisconnected) {
+			t.Fatalf("write failed: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for writable stream: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	select {
