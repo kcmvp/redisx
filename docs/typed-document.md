@@ -1,118 +1,79 @@
 # Typed Document Helpers
 
-`redisx` provides a small document contract (`x.Document`) plus typed helpers on both the client and the embedded server side.
+`redisx` provides a small document contract (`x.Document`) plus typed helpers
+on both the client and the embedded server side.
 
 - Remote mode (RESP): use `client/doc`
 - Embedded mode (in-process DB): use `server.DBX` via `server.As[D]`
 
-This keeps `server.DB` as a minimal key-value core, while letting higher-level code work with document-level keys instead of remembering storage prefixes.
+This layer exists so callers can work with document-scoped inputs instead of
+manually composing storage keys, key patterns, and index names.
 
-## Define a document type
+The client-side package path is `client/doc`; examples typically import it as
+`doc`.
 
-Documents are represented as JSON strings. A document type is typically a `string` alias that implements `x.Document`:
+For runnable examples, see [howto.md](howto.md).
 
-```go
-type UserDoc string
+## Document contract
 
-func (UserDoc) Namespace() string  { return "user" }
-func (UserDoc) Mem() bool          { return false }
-func (UserDoc) KeyAttrs() []string { return []string{"id"} }
-func (u UserDoc) RawJSON() string  { return string(u) }
-func (UserDoc) TTL() time.Duration { return time.Hour }
-```
+A document type is a JSON string alias that describes how one logical document
+maps onto storage:
 
-Write-side key derivation is done by `x.StorageKey(d)`:
+- `Namespace()`: the document namespace, such as `user`
+- `KeyAttrs()`: JSON paths used to derive the storage key, such as `id`
+- `TTL()`: the default TTL used by typed writes
+- `Mem()`: whether the document belongs to the memory-only layer
+- `RawJSON()`: the raw JSON payload
 
-- reads `d.RawJSON()`
-- extracts JSON values by each path in `d.KeyAttrs()`
-- joins them with `":"`
-- prepends `d.Namespace()`
+For example, if `Namespace() == "user"` and `KeyAttrs() == []string{"id"}`,
+then `{"id":"200"}` resolves to the storage key `user:200`.
 
-For example, `{"id":"200"}` becomes `user:200`.
+## Mental model
 
-Typed write helpers use the document TTL declared by `D` automatically:
+Typed helpers accept document-scoped values. `redisx` derives storage-scoped
+names from `D` for you.
 
-- `dbx.Set(d)` and `doc.Set(d)` write with `d.TTL()`
-- `dbx.SetNX(d)` and `doc.SetNX(d)` also use `d.TTL()`
-- `dbx.Update(...)` and `doc.Update(...)` preserve an existing key TTL
+### Single-document APIs
 
-Read-side key derivation is done by `x.StorageKeyValue[D](key)`:
+- `Get("200")` accepts the document-level key value, not the storage key
+  `user:200`
+- `Set(d)` and `SetNX(d)` derive the storage key from `d.RawJSON()` and
+  `d.KeyAttrs()`
+- `Delete(d)` also derives the storage key from the document itself; when
+  `KeyAttrs() == []string{"id"}`, a payload like `{"id":"200"}` is enough
 
-- `key` is the document-level key value, such as `"200"`
-- the helper derives the storage prefix from `D`
-- the final storage key becomes `user:200`
+### Pattern-based APIs
 
-## Embedded mode: bind one document type to a DB
+For methods that accept a `keyPattern` (`Keys`, `SearchKey`, `Update`), the
+pattern is one document-scoped sub-pattern:
 
-Use `server.As[D]` to obtain a typed view over an existing `*server.DB`:
+- `Keys("*")` means `user:*`
+- `SearchKey("*", filter, false)` searches over `user:*`
+- `Update("*", filter, ...)` updates `user:*`
 
-```go
-db := server.Start("127.0.0.1:6380", "/tmp/redisx.db")
-dbx := server.As[UserDoc](db)
+Typed helpers reject already-prefixed storage patterns such as `user:*`,
+because the namespace is already derived from `D`.
 
-_ = dbx.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
+### Indexed search
 
-doc, _ := dbx.Get("200")
-_ = doc
-```
+`SearchIndex` applies the same document-scoped rule to both inputs:
 
-### What `As[D]` does
+- `idxName` is one logical name such as `age`, not one runtime name such as
+  `user_age`
+- `keyPattern` is one document-scoped sub-pattern such as `*`, not one full
+  storage pattern such as `user:*`
 
-`server.As[D]` performs a zero-allocation pointer conversion:
+### TTL behavior
 
-- it does not allocate a wrapper object
-- it does not copy `DB`
-- it only changes the static type of the pointer (`*DB` -> `*DBX[D]`)
+- `Set(d)` and `SetNX(d)` write with `d.TTL()`
+- `Update(...)` preserves an existing key TTL
 
-`D` is constrained by:
+## Embedded mode
 
-```go
-type x.Document interface {
-    ~string
-    Namespace() string
-    Mem() bool
-    KeyAttrs() []string
-    RawJSON() string
-    TTL() time.Duration
-}
-```
+Use `server.As[D]` to bind one document type to an existing `*server.DB`.
 
-`~string` ensures `Get(...) (D, error)` can safely cast the loaded raw JSON string to `D`.
+`As[D]` only changes the static pointer type (`*DB` -> `*DBX[D]`). It does not
+allocate a wrapper and does not copy `DB`.
 
-## Remote mode: typed helpers on the shared client connection
-
-The remote equivalent lives in `client/doc` and matches the same idea:
-
-```go
-if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
-    panic(err)
-}
-defer client.Disconnect()
-
-_ = doc.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
-got, _ := doc.Get[UserDoc]("200")
-_ = got
-```
-
-## Pattern semantics
-
-For document-scoped methods that accept a `keyPattern` (`Keys`, `SearchKey`, `Update`), the keyPattern is a _sub-pattern_ that is automatically prefixed:
-
-- `dbx.Keys("*")` matches `user:*`
-- `dbx.SearchKey("*", filter, false)` searches over `user:*`
-- `dbx.Update("*", filter, x.Set(...))` updates `user:*`
-
-This avoids hardcoding the `"user"` namespace at call sites.
-
-Typed helpers reject already-prefixed storage patterns such as `user:*`, because
-the document type already determines the namespace prefix.
-
-For `SearchIndex`, the same rule applies to both inputs:
-
-- `idxName` is one logical name such as `age`, not one full runtime name such as `user_age`
-- `keyPattern` is one document-scoped sub-pattern such as `*`, not one full storage pattern such as `user:*`
-
-## Practical notes
-
-- `Get(key)` accepts the document-level key value, not the prefixed storage key. For `UserDoc`, pass `"200"` instead of `"user:200"`.
-- `Delete(d)` still accepts a document and derives the storage key from `KeyAttrs()`. For example, `{"id":"200"}` is enough when `KeyAttrs() == []{"id"}`.
+`D` must remain a `string` alias so `Get(...)` can safely return loaded raw
+JSON as `D`.

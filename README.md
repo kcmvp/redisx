@@ -62,31 +62,51 @@ You define a document type once, then work with document-level keys instead of m
 
 This keeps the low-level key/value API available, while giving higher-level code a cleaner JSON document entry point.
 
+In Go code, the client-side package path is `client/doc`; examples typically
+import it as `doc`.
+
 Core document commands:
 
 - `SEARCHINDEX`: query through one registered JSON index
 - `SEARCHKEY`: scan one full storage-key pattern and filter JSON payloads
 - `UPDATE`: patch matched JSON documents in place
+- `GET`, `SET`, `SETNX`, `DEL`, and `KEYS`: also have typed document helpers
 
 Parameter semantics differ by API surface:
 
 - raw RESP commands use full storage keys, full key patterns, and full index names
 - typed `x.Document` entry points use logical index names and document-scoped sub-patterns
 
+Practical notes for typed helpers:
+
+- `Get("200")` accepts the document-level key value, not the full storage key `"user:200"`
+- `Keys("*")`, `SearchKey("*", ...)`, and `Update("*", ...)` accept one document-scoped sub-pattern, which is automatically prefixed to `user:*`
+- `SearchIndex("age", "*", ...)` accepts the logical index name `age`, not the full runtime index name `user_age`
+- typed helpers reject already-prefixed storage patterns such as `user:*`, because the namespace is already derived from `D`
+
 For the full typed API contract, see [docs/typed-document.md](docs/typed-document.md).
 For detailed command examples, see [docs/howto.md](docs/howto.md).
 
-## Usage Modes
+### 4. Stream Ingest (`ingest/stream`)
 
-`redisx` supports two access modes:
+`redisx` also includes an optional websocket ingestion extension in
+`ingest/stream`.
 
-- **Remote access:** connect to the RESP server with the `client` package or any Redis-compatible client.
-- **In-process access:** start the server and use the returned `*server.DB` directly inside the same application.
+It is designed for one focused job: consume external websocket streams and
+forward payloads into `x.Document` workflows.
 
-If your values are JSON documents, both modes also support the typed `x.Document` helpers:
+The package provides:
 
-- **Remote typed documents:** `client/doc`
-- **Embedded typed documents:** `server.As[D]` -> `*server.DBX[D]`
+- `stream.Start[D](...)`: for endpoints whose full subscription set is already encoded in the URL
+- `stream.StartSubscribable[D](...)`: for protocols that add and remove subscriptions over one existing websocket connection
+- automatic reconnect and subscription restore after reconnect
+- optional active websocket ping via one `time.Duration` argument
+
+This keeps the core storage API small while giving stream-driven applications a
+native way to feed realtime document payloads into `redisx`.
+
+For the full stream ingest contract and examples, see
+[docs/stream.md](docs/stream.md).
 
 ## Storage Layers
 
@@ -182,18 +202,17 @@ SET _auth_:batch-worker 20
 - If a stored auth limit is expired or unavailable, that auth key is treated as unavailable.
 - `internalAuthKey` is generated per process, is not stored in the database, and is always unlimited.
 
-## Command How-To
+## Docs
 
-For detailed, copy-paste oriented examples of every supported command, see
-[docs/howto.md](docs/howto.md).
-
-It includes:
-
-- connection and authentication flows
-- key-value commands
-- pub/sub commands
-- JSON query and update commands
-- typed JSON document API end-to-end examples
+- [docs/howto.md](docs/howto.md): copy-paste oriented command examples,
+  including connection/authentication flows, key-value commands, pub/sub
+  commands, JSON query/update commands, and typed document end-to-end examples
+- [docs/typed-document.md](docs/typed-document.md): the `x.Document` contract
+  and the input semantics of typed helpers on both the client and embedded
+  server side
+- [docs/stream.md](docs/stream.md): the websocket stream ingestion extension
+  for `x.Document` workflows, including reconnect and subscription-aware
+  behavior
 
 ## Installation
 

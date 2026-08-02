@@ -3,6 +3,7 @@ module github.com/kcmvp/redisx
 go 1.25.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/samber/lo v1.53.0
 	github.com/samber/mo v1.17.0

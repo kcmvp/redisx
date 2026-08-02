@@ -515,6 +515,9 @@ if err := client.Set(key, `{"online":true}`); err != nil {
 
 ## Typed JSON Document API End-To-End
 
+The client-side typed helper package lives at `client/doc`; examples import it
+as `doc`.
+
 Client mode:
 
 ```go
