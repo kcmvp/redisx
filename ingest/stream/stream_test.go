@@ -38,7 +38,9 @@ func TestStartWriteAndClose(t *testing.T) {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		if writeErr := conn.WriteMessage(websocket.TextMessage, []byte(`{"data":"hello"}`)); writeErr != nil {
 			t.Errorf("write welcome message failed: %v", writeErr)
@@ -55,7 +57,9 @@ func TestStartWriteAndClose(t *testing.T) {
 	defer server.Close()
 
 	s := Start[testDocument](toWebsocketURL(server.URL))
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	select {
 	case message := <-s.C():
@@ -109,7 +113,9 @@ func TestStreamSubscribeAndUnsubscribe(t *testing.T) {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		select {
 		case connected <- struct{}{}:
@@ -137,7 +143,9 @@ func TestStreamSubscribeAndUnsubscribe(t *testing.T) {
 	unsubscribe := subscriptionMessage("UNSUBSCRIBE", &nextID)
 
 	s := StartSubscribable[testDocument](toWebsocketURL(server.URL), subscribe, unsubscribe)
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	select {
 	case <-connected:
@@ -185,7 +193,9 @@ func TestStreamRestoresSubscriptionsAfterReconnect(t *testing.T) {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		connects.Add(1)
 
@@ -210,7 +220,9 @@ func TestStreamRestoresSubscriptionsAfterReconnect(t *testing.T) {
 	unsubscribe := subscriptionMessage("UNSUBSCRIBE", &nextID)
 
 	s := StartSubscribable[testDocument](toWebsocketURL(server.URL), subscribe, unsubscribe)
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	if err := s.Subscribe("ethusdt@trade", "btcusdt@trade"); err != nil {
 		t.Fatalf("subscribe failed: %v", err)
@@ -298,7 +310,9 @@ func TestDetectConnTreatsInboundMessagesAsAlive(t *testing.T) {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
@@ -319,7 +333,9 @@ func TestDetectConnTreatsInboundMessagesAsAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
-	defer ws.Close()
+	defer func() {
+		_ = ws.Close()
+	}()
 
 	done := make(chan struct{})
 	touch := detectConn(ws, 30*time.Millisecond, 0, done)
@@ -348,7 +364,9 @@ func TestStartActivePing(t *testing.T) {
 			t.Errorf("upgrade failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 
 		conn.SetPingHandler(func(appData string) error {
 			select {
@@ -367,7 +385,9 @@ func TestStartActivePing(t *testing.T) {
 	defer server.Close()
 
 	s := Start[testDocument](toWebsocketURL(server.URL), 20*time.Millisecond)
-	defer s.Close()
+	defer func() {
+		_ = s.Close()
+	}()
 
 	select {
 	case <-pinged:
