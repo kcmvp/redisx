@@ -61,7 +61,7 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 
 func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	conn.WriteAny(map[string]any{
-		"server":  "mresp",
+		"server":  "redisx",
 		"version": "1.0.0",
 		"proto":   2,
 		"id":      1,

@@ -85,7 +85,7 @@ HELLO
 Example response fields:
 
 ```text
-server: mresp
+server: redisx
 version: 1.0.0
 proto: 2
 mode: standalone
