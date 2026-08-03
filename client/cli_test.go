@@ -1,7 +1,14 @@
 package client
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -44,6 +51,7 @@ func (s *ClientTestSuite) SetupTest() {
 	kvClientMu.Unlock()
 
 	cliOnce = sync.Once{}
+	signalNotifyContextFn = signal.NotifyContext
 
 	for len(pubChan) > 0 {
 		<-pubChan
@@ -548,6 +556,194 @@ func (s *ClientTestSuite) TestConnectEmbed() {
 	err := ConnectEmbed(clientTestServerAddr)
 	s.NoError(err)
 	s.ensureConnected()
+}
+
+func (s *ClientTestSuite) TestConnectEmbedStopsOnProcessSignal() {
+	s.SetupTest()
+
+	sigCtx, sigCancel := context.WithCancel(context.Background())
+	signalNotifyContextFn = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
+		return sigCtx, sigCancel
+	}
+
+	err := ConnectEmbed(clientTestServerAddr)
+	s.NoError(err)
+	s.ensureConnected()
+
+	sigCancel()
+
+	for i := 0; i < 40; i++ {
+		ctx, _ := getLifecycleCtx()
+		if client := getSharedClient(); client == nil && ctx != nil && ctx.Err() != nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	ctx, _ := getLifecycleCtx()
+	s.Nil(getSharedClient())
+	s.Require().NotNil(ctx)
+	s.Error(ctx.Err())
+}
+
+func TestEmbedServerAndClientExitTogetherOnSIGINT(t *testing.T) {
+	if os.Getenv("REDISX_CHILD_EMBED_SIGNAL") == "1" {
+		runEmbedSignalChild(t)
+		return
+	}
+
+	addr := pickFreeAddr(t)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestEmbedServerAndClientExitTogetherOnSIGINT$")
+	cmd.Env = append(os.Environ(),
+		"REDISX_CHILD_EMBED_SIGNAL=1",
+		"REDISX_CHILD_ADDR="+addr,
+	)
+
+	var stderr bytes.Buffer
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe() failed: %v", err)
+	}
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+
+	readyCh := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if scanner.Text() == "READY" {
+				readyCh <- nil
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			readyCh <- err
+			return
+		}
+		readyCh <- fmt.Errorf("child exited before ready: %s", stderr.String())
+	}()
+
+	select {
+	case err := <-readyCh:
+		if err != nil {
+			t.Fatalf("child failed before ready: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("timed out waiting for child readiness: %s", stderr.String())
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("Signal() failed: %v", err)
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-waitCh:
+		if err != nil {
+			t.Fatalf("child exited with error: %v, stderr=%s", err, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("timed out waiting for child shutdown: %s", stderr.String())
+	}
+}
+
+func runEmbedSignalChild(t *testing.T) {
+	t.Helper()
+
+	addr := os.Getenv("REDISX_CHILD_ADDR")
+	if addr == "" {
+		t.Fatal("REDISX_CHILD_ADDR is required")
+	}
+
+	t.Setenv("HOME", t.TempDir())
+
+	dbPath := filepath.Join(t.TempDir(), "redisx.db")
+	db := server.Start(addr, dbPath)
+	if db == nil {
+		t.Fatal("server.Start() returned nil")
+	}
+
+	if err := ConnectEmbed(addr); err != nil {
+		t.Fatalf("ConnectEmbed() failed: %v", err)
+	}
+
+	waitForSharedClient(t)
+	fmt.Println("READY")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	select {
+	case <-sigCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for interrupt signal")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, _ := getLifecycleCtx()
+		clientStopped := ctx != nil && ctx.Err() != nil && getSharedClient() == nil
+		serverStopped := listenerClosed(addr)
+		if clientStopped && serverStopped {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	ctx, _ := getLifecycleCtx()
+	t.Fatalf(
+		"timed out waiting for graceful shutdown: client_nil=%t lifecycle_done=%t listener_closed=%t",
+		getSharedClient() == nil,
+		ctx != nil && ctx.Err() != nil,
+		listenerClosed(addr),
+	)
+}
+
+func waitForSharedClient(t *testing.T) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		client := getSharedClient()
+		if client != nil && healthCheck(context.Background(), client) == nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for shared client connection")
+}
+
+func listenerClosed(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	if err != nil {
+		return true
+	}
+	_ = conn.Close()
+	return false
+}
+
+func pickFreeAddr(t *testing.T) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() failed: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
 }
 
 func (s *ClientTestSuite) TestPublishCommand() {

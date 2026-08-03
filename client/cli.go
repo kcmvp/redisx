@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
@@ -47,6 +50,8 @@ var (
 	kvClientMu sync.RWMutex
 	kvClient   *redis.Client
 	cliOnce    sync.Once
+
+	signalNotifyContextFn = signal.NotifyContext
 )
 
 // resetHandlers closes all registered subscription channels and clears the
@@ -152,7 +157,12 @@ func Connect(respAddr, authKey string) error {
 	}
 
 	cliOnce.Do(func() {
-		ctx, cancel := context.WithCancel(context.Background())
+		sigCtx, stopSignals := signalNotifyContextFn(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, cancelRoot := context.WithCancel(sigCtx)
+		cancel := func() {
+			stopSignals()
+			cancelRoot()
+		}
 		setLifecycleCtx(ctx, cancel)
 
 		go func() {
@@ -171,7 +181,7 @@ func Connect(respAddr, authKey string) error {
 					default:
 					}
 					if client, err = connect(respAddr, authKey); err != nil {
-						slog.Warn("mresp connect failed", "error", err)
+						slog.Warn("redisx connect failed", "error", err)
 						return err, true
 					}
 					return nil, false
@@ -184,11 +194,11 @@ func Connect(respAddr, authKey string) error {
 
 				if prev := setSharedClient(client); prev != nil && prev != client {
 					if err := prev.Close(); err != nil {
-						slog.Warn("mresp close previous client failed", "error", err)
+						slog.Warn("redisx close previous client failed", "error", err)
 					}
 				}
 
-				slog.Info("mresp connected")
+				slog.Info("redisx connected")
 
 				rootCtx, _ := getLifecycleCtx()
 				workerCtx, cancelRun := context.WithCancel(rootCtx)
@@ -206,14 +216,14 @@ func Connect(respAddr, authKey string) error {
 				go func() {
 					defer wg.Done()
 					if err := produce(workerCtx, client); err != nil && err != context.Canceled {
-						slog.Warn("mresp producer exited", "error", err)
+						slog.Warn("redisx producer exited", "error", err)
 					}
 					notifyExit("producer")
 				}()
 				go func() {
 					defer wg.Done()
 					if err := consume(workerCtx, client); err != nil && err != context.Canceled {
-						slog.Warn("mresp consumer exited", "error", err)
+						slog.Warn("redisx consumer exited", "error", err)
 					}
 					notifyExit("consumer")
 				}()
@@ -226,11 +236,11 @@ func Connect(respAddr, authKey string) error {
 					case <-rootCtx.Done():
 						lost = true
 					case worker := <-firstExit:
-						slog.Warn("mresp connection lost, restarting lifecycle", "worker", worker)
+						slog.Warn("redisx connection lost, restarting lifecycle", "worker", worker)
 						lost = true
 					case <-healthTicker.C:
 						if err := healthCheck(context.Background(), client); err != nil {
-							slog.Warn("mresp connection lost, restarting lifecycle", "error", err)
+							slog.Warn("redisx connection lost, restarting lifecycle", "error", err)
 							lost = true
 						}
 					}
@@ -242,7 +252,7 @@ func Connect(respAddr, authKey string) error {
 				// Remove this client from shared state first, then close it to unblock workers.
 				clearSharedClientIf(client)
 				if err := client.Close(); err != nil {
-					slog.Warn("mresp close client failed", "error", err)
+					slog.Warn("redisx close client failed", "error", err)
 				}
 
 				waitDone := make(chan struct{})
@@ -258,7 +268,7 @@ func Connect(respAddr, authKey string) error {
 						waitTicker.Stop()
 						goto workersStopped
 					case <-waitTicker.C:
-						slog.Warn("mresp waiting for workers to stop")
+						slog.Warn("redisx waiting for workers to stop")
 					}
 				}
 			workersStopped:
@@ -622,7 +632,7 @@ func Publish(topic, msg string) bool {
 	}
 
 	if getSharedClient() == nil {
-		slog.Warn("mresp send skipped, resp client is not connected")
+		slog.Warn("redisx send skipped, resp client is not connected")
 		return false
 	}
 
@@ -667,7 +677,7 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	client := redis.NewClient(options)
 	if err := healthCheck(context.Background(), client); err != nil {
 		if closeErr := client.Close(); closeErr != nil {
-			slog.Warn("mresp close client after failed health check failed", "error", closeErr)
+			slog.Warn("redisx close client after failed health check failed", "error", closeErr)
 		}
 		return nil, err
 	}
@@ -685,7 +695,7 @@ func produce(ctx context.Context, client *redis.Client) error {
 				continue
 			}
 			if err := client.Publish(ctx, msg.topic, msg.payload).Err(); err != nil {
-				slog.Warn("mresp publish failed", "topic", msg.topic, "error", err)
+				slog.Warn("redisx publish failed", "topic", msg.topic, "error", err)
 				return err
 			}
 		}
@@ -721,7 +731,7 @@ func consume(ctx context.Context, client *redis.Client) error {
 		if consumer == nil {
 			consumer = client.Subscribe(ctx, topic)
 			if _, err := consumer.Receive(ctx); err != nil {
-				slog.Warn("mresp subscribe receive error", "error", err)
+				slog.Warn("redisx subscribe receive error", "error", err)
 				return err
 			}
 			remoteMsgCh = consumer.Channel()
@@ -739,7 +749,7 @@ func consume(ctx context.Context, client *redis.Client) error {
 	defer func() {
 		if consumer != nil {
 			if err := consumer.Close(); err != nil {
-				slog.Warn("mresp close consumer failed", "error", err)
+				slog.Warn("redisx close consumer failed", "error", err)
 			}
 		}
 	}()
