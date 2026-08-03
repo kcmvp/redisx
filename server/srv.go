@@ -221,7 +221,9 @@ func acceptCon(conn redcon.Conn) bool {
 	return true
 }
 
-// PrivateIPs returns all non-loopback private IPs on the current host.
+// PrivateIPs returns all non-loopback private IPs on the current host, ordered
+// by preferred LAN usage: 192.168/16 first, then 10/8, then 172.16/12, then
+// any remaining private addresses.
 func PrivateIPs() ([]string, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
@@ -260,8 +262,29 @@ func collectPrivateIPs(addrs []net.Addr) []string {
 		ips = append(ips, s)
 	}
 
-	sort.Strings(ips)
+	sort.Slice(ips, func(i, j int) bool {
+		li, ri := privateIPRank(ips[i]), privateIPRank(ips[j])
+		if li != ri {
+			return li < ri
+		}
+		return ips[i] < ips[j]
+	})
 	return ips
+}
+
+func privateIPRank(s string) int {
+	ip := net.ParseIP(s)
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 192 && ip4[1] == 168:
+			return 0
+		case ip4[0] == 10:
+			return 1
+		case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
+			return 2
+		}
+	}
+	return 3
 }
 
 func closeCon(conn redcon.Conn, err error) {
