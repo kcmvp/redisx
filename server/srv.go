@@ -337,7 +337,12 @@ func isServerShutdownErr(err error) bool {
 
 func handleShutdownSignals(sigCh <-chan os.Signal, doneCh <-chan struct{}, stopFn func() error) {
 	select {
-	case <-sigCh:
+	case sig := <-sigCh:
+		if sig != nil {
+			slog.Info("redisx server caught shutdown signal", "signal", sig.String())
+		} else {
+			slog.Info("redisx server caught shutdown signal")
+		}
 		if err := stopFn(); err != nil {
 			slog.Warn("graceful shutdown failed", "error", err)
 		}
@@ -513,12 +518,12 @@ func Start(address string, dbPath string, indexes ...x.Index) *DB {
 			)
 
 			if err != nil && !isServerShutdownErr(err) {
-				slog.Error("resp server stopped", "error", err)
+					slog.Error("redisx server stopped", "error", err)
 				if exitFn := getOsExitFn(); exitFn != nil {
 					exitFn(1)
 				}
 			} else if err != nil {
-				slog.Info("resp server stopped")
+					slog.Info("redisx server stopped")
 			}
 			close(startedCh)
 		}()

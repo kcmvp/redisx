@@ -51,7 +51,8 @@ var (
 	kvClient   *redis.Client
 	cliOnce    sync.Once
 
-	signalNotifyContextFn = signal.NotifyContext
+	signalNotifyFn = signal.Notify
+	signalStopFn   = signal.Stop
 )
 
 // resetHandlers closes all registered subscription channels and clears the
@@ -157,13 +158,30 @@ func Connect(respAddr, authKey string) error {
 	}
 
 	cliOnce.Do(func() {
-		sigCtx, stopSignals := signalNotifyContextFn(context.Background(), os.Interrupt, syscall.SIGTERM)
-		ctx, cancelRoot := context.WithCancel(sigCtx)
+		ctx, cancelRoot := context.WithCancel(context.Background())
+		sigCh := make(chan os.Signal, 1)
+		notifyFn := signalNotifyFn
+		stopFn := signalStopFn
+		notifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
 		cancel := func() {
-			stopSignals()
+			stopFn(sigCh)
 			cancelRoot()
 		}
 		setLifecycleCtx(ctx, cancel)
+
+		go func() {
+			select {
+			case sig := <-sigCh:
+				if sig != nil {
+					slog.Info("redisx client caught shutdown signal", "signal", sig.String())
+				} else {
+					slog.Info("redisx client caught shutdown signal")
+				}
+				cancel()
+			case <-ctx.Done():
+				stopFn(sigCh)
+			}
+		}()
 
 		go func() {
 			for {
@@ -274,6 +292,7 @@ func Connect(respAddr, authKey string) error {
 			workersStopped:
 				stopCtx, _ := getLifecycleCtx()
 				if stopCtx == nil || stopCtx.Err() != nil {
+					slog.Info("redisx client stopped")
 					return
 				}
 			}
@@ -288,15 +307,15 @@ func ConnectEmbed(respAddr string) error {
 	return Connect(respAddr, internal.AuthKey())
 }
 
-// Disconnect stops the current bridge lifecycle and closes the shared client.
+// disconnect stops the current bridge lifecycle and closes the shared client.
 //
 // Note: this is currently treated as a best-effort shutdown helper for tests
 // and examples. It does not reset cliOnce, so calling Connect again after
-// Disconnect does not start a brand new lifecycle.
+// disconnect does not start a brand new lifecycle.
 //
 // If production usage later requires a full stop-then-restart flow, revisit
 // the lifecycle state model here instead of relying on the current behavior.
-func Disconnect() {
+func disconnect() {
 	_, cancel := getLifecycleCtx()
 
 	if cancel != nil {

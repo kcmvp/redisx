@@ -71,7 +71,6 @@ Go client:
 if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
     panic(err)
 }
-defer client.Disconnect()
 ```
 
 ### `HELLO`
@@ -530,7 +529,6 @@ import (
 if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
     panic(err)
 }
-defer client.Disconnect()
 
 _ = doc.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
 
