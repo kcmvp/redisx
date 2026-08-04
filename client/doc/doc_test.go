@@ -45,10 +45,6 @@ func (s *DocTestSuite) SetupSuite() {
 	s.T().Fatal("failed to connect to test server")
 }
 
-func (s *DocTestSuite) TearDownSuite() {
-	client.Disconnect()
-}
-
 type UserDoc string
 
 func (UserDoc) Namespace() string  { return "user" }

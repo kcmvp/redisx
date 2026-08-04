@@ -37,7 +37,7 @@ func (u testUserDoc) RawJSON() string  { return string(u) }
 func (testUserDoc) TTL() time.Duration { return 0 }
 
 func (s *ClientTestSuite) SetupTest() {
-	Disconnect()
+	disconnect()
 
 	handlersMu.Lock()
 	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
@@ -51,7 +51,8 @@ func (s *ClientTestSuite) SetupTest() {
 	kvClientMu.Unlock()
 
 	cliOnce = sync.Once{}
-	signalNotifyContextFn = signal.NotifyContext
+	signalNotifyFn = signal.Notify
+	signalStopFn = signal.Stop
 
 	for len(pubChan) > 0 {
 		<-pubChan
@@ -561,16 +562,17 @@ func (s *ClientTestSuite) TestConnectEmbed() {
 func (s *ClientTestSuite) TestConnectEmbedStopsOnProcessSignal() {
 	s.SetupTest()
 
-	sigCtx, sigCancel := context.WithCancel(context.Background())
-	signalNotifyContextFn = func(context.Context, ...os.Signal) (context.Context, context.CancelFunc) {
-		return sigCtx, sigCancel
+	var capturedSigCh chan<- os.Signal
+	signalNotifyFn = func(c chan<- os.Signal, _ ...os.Signal) {
+		capturedSigCh = c
 	}
 
 	err := ConnectEmbed(clientTestServerAddr)
 	s.NoError(err)
 	s.ensureConnected()
 
-	sigCancel()
+	s.Require().NotNil(capturedSigCh)
+	capturedSigCh <- os.Interrupt
 
 	for i := 0; i < 40; i++ {
 		ctx, _ := getLifecycleCtx()
