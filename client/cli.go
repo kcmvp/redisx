@@ -160,9 +160,11 @@ func Connect(respAddr, authKey string) error {
 	cliOnce.Do(func() {
 		ctx, cancelRoot := context.WithCancel(context.Background())
 		sigCh := make(chan os.Signal, 1)
-		signalNotifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
+		notifyFn := signalNotifyFn
+		stopFn := signalStopFn
+		notifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
 		cancel := func() {
-			signalStopFn(sigCh)
+			stopFn(sigCh)
 			cancelRoot()
 		}
 		setLifecycleCtx(ctx, cancel)
@@ -177,7 +179,7 @@ func Connect(respAddr, authKey string) error {
 				}
 				cancel()
 			case <-ctx.Done():
-				signalStopFn(sigCh)
+				stopFn(sigCh)
 			}
 		}()
 

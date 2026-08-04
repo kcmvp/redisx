@@ -3,8 +3,11 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -441,12 +444,11 @@ func (s *ServerTestSuite) TestListenAndServeWithStop() {
 }
 
 func (s *ServerTestSuite) TestStartStorageFailure() {
-	// Setup environment to make storage.Open fail
 	tempDir := s.T().TempDir()
-	fileHome := tempDir + "/fakehome"
-	f, _ := os.Create(fileHome)
-	_ = f.Close()
-	s.T().Setenv("HOME", fileHome)
+	parentFile := filepath.Join(tempDir, "not-a-dir")
+	f, err := os.Create(parentFile)
+	s.Require().NoError(err)
+	s.Require().NoError(f.Close())
 
 	exitCalled := false
 	globalMu.Lock()
@@ -455,7 +457,11 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	}
 	globalMu.Unlock()
 
-	db := Start("127.0.0.1:0", "/dev/null/kv.db")
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(prevLogger)
+
+	db := Start("127.0.0.1:0", filepath.Join(parentFile, "kv.db"))
 	s.Nil(db)
 	s.True(exitCalled)
 
