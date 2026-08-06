@@ -442,7 +442,7 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 		results := res.MustGet()
 		conn.WriteArray(len(results))
 		for _, val := range results {
-			conn.WriteBulk([]byte(val))
+			conn.WriteBulkString(val)
 		}
 	}
 }
@@ -517,7 +517,7 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 		results := res.MustGet()
 		conn.WriteArray(len(results))
 		for _, val := range results {
-			conn.WriteBulk([]byte(val))
+			conn.WriteBulkString(val)
 		}
 	}
 }
