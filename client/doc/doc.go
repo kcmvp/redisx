@@ -1,11 +1,37 @@
 package doc
 
 import (
+	"time"
+
 	"github.com/kcmvp/redisx/client"
 	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/x"
 	"github.com/samber/mo"
 )
+
+func AddAbortHook(h func(key string, valueJSON []byte) error) client.HookID {
+	return client.AddAbortHook(client.AbortHook(h))
+}
+
+func AddTransformHook(h func(key string, valueJSON []byte) ([]byte, error)) client.HookID {
+	return client.AddTransformHook(client.TransformHook(h))
+}
+
+func AddObserverHook(h func(key string, valueJSON []byte)) client.HookID {
+	return client.AddObserverHook(client.ObserverHook(h))
+}
+
+func AddObserverAfterHook(h func(key string, valueJSON []byte, committed bool, writeErr error)) client.HookID {
+	return client.AddObserverAfterHook(client.ObserverAfterHook(h))
+}
+
+func RemoveHook(id client.HookID) {
+	client.RemoveHook(id)
+}
+
+func SetHookTimeout(d time.Duration) {
+	client.SetHookTimeout(d)
+}
 
 // Get retrieves one document by its document-level key value.
 //

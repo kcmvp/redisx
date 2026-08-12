@@ -108,6 +108,108 @@ native way to feed realtime document payloads into `redisx`.
 For the full stream ingest contract and examples, see
 [docs/stream.md](docs/stream.md).
 
+### 5. Write Hook Subsystem — Register once, applied globally
+
+`redisx` ships a first-class typed **Write Hook Subsystem** on top of every
+write path (`client.Set`, `client.SetWithTTL`, `client.SetNX`,
+`client.SetNXWithTTL`, and their typed document helpers in `client/doc`).
+
+Register a hook **once** when your process boots; it applies to every future
+write without touching any business call site. Four semantic hook types are
+provided as distinct Go function signatures — the type system enforces the
+correct error-vs-value contract for each:
+
+| # | Type | Timing | Signature | Fail policy | Typical use |
+|---|---|---|---|---|---|
+| 1 | **AbortHook** | Before write | `(key, value) error` | **fail-closed** — any err/panic/timeout **aborts** the write | DLP, ACL, rate limit, quota, audit gating |
+| 2 | **TransformHook** | Before write | `(key, value) (newValue, err)` | **fail-closed** on err | AES encrypt, gzip, schema prefix, payload normalization |
+| 3 | **ObserverHook** (Before) | Before write, after Abort+Transform | `(key, value)` — no error return | **fail-open** — panic/timeout logged only | debug fixture capture, metrics counters, ad-hoc snapshot dumps |
+| 4 | **ObserverAfterHook** (After) | After write | `(key, value, committed, writeErr)` — no error return | **fail-open** | CDC, L1 cache invalidation, audit, dual-write migration |
+
+Mandatory synchronous execution order (all Before-phase hooks complete their
+lifecycle **before** `Set` returns, even under outer `context.WithTimeout`):
+
+```
+AbortHook → TransformHook chain → ObserverHook (sees post-transform value)
+           ↓ actual Redis SET/SETNX ↓
+ObserverAfterHook (sees final value, committed bool + writeErr)
+```
+
+Every hook has two built-in, **always-on** safety nets:
+1. **Panic isolation** — `recover()` + `slog.Error` with hook label, panic
+   value, and a full stack trace. Never propagates to your main code.
+2. **Per-hook execution timeout** — default 100 ms, configurable via
+   `client.SetHookTimeout(d)`. Pass `d <= 0` to disable timeouts (panic
+   isolation remains on).
+
+Fail-closed vs fail-open is non-negotiable per hook type:
+
+- **AbortHook / TransformHook** panic or timeout ⇒ write is **aborted**
+  (security and data-safety default).
+- **Observer*Hook** panic or timeout ⇒ **only a log is emitted**; the write and
+  sibling hooks continue unaffected.
+
+There is **zero cost by default**: the hot path does a single `atomic.Load`
+when zero hooks are registered (~0.24 ns/op, 0 B/op, 0 allocs on Apple M4),
+which is well under 0.01% of a real Redis SET round-trip. Hook add/remove uses
+a copy-on-write slice swap, so writing can proceed concurrently with
+registration changes.
+
+#### Quick example
+
+```go
+import (
+    "github.com/kcmvp/redisx/client"
+    doc "github.com/kcmvp/redisx/client/doc" // typed JSON docs
+)
+
+// 1) Gate — abort writes of oversized payloads (fail-closed).
+oversize := client.AddAbortHook(func(key string, value []byte) error {
+    if len(value) > 1024*1024 {
+        return fmt.Errorf("rejecting %s: payload %d bytes > 1MB", key, len(value))
+    }
+    return nil
+})
+
+// 2) Transform — wrap every JSON doc with a {"schema":"v1","doc":...} envelope.
+// (Illustrative skeleton; see docs/write-hooks.md for the full copy-safe version.)
+schemaTag := doc.AddTransformHook(func(key string, valueJSON []byte) ([]byte, error) {
+    env := make([]byte, 0, len(`{"schema":"v1","doc":}`)+len(valueJSON))
+    env = append(env, []byte(`{"schema":"v1","doc":}`)...)
+    env = append(env, valueJSON...)
+    env = append(env, '}')
+    return env, nil
+})
+
+// 3) Observe before write — capture every user-document write to a test fixture.
+var captureMu sync.Mutex
+var fixtures [][]byte
+capture := doc.AddObserverHook(func(key string, valueJSON []byte) {
+    if strings.HasPrefix(key, "user:") {
+        captureMu.Lock()
+        fixtures = append(fixtures, append([]byte(nil), valueJSON...))
+        captureMu.Unlock()
+    }
+})
+
+// 4) Observe after write — invalidate an external L1 cache on commit success only.
+// committed=true ⇔ Set/SetWithTTL succeeded OR SetNX/SetNXWithTTL returned ok=true.
+// When SetNX returns ok=false (key existed), committed=false so downstream L1/CDC
+// will correctly treat it as "no new value was written".
+l1 := client.AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+    if committed {
+        go externalL1Cache.Evict(key) // async inside Observer — you choose
+    }
+})
+
+// Later: remove a specific hook, or disable timeouts globally for heavy-duty observers.
+client.RemoveHook(capture)
+client.SetHookTimeout(0) // timeouts off; panic recover still on.
+```
+
+For the full hook contract, safety-net composition rules, real-world patterns
+per hook type, and troubleshooting, see [docs/write-hooks.md](docs/write-hooks.md).
+
 ## Storage Layers
 
 `redisx` supports two storage layers inside the same server:
@@ -210,6 +312,11 @@ SET _auth_:batch-worker 20
 - [docs/typed-document.md](docs/typed-document.md): the `x.Document` contract
   and the input semantics of typed helpers on both the client and embedded
   server side
+- [docs/write-hooks.md](docs/write-hooks.md): the **Write Hook Subsystem** —
+  four typed hook kinds (Abort / Transform / Observer-Before /
+  Observer-After), their fail-policy matrix, safety-net composition rules,
+  real-world usage patterns per hook type, hook lifecycle guidance, and
+  troubleshooting
 - [docs/stream.md](docs/stream.md): the websocket stream ingestion extension
   for `x.Document` workflows, including reconnect and subscription-aware
   behavior

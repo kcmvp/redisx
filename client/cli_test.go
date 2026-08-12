@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -61,6 +62,8 @@ func (s *ClientTestSuite) SetupTest() {
 		<-subscribeReqCh
 	}
 	atomic.StoreUint64(&pipeDrops, 0)
+
+	resetHooks()
 }
 
 type ClientTestSuite struct {
@@ -1280,4 +1283,856 @@ func (s *ClientTestSuite) TestSetAndClearSharedClientHelpers() {
 
 	clearSharedClientIf(c2)
 	s.Nil(getSharedClient())
+}
+
+func (s *ClientTestSuite) TestHookRegistrationAndRemoval() {
+	s.SetupTest()
+
+	s.Nil(snapshotHooks(), "no hooks initially")
+
+	id1 := AddObserverHook(func(key string, value []byte) {})
+	s.NotEqual(HookID(0), id1, "HookID should be non-zero")
+	s.NotNil(snapshotHooks())
+	s.Len(snapshotHooks().observers, 1)
+
+	id2 := AddAbortHook(func(key string, value []byte) error { return nil })
+	id3 := AddTransformHook(func(key string, value []byte) ([]byte, error) { return value, nil })
+	id4 := AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {})
+	s.Len(snapshotHooks().aborts, 1)
+	s.Len(snapshotHooks().transforms, 1)
+	s.Len(snapshotHooks().afters, 1)
+
+	s.NotEqual(id1, id2)
+	s.NotEqual(id2, id3)
+	s.NotEqual(id3, id4)
+
+	RemoveHook(id2)
+	s.Len(snapshotHooks().aborts, 0)
+	s.Len(snapshotHooks().observers, 1)
+	s.Len(snapshotHooks().transforms, 1)
+	s.Len(snapshotHooks().afters, 1)
+
+	RemoveHook(id1)
+	RemoveHook(id3)
+	RemoveHook(id4)
+	reg := snapshotHooks()
+	s.Nil(reg, "after removing every hook, registry snapshot must be nil to keep the zero-cost default path")
+
+	RemoveHook(HookID(0))
+	RemoveHook(9999)
+	RemoveHook(id1)
+}
+
+func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
+	s.SetupTest()
+
+	var called bool
+	var gotKey string
+	var gotVal []byte
+	AddObserverHook(func(key string, value []byte) {
+		called = true
+		gotKey = key
+		gotVal = append([]byte(nil), value...)
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-obs-1", "hello")
+	s.NoError(err)
+	s.True(called, "ObserverHook must be called")
+	s.Equal("hook-obs-1", gotKey)
+	s.Equal([]byte("hello"), gotVal)
+
+	stored, err := Get("hook-obs-1")
+	s.NoError(err)
+	s.Equal("hello", stored)
+}
+
+func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
+	s.SetupTest()
+
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddObserverHook(func(key string, value []byte) {
+		panic("boom observer")
+	})
+
+	var ok bool
+	AddObserverHook(func(key string, value []byte) {
+		ok = true
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-obs-panic", "val")
+	s.NoError(err, "ObserverHook panic must not abort write")
+	s.True(ok, "subsequent ObserverHooks must still run after panic in prior observer")
+
+	stored, err := Get("hook-obs-panic")
+	s.NoError(err)
+	s.Equal("val", stored)
+}
+
+func (s *ClientTestSuite) TestObserverHookFailOpenOnTimeout() {
+	s.SetupTest()
+
+	SetHookTimeout(50 * time.Millisecond)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddObserverHook(func(key string, value []byte) {
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	var ok bool
+	AddObserverHook(func(key string, value []byte) {
+		ok = true
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	start := time.Now()
+	err = Set("hook-obs-timeout", "val")
+	elapsed := time.Since(start)
+	s.NoError(err, "ObserverHook timeout must not abort write")
+	s.True(ok, "subsequent ObserverHooks must still run")
+	s.Less(elapsed, 500*time.Millisecond, "timeout should bound the hook time")
+
+	stored, err := Get("hook-obs-timeout")
+	s.NoError(err)
+	s.Equal("val", stored)
+}
+
+func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
+	s.SetupTest()
+
+	customErr := errors.New("blocked by policy")
+	AddAbortHook(func(key string, value []byte) error {
+		if key == "forbidden" {
+			return customErr
+		}
+		return nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("forbidden", "secret")
+	s.ErrorIs(err, customErr)
+
+	_, err = Get("forbidden")
+	s.Error(err, "key must not exist after abort")
+
+	err = Set("allowed", "public")
+	s.NoError(err)
+	v, err := Get("allowed")
+	s.NoError(err)
+	s.Equal("public", v)
+}
+
+func (s *ClientTestSuite) TestAbortHookFailClosedOnPanic() {
+	s.SetupTest()
+
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddAbortHook(func(key string, value []byte) error {
+		panic("abort panic")
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-abort-panic", "val")
+	s.Error(err, "AbortHook panic must abort write (fail-closed)")
+	s.Contains(err.Error(), "panic")
+
+	_, err = Get("hook-abort-panic")
+	s.Error(err, "key must not exist after AbortHook panic")
+}
+
+func (s *ClientTestSuite) TestAbortHookFailClosedOnTimeout() {
+	s.SetupTest()
+
+	SetHookTimeout(50 * time.Millisecond)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddAbortHook(func(key string, value []byte) error {
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	start := time.Now()
+	err = Set("hook-abort-timeout", "val")
+	elapsed := time.Since(start)
+	s.Error(err, "AbortHook timeout must abort write (fail-closed)")
+	s.Contains(err.Error(), "timeout")
+	s.Less(elapsed, 500*time.Millisecond)
+}
+
+func (s *ClientTestSuite) TestTransformHookChangesValue() {
+	s.SetupTest()
+
+	prefix := []byte("enc:")
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(prefix)+len(value))
+		copy(out, prefix)
+		copy(out[len(prefix):], value)
+		return out, nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-transform-1", "plain")
+	s.NoError(err)
+
+	stored, err := Get("hook-transform-1")
+	s.NoError(err)
+	s.Equal("enc:plain", stored, "TransformHook must change the written value")
+}
+
+func (s *ClientTestSuite) TestTransformHookChain() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(value))
+		for i, b := range value {
+			out[i] = b + 1
+		}
+		return out, nil
+	})
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(value))
+		for i, b := range value {
+			out[i] = b * 2
+		}
+		return out, nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-transform-chain", "\x01")
+	s.NoError(err)
+
+	stored, err := Get("hook-transform-chain")
+	s.NoError(err)
+	s.Equal([]byte{("\x01"[0] + 1) * 2}, []byte(stored),
+		"TransformHooks must chain in registration order: (+1) then (*2)")
+}
+
+func (s *ClientTestSuite) TestTransformHookFailClosedOnError() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		return nil, errors.New("transform failed")
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-transform-err", "val")
+	s.Error(err)
+	s.Contains(err.Error(), "transform failed")
+
+	_, err = Get("hook-transform-err")
+	s.Error(err, "key must not exist after TransformHook error")
+}
+
+func (s *ClientTestSuite) TestTransformHookFailClosedOnPanic() {
+	s.SetupTest()
+
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		panic("transform panic")
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-transform-panic", "val")
+	s.Error(err)
+	s.Contains(err.Error(), "panic")
+
+	_, err = Get("hook-transform-panic")
+	s.Error(err)
+}
+
+func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
+	s.SetupTest()
+
+	var gotKey, gotVal string
+	var gotWriteErr error
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		gotKey = key
+		gotVal = string(value)
+		gotWriteErr = writeErr
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-after-1", "hello-after")
+	s.NoError(err)
+	s.Equal("hook-after-1", gotKey)
+	s.Equal("hello-after", gotVal)
+	s.NoError(gotWriteErr, "writeErr should be nil on success")
+}
+
+func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(value))
+		copy(out, value)
+		for i := range out {
+			out[i] = out[i] + 1
+		}
+		return out, nil
+	})
+
+	var gotVal []byte
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		gotVal = append([]byte(nil), value...)
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-after-transformed", "ABC")
+	s.NoError(err)
+	s.Equal([]byte("BCD"), gotVal, "ObserverAfter must see the transformed value")
+}
+
+func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
+	s.SetupTest()
+
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		panic("after hook boom")
+	})
+
+	var ok bool
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		ok = true
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-after-panic", "val")
+	s.NoError(err, "ObserverAfterHook panic must not affect write result")
+	s.True(ok, "subsequent ObserverAfterHooks must still run")
+
+	stored, err := Get("hook-after-panic")
+	s.NoError(err)
+	s.Equal("val", stored)
+}
+
+func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
+	s.SetupTest()
+
+	SetHookTimeout(50 * time.Millisecond)
+	defer SetHookTimeout(defaultHookTimeout)
+
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	var ok bool
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		ok = true
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	start := time.Now()
+	err = Set("hook-after-timeout", "val")
+	elapsed := time.Since(start)
+	s.NoError(err, "ObserverAfterHook timeout must not affect write result")
+	s.True(ok, "subsequent ObserverAfterHooks must still run")
+	s.Less(elapsed, 500*time.Millisecond)
+}
+
+func (s *ClientTestSuite) TestHookExecutionOrder() {
+	s.SetupTest()
+
+	var seq atomic.Int64
+	steps := make([]int64, 5)
+	capture := func(idx int) {
+		steps[idx] = seq.Add(1)
+	}
+
+	AddAbortHook(func(key string, value []byte) error {
+		capture(0)
+		s.Equal("original", string(value), "Abort must see original value")
+		return nil
+	})
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		capture(1)
+		s.Equal("original", string(value), "Transform must see original value")
+		out := make([]byte, len("transformed"))
+		copy(out, "transformed")
+		return out, nil
+	})
+	AddObserverHook(func(key string, value []byte) {
+		capture(2)
+		s.Equal("transformed", string(value), "ObserverBefore must see POST-transform value (A5)")
+	})
+	// Write happens between index 2 and 3 (captured below as manual step 3)
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		capture(4)
+		s.Equal("transformed", string(value), "ObserverAfter must see transformed value")
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-order", "original")
+	s.NoError(err)
+	steps[3] = seq.Add(1) // Capture "write step" after Set returns
+
+	s.Equal([]int64{1, 2, 3, 5, 4}, steps,
+		"Order MUST be Abort(1) → Transform(2) → ObserverBefore(3) → [actual Redis write happens  before return ~4 but AFTER Before hooks] → ObserverAfter(4) — seq: [1,2,3,4,5]")
+	s.Equal(int64(1), steps[0]) // Abort
+	s.Equal(int64(2), steps[1]) // Transform
+	s.Equal(int64(3), steps[2]) // ObserverBefore
+	s.Equal(int64(4), steps[4]) // ObserverAfter runs BEFORE Set returns (sync)
+	s.Equal(int64(5), steps[3]) // our post-Set capture happens last
+
+	stored, err := Get("hook-order")
+	s.NoError(err)
+	s.Equal("transformed", stored)
+}
+
+func (s *ClientTestSuite) TestObserverBeforeSeesPostTransformValueButAbortSeesOriginal() {
+	s.SetupTest()
+
+	var abortSaw, transformSaw, observerSaw []byte
+
+	AddAbortHook(func(key string, value []byte) error {
+		abortSaw = append([]byte(nil), value...)
+		return nil
+	})
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		transformSaw = append([]byte(nil), value...)
+		out := make([]byte, len(value)+len("-transformed"))
+		copy(out, value)
+		copy(out[len(value):], "-transformed")
+		return out, nil
+	})
+	AddObserverHook(func(key string, value []byte) {
+		observerSaw = append([]byte(nil), value...)
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-see-orig", "raw-value")
+	s.NoError(err)
+	s.Equal([]byte("raw-value"), abortSaw,
+		"AbortHook must see ORIGINAL value (runs first)")
+	s.Equal([]byte("raw-value"), transformSaw,
+		"TransformHook must see ORIGINAL value (runs second)")
+	s.Equal([]byte("raw-value-transformed"), observerSaw,
+		"ObserverBefore must see POST-TRANSFORM value (runs third, A5 order)")
+}
+
+func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
+	s.SetupTest()
+
+	var afterCalled bool
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		afterCalled = true
+	})
+
+	var observerBeforeCalled bool
+	AddObserverHook(func(key string, value []byte) {
+		observerBeforeCalled = true
+	})
+
+	AddAbortHook(func(key string, value []byte) error {
+		return errors.New("abort")
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("hook-no-after", "val")
+	s.Error(err)
+	s.False(observerBeforeCalled,
+		"ObserverBefore must NOT run when AbortHook aborted earlier (fail-closed propagates out of Abort phase)")
+	s.False(afterCalled, "ObserverAfter hooks must NOT run when write was aborted in Before phase")
+}
+
+func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		// Emulate user who forgot to either return a fresh slice or return an error.
+		// Framework must fail-closed instead of silently writing "".
+		return nil, nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = Set("nil-transform", "should-not-be-overwritten")
+	s.Error(err)
+	s.Contains(err.Error(), "returned nil bytes without error")
+
+	existing, gerr := Get("nil-transform")
+	if gerr == nil {
+		s.Equal("", existing,
+			"key either should not exist OR be empty string; what we must NOT see is 'should-not-be-overwritten' overwritten to ''.")
+	}
+}
+
+func (s *ClientTestSuite) TestSetHookZeroTimeoutUsesSyncPathNoGoroutineAllocs() {
+	s.SetupTest()
+
+	old := getHookTimeout()
+	SetHookTimeout(0)
+	defer SetHookTimeout(old)
+
+	AddObserverHook(func(key string, value []byte) {})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	// Quick sanity — no error, writes succeed with T=0.
+	err = Set("sync-path", "v")
+	s.NoError(err)
+	v, gerr := Get("sync-path")
+	s.NoError(gerr)
+	s.Equal("v", v)
+}
+
+func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError() {
+	s.SetupTest()
+
+	var gotKey string
+	var gotCommitted bool
+	var gotErr error
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		gotKey = key
+		gotCommitted = committed
+		gotErr = writeErr
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	// (1) Plain Set success -> committed true, err nil
+	err = Set("after-commit-1", "v1")
+	s.NoError(err)
+	s.Equal("after-commit-1", gotKey)
+	s.True(gotCommitted)
+	s.NoError(gotErr)
+
+	// (2) Abort in before-hook -> ObserverAfter does NOT run at all, got* unchanged (per invariant).
+	abortID := AddAbortHook(func(key string, value []byte) error {
+		return errors.New("blocked in abort hook")
+	})
+	defer RemoveHook(abortID)
+	err = Set("after-commit-2", "v2")
+	s.Error(err)
+	// gotKey/gotCommitted/gotErr still hold values from the previous successful Set because
+	// runAfterHooks is entirely skipped when runBeforeHooks aborts (fail-closed propagation).
+	s.Equal("after-commit-1", gotKey)
+	s.True(gotCommitted)
+}
+
+func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
+	s.SetupTest()
+
+	var obsKey, obsVal string
+	AddObserverHook(func(key string, value []byte) {
+		obsKey = key
+		obsVal = string(value)
+	})
+
+	prefix := []byte("x:")
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(prefix)+len(value))
+		copy(out, prefix)
+		copy(out[len(prefix):], value)
+		return out, nil
+	})
+
+	var afterErr error
+	var afterVal string
+	var afterCommitted bool
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		afterErr = writeErr
+		afterVal = string(value)
+		afterCommitted = committed
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	ok, err := SetNX("hook-setnx-1", "original")
+	s.NoError(err)
+	s.True(ok)
+	s.True(afterCommitted, "first SetNX write actually occurred -> committed=true")
+	s.Equal("hook-setnx-1", obsKey)
+	s.Equal("x:original", obsVal,
+		"ObserverBefore runs after Transform, so sees post-transform value (A5 order)")
+	s.Equal("x:original", afterVal)
+	s.NoError(afterErr)
+
+	stored, err := Get("hook-setnx-1")
+	s.NoError(err)
+	s.Equal("x:original", stored)
+
+	ok, err = SetNX("hook-setnx-1", "another")
+	s.NoError(err)
+	s.False(ok, "SetNX should return false on existing key")
+	s.False(afterCommitted,
+		"SetNX ok=false MUST propagate committed=false to ObserverAfter, otherwise downstream L1/CDC will incorrectly think a write happened.")
+}
+
+func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(value))
+		copy(out, value)
+		return append(out, '-', 't', 't', 'l'), nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	err = SetWithTTL("hook-ttl", "base", 100*time.Millisecond)
+	s.NoError(err)
+
+	v, err := Get("hook-ttl")
+	s.NoError(err)
+	s.Equal("base-ttl", v)
+
+	time.Sleep(200 * time.Millisecond)
+	_, err = Get("hook-ttl")
+	s.Error(err)
+}
+
+func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
+	s.SetupTest()
+
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		return append([]byte(nil), value...), nil
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	ok, err := SetNXWithTTL("hook-setnx-ttl", "x", 80*time.Millisecond)
+	s.NoError(err)
+	s.True(ok)
+
+	v, err := Get("hook-setnx-ttl")
+	s.NoError(err)
+	s.Equal("x", v)
+
+	time.Sleep(160 * time.Millisecond)
+	_, err = Get("hook-setnx-ttl")
+	s.Error(err)
+}
+
+func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
+	s.SetupTest()
+
+	id := AddObserverHook(func(key string, value []byte) {})
+	_ = id
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			RemoveHook(id)
+			AddObserverHook(func(key string, value []byte) {})
+		}
+	}()
+
+	for i := 0; i < 50; i++ {
+		_ = Set(fmt.Sprintf("hook-safe-%d", i), "v")
+	}
+	<-done
+}
+
+func BenchmarkSetNoHooks(b *testing.B) {
+	resetHooks()
+	db := server.Start(
+		clientTestServerAddr,
+		filepath.Join(b.TempDir(), "redisx-bench.db"),
+	)
+	if db == nil {
+		b.Fatal("embedded server Start returned nil")
+	}
+	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	time.Sleep(200 * time.Millisecond)
+	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	_ = setSharedClient(mockClient)
+	defer func() {
+		_ = mockClient.Close()
+		clearSharedClientIf(mockClient)
+		_ = db.Close()
+		resetHooks()
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = SetWithTTL("bench-nohook", "payload-value", 0)
+	}
+}
+
+func BenchmarkSetWithObserverHooks(b *testing.B) {
+	resetHooks()
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+	AddObserverHook(func(key string, value []byte) {})
+	AddObserverHook(func(key string, value []byte) {})
+	AddObserverHook(func(key string, value []byte) {})
+
+	db := server.Start(
+		clientTestServerAddr,
+		filepath.Join(b.TempDir(), "redisx-bench.db"),
+	)
+	if db == nil {
+		b.Fatal("embedded server Start returned nil")
+	}
+	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	time.Sleep(200 * time.Millisecond)
+	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	_ = setSharedClient(mockClient)
+	defer func() {
+		_ = mockClient.Close()
+		clearSharedClientIf(mockClient)
+		_ = db.Close()
+		resetHooks()
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = SetWithTTL("bench-observer", "payload-value", 0)
+	}
+}
+
+func BenchmarkSetWithAbortHook(b *testing.B) {
+	resetHooks()
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+	AddAbortHook(func(key string, value []byte) error {
+		return nil
+	})
+
+	db := server.Start(
+		clientTestServerAddr,
+		filepath.Join(b.TempDir(), "redisx-bench.db"),
+	)
+	if db == nil {
+		b.Fatal("embedded server Start returned nil")
+	}
+	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	time.Sleep(200 * time.Millisecond)
+	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	_ = setSharedClient(mockClient)
+	defer func() {
+		_ = mockClient.Close()
+		clearSharedClientIf(mockClient)
+		_ = db.Close()
+		resetHooks()
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = SetWithTTL("bench-abort", "payload-value", 0)
+	}
+}
+
+func BenchmarkSetWithTransformHook(b *testing.B) {
+	resetHooks()
+	SetHookTimeout(0)
+	defer SetHookTimeout(defaultHookTimeout)
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		out := make([]byte, len(value))
+		copy(out, value)
+		return out, nil
+	})
+
+	db := server.Start(
+		clientTestServerAddr,
+		filepath.Join(b.TempDir(), "redisx-bench.db"),
+	)
+	if db == nil {
+		b.Fatal("embedded server Start returned nil")
+	}
+	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	time.Sleep(200 * time.Millisecond)
+	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	_ = setSharedClient(mockClient)
+	defer func() {
+		_ = mockClient.Close()
+		clearSharedClientIf(mockClient)
+		_ = db.Close()
+		resetHooks()
+	}()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = SetWithTTL("bench-transform", "payload-value", 0)
+	}
+}
+
+func BenchmarkHooksStoreLoadBaseline(b *testing.B) {
+	resetHooks()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = snapshotHooks()
+	}
 }

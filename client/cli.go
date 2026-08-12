@@ -1,5 +1,21 @@
 package client
 
+// Write Hook Subsystem — safety-net composition policy:
+//
+//   - Double recover: stack-safe, no side effects (innermost-first).
+//   - Double timeout:
+//     User timeout < framework timeout → no duplicate log.
+//     User timeout > framework timeout → duplicate slog. Fix: use per-hook timeouts + globally SetHookTimeout(0).
+//   - AbortHook timeout/panic = fail-closed (ABORT). Non-negotiable security default.
+//   - Observer*Hook timeout/panic = fail-open (LOG ONLY). Never impact write.
+//
+// Execution order (synchronous, all Before hooks lifecycle complete before Set returns):
+//  1. AbortHook (fail-closed) → abort on any error/panic/timeout
+//  2. TransformHook (fail-closed) → abort on any error/panic/timeout; chains in registration order
+//  3. ObserverHook (fail-open Before) → sees post-Transform value; only log on panic/timeout
+//  4. Actual Redis SET / SETNX / ...
+//  5. ObserverAfterHook (fail-open After) → receives final value + writeErr; only log on panic/timeout
+
 import (
 	"context"
 	"errors"
@@ -7,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +42,8 @@ const (
 	bufferSize     = 200
 	dialTimeout    = 3 * time.Second
 	reconnectEvery = 5 * time.Second
+
+	defaultHookTimeout = 100 * time.Millisecond
 )
 
 // ReceivedMessage is a transport-agnostic message exposed to callers.
@@ -54,6 +73,261 @@ var (
 	signalNotifyFn = signal.Notify
 	signalStopFn   = signal.Stop
 )
+
+type HookID uint64
+
+type AbortHook func(key string, value []byte) error
+type TransformHook func(key string, value []byte) (newValue []byte, err error)
+type ObserverHook func(key string, value []byte)
+type ObserverAfterHook func(key string, value []byte, committed bool, writeErr error)
+
+type registeredAbortHook struct {
+	id HookID
+	h  AbortHook
+}
+type registeredTransformHook struct {
+	id HookID
+	h  TransformHook
+}
+type registeredObserverHook struct {
+	id HookID
+	h  ObserverHook
+}
+type registeredObserverAfterHook struct {
+	id HookID
+	h  ObserverAfterHook
+}
+
+type hooksRegistry struct {
+	aborts     []registeredAbortHook
+	transforms []registeredTransformHook
+	observers  []registeredObserverHook
+	afters     []registeredObserverAfterHook
+}
+
+var (
+	hooksMu      sync.RWMutex
+	hooksStore   atomic.Pointer[hooksRegistry]
+	hooksNextID  HookID
+	hooksTimeout atomic.Int64
+)
+
+func init() {
+	hooksStore.Store(nil)
+	hooksTimeout.Store(int64(defaultHookTimeout))
+}
+
+func SetHookTimeout(d time.Duration) {
+	hooksTimeout.Store(int64(d))
+}
+
+func getHookTimeout() time.Duration {
+	return time.Duration(hooksTimeout.Load())
+}
+
+func snapshotHooks() *hooksRegistry {
+	return hooksStore.Load()
+}
+
+func cloneRegistry(reg *hooksRegistry) *hooksRegistry {
+	n := &hooksRegistry{}
+	if reg != nil {
+		n.aborts = append([]registeredAbortHook(nil), reg.aborts...)
+		n.transforms = append([]registeredTransformHook(nil), reg.transforms...)
+		n.observers = append([]registeredObserverHook(nil), reg.observers...)
+		n.afters = append([]registeredObserverAfterHook(nil), reg.afters...)
+	}
+	return n
+}
+
+func nextHookID() HookID {
+	for {
+		cur := atomic.LoadUint64((*uint64)(&hooksNextID))
+		nxt := cur + 1
+		if nxt == 0 {
+			nxt = 1
+		}
+		if atomic.CompareAndSwapUint64((*uint64)(&hooksNextID), cur, nxt) {
+			return HookID(nxt)
+		}
+	}
+}
+
+func AddAbortHook(h AbortHook) HookID {
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	id := nextHookID()
+	reg := cloneRegistry(hooksStore.Load())
+	reg.aborts = append(reg.aborts, registeredAbortHook{id: id, h: h})
+	hooksStore.Store(reg)
+	return id
+}
+
+func AddTransformHook(h TransformHook) HookID {
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	id := nextHookID()
+	reg := cloneRegistry(hooksStore.Load())
+	reg.transforms = append(reg.transforms, registeredTransformHook{id: id, h: h})
+	hooksStore.Store(reg)
+	return id
+}
+
+func AddObserverHook(h ObserverHook) HookID {
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	id := nextHookID()
+	reg := cloneRegistry(hooksStore.Load())
+	reg.observers = append(reg.observers, registeredObserverHook{id: id, h: h})
+	hooksStore.Store(reg)
+	return id
+}
+
+func AddObserverAfterHook(h ObserverAfterHook) HookID {
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	id := nextHookID()
+	reg := cloneRegistry(hooksStore.Load())
+	reg.afters = append(reg.afters, registeredObserverAfterHook{id: id, h: h})
+	hooksStore.Store(reg)
+	return id
+}
+
+func RemoveHook(id HookID) {
+	if id == 0 {
+		return
+	}
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	reg := hooksStore.Load()
+	if reg == nil {
+		return
+	}
+	n := &hooksRegistry{}
+	for _, h := range reg.aborts {
+		if h.id != id {
+			n.aborts = append(n.aborts, h)
+		}
+	}
+	for _, h := range reg.transforms {
+		if h.id != id {
+			n.transforms = append(n.transforms, h)
+		}
+	}
+	for _, h := range reg.observers {
+		if h.id != id {
+			n.observers = append(n.observers, h)
+		}
+	}
+	for _, h := range reg.afters {
+		if h.id != id {
+			n.afters = append(n.afters, h)
+		}
+	}
+	if len(n.aborts) == 0 && len(n.transforms) == 0 && len(n.observers) == 0 && len(n.afters) == 0 {
+		hooksStore.Store(nil)
+		return
+	}
+	hooksStore.Store(n)
+}
+
+func resetHooks() {
+	hooksMu.Lock()
+	defer hooksMu.Unlock()
+	hooksStore.Store(nil)
+	atomic.StoreUint64((*uint64)(&hooksNextID), 0)
+	hooksTimeout.Store(int64(defaultHookTimeout))
+}
+
+func runHookWithSafety(label string, fn func() error) error {
+	d := getHookTimeout()
+	if d <= 0 {
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("write hook panic", "hook", label, "panic", r, "stack", stackStr())
+					err = fmt.Errorf("hook %s panic: %v", label, r)
+				}
+			}()
+			err = fn()
+		}()
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("write hook panic", "hook", label, "panic", r, "stack", stackStr())
+				done <- fmt.Errorf("hook %s panic: %v", label, r)
+			}
+		}()
+		done <- fn()
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		slog.Warn("write hook timeout", "hook", label, "timeout", d)
+		return fmt.Errorf("hook %s timeout after %s", label, d)
+	case err := <-done:
+		return err
+	}
+}
+
+func stackStr() string {
+	buf := make([]byte, 4096)
+	n := runtimeStack(buf, false)
+	return string(buf[:n])
+}
+
+var runtimeStack = runtime.Stack
+
+func runBeforeHooks(reg *hooksRegistry, key string, value []byte) ([]byte, error) {
+	for i, rh := range reg.aborts {
+		h := rh.h
+		if err := runHookWithSafety(fmt.Sprintf("Abort#%d", i), func() error {
+			return h(key, value)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	cur := value
+	for i, rh := range reg.transforms {
+		h := rh.h
+		var nv []byte
+		herr := runHookWithSafety(fmt.Sprintf("Transform#%d", i), func() error {
+			var innerErr error
+			nv, innerErr = h(key, cur)
+			return innerErr
+		})
+		if herr != nil {
+			return nil, herr
+		}
+		if nv == nil {
+			return nil, fmt.Errorf("hook Transform#%d returned nil bytes without error", i)
+		}
+		cur = nv
+	}
+	for i, rh := range reg.observers {
+		h := rh.h
+		_ = runHookWithSafety(fmt.Sprintf("Observer#%d", i), func() error {
+			h(key, cur)
+			return nil
+		})
+	}
+	return cur, nil
+}
+
+func runAfterHooks(reg *hooksRegistry, key string, value []byte, committed bool, writeErr error) {
+	for i, rh := range reg.afters {
+		h := rh.h
+		_ = runHookWithSafety(fmt.Sprintf("ObserverAfter#%d", i), func() error {
+			h(key, value, committed, writeErr)
+			return nil
+		})
+	}
+}
 
 // resetHandlers closes all registered subscription channels and clears the
 // topic registry. This is reserved for explicit full shutdown paths such as
@@ -360,27 +634,34 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 		return errors.New("resp client is not connected")
 	}
 
+	reg := hooksStore.Load()
+	finalVal := value
+	var valBytes []byte
+	if reg != nil {
+		valBytes = []byte(value)
+		transformed, herr := runBeforeHooks(reg, key, valBytes)
+		if herr != nil {
+			return herr
+		}
+		finalVal = string(transformed)
+		valBytes = transformed
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	return client.Set(ctx, key, value, ttl).Err()
+	werr := client.Set(ctx, key, finalVal, ttl).Err()
+	committed := werr == nil
+
+	if reg != nil {
+		runAfterHooks(reg, key, valBytes, committed, werr)
+	}
+	return werr
 }
 
 // Set stores a value for the given key using the shared resp client.
 func Set(key, value string) error {
-	if key == "" {
-		return nil
-	}
-
-	client := getSharedClient()
-	if client == nil {
-		return errors.New("resp client is not connected")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-
-	return client.Set(ctx, key, value, 0).Err()
+	return SetWithTTL(key, value, 0)
 }
 
 // SetNX stores a value for the given key only if the key does not exist.
@@ -394,11 +675,30 @@ func SetNX(key, value string) (bool, error) {
 		return false, errors.New("resp client is not connected")
 	}
 
+	reg := hooksStore.Load()
+	finalVal := value
+	var valBytes []byte
+	if reg != nil {
+		valBytes = []byte(value)
+		transformed, herr := runBeforeHooks(reg, key, valBytes)
+		if herr != nil {
+			return false, herr
+		}
+		finalVal = string(transformed)
+		valBytes = transformed
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	res, err := client.Do(ctx, "SETNX", key, value).Int()
-	return res == 1, err
+	res, werr := client.Do(ctx, "SETNX", key, finalVal).Int()
+	ok := res == 1
+	committed := ok && werr == nil
+
+	if reg != nil {
+		runAfterHooks(reg, key, valBytes, committed, werr)
+	}
+	return ok, werr
 }
 
 // SetNXWithTTL stores a value for the given key only if the key does not
@@ -417,10 +717,29 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 		return false, errors.New("resp client is not connected")
 	}
 
+	reg := hooksStore.Load()
+	finalVal := value
+	var valBytes []byte
+	if reg != nil {
+		valBytes = []byte(value)
+		transformed, herr := runBeforeHooks(reg, key, valBytes)
+		if herr != nil {
+			return false, herr
+		}
+		finalVal = string(transformed)
+		valBytes = transformed
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	return client.SetNX(ctx, key, value, ttl).Result()
+	ok, werr := client.SetNX(ctx, key, finalVal, ttl).Result()
+	committed := ok && werr == nil
+
+	if reg != nil {
+		runAfterHooks(reg, key, valBytes, committed, werr)
+	}
+	return ok, werr
 }
 
 // Delete removes the specified key using the shared resp client.
