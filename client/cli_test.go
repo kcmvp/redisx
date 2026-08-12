@@ -1316,10 +1316,7 @@ func (s *ClientTestSuite) TestHookRegistrationAndRemoval() {
 	RemoveHook(id3)
 	RemoveHook(id4)
 	reg := snapshotHooks()
-	s.Len(reg.aborts, 0)
-	s.Len(reg.observers, 0)
-	s.Len(reg.transforms, 0)
-	s.Len(reg.afters, 0)
+	s.Nil(reg, "after removing every hook, registry snapshot must be nil to keep the zero-cost default path")
 
 	RemoveHook(HookID(0))
 	RemoveHook(9999)

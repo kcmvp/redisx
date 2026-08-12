@@ -224,6 +224,10 @@ func RemoveHook(id HookID) {
 			n.afters = append(n.afters, h)
 		}
 	}
+	if len(n.aborts) == 0 && len(n.transforms) == 0 && len(n.observers) == 0 && len(n.afters) == 0 {
+		hooksStore.Store(nil)
+		return
+	}
 	hooksStore.Store(n)
 }
 
@@ -650,9 +654,6 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 	committed := werr == nil
 
 	if reg != nil {
-		if valBytes == nil {
-			valBytes = []byte(finalVal)
-		}
 		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return werr
@@ -695,9 +696,6 @@ func SetNX(key, value string) (bool, error) {
 	committed := ok && werr == nil
 
 	if reg != nil {
-		if valBytes == nil {
-			valBytes = []byte(finalVal)
-		}
 		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return ok, werr
@@ -739,9 +737,6 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 	committed := ok && werr == nil
 
 	if reg != nil {
-		if valBytes == nil {
-			valBytes = []byte(finalVal)
-		}
 		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return ok, werr
