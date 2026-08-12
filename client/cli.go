@@ -79,7 +79,7 @@ type HookID uint64
 type AbortHook func(key string, value []byte) error
 type TransformHook func(key string, value []byte) (newValue []byte, err error)
 type ObserverHook func(key string, value []byte)
-type ObserverAfterHook func(key string, value []byte, writeErr error)
+type ObserverAfterHook func(key string, value []byte, committed bool, writeErr error)
 
 type registeredAbortHook struct {
 	id HookID
@@ -237,6 +237,19 @@ func resetHooks() {
 
 func runHookWithSafety(label string, fn func() error) error {
 	d := getHookTimeout()
+	if d <= 0 {
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("write hook panic", "hook", label, "panic", r, "stack", stackStr())
+					err = fmt.Errorf("hook %s panic: %v", label, r)
+				}
+			}()
+			err = fn()
+		}()
+		return err
+	}
 	done := make(chan error, 1)
 	go func() {
 		defer func() {
@@ -247,18 +260,15 @@ func runHookWithSafety(label string, fn func() error) error {
 		}()
 		done <- fn()
 	}()
-	if d > 0 {
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			slog.Warn("write hook timeout", "hook", label, "timeout", d)
-			return fmt.Errorf("hook %s timeout after %s", label, d)
-		case err := <-done:
-			return err
-		}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		slog.Warn("write hook timeout", "hook", label, "timeout", d)
+		return fmt.Errorf("hook %s timeout after %s", label, d)
+	case err := <-done:
+		return err
 	}
-	return <-done
 }
 
 func stackStr() string {
@@ -290,6 +300,9 @@ func runBeforeHooks(reg *hooksRegistry, key string, value []byte) ([]byte, error
 		if herr != nil {
 			return nil, herr
 		}
+		if nv == nil {
+			return nil, fmt.Errorf("hook Transform#%d returned nil bytes without error", i)
+		}
 		cur = nv
 	}
 	for i, rh := range reg.observers {
@@ -302,11 +315,11 @@ func runBeforeHooks(reg *hooksRegistry, key string, value []byte) ([]byte, error
 	return cur, nil
 }
 
-func runAfterHooks(reg *hooksRegistry, key string, value []byte, writeErr error) {
+func runAfterHooks(reg *hooksRegistry, key string, value []byte, committed bool, writeErr error) {
 	for i, rh := range reg.afters {
 		h := rh.h
 		_ = runHookWithSafety(fmt.Sprintf("ObserverAfter#%d", i), func() error {
-			h(key, value, writeErr)
+			h(key, value, committed, writeErr)
 			return nil
 		})
 	}
@@ -634,12 +647,13 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 	defer cancel()
 
 	werr := client.Set(ctx, key, finalVal, ttl).Err()
+	committed := werr == nil
 
 	if reg != nil {
 		if valBytes == nil {
 			valBytes = []byte(finalVal)
 		}
-		runAfterHooks(reg, key, valBytes, werr)
+		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return werr
 }
@@ -678,12 +692,13 @@ func SetNX(key, value string) (bool, error) {
 
 	res, werr := client.Do(ctx, "SETNX", key, finalVal).Int()
 	ok := res == 1
+	committed := ok && werr == nil
 
 	if reg != nil {
 		if valBytes == nil {
 			valBytes = []byte(finalVal)
 		}
-		runAfterHooks(reg, key, valBytes, werr)
+		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return ok, werr
 }
@@ -721,12 +736,13 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 	defer cancel()
 
 	ok, werr := client.SetNX(ctx, key, finalVal, ttl).Result()
+	committed := ok && werr == nil
 
 	if reg != nil {
 		if valBytes == nil {
 			valBytes = []byte(finalVal)
 		}
-		runAfterHooks(reg, key, valBytes, werr)
+		runAfterHooks(reg, key, valBytes, committed, werr)
 	}
 	return ok, werr
 }

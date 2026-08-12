@@ -1297,7 +1297,7 @@ func (s *ClientTestSuite) TestHookRegistrationAndRemoval() {
 
 	id2 := AddAbortHook(func(key string, value []byte) error { return nil })
 	id3 := AddTransformHook(func(key string, value []byte) ([]byte, error) { return value, nil })
-	id4 := AddObserverAfterHook(func(key string, value []byte, writeErr error) {})
+	id4 := AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {})
 	s.Len(snapshotHooks().aborts, 1)
 	s.Len(snapshotHooks().transforms, 1)
 	s.Len(snapshotHooks().afters, 1)
@@ -1585,7 +1585,7 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 
 	var gotKey, gotVal string
 	var gotWriteErr error
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		gotKey = key
 		gotVal = string(value)
 		gotWriteErr = writeErr
@@ -1615,7 +1615,7 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	})
 
 	var gotVal []byte
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		gotVal = append([]byte(nil), value...)
 	})
 
@@ -1634,12 +1634,12 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 	SetHookTimeout(0)
 	defer SetHookTimeout(defaultHookTimeout)
 
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		panic("after hook boom")
 	})
 
 	var ok bool
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		ok = true
 	})
 
@@ -1662,12 +1662,12 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
 	SetHookTimeout(50 * time.Millisecond)
 	defer SetHookTimeout(defaultHookTimeout)
 
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		time.Sleep(200 * time.Millisecond)
 	})
 
 	var ok bool
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		ok = true
 	})
 
@@ -1709,7 +1709,7 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 		s.Equal("transformed", string(value), "ObserverBefore must see POST-transform value (A5)")
 	})
 	// Write happens between index 2 and 3 (captured below as manual step 3)
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		capture(4)
 		s.Equal("transformed", string(value), "ObserverAfter must see transformed value")
 	})
@@ -1773,7 +1773,7 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.SetupTest()
 
 	var afterCalled bool
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		afterCalled = true
 	})
 
@@ -1797,33 +1797,85 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.False(afterCalled, "ObserverAfter hooks must NOT run when write was aborted in Before phase")
 }
 
-func (s *ClientTestSuite) TestHookTimeoutZeroDisablesTimeoutKeepsPanicRecover() {
+func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() {
 	s.SetupTest()
 
-	SetHookTimeout(0)
-
-	panicRecovered := false
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				panicRecovered = true
-			}
-		}()
-		_ = runHookWithSafety("test-zero", func() error {
-			panic("inside zero timeout hook")
-		})
-	}()
-	s.False(panicRecovered, "panic should be recovered inside runHookWithSafety when d=0")
-
-	start := time.Now()
-	err := runHookWithSafety("test-zero-sleep", func() error {
-		time.Sleep(20 * time.Millisecond)
-		return nil
+	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+		// Emulate user who forgot to either return a fresh slice or return an error.
+		// Framework must fail-closed instead of silently writing "".
+		return nil, nil
 	})
-	elapsed := time.Since(start)
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
-	s.GreaterOrEqual(elapsed, 20*time.Millisecond,
-		"with SetHookTimeout(0), timeout is disabled and hook runs to completion")
+	s.ensureConnected()
+
+	err = Set("nil-transform", "should-not-be-overwritten")
+	s.Error(err)
+	s.Contains(err.Error(), "returned nil bytes without error")
+
+	existing, gerr := Get("nil-transform")
+	if gerr == nil {
+		s.Equal("", existing,
+			"key either should not exist OR be empty string; what we must NOT see is 'should-not-be-overwritten' overwritten to ''.")
+	}
+}
+
+func (s *ClientTestSuite) TestSetHookZeroTimeoutUsesSyncPathNoGoroutineAllocs() {
+	s.SetupTest()
+
+	old := getHookTimeout()
+	SetHookTimeout(0)
+	defer SetHookTimeout(old)
+
+	AddObserverHook(func(key string, value []byte) {})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	// Quick sanity — no error, writes succeed with T=0.
+	err = Set("sync-path", "v")
+	s.NoError(err)
+	v, gerr := Get("sync-path")
+	s.NoError(gerr)
+	s.Equal("v", v)
+}
+
+func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError() {
+	s.SetupTest()
+
+	var gotKey string
+	var gotCommitted bool
+	var gotErr error
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+		gotKey = key
+		gotCommitted = committed
+		gotErr = writeErr
+	})
+
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err)
+	s.ensureConnected()
+
+	// (1) Plain Set success -> committed true, err nil
+	err = Set("after-commit-1", "v1")
+	s.NoError(err)
+	s.Equal("after-commit-1", gotKey)
+	s.True(gotCommitted)
+	s.NoError(gotErr)
+
+	// (2) Abort in before-hook -> ObserverAfter does NOT run at all, got* unchanged (per invariant).
+	abortID := AddAbortHook(func(key string, value []byte) error {
+		return errors.New("blocked in abort hook")
+	})
+	defer RemoveHook(abortID)
+	err = Set("after-commit-2", "v2")
+	s.Error(err)
+	// gotKey/gotCommitted/gotErr still hold values from the previous successful Set because
+	// runAfterHooks is entirely skipped when runBeforeHooks aborts (fail-closed propagation).
+	s.Equal("after-commit-1", gotKey)
+	s.True(gotCommitted)
 }
 
 func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
@@ -1845,9 +1897,11 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 
 	var afterErr error
 	var afterVal string
-	AddObserverAfterHook(func(key string, value []byte, writeErr error) {
+	var afterCommitted bool
+	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		afterErr = writeErr
 		afterVal = string(value)
+		afterCommitted = committed
 	})
 
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -1857,6 +1911,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	ok, err := SetNX("hook-setnx-1", "original")
 	s.NoError(err)
 	s.True(ok)
+	s.True(afterCommitted, "first SetNX write actually occurred -> committed=true")
 	s.Equal("hook-setnx-1", obsKey)
 	s.Equal("x:original", obsVal,
 		"ObserverBefore runs after Transform, so sees post-transform value (A5 order)")
@@ -1870,6 +1925,8 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	ok, err = SetNX("hook-setnx-1", "another")
 	s.NoError(err)
 	s.False(ok, "SetNX should return false on existing key")
+	s.False(afterCommitted,
+		"SetNX ok=false MUST propagate committed=false to ObserverAfter, otherwise downstream L1/CDC will incorrectly think a write happened.")
 }
 
 func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {

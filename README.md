@@ -124,7 +124,7 @@ correct error-vs-value contract for each:
 | 1 | **AbortHook** | Before write | `(key, value) error` | **fail-closed** — any err/panic/timeout **aborts** the write | DLP, ACL, rate limit, quota, audit gating |
 | 2 | **TransformHook** | Before write | `(key, value) (newValue, err)` | **fail-closed** on err | AES encrypt, gzip, schema prefix, payload normalization |
 | 3 | **ObserverHook** (Before) | Before write, after Abort+Transform | `(key, value)` — no error return | **fail-open** — panic/timeout logged only | debug fixture capture, metrics counters, ad-hoc snapshot dumps |
-| 4 | **ObserverAfterHook** (After) | After write | `(key, value, writeErr)` — no error return | **fail-open** | CDC, L1 cache invalidation, audit, dual-write migration |
+| 4 | **ObserverAfterHook** (After) | After write | `(key, value, committed, writeErr)` — no error return | **fail-open** | CDC, L1 cache invalidation, audit, dual-write migration |
 
 Mandatory synchronous execution order (all Before-phase hooks complete their
 lifecycle **before** `Set` returns, even under outer `context.WithTimeout`):
@@ -132,7 +132,7 @@ lifecycle **before** `Set` returns, even under outer `context.WithTimeout`):
 ```
 AbortHook → TransformHook chain → ObserverHook (sees post-transform value)
            ↓ actual Redis SET/SETNX ↓
-ObserverAfterHook (sees final value + writeErr)
+ObserverAfterHook (sees final value, committed bool + writeErr)
 ```
 
 Every hook has two built-in, **always-on** safety nets:
@@ -192,9 +192,12 @@ capture := doc.AddObserverHook(func(key string, valueJSON []byte) {
     }
 })
 
-// 4) Observe after write — invalidate an external L1 cache on success only.
-l1 := client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
-    if writeErr == nil {
+// 4) Observe after write — invalidate an external L1 cache on commit success only.
+// committed=true ⇔ Set/SetWithTTL succeeded OR SetNX/SetNXWithTTL returned ok=true.
+// When SetNX returns ok=false (key existed), committed=false so downstream L1/CDC
+// will correctly treat it as "no new value was written".
+l1 := client.AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+    if committed {
         go externalL1Cache.Evict(key) // async inside Observer — you choose
     }
 })

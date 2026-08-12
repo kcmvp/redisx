@@ -51,7 +51,7 @@ The five synchronous phases, in order:
 | 2 | **TransformHook** (all registered, in registration order) | output of previous TransformHook; original value for the first one | **ABORT** on any error; otherwise each TransformHook feeds its `newValue` into the next. |
 | 3 | **ObserverHook** — the “Before” observer | **post-Transform** value (i.e. what will actually be written) | Only a `slog` warning/error is produced; the write and sibling observer hooks continue unaffected (fail-open). |
 | 4 | Actual Redis `SET` / `SETNX` / `SETNX + TTL` | final value from phase 2 | Propagated to the caller as the `Set` return value; also passed to phase 5. |
-| 5 | **ObserverAfterHook** (all registered, in registration order) | final written value + `writeErr` (phase 4 result) | Only a `slog` warning/error is produced on panic/timeout (fail-open). |
+| 5 | **ObserverAfterHook** (all registered, in registration order) | final written value + `committed bool` + `writeErr` (phase 4 result: `committed=true` iff actual data change occurred) | Only a `slog` warning/error is produced on panic/timeout (fail-open). |
 
 Important invariants derived from the order:
 
@@ -344,16 +344,24 @@ never re-derive “original input” from the output of another hook.
 Use for CDC, L1 cache invalidation, audit logs that must include the
 success/failure of the Redis op, and gradual dual-write migrations.
 
-Signature: `func(key string, value []byte, writeErr error)` — no error return.
+Signature: `func(key string, value []byte, committed bool, writeErr error)` — no error return.
+
+`committed` tells you whether the key actually changed in Redis:
+
+- `Set` / `SetWithTTL`: `committed = (writeErr == nil)`
+- `SetNX` / `SetNXWithTTL`: `committed = ok && (writeErr == nil)` — so if
+  the key already existed (`ok=false`), `committed` is `false` even when no
+  error occurred. This is the critical semantic that distinguishes “the
+  command ran fine” from “a *new value was actually written*”.
 
 Same fail-open guarantees as ObserverHook.
 
-**L1 cache evict on write success**
+**L1 cache evict on write commit success only (safe for SetNX)**
 
 ```go
-client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
-    if writeErr != nil {
-        return // don't evict on network failure / timeout; key may still be cached
+client.AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+    if !committed {
+        return // SetNX ok=false or network failure — don't evict L1, stale value is still valid
     }
     go localL1.Evict(key) // async — you decide, framework dispatch is sync
 })
@@ -362,8 +370,8 @@ client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
 **CDC to a Kafka topic (batching inside the hook is fine)**
 
 ```go
-client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
-    if writeErr != nil {
+client.AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+    if !committed {
         cdcDropped.Add(1)
         return
     }
@@ -374,8 +382,8 @@ client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
 **Dual-write migration (old redisx → new external store, track divergence)**
 
 ```go
-client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
-    if writeErr != nil {
+client.AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+    if !committed {
         return
     }
     // Go routine inside the hook: CDC is side effect, not on the hot path.
@@ -411,7 +419,7 @@ client.AddObserverAfterHook(func(key string, value []byte, writeErr error) {
 - `AbortHook(k, value)`: `value` is READ-ONLY. Do not write into it.
 - `TransformHook(k, value)`: `value` is READ-ONLY. You MUST return a
   freshly-allocated slice for `newValue`.
-- `ObserverHook(k, value)` and `ObserverAfterHook(k, value, writeErr)`:
+- `ObserverHook(k, value)` and `ObserverAfterHook(k, value, committed, writeErr)`:
   `value` is READ-ONLY. If you need to retain the bytes (e.g. for async
   forwarding), copy them: `v := append([]byte(nil), value...)`.
 
@@ -491,20 +499,20 @@ type HookID uint64
 type AbortHook          func(key string, value []byte) error
 type TransformHook      func(key string, value []byte) (newValue []byte, err error)
 type ObserverHook       func(key string, value []byte)
-type ObserverAfterHook  func(key string, value []byte, writeErr error)
+type ObserverAfterHook  func(key string, value []byte, committed bool, writeErr error)
 
 func AddAbortHook(h AbortHook) HookID
 func AddTransformHook(h TransformHook) HookID
 func AddObserverHook(h ObserverHook) HookID
 func AddObserverAfterHook(h ObserverAfterHook) HookID
 func RemoveHook(id HookID)               // removing 0 or unknown id is safe
-func SetHookTimeout(d time.Duration)     // d<=0 disables timeouts; panic recover stays on
+func SetHookTimeout(d time.Duration)     // d<=0 disables timeouts (sync exec); panic recover stays on
 
 // ---- doc package (typed JSON documents — thin forwarders) ----
 func AddAbortHook(h func(key string, valueJSON []byte) error) client.HookID
 func AddTransformHook(h func(key string, valueJSON []byte) ([]byte, error)) client.HookID
 func AddObserverHook(h func(key string, valueJSON []byte)) client.HookID
-func AddObserverAfterHook(h func(key string, valueJSON []byte, writeErr error)) client.HookID
+func AddObserverAfterHook(h func(key string, valueJSON []byte, committed bool, writeErr error)) client.HookID
 func RemoveHook(id client.HookID)
 func SetHookTimeout(d time.Duration)
 ```

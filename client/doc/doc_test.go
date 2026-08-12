@@ -190,10 +190,12 @@ func (s *DocTestSuite) TestDocHookForwarders() {
 
 	var afterKey, afterVal string
 	var afterWriteErr error
-	id4 := AddObserverAfterHook(func(key string, valueJSON []byte, writeErr error) {
+	var afterCommitted bool
+	id4 := AddObserverAfterHook(func(key string, valueJSON []byte, committed bool, writeErr error) {
 		afterKey = key
 		afterVal = string(valueJSON)
 		afterWriteErr = writeErr
+		afterCommitted = committed
 	})
 	defer RemoveHook(id4)
 
@@ -206,6 +208,7 @@ func (s *DocTestSuite) TestDocHookForwarders() {
 	s.True(transformed)
 	s.Equal("user:998", afterKey)
 	s.Contains(afterVal, `"transformed":true`)
+	s.True(afterCommitted, "typed doc Set committed the write -> committed=true")
 	s.NoError(afterWriteErr)
 
 	got, err := Get[UserDoc]("998")

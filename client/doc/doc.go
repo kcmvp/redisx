@@ -21,7 +21,7 @@ func AddObserverHook(h func(key string, valueJSON []byte)) client.HookID {
 	return client.AddObserverHook(client.ObserverHook(h))
 }
 
-func AddObserverAfterHook(h func(key string, valueJSON []byte, writeErr error)) client.HookID {
+func AddObserverAfterHook(h func(key string, valueJSON []byte, committed bool, writeErr error)) client.HookID {
 	return client.AddObserverAfterHook(client.ObserverAfterHook(h))
 }
 
