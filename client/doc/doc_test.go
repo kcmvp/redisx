@@ -1,6 +1,7 @@
 package doc
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -153,4 +154,66 @@ func (s *DocTestSuite) TestSearchIndexRejectsFullIdxName() {
 	res := SearchIndex[UserDoc]("user_age", "*", nil, false)
 	s.Require().True(res.IsError())
 	s.Contains(res.Error().Error(), "fully-qualified index name")
+}
+
+func (s *DocTestSuite) TestDocHookForwarders() {
+	var obsKey, obsVal string
+	id1 := AddObserverHook(func(key string, valueJSON []byte) {
+		obsKey = key
+		obsVal = string(valueJSON)
+	})
+	defer RemoveHook(id1)
+
+	testAbortErr := errors.New("doc hook abort test")
+	aborted := false
+	id2 := AddAbortHook(func(key string, valueJSON []byte) error {
+		if string(valueJSON) == `{"id":"999","blocked":true}` {
+			aborted = true
+			return testAbortErr
+		}
+		return nil
+	})
+	defer RemoveHook(id2)
+
+	transformed := false
+	id3 := AddTransformHook(func(key string, valueJSON []byte) ([]byte, error) {
+		if key == "user:998" {
+			transformed = true
+			out := make([]byte, 0, len(valueJSON)+20)
+			out = append(out, valueJSON[:len(valueJSON)-1]...)
+			out = append(out, []byte(`,"transformed":true}`)...)
+			return out, nil
+		}
+		return valueJSON, nil
+	})
+	defer RemoveHook(id3)
+
+	var afterKey, afterVal string
+	var afterWriteErr error
+	id4 := AddObserverAfterHook(func(key string, valueJSON []byte, writeErr error) {
+		afterKey = key
+		afterVal = string(valueJSON)
+		afterWriteErr = writeErr
+	})
+	defer RemoveHook(id4)
+
+	orig := UserDoc(`{"id":"998","name":"Alice"}`)
+	err := Set(orig)
+	s.Require().NoError(err)
+	s.Equal("user:998", obsKey)
+	s.Equal(`{"id":"998","name":"Alice","transformed":true}`, obsVal,
+		"ObserverHook (Before) runs after Abort + Transform per A5 mandatory order, so sees post-transform JSON")
+	s.True(transformed)
+	s.Equal("user:998", afterKey)
+	s.Contains(afterVal, `"transformed":true`)
+	s.NoError(afterWriteErr)
+
+	got, err := Get[UserDoc]("998")
+	s.Require().NoError(err)
+	s.Contains(string(got), `"transformed":true`)
+
+	blockedDoc := UserDoc(`{"id":"999","blocked":true}`)
+	err = Set(blockedDoc)
+	s.ErrorIs(err, testAbortErr)
+	s.True(aborted)
 }

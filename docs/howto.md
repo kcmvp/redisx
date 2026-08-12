@@ -8,6 +8,11 @@ It covers:
 - the corresponding Go client calls where they help
 - the typed JSON document API entry points for document-centric workflows
 
+For intercepting writes (DLP gates, AES encryption, L1 cache invalidation,
+CDC, audit logging, debug-fixture capture) without modifying individual
+call sites, see **[write-hooks.md](write-hooks.md)** — the Write Hook
+Subsystem overview, usage patterns, and troubleshooting guide.
+
 ## Setup
 
 Assume the server is started like this:
