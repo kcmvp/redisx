@@ -566,7 +566,7 @@ func (s *UpdateKeyRangeSuite) TestTypedScopedLimitCarry4LayerAlignment() {
 		}
 		s.Equal("", got, "unexpected scoped value (neither yes nor empty): %q raw=%s", got, d.RawJSON())
 	}
-	s.Equal(len(idSet), cntYes, "scoped=yes逐 doc 验值 want=%d got=%d", len(idSet), cntYes)
+	s.Equal(len(idSet), cntYes, "scoped=yes per-doc value check want=%d got=%d", len(idSet), cntYes)
 
 	limitRes := Update[UserDoc](x.KeysPattern("ukr_*").Limit(2), x.Eq("tag", "ukr4align"), x.Set("scoped", "lim2"))
 	s.Require().NoError(limitRes.Error())
@@ -586,7 +586,7 @@ func (s *UpdateKeyRangeSuite) TestTypedScopedLimitCarry4LayerAlignment() {
 			continue
 		}
 	}
-	s.Equal(2, cntLim2, "scoped=lim2 逐 doc 验值 want=2 got=%d", cntLim2)
+	s.Equal(2, cntLim2, "scoped=lim2 per-doc value check want=2 got=%d", cntLim2)
 }
 
 func TestUpdateKeyRangeSuite(t *testing.T) {

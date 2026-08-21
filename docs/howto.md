@@ -397,8 +397,8 @@ Important constraints:
   for `LIMIT N` are all centralised in
   **[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**;
   the quick JSON/Go lookup table is kept under
-  **SEARCHKEY "KeyRange JSON shape"](#keyrange-json-shape----one-of-6-sealed-constructors)
-  in this file**.
+  **[SEARCHKEY "KeyRange JSON shape"](#keyrange-json-shape-one-of-6-sealed-constructors)**
+  in this file.
 - indexes must be registered at startup
 - the index chooses the storage layer first
 - a `KeyRange` routing that resolves to a **different storage layer**
@@ -564,7 +564,7 @@ ordering is always ascending after `sort.Strings` on the server):
 | 5 | `{kr}` `{filter}` `{update}` `LIMIT` `count` — LIMIT callback early-stop wins if both set |
 
 The KeyRange JSON payload is identical to the one used by
-[`SEARCHKEY`](#keyrange-json-shape----one-of-6-sealed-constructors) and
+[`SEARCHKEY`](#keyrange-json-shape-one-of-6-sealed-constructors) and
 [`SEARCHINDEX`](#searchindex), with the same 6 sealed constructors, the same
 `:` namespace convention (first `:` splits scope from id), and the same
 server-side `scopeGuard` safety net. The full specification, including
