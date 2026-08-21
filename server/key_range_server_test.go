@@ -373,25 +373,23 @@ func assertKRResult(t *testing.T, caseName, label string, wantAsc, ids []string,
 	if len(want) == 0 && len(ids) == 0 {
 		return
 	}
-	if len(ids) > 0 {
-		strict := true
-		for i := 1; i < len(ids); i++ {
-			if desc {
+	if len(ids) > 1 {
+		if desc {
+			for i := 1; i < len(ids); i++ {
 				if ids[i-1] <= ids[i] {
-					strict = false
-					break
-				}
-			} else {
-				if ids[i-1] >= ids[i] {
-					strict = false
+					t.Errorf("%s/%s DESC not strictly decreasing: ids[%d]=%q ids[%d]=%q",
+						caseName, label, i-1, ids[i-1], i, ids[i])
 					break
 				}
 			}
-		}
-		if !strict && len(ids) > 1 {
-			// UPDATE always sorts storage keys ASC (sort.Strings), so for DESC label we reverse ids.
-			// IDs from fixture are zero-padded lexicographic unique => still monotonic when reversed.
-			// Keep relaxed comparison: allow equal-order (same IDs) only if content matches.
+		} else {
+			for i := 1; i < len(ids); i++ {
+				if ids[i-1] >= ids[i] {
+					t.Errorf("%s/%s ASC not strictly increasing: ids[%d]=%q ids[%d]=%q",
+						caseName, label, i-1, ids[i-1], i, ids[i])
+					break
+				}
+			}
 		}
 	}
 	if len(want) != len(ids) {
@@ -535,8 +533,7 @@ func updIDPrefix() string {
 	return testutil.XKeyPrefix(updateKRFixtureNamespace, testutil.KeyRangeFixtureMem())
 }
 
-func updFromRaw(raw string) gjson.Result { return gjson.Parse(raw) }
-func updRawGet(raw, path string) string  { return gjson.Get(raw, path).String() }
+func updRawGet(raw, path string) string { return gjson.Get(raw, path).String() }
 
 func updIDFromStorage(storageKeys []string) []string {
 	prefix := updIDPrefix()
