@@ -780,17 +780,22 @@ func Keys(keyPattern string) mo.Result[[]string] {
 
 // SearchIndex executes the RESP X command below on the shared connection:
 //
-//	SEARCHINDEX <index_name> <key_pattern> <json_filter> [ASC|DESC]
+//	SEARCHINDEX <index_name> <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 //
-// The key pattern follows BuntDB glob matching, and the filter is serialized
-// from the provided x.Filter into the MongoDB-style JSON syntax understood by
-// the server.
+// The key range is a sealed x.KeyRange value (6 ctors: KeysBt / KeysGt /
+// KeysGte / KeysLt / KeysLte / KeysPattern) serialized via MarshalJSON.
+// The optional truncation limit is CARRIED ON the KeyRange object itself via
+//
+//	kr.Limit(count)
+//
+// (the function signature intentionally does NOT expose a separate limit
+// parameter, matching SearchKey shape).
 //
 // Example:
 //
 //	res := client.SearchIndex(
 //		"idx_age",
-//		"user:*",
+//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
 //		x.And(
 //			x.Gte("age", 18),
 //			x.Eq("status", "active"),
@@ -798,12 +803,12 @@ func Keys(keyPattern string) mo.Result[[]string] {
 //		false,
 //	)
 //	users := res.MustGet()
-func SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
 	}
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("key pattern is required"))
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
 
 	client := getSharedClient()
@@ -814,6 +819,11 @@ func SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
+	krBytes, krErr := kr.MarshalJSON()
+	if krErr != nil {
+		return mo.Err[[]string](fmt.Errorf("failed to serialize key range: %w", krErr))
+	}
+
 	var filterJSON string
 	if filter != nil {
 		b, err := filter.MarshalJSON()
@@ -822,15 +832,22 @@ func SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool
 		}
 		filterJSON = string(b)
 	} else {
-		filterJSON = "{}" // empty filter
+		filterJSON = "{}"
 	}
 
-	order := "ASC"
+	args := make([]interface{}, 0, 7)
+	args = append(args, proto.CmdSearchIndex, indexName, string(krBytes), filterJSON)
+
 	if desc {
-		order = "DESC"
+		args = append(args, "DESC")
+	} else {
+		args = append(args, "ASC")
+	}
+	if lim := kr.GetLimit(); lim != -1 {
+		args = append(args, "LIMIT", strconv.Itoa(lim))
 	}
 
-	cmd := client.Do(ctx, proto.CmdSearchIndex, indexName, keyPattern, filterJSON, order)
+	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)

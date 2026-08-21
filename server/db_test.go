@@ -275,19 +275,19 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	suite.Equal("cold", gjson.Get(db.Get("user:1").MustGet(), "status").String())
 	suite.Equal("hot", gjson.Get(db.Get("_m_user:2").MustGet(), "status").String())
 
-	diskRes := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", nil, false)
+	diskRes := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), nil, false)
 	suite.True(diskRes.IsOk())
 	suite.Len(diskRes.MustGet(), 1)
 
-	memRes := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), "_m_user:*", nil, false)
+	memRes := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), x.KeysPattern("_m_user:*"), nil, false)
 	suite.True(memRes.IsOk())
 	suite.Len(memRes.MustGet(), 2)
 
-	mismatchDisk := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), "_m_user:*", nil, false)
+	mismatchDisk := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("_m_user:*"), nil, false)
 	suite.True(mismatchDisk.IsError())
 	suite.Contains(mismatchDisk.Error().Error(), "different storage layer")
 
-	mismatchMem := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), "user:*", nil, false)
+	mismatchMem := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), nil, false)
 	suite.True(mismatchMem.IsError())
 	suite.Contains(mismatchMem.Error().Error(), "different storage layer")
 
@@ -346,15 +346,15 @@ func TestDBX(t *testing.T) {
 	require.NoError(t, searchRes.Error())
 	require.Contains(t, searchRes.MustGet(), testUserDoc(raw))
 
-	idxRes := dbx.SearchIndex("age", "*", x.Eq("age", float64(30)), false)
+	idxRes := dbx.SearchIndex("age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
 	require.NoError(t, idxRes.Error())
 	require.Contains(t, idxRes.MustGet(), testUserDoc(raw))
 
-	badIdxRes := dbx.SearchIndex("age", "user:*", x.Eq("age", float64(30)), false)
+	badIdxRes := dbx.SearchIndex("age", x.KeysPattern("user:*"), x.Eq("age", float64(30)), false)
 	require.Error(t, badIdxRes.Error())
 	require.Contains(t, badIdxRes.Error().Error(), "document-scoped")
 
-	badFullIdxNameRes := dbx.SearchIndex("user_age", "*", x.Eq("age", float64(30)), false)
+	badFullIdxNameRes := dbx.SearchIndex("user_age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
 	require.Error(t, badFullIdxNameRes.Error())
 	require.Contains(t, badFullIdxNameRes.Error().Error(), "fully-qualified index name")
 
@@ -636,61 +636,73 @@ func (suite *SearchSuite) TearDownTest() {
 
 func (suite *SearchSuite) TestSearchIndex() {
 	tests := []struct {
-		name       string
-		indexName  string
-		keyPattern string
-		filter     x.Filter
-		desc       bool
-		wantErr    bool
-		wantLen    int
+		name      string
+		indexName string
+		kr        x.KeyRange
+		filter    x.Filter
+		desc      bool
+		wantErr   bool
+		wantLen   int
 	}{
 		{
-			name:       "Query ascending all",
-			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
-			keyPattern: "user:*",
-			filter:     nil,
-			desc:       false,
-			wantErr:    false,
-			wantLen:    5,
+			name:      "Query ascending all",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:*"),
+			filter:    nil,
+			desc:      false,
+			wantErr:   false,
+			wantLen:   5,
 		},
 		{
-			name:       "Query descending all",
-			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
-			keyPattern: "user:*",
-			filter:     nil,
-			desc:       true,
-			wantErr:    false,
-			wantLen:    5,
+			name:      "Query descending all",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:*"),
+			filter:    nil,
+			desc:      true,
+			wantErr:   false,
+			wantLen:   5,
 		},
 		{
-			name:       "Query with filter",
-			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
-			keyPattern: "user:*",
-			filter:     x.Gt("age", float64(28)),
-			desc:       false,
-			wantErr:    false,
-			wantLen:    2,
+			name:      "Query with filter",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:*"),
+			filter:    x.Gt("age", float64(28)),
+			desc:      false,
+			wantErr:   false,
+			wantLen:   2,
 		},
 		{
-			name:       "Query with key pattern filter",
-			indexName:  x.Idx[testUserDoc]("age", "*", "age").Name(),
-			keyPattern: "user:Engineering:*",
-			filter:     nil,
-			desc:       false,
-			wantErr:    false,
-			wantLen:    3,
+			name:      "Query with key pattern filter",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:Engineering:*"),
+			filter:    nil,
+			desc:      false,
+			wantErr:   false,
+			wantLen:   3,
 		},
 		{
-			name:       "Query empty index name",
-			indexName:  "",
-			keyPattern: "user:*",
-			wantErr:    true,
+			name:      "Query empty index name",
+			indexName: "",
+			kr:        x.KeysPattern("user:*"),
+			wantErr:   true,
+		},
+		{
+			name:      "Query unknown non-empty index → index not found error",
+			indexName: "nonexistent_idx_zzz",
+			kr:        x.KeysPattern("user:*"),
+			wantErr:   true,
+		},
+		{
+			name:      "Query unanchored wildcard KeyRange → rejected with cannot start with wildcard",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("*user:*"),
+			wantErr:   true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchIndex(tt.indexName, tt.keyPattern, tt.filter, tt.desc)
+			res := suite.db.SearchIndex(tt.indexName, tt.kr, tt.filter, tt.desc)
 			if tt.wantErr {
 				suite.True(res.IsError())
 			} else {

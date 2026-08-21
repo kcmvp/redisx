@@ -74,16 +74,27 @@ type ClientTestSuite struct {
 func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
+
+	probePrefix := testutil.XKeyPrefix(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
+	probeKP := probePrefix + "*"
+	probeStripped := probePrefix[:len(probePrefix)-1]
+	idxProbeScore := x.RawIndex(probeStripped+"_score", probeKP, "score")
+	idxProbeBucket := x.RawIndex(probeStripped+"_bucket", probeKP, "bucket")
+	idxProbeSparse := x.RawIndex(probeStripped+"_sparse_amt", probeKP, "sparse_amt")
+
 	db := server.Start(
 		clientTestServerAddr,
 		dbPath,
 		x.Idx[testUserDoc]("age", "*", "age"),
 		x.Idx[testUserDoc]("email", "*", "email"),
+		idxProbeScore,
+		idxProbeBucket,
+		idxProbeSparse,
 	)
 	s.Require().NotNil(db)
 	s.Require().NoError(db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50"))
 
-	for _, kv := range testutil.LoadXFor(s.T(), "probe-client", true) {
+	for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
 		s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
 	}
 
@@ -119,6 +130,12 @@ func (s *ClientTestSuite) ensureConnected() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	s.T().Fatal("Connect() failed to establish shared client in time")
+}
+
+func (s *ClientTestSuite) ensureConnectedClientAndAuth() {
+	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
+	s.NoError(err, "Connect to %s with auth key failed: %v", clientTestServerAddr, err)
+	s.ensureConnected()
 }
 
 func (s *ClientTestSuite) TestSubscribeCommand() {
@@ -855,31 +872,31 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 	}
 
 	tests := []struct {
-		name       string
-		index      string
-		keyPattern string
-		filter     x.Filter
-		desc       bool
-		expectErr  bool
-		expectLen  int
+		name      string
+		index     string
+		kr        x.KeyRange
+		filter    x.Filter
+		desc      bool
+		expectErr bool
+		expectLen int
 	}{
-		{"Missing index", "", "user:*", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Unknown index", "unknown", "user:*", x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Eq string", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", x.Eq("email", "ken@example.com"), false, false, 1},
-		{"Eq false", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", x.Eq("email", "nobody@example.com"), false, false, 0},
-		{"Gt number", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Gt("age", 25), false, false, 2},
-		{"Lt number", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Lt("age", 35), false, false, 2},
-		{"And true", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
-		{"And false", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-		{"Or", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
-		{"Empty filter", x.Idx[testUserDoc]("email", "*", "email").Name(), "user:*", nil, false, false, 3},
-		{"Key pattern narrows index scan", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:2", nil, false, false, 1},
-		{"Descend test", x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", x.Gt("age", 10), true, false, 3},
+		{"Missing index", "", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Unknown index", "unknown", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Eq string", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, false, 1},
+		{"Eq false", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "nobody@example.com"), false, false, 0},
+		{"Gt number", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 25), false, false, 2},
+		{"Lt number", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Lt("age", 35), false, false, 2},
+		{"And true", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
+		{"And false", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
+		{"Or", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
+		{"Empty filter", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), nil, false, false, 3},
+		{"Key pattern narrows index scan", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:2"), nil, false, false, 1},
+		{"Descend test", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 10), true, false, 3},
 	}
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchIndex(tt.index, tt.keyPattern, tt.filter, tt.desc)
+			res := SearchIndex(tt.index, tt.kr, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -2140,261 +2157,4 @@ func BenchmarkHooksStoreLoadBaseline(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = snapshotHooks()
 	}
-}
-
-const (
-	cliFixtureNamespace = "probe-client"
-	cliFixtureMem       = true
-)
-
-func cliFixtureID(id string) string {
-	return testutil.XIDKey(cliFixtureNamespace, cliFixtureMem, id)
-}
-
-type cliCtorCase struct {
-	name    string
-	build   func() x.KeyRange
-	wantAsc []string
-}
-
-func cliCtorCases() []cliCtorCase {
-	allAsc := testutil.XRangeIDs(0, 99)
-	cases := []cliCtorCase{}
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysPattern_star_all_100",
-		build:   func() x.KeyRange { return x.KeysPattern(testutil.XKeyPrefix(cliFixtureNamespace, cliFixtureMem) + "*") },
-		wantAsc: allAsc,
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysPattern_leading_glob_p05_star_band05_only_10",
-		build:   func() x.KeyRange { return x.KeysPattern(cliFixtureID("p05*")) },
-		wantAsc: testutil.XRangeIDs(50, 59),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:  "KeysPattern_single_char_question_p0_Q5_10_every_tenth",
-		build: func() x.KeyRange { return x.KeysPattern(cliFixtureID("p0?5")) },
-		wantAsc: []string{
-			"p005", "p015", "p025", "p035", "p045",
-			"p055", "p065", "p075", "p085", "p095",
-		},
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysGte_literal_p050_INCLUSIVE_50",
-		build:   func() x.KeyRange { return x.KeysGte(cliFixtureID("p050")) },
-		wantAsc: testutil.XRangeIDs(50, 99),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysGte_pattern_p05_star_10_ONLY_match_true_kept",
-		build:   func() x.KeyRange { return x.KeysGte(cliFixtureID("p05*")) },
-		wantAsc: testutil.XRangeIDs(50, 59),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysGt_literal_p050_EXCLUSIVE_49",
-		build:   func() x.KeyRange { return x.KeysGt(cliFixtureID("p050")) },
-		wantAsc: testutil.XRangeIDs(51, 99),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysGt_pattern_p05_star_SAME_10_as_Gte_pattern_for_band05",
-		build:   func() x.KeyRange { return x.KeysGt(cliFixtureID("p05*")) },
-		wantAsc: testutil.XRangeIDs(50, 59),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysLte_literal_p049_INCLUSIVE_50",
-		build:   func() x.KeyRange { return x.KeysLte(cliFixtureID("p049")) },
-		wantAsc: testutil.XRangeIDs(0, 49),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysLte_pattern_p04_star_EMPTY_never_both_true",
-		build:   func() x.KeyRange { return x.KeysLte(cliFixtureID("p04*")) },
-		wantAsc: []string{},
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysLt_literal_p050_EXCLUSIVE_50",
-		build:   func() x.KeyRange { return x.KeysLt(cliFixtureID("p050")) },
-		wantAsc: testutil.XRangeIDs(0, 49),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysLt_pattern_p05_star_EMPTY_never_both_true",
-		build:   func() x.KeyRange { return x.KeysLt(cliFixtureID("p05*")) },
-		wantAsc: []string{},
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysBt_literal_literal_p020_p070_halfopen_50",
-		build:   func() x.KeyRange { return x.KeysBt(cliFixtureID("p020"), cliFixtureID("p070")) },
-		wantAsc: testutil.XRangeIDs(20, 69),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysBt_pattern_ge_p03_star_literal_lt_p070_40",
-		build:   func() x.KeyRange { return x.KeysBt(cliFixtureID("p03*"), cliFixtureID("p070")) },
-		wantAsc: testutil.XRangeIDs(30, 69),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysBt_literal_ge_p020_pattern_lt_p06_star_50",
-		build:   func() x.KeyRange { return x.KeysBt(cliFixtureID("p020"), cliFixtureID("p06*")) },
-		wantAsc: testutil.XRangeIDs(20, 69),
-	})
-
-	cases = append(cases, cliCtorCase{
-		name:    "KeysBt_pattern_p03_star_pattern_p06_star_40",
-		build:   func() x.KeyRange { return x.KeysBt(cliFixtureID("p03*"), cliFixtureID("p06*")) },
-		wantAsc: testutil.XRangeIDs(30, 69),
-	})
-
-	return cases
-}
-
-func (s *ClientTestSuite) ensureConnectedClientAndAuth() {
-	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-	s.NoError(err, "Connect to %s with auth key failed: %v", clientTestServerAddr, err)
-	s.ensureConnected()
-}
-
-func (s *ClientTestSuite) TestSearchKeyKeyRangeXSeedCountIs100_via_RESP_wire() {
-	s.ensureConnectedClientAndAuth()
-
-	kr := x.KeysPattern(testutil.XKeyPrefix(cliFixtureNamespace, cliFixtureMem) + "*")
-	got := SearchKey(kr, nil, false)
-	s.False(got.IsError(), "SearchKey err: %v", got.Error())
-	s.Len(got.MustGet(), testutil.CountX(),
-		"fixture X should seed exactly %d keys via RESP; got %d (JSON roundtrip / mem layer routing broken?)",
-		testutil.CountX(), len(got.MustGet()))
-}
-
-func (s *ClientTestSuite) TestSearchKeyKeyRangeXNoCrossContamination_via_RESP_wire() {
-	s.ensureConnectedClientAndAuth()
-
-	krWrongPrefix := x.KeysPattern("probe-client:*")
-	resWrong := SearchKey(krWrongPrefix, nil, false)
-	s.False(resWrong.IsError(), "SearchKey err: %v", resWrong.Error())
-	s.Empty(resWrong.MustGet(),
-		"keys without _m_ prefix should not exist — XFixture.Mem() must add _m_ prefix")
-
-	krServer := x.KeysPattern(testutil.XKeyPrefix("probe-server", true) + "*")
-	resServer := SearchKey(krServer, nil, false)
-	s.False(resServer.IsError())
-	s.Empty(resServer.MustGet(),
-		"client suite DB should NOT contain probe-server namespace keys (concurrency / cross-contamination)")
-}
-
-func (s *ClientTestSuite) TestSearchKeyKeyRangeFullMatrix_TABLE_DRIVEN_via_RESP_wire() {
-	s.ensureConnectedClientAndAuth()
-
-	for _, tc := range cliCtorCases() {
-		kr := tc.build()
-
-		s.Run(tc.name+"/ASC_no_limit", func() {
-			res := SearchKey(kr, nil, false)
-			s.False(res.IsError(), "SearchKey ASC err: %v", res.Error())
-			ids := testutil.XIDsFromValues(res.MustGet())
-			s.Equal(len(tc.wantAsc), len(ids), "length mismatch: want %d got %d", len(tc.wantAsc), len(ids))
-			if len(ids) > 0 {
-				s.True(testutil.XStrictMonotonic(ids, false), "ASC not strictly monotonic")
-			}
-			s.Equal(tc.wantAsc, ids, "ASC full list mismatch")
-		})
-
-		s.Run(tc.name+"/DESC_no_limit", func() {
-			res := SearchKey(kr, nil, true)
-			s.False(res.IsError(), "SearchKey DESC err: %v", res.Error())
-			ids := testutil.XIDsFromValues(res.MustGet())
-			s.Equal(len(tc.wantAsc), len(ids), "DESC length mismatch: want %d got %d", len(tc.wantAsc), len(ids))
-			if len(ids) > 0 {
-				s.True(testutil.XStrictMonotonic(ids, true), "DESC not strictly monotonic")
-			}
-			s.Equal(testutil.XReverseIDs(tc.wantAsc), ids, "DESC full list must equal reverse(ASC)")
-		})
-
-		if len(tc.wantAsc) >= 5 {
-			s.Run(tc.name+"/ASC_Limit_5_is_first_5", func() {
-				krLimit := kr.Limit(5)
-				res := SearchKey(krLimit, nil, false)
-				s.False(res.IsError(), "SearchKey ASC Limit(5) err: %v", res.Error())
-				ids := testutil.XIDsFromValues(res.MustGet())
-				s.Len(ids, 5, "Limit(5) should return exactly 5 entries; got %d", len(ids))
-				s.Equal(testutil.XFirstN(tc.wantAsc, 5), ids, "ASC Limit(5) must equal first 5 of ASC unlimited")
-			})
-
-			s.Run(tc.name+"/DESC_Limit_5_is_last_5_of_ASC_reversed", func() {
-				krLimit := kr.Limit(5)
-				res := SearchKey(krLimit, nil, true)
-				s.False(res.IsError(), "SearchKey DESC Limit(5) err: %v", res.Error())
-				ids := testutil.XIDsFromValues(res.MustGet())
-				s.Len(ids, 5, "DESC Limit(5) should return exactly 5 entries; got %d", len(ids))
-				wantDesc5 := testutil.XReverseIDs(testutil.XLastN(tc.wantAsc, 5))
-				s.Equal(wantDesc5, ids, "DESC Limit(5) must be reverse(last 5 ASC); got %v want %v", ids, wantDesc5)
-			})
-		}
-
-		if len(tc.wantAsc) >= 3 {
-			s.Run(tc.name+"/ASC_Limit_EQ_full_count_returns_all", func() {
-				krLimit := kr.Limit(len(tc.wantAsc))
-				res := SearchKey(krLimit, nil, false)
-				s.False(res.IsError())
-				ids := testutil.XIDsFromValues(res.MustGet())
-				s.Equal(tc.wantAsc, ids, "Limit(%d) should be identical to unlimited ASC", len(tc.wantAsc))
-			})
-
-			s.Run(tc.name+"/ASC_Limit_OVER_count_safe_returns_all", func() {
-				krLimit := kr.Limit(len(tc.wantAsc) + 500)
-				res := SearchKey(krLimit, nil, false)
-				s.False(res.IsError())
-				ids := testutil.XIDsFromValues(res.MustGet())
-				s.Equal(tc.wantAsc, ids, "Limit larger than result set must be safe (no extra, no short)")
-			})
-		}
-	}
-}
-
-func (s *ClientTestSuite) TestSearchKeyKeyRangeGtGteBoundaryGap_via_RESP_wire() {
-	s.ensureConnectedClientAndAuth()
-
-	resGte := SearchKey(x.KeysGte(cliFixtureID("p050")), nil, false)
-	s.False(resGte.IsError())
-	idsGte := testutil.XIDsFromValues(resGte.MustGet())
-
-	resGt := SearchKey(x.KeysGt(cliFixtureID("p050")), nil, false)
-	s.False(resGt.IsError())
-	idsGt := testutil.XIDsFromValues(resGt.MustGet())
-
-	s.Equal(len(idsGte), len(idsGt)+1,
-		"Gte should be strictly 1 item longer than Gt (the boundary itself); %d vs %d", len(idsGte), len(idsGt))
-	s.Contains(idsGte, "p050", "Gte must INCLUDE boundary p050")
-	s.NotContains(idsGt, "p050", "Gt must EXCLUDE boundary p050")
-	s.Equal(idsGte[1:], idsGt, "Gt should equal Gte minus the first boundary element")
-}
-
-func (s *ClientTestSuite) TestSearchKeyKeyRangeLtLteBoundaryGap_via_RESP_wire() {
-	s.ensureConnectedClientAndAuth()
-
-	resLte := SearchKey(x.KeysLte(cliFixtureID("p049")), nil, false)
-	s.False(resLte.IsError())
-	idsLte := testutil.XIDsFromValues(resLte.MustGet())
-
-	resLt := SearchKey(x.KeysLt(cliFixtureID("p050")), nil, false)
-	s.False(resLt.IsError())
-	idsLt := testutil.XIDsFromValues(resLt.MustGet())
-
-	s.Equal(idsLte, idsLt, "KeysLte(p049) == KeysLt(p050) (both mean 0..49 inclusive = 50 items)")
-	s.Len(idsLte, 50)
-
-	resLte050 := SearchKey(x.KeysLte(cliFixtureID("p050")), nil, false)
-	s.False(resLte050.IsError())
-	idsLte050 := testutil.XIDsFromValues(resLte050.MustGet())
-	s.Contains(idsLte050, "p050", "KeysLte(p050) must include the boundary")
-	s.Equal(len(idsLt), len(idsLte050)-1,
-		"Lte(p050) should be exactly 1 longer than Lt(p050)")
 }

@@ -693,13 +693,13 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchindex_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "age", `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age", "{invalid"}},
+			commands:   [][]string{{cmdSearchIndex, "age", `{"op":"pattern","p":"*"}`, "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
@@ -729,14 +729,70 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchindex_invalid_order_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "attr", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "attr", `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "attr", "{invalid}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, "attr", `{"op":"pattern","p":"*"}`, "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
+		},
+		{
+			name:       "searchindex_zero_legacy_rejects_plain_glob_arg2",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, "age", "user:*", "{}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
+		},
+		{
+			name:       "searchindex_limit_count_zero_rejects_wire",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "0"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: 0"},
+		},
+		{
+			name:       "searchindex_limit_count_negative_rejects_wire",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "-5"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: -5"},
+		},
+		{
+			name:       "searchindex_argc5_keyword_not_limit_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "FOO", "5"}},
+			wantErrors: []string{"ERR invalid argument: FOO"},
+		},
+		{
+			name:       "searchindex_argc6_keyword_not_limit_after_asc_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "ASC", "BLAH", "3"}},
+			wantErrors: []string{"ERR invalid argument: BLAH"},
+		},
+		{
+			name:       "searchindex_argc5_limit_parseint_non_numeric_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "not_a_number"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: not_a_number"},
+		},
+		{
+			name:       "searchindex_argc5_desc_plus_limit",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*_{id}"}`, "{}", "DESC", "LIMIT", "1"}},
+			wantArrays: [][]string{{`{"id":"2_{id}", "age":30}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+			},
+		},
+		{
+			name:       "searchindex_argc4_limit_only_asc_default",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*_{id}"}`, "{}", "LIMIT", "1"}},
+			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+			},
 		},
 		{
 			name:       "searchkey_wrong_number_of_args_02",
@@ -809,17 +865,17 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchindex success",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), "user:*", "{}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*_{id}"}`, "{}", "ASC"}},
 			wantArrays: [][]string{{`{"id":"1_{id}", "age":20}`, `{"id":"2_{id}", "age":30}`}},
 			setupDB: func(uid string) {
-				_ = s.db.Set(fmt.Sprintf("user:%s:1", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
-				_ = s.db.Set(fmt.Sprintf("user:%s:2", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20}`, uid))
+				_ = s.db.Set(fmt.Sprintf("user:2_%s", uid), fmt.Sprintf(`{"id":"2_%s", "age":30}`, uid))
 			},
 		},
 		{
 			name:       "searchindex unknown index",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "unknown", "{}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, "unknown", `{"op":"pattern","p":"*"}`, "{}", "ASC"}},
 			wantErrors: []string{"ERR index not found: unknown"},
 		},
 		{

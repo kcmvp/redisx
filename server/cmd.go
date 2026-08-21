@@ -388,41 +388,79 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 }
 
 func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 3 || len(cmd.Args) > 5 {
+	// Strict RESP positional argc shape (fr-searchindex.md §2):
+	// shifted +1 from SEARCHKEY argc table because the first positional arg
+	// is indexName. LIMIT count is TWO tokens (the keyword + the numeric
+	// value), so the 4th argc shape covers "LIMIT count" (2 trailing tokens).
+	//
+	//   argc after cmd word | shape
+	//   -------------------+---------------------------------------------------
+	//   3                  |  idx_name  kr_json  filter_json                  (ASC, no LIMIT)
+	//   4                  |  idx_name  kr_json  filter_json  ASC|DESC        (dir only)
+	//   5                  |  idx_name  kr_json  filter_json  LIMIT count     (count only, ASC default)
+	//   6                  |  idx_name  kr_json  filter_json  ASC|DESC LIMIT count
+	//   2 / 7+             |  WRONG ARGS
+	nArgs := len(cmd.Args) - 1
+	if nArgs < 3 || nArgs > 6 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	indexName := string(cmd.Args[1])
-	keyPattern := "*"
-	filterJSON := ""
-	orderArg := ""
 
-	switch len(cmd.Args) {
-	case 3:
-		filterJSON = string(cmd.Args[2])
-	case 4:
-		third := string(cmd.Args[2])
-		if strings.HasPrefix(strings.TrimSpace(third), "{") {
-			filterJSON = third
-			orderArg = string(cmd.Args[3])
-		} else {
-			keyPattern = third
-			filterJSON = string(cmd.Args[3])
-		}
-	case 5:
-		keyPattern = string(cmd.Args[2])
-		filterJSON = string(cmd.Args[3])
-		orderArg = string(cmd.Args[4])
+	indexName := string(cmd.Args[1])
+	krJSON := string(cmd.Args[2])
+	filterJSON := string(cmd.Args[3])
+	// Zero-legacy: Arg#2 must be JSON object (not a legacy glob string).
+	if len(krJSON) == 0 || krJSON[0] != '{' {
+		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+		return
+	}
+	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
+	if krErr != nil {
+		conn.WriteError("ERR invalid key range: " + krErr.Error())
+		return
 	}
 
-	var desc bool
-	if orderArg != "" {
-		order := strings.ToUpper(orderArg)
-		if order != "ASC" && order != "DESC" {
-			conn.WriteError("ERR invalid order: " + orderArg)
+	desc := false
+	switch nArgs {
+	case 4:
+		a := strings.ToUpper(string(cmd.Args[4]))
+		if a != "ASC" && a != "DESC" {
+			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
 			return
 		}
-		desc = order == "DESC"
+		desc = a == "DESC"
+	case 5:
+		a := strings.ToUpper(string(cmd.Args[4]))
+		if a != "LIMIT" {
+			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
+			return
+		}
+		countStr := string(cmd.Args[5])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count <= 0 {
+			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
+			return
+		}
+		kr = kr.Limit(count)
+	case 6:
+		a4 := strings.ToUpper(string(cmd.Args[4]))
+		a5 := strings.ToUpper(string(cmd.Args[5]))
+		if a4 != "ASC" && a4 != "DESC" {
+			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
+			return
+		}
+		desc = a4 == "DESC"
+		if a5 != "LIMIT" {
+			conn.WriteError("ERR invalid argument: " + string(cmd.Args[5]))
+			return
+		}
+		countStr := string(cmd.Args[6])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count <= 0 {
+			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
+			return
+		}
+		kr = kr.Limit(count)
 	}
 
 	filter, err := parseFilter(filterJSON)
@@ -431,7 +469,7 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 		return
 	}
 
-	res := db.SearchIndex(indexName, keyPattern, filter, desc)
+	res := db.SearchIndex(indexName, kr, filter, desc)
 	if res.IsError() {
 		if errors.Is(res.Error(), buntdb.ErrNotFound) {
 			conn.WriteArray(0)
