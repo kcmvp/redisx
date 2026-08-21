@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -264,7 +265,7 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	suite.ElementsMatch([]string{"user:1"}, db.Keys("user:*").MustGet())
 	suite.ElementsMatch([]string{"_m_user:2", "_m_user:3"}, db.Keys("_m_user:*").MustGet())
 
-	res := db.SearchKey("*user:*", nil, false)
+	res := db.SearchKey(x.KeysPattern("*user:*"), nil, false)
 	suite.True(res.IsError())
 	suite.Contains(res.Error().Error(), "cannot start with wildcard")
 
@@ -341,7 +342,7 @@ func TestDBX(t *testing.T) {
 	require.Error(t, badKeysRes.Error())
 	require.Contains(t, badKeysRes.Error().Error(), "document-scoped")
 
-	searchRes := dbx.SearchKey("*", x.Eq("age", float64(30)), false)
+	searchRes := dbx.SearchKey(x.KeysPattern("*"), x.Eq("age", float64(30)), false)
 	require.NoError(t, searchRes.Error())
 	require.Contains(t, searchRes.MustGet(), testUserDoc(raw))
 
@@ -704,7 +705,7 @@ func (suite *SearchSuite) TestSearchIndex() {
 func (suite *SearchSuite) TestSearchKey() {
 	tests := []struct {
 		name      string
-		pattern   string
+		kr        x.KeyRange
 		filter    x.Filter
 		desc      bool
 		wantErr   bool
@@ -713,7 +714,7 @@ func (suite *SearchSuite) TestSearchKey() {
 	}{
 		{
 			name:      "QueryKey Engineering department ascending",
-			pattern:   "user:Engineering:*",
+			kr:        x.KeysPattern("user:Engineering:*"),
 			filter:    nil,
 			desc:      false,
 			wantEmpty: false,
@@ -721,7 +722,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey Engineering department descending",
-			pattern:   "user:Engineering:*",
+			kr:        x.KeysPattern("user:Engineering:*"),
 			filter:    nil,
 			desc:      true,
 			wantEmpty: false,
@@ -729,7 +730,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey with filter",
-			pattern:   "user:*",
+			kr:        x.KeysPattern("user:*"),
 			filter:    x.Eq("is_active", true),
 			desc:      false,
 			wantEmpty: false,
@@ -737,19 +738,19 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey no match",
-			pattern:   "user:Marketing:*",
+			kr:        x.KeysPattern("user:Marketing:*"),
 			wantEmpty: true,
 		},
 		{
 			name:    "QueryKey rejects cross-layer wildcard",
-			pattern: "*user:*",
+			kr:      x.KeysPattern("*user:*"),
 			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			res := suite.db.SearchKey(tt.pattern, tt.filter, tt.desc)
+			res := suite.db.SearchKey(tt.kr, tt.filter, tt.desc)
 			if tt.wantErr {
 				suite.True(res.IsError())
 				suite.Contains(res.Error().Error(), "cannot start with wildcard")
@@ -765,6 +766,107 @@ func (suite *SearchSuite) TestSearchKey() {
 			}
 		})
 	}
+}
+
+func (suite *SearchSuite) setup1000Fixture(prefix string) {
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("%s%04d", prefix, i)
+		val := fmt.Sprintf(`{"key":"%s","n":%d}`, key, i)
+		suite.NoError(suite.db.Set(key, val))
+	}
+}
+
+func (suite *SearchSuite) TestSearchKey1000Fixture() {
+	prefix := "u:"
+	suite.setup1000Fixture(prefix)
+
+	suite.Run("B_1_KeysBt_band_count", func() {
+		kr := x.KeysBt(prefix+"0100", prefix+"0200")
+		res := suite.db.SearchKey(kr, nil, false)
+		suite.True(res.IsOk())
+		got := res.MustGet()
+		suite.NotEqual(1000, len(got), "must not visit all 1000 entries — super-range sweep required")
+		suite.GreaterOrEqual(len(got), 98)
+		suite.LessOrEqual(len(got), 102)
+		suite.Equal(100, len(got), "literal [0100,0200) half-open should hit exactly 100 keys")
+	})
+
+	suite.Run("B_2_Limit_10_early_stop_not_post_hoc_trunc", func() {
+		krBase := x.KeysBt(prefix+"0100", prefix+"0200")
+		full := suite.db.SearchKey(krBase, nil, false)
+		suite.True(full.IsOk())
+		fullList := full.MustGet()
+		suite.Len(fullList, 100)
+
+		kr10 := krBase.Limit(10)
+		res := suite.db.SearchKey(kr10, nil, false)
+		suite.True(res.IsOk())
+		got10 := res.MustGet()
+		suite.Len(got10, 10, "Limit(10) must return exactly 10 entries")
+		suite.Equal(fullList[:10], got10, "Limit(10) must return first 10 of full ASC output")
+
+		visited := 0
+		err := suite.db.disk.View(func(tx *buntdb.Tx) error {
+			return applyKeyRange(tx, kr10, x.RangeAsc, func(key, value string) bool {
+				visited++
+				return true
+			})
+		})
+		suite.NoError(err)
+		suite.Equal(10, visited, "kr.Apply must invoke callback exactly 10 times — LIMIT must be true early-stop, not post-hoc slice trunc")
+	})
+
+	suite.Run("B_3_KeysGte_pattern_pivot_strict_lex_asc", func() {
+		kr := x.KeysGte(prefix + "05*")
+		res := suite.db.SearchKey(kr, nil, false)
+		suite.True(res.IsOk())
+		got := res.MustGet()
+		suite.Len(got, 100, "KeysGte(u:05*) should return band 0500..0599 exactly 100")
+
+		keys := make([]string, 0, len(got))
+		for _, v := range got {
+			keys = append(keys, gjson.Get(v, "key").String())
+		}
+		for i := 1; i < len(keys); i++ {
+			suite.Less(keys[i-1], keys[i], "strict lex ASC zero inversion: %s >= %s", keys[i-1], keys[i])
+		}
+		suite.Equal(prefix+"0500", keys[0])
+		suite.Equal(prefix+"0599", keys[len(keys)-1])
+	})
+
+	suite.Run("B_4_KeysBt_pattern_pattern_dual_param", func() {
+		kr := x.KeysBt(prefix+"03*", prefix+"07*").Limit(50)
+		res := suite.db.SearchKey(kr, nil, false)
+		suite.True(res.IsOk())
+		got := res.MustGet()
+		suite.Len(got, 50, "pattern/pattern bt Limit(50) first 50 by ASC order")
+
+		keys := make([]string, 0, len(got))
+		for _, v := range got {
+			keys = append(keys, gjson.Get(v, "key").String())
+		}
+		for i := 1; i < len(keys); i++ {
+			suite.Less(keys[i-1], keys[i], "strict lex ASC zero inversion in pattern/pattern: %s >= %s", keys[i-1], keys[i])
+		}
+		suite.Equal(prefix+"0300", keys[0])
+		suite.Equal(prefix+"0349", keys[49])
+
+		krNoLimit := x.KeysBt(prefix+"03*", prefix+"07*")
+		fullRes := suite.db.SearchKey(krNoLimit, nil, false)
+		suite.True(fullRes.IsOk())
+		fullAll := fullRes.MustGet()
+		// Heuristic for pattern/pattern KeysBt(ge, lt): Allowable(ge) to Allowable(lt)
+		// sweeps bands 03,04,05,06,07 — total 500 entries (not 400), because
+		// any key u:07XX satisfies match.Match(k, "u:07*") = true under the ltOK
+		// OR-branch: (k < lt_literal) || (pattern && match(k, lt_pattern)).
+		suite.Len(fullAll, 500)
+
+		// Additional semantic check: first band should be 03, last band 07
+		firstKey := gjson.Get(fullAll[0], "key").String()
+		lastKey := gjson.Get(fullAll[len(fullAll)-1], "key").String()
+		suite.Equal(prefix+"0300", firstKey)
+		suite.Equal(prefix+"0799", lastKey)
+	})
 }
 
 func TestSearchSuite(t *testing.T) {

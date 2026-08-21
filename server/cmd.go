@@ -483,21 +483,76 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 }
 
 func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 3 || len(cmd.Args) > 4 {
+	// Strict RESP positional argc shape (fr-searchkeyrange.md §2):
+	//
+	//   argc after cmd word | shape
+	//   -------------------+------------------------------------------------
+	//   2                  |  <kr_json> <filter_json>                 (ASC,  no LIMIT)
+	//   3                  |  <kr_json> <filter_json> ASC|DESC        (dir only, no LIMIT)
+	//   4                  |  <kr_json> <filter_json> LIMIT count     (count only, ASC default)
+	//   5                  |  <kr_json> <filter_json> ASC|DESC LIMIT count
+	//   1 / 6+             |  WRONG ARGS
+	nArgs := len(cmd.Args) - 1
+	if nArgs < 2 || nArgs > 5 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	pattern := string(cmd.Args[1])
-	filterJSON := string(cmd.Args[2])
 
-	var desc bool
-	if len(cmd.Args) == 4 {
-		order := strings.ToUpper(string(cmd.Args[3]))
-		if order != "ASC" && order != "DESC" {
+	krJSON := string(cmd.Args[1])
+	filterJSON := string(cmd.Args[2])
+	// Zero-legacy: Arg#1 must be a JSON object (not a legacy glob string).
+	if len(krJSON) == 0 || krJSON[0] != '{' {
+		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+		return
+	}
+	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
+	if krErr != nil {
+		conn.WriteError("ERR invalid key range: " + krErr.Error())
+		return
+	}
+
+	desc := false
+	switch nArgs {
+	case 3:
+		a := strings.ToUpper(string(cmd.Args[3]))
+		if a != "ASC" && a != "DESC" {
 			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
 			return
 		}
-		desc = order == "DESC"
+		desc = a == "DESC"
+	case 4:
+		a := strings.ToUpper(string(cmd.Args[3]))
+		if a != "LIMIT" {
+			conn.WriteError("ERR invalid argument: " + string(cmd.Args[3]))
+			return
+		}
+		countStr := string(cmd.Args[4])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count <= 0 {
+			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
+			return
+		}
+		// wire count > 0 assert first → kr.Limit(count) never panics.
+		kr = kr.Limit(count)
+	case 5:
+		a3 := strings.ToUpper(string(cmd.Args[3]))
+		a4 := strings.ToUpper(string(cmd.Args[4]))
+		if a3 != "ASC" && a3 != "DESC" {
+			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
+			return
+		}
+		desc = a3 == "DESC"
+		if a4 != "LIMIT" {
+			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
+			return
+		}
+		countStr := string(cmd.Args[5])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count <= 0 {
+			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
+			return
+		}
+		kr = kr.Limit(count)
 	}
 
 	filter, err := parseFilter(filterJSON)
@@ -506,7 +561,7 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 		return
 	}
 
-	res := db.SearchKey(pattern, filter, desc)
+	res := db.SearchKey(kr, filter, desc)
 	if res.IsError() {
 		if errors.Is(res.Error(), buntdb.ErrNotFound) {
 			conn.WriteArray(0)

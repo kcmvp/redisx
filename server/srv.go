@@ -518,12 +518,12 @@ func Start(address string, dbPath string, indexes ...x.Index) *DB {
 			)
 
 			if err != nil && !isServerShutdownErr(err) {
-					slog.Error("redisx server stopped", "error", err)
+				slog.Error("redisx server stopped", "error", err)
 				if exitFn := getOsExitFn(); exitFn != nil {
 					exitFn(1)
 				}
 			} else if err != nil {
-					slog.Info("redisx server stopped")
+				slog.Info("redisx server stopped")
 			}
 			close(startedCh)
 		}()

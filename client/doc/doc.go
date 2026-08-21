@@ -121,14 +121,20 @@ func SearchIndex[D x.Document](idxName string, keyPattern string, filter x.Filte
 	return mo.Ok(out)
 }
 
-// SearchKey executes SEARCHKEY using the document type prefix and sub-pattern.
-func SearchKey[D x.Document](keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+// SearchKey executes SEARCHKEY using the document type prefix, namespace-scoped
+// key range, and optional typed filter.
+//
+// LIMIT is carried directly on the sealed x.KeyRange via .Limit(n int) —
+// there is no separate parameter on the function signature. Any value set on
+// the input scopedKR is preserved through the full-scope key range that
+// internal.ScopeKeyRange produces.
+func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	res := client.SearchKey(fullKeyPattern, filter, desc)
+	res := client.SearchKey(fullKR, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}
