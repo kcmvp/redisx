@@ -16,10 +16,7 @@ func withLimit(limit int, fn func(key, value string) bool) func(key, value strin
 			return false
 		}
 		consumed++
-		if consumed >= limit {
-			return false
-		}
-		return true
+		return consumed < limit
 	}
 }
 

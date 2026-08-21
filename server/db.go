@@ -209,11 +209,6 @@ func (db *DB) store(layer storageLayer) *buntdb.DB {
 	return db.disk
 }
 
-type kvPair struct {
-	key   string
-	value string
-}
-
 func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
 	if ttl <= 0 {
 		return nil
