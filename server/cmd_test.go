@@ -711,13 +711,13 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchkey_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "*", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchkey_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "*", "{invalid"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*"}`, "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
@@ -747,20 +747,64 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchkey_invalid_order_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "pattern", "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"pattern"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchkey_invalid_json_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "pattern", "{invalid}", "ASC"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"pattern"}`, "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchkey_forbidden_cross_layer_pattern",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "*user:*", "{}", "ASC"}},
-			wantErrors: []string{"ERR key pattern cannot start with wildcard"},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*user:*"}`, "{}", "ASC"}},
+			wantErrors: []string{"ERR key range cannot start with wildcard"},
+		},
+		{
+			name:       "searchkey_zero_legacy_rejects_plain_glob_arg1",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, "*user:*", "{}"}},
+			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
+		},
+		{
+			name:       "searchkey_limit_count_zero_rejects_wire",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "0"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: 0"},
+		},
+		{
+			name:       "searchkey_limit_count_negative_rejects_wire",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "-5"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: -5"},
+		},
+		{
+			name:       "searchkey_limit_count_non_numeric_rejects_wire",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "abc"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: abc"},
+		},
+		{
+			name:       "searchkey_argc5_desc_plus_limit",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"t:*"}`, "{}", "DESC", "LIMIT", "1"}},
+			wantArrays: [][]string{{`{"k":"t:2"}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set("t:1", `{"k":"t:1"}`)
+				_ = s.db.Set("t:2", `{"k":"t:2"}`)
+			},
+		},
+		{
+			name:       "searchkey_argc4_limit_only_asc_default",
+			auth:       true,
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"t:*"}`, "{}", "LIMIT", "1"}},
+			wantArrays: [][]string{{`{"k":"t:1"}`}},
+			setupDB: func(uid string) {
+				_ = s.db.Set("t:1", `{"k":"t:1"}`)
+				_ = s.db.Set("t:2", `{"k":"t:2"}`)
+			},
 		},
 		{
 			name:       "searchindex success",
@@ -803,7 +847,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchkey success",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "user:*_{id}", "{}", "DESC"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*_{id}"}`, "{}", "DESC"}},
 			wantArrays: [][]string{{`{"id":"2_{id}"}`, `{"id":"1_{id}"}`}},
 			setupDB: func(uid string) {
 				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s"}`, uid))
@@ -813,7 +857,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchkey not found",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "unknown_{id}:*", "{}"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"unknown_{id}:*"}`, "{}"}},
 			wantArrays: [][]string{{}},
 		},
 	}

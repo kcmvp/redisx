@@ -30,4 +30,5 @@ go.work.sum
 *.patch
 *.txt
 *.db
+fr/fr*
 

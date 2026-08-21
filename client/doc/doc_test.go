@@ -24,7 +24,7 @@ const docTestServerAddr = "127.0.0.1:36382"
 
 func (s *DocTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
-	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
+	dbPath := filepath.Join(s.T().TempDir(), "docTest.db")
 	db := server.Start(
 		docTestServerAddr,
 		dbPath,
@@ -81,7 +81,7 @@ func (s *DocTestSuite) TestGenericDocMethods() {
 	s.Require().NoError(keysRes.Error())
 	s.Contains(keysRes.MustGet(), "user:200")
 
-	searchRes := SearchKey[UserDoc]("*", x.Eq("age", 30), false)
+	searchRes := SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), false)
 	s.Require().NoError(searchRes.Error())
 	s.Contains(searchRes.MustGet(), UserDoc(jsonStr))
 
@@ -133,7 +133,7 @@ func (s *DocTestSuite) TestSearchIndexRejectsPrefixedStoragePattern() {
 }
 
 func (s *DocTestSuite) TestSearchKeyRejectsPrefixedStoragePattern() {
-	res := SearchKey[UserDoc]("user:*", nil, false)
+	res := SearchKey[UserDoc](x.KeysPattern("user:*"), nil, false)
 	s.Require().True(res.IsError())
 	s.Contains(res.Error().Error(), "document-scoped")
 }
@@ -154,6 +154,23 @@ func (s *DocTestSuite) TestSearchIndexRejectsFullIdxName() {
 	res := SearchIndex[UserDoc]("user_age", "*", nil, false)
 	s.Require().True(res.IsError())
 	s.Contains(res.Error().Error(), "fully-qualified index name")
+}
+
+func (s *DocTestSuite) TestSearchKeyScopedLimitCarry4LayerAlignment() {
+	idSet := []string{"k_layer_a", "k_layer_b", "k_layer_c", "k_layer_d", "k_layer_e"}
+	for _, id := range idSet {
+		doc := UserDoc(`{"id":"` + id + `","tag":"layer4align"}`)
+		s.NoError(Set(doc))
+	}
+
+	fullRes := SearchKey[UserDoc](x.KeysPattern("k_layer*"), x.Eq("tag", "layer4align"), false)
+	s.Require().NoError(fullRes.Error())
+	s.Len(fullRes.MustGet(), len(idSet))
+
+	limitRes := SearchKey[UserDoc](x.KeysPattern("k_layer*").Limit(2), x.Eq("tag", "layer4align"), false)
+	s.Require().NoError(limitRes.Error())
+	s.Len(limitRes.MustGet(), 2, "Limit(2) must be carried through ScopeKeyRange namespace injection")
+	s.Equal(fullRes.MustGet()[:2], limitRes.MustGet(), "ScopeKeyRange Limit must preserve ASC order first-N, not arbitrary slice")
 }
 
 func (s *DocTestSuite) TestDocHookForwarders() {

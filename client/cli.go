@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -840,22 +841,30 @@ func SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool
 
 // SearchKey executes the RESP X command below on the shared connection:
 //
-//	SEARCHKEY <key_pattern> <json_filter> [ASC|DESC]
+//	SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 //
-// The key pattern follows BuntDB glob matching, and the filter is serialized from
-// x.Filter into the server's MongoDB-style JSON query format.
+// The key range is a sealed x.KeyRange value (6 ctors: KeysBt / KeysGt /
+// KeysGte / KeysLt / KeysLte / KeysPattern) serialized via MarshalJSON.
+// The optional truncation limit is CARRIED ON the KeyRange object itself via
+//
+//	kr.Limit(count)
+//
+// (the function signature intentionally does NOT expose a separate limit
+// parameter, so the function shape remains 3-arg, identical to the Update
+// sibling which intentionally stays as the legacy string pattern arg on its
+// first param — zero cross-feature scope creep).
 //
 // Example:
 //
 //	res := client.SearchKey(
-//		"user:*",
+//		x.KeysGte("user:engineering:0100").Limit(50),
 //		x.Eq("region", "us"),
 //		true,
 //	)
 //	users := res.MustGet()
-func SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("key pattern is required"))
+func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
 
 	client := getSharedClient()
@@ -866,6 +875,11 @@ func SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
+	krBytes, krErr := kr.MarshalJSON()
+	if krErr != nil {
+		return mo.Err[[]string](fmt.Errorf("failed to serialize key range: %w", krErr))
+	}
+
 	var filterJSON string
 	if filter != nil {
 		b, err := filter.MarshalJSON()
@@ -874,15 +888,22 @@ func SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string
 		}
 		filterJSON = string(b)
 	} else {
-		filterJSON = "{}" // empty filter
+		filterJSON = "{}"
 	}
 
-	order := "ASC"
+	args := make([]interface{}, 0, 6)
+	args = append(args, proto.CmdSearchKey, string(krBytes), filterJSON)
+
 	if desc {
-		order = "DESC"
+		args = append(args, "DESC")
+	} else {
+		args = append(args, "ASC")
+	}
+	if lim := kr.GetLimit(); lim != -1 {
+		args = append(args, "LIMIT", strconv.Itoa(lim))
 	}
 
-	cmd := client.Do(ctx, proto.CmdSearchKey, keyPattern, filterJSON, order)
+	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)

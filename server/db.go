@@ -425,55 +425,60 @@ func (db *DB) SearchIndex(indexName string, keyPattern string, filter x.Filter, 
 	return mo.Ok(results)
 }
 
-// SearchKey resolves one full storage-key pattern to one storage layer first,
-// then scans matching keys in that layer, applies the optional filter to each
-// JSON value, and returns the matched JSON documents in key order.
+// SearchKey resolves one sealed x.KeyRange to one storage layer first, then
+// walks the matching default storage-index key range using buntdb's native
+// six BTree iterators, applies the optional x.Filter to each JSON value, and
+// returns matched documents in key order (ASC or DESC). LIMIT truncation is
+// applied inside the native iterator callback via kr.GetLimit() when set.
 //
-// keyPattern uses key glob matching such as "*" and "?".
+// The KeyRange itself must pin exactly one storage layer: either a literal
+// anchor via its Bounds().Lo, or a non-leading-wildcard glob pattern via
+// Pattern(). Unanchored KeyRanges (leading-wildcard pattern such as "*foo")
+// are rejected with an error exactly as the legacy string-keyPattern path
+// used to reject them via resolvePatternLayer.
 //
 // RESP equivalent:
 //
-//	SEARCHKEY <key_pattern> <json_filter> [ASC|DESC]
+//	SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 //
 // Example:
 //
 //	res := db.SearchKey(
-//		"user:engineering:*",
+//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
 //		x.Eq("region", "us"),
 //		true,
 //	)
 //	users := res.MustGet()
-func (db *DB) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
-	layer, constrained, err := resolvePatternLayer(keyPattern)
-	if err != nil {
-		return mo.Err[[]string](err)
+func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
+	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
+		return layerForKey(k)
+	})
 	if !constrained {
-		return mo.Err[[]string](errors.New("key pattern cannot start with wildcard"))
+		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
-	var entries []kvPair
-	err = db.store(layer).View(func(tx *buntdb.Tx) error {
-		return tx.AscendKeys(keyPattern, func(key, value string) bool {
+	layer := layerObj.(storageLayer)
+
+	dir := x.RangeAsc
+	if desc {
+		dir = x.RangeDesc
+	}
+	var results []string
+	err := db.store(layer).View(func(tx *buntdb.Tx) error {
+		return applyKeyRange(tx, kr, dir, func(_, value string) bool {
+			if !gjson.Valid(value) {
+				return true
+			}
 			if filter == nil || filter.Eval(value) {
-				entries = append(entries, kvPair{key: key, value: value})
+				results = append(results, value)
 			}
 			return true
 		})
 	})
 	if err != nil {
 		return mo.Err[[]string](err)
-	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		if desc {
-			return entries[i].key > entries[j].key
-		}
-		return entries[i].key < entries[j].key
-	})
-
-	results := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		results = append(results, entry.value)
 	}
 	return mo.Ok(results)
 }
@@ -737,17 +742,20 @@ func (dbx *DBX[D]) SearchIndex(idxName string, keyPattern string, filter x.Filte
 	return mo.Ok(out)
 }
 
-// SearchKey returns documents matching the prefixed key pattern and filter.
-func (dbx *DBX[D]) SearchKey(keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+// SearchKey returns documents matching the prefixed scoped key range and filter.
+func (dbx *DBX[D]) SearchKey(scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if dbx == nil {
 		return mo.Err[[]D](errors.New("db is nil"))
 	}
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
+	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	res := (*DB)(dbx).SearchKey(fullKeyPattern, filter, desc)
+	res := (*DB)(dbx).SearchKey(fullKR, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}

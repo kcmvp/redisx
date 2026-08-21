@@ -93,6 +93,49 @@ jobs:
     - name: Download dependencies
       run: go mod download
 
+    - name: Architecture rule — client (non-test) must NOT import server
+      run: |
+        set -euo pipefail
+
+        echo "--- (1) Direct source import audit: no redisx/server, buntdb, or client→server in core SDK packages (x, client, client/doc); excluding *_test.go ---"
+        DIRECT_FORBIDDEN=$(
+          ( grep -RIlsE '"github.com/kcmvp/redisx/server"|"github.com/tidwall/buntdb"' x/ client/ client/doc/ 2>/dev/null || true ) \
+            | grep -v '_test.go$' || true
+        )
+        if [ -n "$DIRECT_FORBIDDEN" ]; then
+          echo "ERROR: x/ or client/ non-test files directly import redisx/server or buntdb — forbidden."
+          echo "$DIRECT_FORBIDDEN"
+          exit 1
+        fi
+        echo "OK: no direct import of redisx/server or buntdb in x/client/client-doc non-test files."
+
+        echo "--- (2) Transitive dep audit: ./x ./client ./client/doc non-test graphs must NOT pull server or buntdb ---"
+        for pkg in ./x ./client ./client/doc; do
+          echo "Checking transitive deps of $pkg (non-test)..."
+          SERVER_DEPS=$(go list -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/kcmvp/redisx/server($|/)' || true; })
+          if [ -n "$SERVER_DEPS" ]; then
+            echo "ERROR: $pkg transitively depends on redisx/server — forbidden."
+            echo "$SERVER_DEPS"
+            exit 1
+          fi
+          BUNTDB_DEPS=$(go list -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/tidwall/buntdb($|/)' || true; })
+          if [ -n "$BUNTDB_DEPS" ]; then
+            echo "ERROR: $pkg transitively depends on buntdb — storage engine leaked into SDK/API layer."
+            echo "$BUNTDB_DEPS"
+            exit 1
+          fi
+        done
+        echo "OK: x + client + client-doc non-test transitive deps free of redisx/server and buntdb."
+
+        echo "--- (3) Reverse direction sanity: server (non-test) must NOT depend on client ---"
+        REVERSE_CLIENT=$(go list -f '{{join .Deps "\n"}}' ./server | { grep -E '^github\.com/kcmvp/redisx/client($|/)' || true; })
+        if [ -n "$REVERSE_CLIENT" ]; then
+          echo "ERROR: ./server transitively depends on redisx/client — dependency direction reversed (must be client→x←server, never server→client)."
+          echo "$REVERSE_CLIENT"
+          exit 1
+        fi
+        echo "OK: ./server (non-test) does not depend on client."
+
     - name: Build
       run: go build -v ./...
 

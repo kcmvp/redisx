@@ -414,43 +414,111 @@ Typed API rules:
 
 ### `SEARCHKEY`
 
-Query JSON documents by scanning one full storage-key pattern.
+Query JSON documents by scanning one storage-key range expressed as a sealed
+`KeyRange` JSON object (see the six constructors below). `SEARCHKEY` was
+upgraded in Issue #42 (FR: SEARCHKEY KeyRange) from a legacy glob string
+argument to a structured JSON shape — the first positional argument must
+be a JSON object, never a raw `"user:*"` string.
+
+#### RESP wire format
 
 ```text
-SEARCHKEY user:* {"status":"active"}
+SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 ```
 
-More examples:
+Argument shapes (strict — the server rejects any count of positional args
+outside 2 / 3 / 4 / 5):
+
+| argc after command | meaning |
+|---|---|
+| 2 | `{kr}` `{filter}` — ASC, no LIMIT |
+| 3 | `{kr}` `{filter}` `ASC\|DESC` — direction only, default LIMIT=∞ |
+| 4 | `{kr}` `{filter}` `LIMIT` `N` — count only, direction defaults to ASC |
+| 5 | `{kr}` `{filter}` `ASC\|DESC` `LIMIT` `N` |
+
+#### KeyRange JSON shape — 6 sealed constructors (one-of)
+
+```json
+{"op":"pattern","p":"user:*"}                          // glob: KeysPattern(p)
+{"op":"gte",    "pivot":"user:100"}                    // [pivot, +∞)  KeysGte
+{"op":"gt",     "pivot":"user:100"}                    // (pivot, +∞)  KeysGt
+{"op":"lte",    "pivot":"user:100"}                    // (-∞, pivot]  KeysLte
+{"op":"lt",     "pivot":"user:100"}                    // (-∞, pivot)  KeysLt
+{"op":"bt",     "ge":"user:0100","lt":"user:0200"}     // [ge, lt) half-open KeysBt
+```
+
+Any `pivot` / `ge` / `lt` / `p` may be a literal key **or** a glob pattern
+containing `* ? [`. Semantic rules you must be aware of:
+
+- `KeysBt` is **half-open** `[ge, lt)` regardless of direction.
+- Single-boundary ctors with a **glob pivot** (`KeysGte("order:p05*")` etc.)
+  apply the **AND** of the dictionary boundary predicate and glob match, so
+  e.g. `KeysLte("order:p04*")` is always empty (lex ≤ and glob match are
+  disjoint sets).
+- Glob patterns starting with a leading wildcard (`*...`, `?...`) are rejected
+  by layer routing (the key range cannot pin a single storage layer).
+
+`LIMIT` is accepted **both** as a trailing positional `LIMIT N` wire arg and
+as an intrinsic field carried inside the sealed `KeyRange` object (Go API:
+`kr.Limit(50)`). When both appear, the wire `LIMIT N` overrides (it re-applies
+`kr.Limit(N)` after unmarshaling).
+
+#### RESP examples
 
 ```text
-SEARCHKEY user:* {"region":"us"}
-SEARCHKEY order:* {"total":{"$gte":100}} DESC
+SEARCHKEY {"op":"pattern","p":"user:*"} {"status":"active"}
+SEARCHKEY {"op":"gte","pivot":"order:2024-01"} {"region":"us"} DESC
+SEARCHKEY {"op":"bt","ge":"user:engineering:0100","lt":"user:engineering:0200"} {"total":{"$gte":100}} LIMIT 50
+SEARCHKEY {"op":"pattern","p":"product:*"} {"$and":[{"category":"book"},{"price":{"$lte":20}}]} DESC LIMIT 10
 ```
 
 Important constraints:
 
-- `key_pattern` must resolve one concrete storage layer
-- patterns starting with `*` or `?` are rejected
+- `KeyRange` must resolve one concrete storage layer before iteration begins
+  (handled by `x.LayerRoutingConstrained` — uses `Bounds()` / `Pattern()` to
+  derive the leading anchor and then routes to either memory or disk layer).
+- Patterns whose routing anchor starts with `*` or `?` are rejected (the
+  caller must narrow the range so it pins a layer).
 
-Go client:
+#### Go client (non-generic `[]string` raw-JSON API)
 
 ```go
-res := client.SearchKey("user:*", x.Eq("status", "active"), false)
+// x.KeyRange sealed ctors + optional chained Limit()
+kr := x.KeysPattern("user:*")
+kr = x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50)
+kr = x.KeysGte("order:2024-01").Limit(200)
+
+// Signature: SearchKey(kr x.KeyRange, filter x.Filter, desc bool)
+res := client.SearchKey(
+    x.KeysPattern("user:*"),
+    x.Eq("status", "active"),
+    false, // desc=false → ASC
+)
 if res.IsError() {
     panic(res.Error())
 }
-raws := res.MustGet()
-_ = raws
+rawJSONs := res.MustGet()
+_ = rawJSONs
 ```
 
-Typed JSON document API:
+#### Typed JSON document API
 
 ```go
-docs := doc.SearchKey[UserDoc]("*", x.Eq("status", "active"), false)
-typed := dbx.SearchKey("*", x.Eq("status", "active"), false)
+// doc.SearchKey[D] applies D's namespace + mem flag to build a KeyRange
+// prefix automatically, then runs SEARCHKEY.
+docs := doc.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
+
+// dbx typed helper mirrors the non-doc signature with a D-scoped prefix.
+typed := dbx.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
 _ = docs
 _ = typed
 ```
+
+> TODO — `UPDATE` and `SEARCHINDEX` command signatures still accept the
+> legacy `keyPattern string` form; they will be upgraded to the same sealed
+> `KeyRange` JSON shape in Issue #43 (FR: SEARCHINDEX parity).
+
+
 
 ### `UPDATE`
 
