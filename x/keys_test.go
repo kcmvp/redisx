@@ -75,10 +75,10 @@ func TestLimitChainingLastWins(t *testing.T) {
 
 func TestMatchesStorageKey6Concrete(t *testing.T) {
 	cases := []struct {
-		name       string
-		kr         KeyRange
-		key        string
-		wantMatch  bool
+		name      string
+		kr        KeyRange
+		key       string
+		wantMatch bool
 	}{
 		{"KeysBt literal in", KeysBt("a", "z"), "m", true},
 		{"KeysBt literal lo-boundary", KeysBt("a", "z"), "a", true},
