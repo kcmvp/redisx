@@ -686,6 +686,18 @@ func (suite *SearchSuite) TestSearchIndex() {
 			kr:        x.KeysPattern("user:*"),
 			wantErr:   true,
 		},
+		{
+			name:      "Query unknown non-empty index → index not found error",
+			indexName: "nonexistent_idx_zzz",
+			kr:        x.KeysPattern("user:*"),
+			wantErr:   true,
+		},
+		{
+			name:      "Query unanchored wildcard KeyRange → rejected with cannot start with wildcard",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("*user:*"),
+			wantErr:   true,
+		},
 	}
 
 	for _, tt := range tests {

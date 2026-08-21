@@ -757,6 +757,24 @@ func (s *CmdTestSuite) TestXCmd() {
 			wantErrors: []string{"ERR invalid count for LIMIT: -5"},
 		},
 		{
+			name:       "searchindex_argc5_keyword_not_limit_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "FOO", "5"}},
+			wantErrors: []string{"ERR invalid argument: FOO"},
+		},
+		{
+			name:       "searchindex_argc6_keyword_not_limit_after_asc_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "ASC", "BLAH", "3"}},
+			wantErrors: []string{"ERR invalid argument: BLAH"},
+		},
+		{
+			name:       "searchindex_argc5_limit_parseint_non_numeric_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*"}`, "{}", "LIMIT", "not_a_number"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: not_a_number"},
+		},
+		{
 			name:       "searchindex_argc5_desc_plus_limit",
 			auth:       true,
 			commands:   [][]string{{cmdSearchIndex, x.Idx[testUserDoc]("age", "*", "age").Name(), `{"op":"pattern","p":"user:*_{id}"}`, "{}", "DESC", "LIMIT", "1"}},

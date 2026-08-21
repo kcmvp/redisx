@@ -390,8 +390,10 @@ Important constraints:
 - the index chooses the storage layer first
 - a `KeyRange` routing that resolves to a **different storage layer**
   than the index is rejected
-- `LIMIT N` is accepted both inside the `KeyRange` payload and as a
-  trailing `LIMIT N` wire token (wire override wins)
+- `LIMIT N` is accepted in two equivalent forms:
+  - Go API: intrinsic field on the sealed `KeyRange` object via `kr.Limit(N)` (carried on the instance, never serialized into the wire JSON)
+  - RESP wire: sent as a **separate trailing `LIMIT N` two-token pair** (wire override wins if both set)
+  - ⚠️ The JSON wire payload for `KeyRange` itself never includes a `limit` field — 6 constructor fields (`pattern`/`bt`/`ge`/`gt`/`lt`/`le`) only
 
 Go client:
 

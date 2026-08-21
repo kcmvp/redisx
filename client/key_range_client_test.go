@@ -160,6 +160,23 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchRejects() {
 	s.Contains(res.Error().Error(), "different storage layer")
 }
 
+func (s *SearchKeyRangeSuite) TestSearchIndexRange_InvalidInputs_EmptyIndexAndNilKeyrange() {
+	s.ensureConnectedClientAndAuth()
+	s.Run("empty index name → early error", func() {
+		res := SearchIndex("", x.KeysPattern(krClientID("*")), nil, false)
+		s.Require().True(res.IsError(), "expected Err for empty indexName; got Ok len=%d", len(res.OrEmpty()))
+		s.Contains(res.Error().Error(), "index name is required",
+			"err=%v", res.Error())
+	})
+	s.Run("nil keyrange → early error", func() {
+		idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+		res := SearchIndex(idxScore, nil, nil, false)
+		s.Require().True(res.IsError(), "expected Err for nil kr; got Ok len=%d", len(res.OrEmpty()))
+		s.Contains(res.Error().Error(), "key range is required",
+			"err=%v", res.Error())
+	})
+}
+
 type SearchKeyRangeSuite struct {
 	suite.Suite
 }

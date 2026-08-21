@@ -563,3 +563,50 @@ func TestIdx(t *testing.T) {
 		})
 	}
 }
+
+func TestRawIndex(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "builds lowercased name and normalizes json path dots to underscores",
+			run: func(t *testing.T) {
+				idx := RawIndex("ScoreRank", "tenant:user:*", "metrics.activity.score")
+				require.Equal(t, "scorerank", idx.Name())
+				require.Equal(t, "tenant:user:*", idx.KeyPattern())
+				require.Equal(t, "metrics_activity_score", idx.Path())
+			},
+		},
+		{
+			name: "rejects empty name",
+			run: func(t *testing.T) {
+				require.Panics(t, func() {
+					RawIndex("", "user:*", "age")
+				})
+			},
+		},
+		{
+			name: "rejects empty key pattern",
+			run: func(t *testing.T) {
+				require.Panics(t, func() {
+					RawIndex("by_age", "", "age")
+				})
+			},
+		},
+		{
+			name: "rejects empty json path",
+			run: func(t *testing.T) {
+				require.Panics(t, func() {
+					RawIndex("by_age", "user:*", "")
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t)
+		})
+	}
+}

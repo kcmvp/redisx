@@ -461,9 +461,14 @@ func (d Index) Path() string {
 // RawIndex constructs one Index directly without binding to a document type.
 //
 // Callers are responsible for passing a fully-qualified index name (same shape
-// as IdxFullName would produce), a full storage-key pattern (same shape as
-// StorageKeyValue would produce), and a JSON path with dots already replaced
-// by underscores. If any argument is empty RawIndex panics.
+// as IdxFullName would produce) and a full storage-key pattern (same shape as
+// StorageKeyValue would produce).
+//
+// The jsonPath argument accepts dot-separated JSON paths (same style as [Idx]):
+// dots are normalized automatically by replacing '.' with '_' so callers do NOT
+// need to pre-replace them. Pre-replacing is harmless but unnecessary.
+//
+// If any argument is empty RawIndex panics.
 //
 // RawIndex is intended for pure-data fixtures that register indexes over a
 // manually-keyed KV space without needing a concrete [Document] type (e.g.

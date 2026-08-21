@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,11 +45,7 @@ func XIDKey(namespace string, mem bool, id string) string {
 }
 
 func KeyRangeIndexName(namespace string, mem bool, name string) string {
-	prefix := XKeyPrefix(namespace, mem)
-	if len(prefix) > 0 && prefix[len(prefix)-1] == ':' {
-		return prefix[:len(prefix)-1] + "_" + name
-	}
-	return prefix + "_" + name
+	return strings.TrimSuffix(XKeyPrefix(namespace, mem), ":") + "_" + name
 }
 
 func KeyRangeKeyPattern(namespace string, mem bool) string {

@@ -398,7 +398,10 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
-	krLayer := krLayerObj.(storageLayer)
+	krLayer, ok := krLayerObj.(storageLayer)
+	if !ok {
+		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", krLayerObj))
+	}
 	if krLayer != layer {
 		return mo.Err[[]string](fmt.Errorf("key range targets a different storage layer than index %s", indexName))
 	}
@@ -437,6 +440,11 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	})
 
 	if err != nil {
+		// Defense-in-depth branch: normally unreachable because the
+		// preceding `db.indexLayers[indexName]` check (L391) already
+		// rejects unknown indexes before calling buntdb.Ascend/Descend.
+		// Kept intentionally to guard against future concurrent DropIndex
+		// or TTL-on-index implementations that could race this path.
 		if errors.Is(err, buntdb.ErrNotFound) {
 			return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 		}
@@ -479,7 +487,10 @@ func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]s
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
-	layer := layerObj.(storageLayer)
+	layer, ok := layerObj.(storageLayer)
+	if !ok {
+		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
+	}
 
 	dir := x.RangeAsc
 	if desc {
