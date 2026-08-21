@@ -458,6 +458,33 @@ func (d Index) Path() string {
 	return d.path
 }
 
+// RawIndex constructs one Index directly without binding to a document type.
+//
+// Callers are responsible for passing a fully-qualified index name (same shape
+// as IdxFullName would produce), a full storage-key pattern (same shape as
+// StorageKeyValue would produce), and a JSON path with dots already replaced
+// by underscores. If any argument is empty RawIndex panics.
+//
+// RawIndex is intended for pure-data fixtures that register indexes over a
+// manually-keyed KV space without needing a concrete [Document] type (e.g.
+// shared SEARCHKEY / SEARCHINDEX parity suites).
+func RawIndex(name string, keyPattern string, jsonPath string) Index {
+	if name == "" {
+		panic("RawIndex: name is required")
+	}
+	if keyPattern == "" {
+		panic("RawIndex: keyPattern is required")
+	}
+	if jsonPath == "" {
+		panic("RawIndex: jsonPath is required")
+	}
+	return Index{
+		name:       strings.ToLower(name),
+		keyPattern: keyPattern,
+		path:       strings.ReplaceAll(jsonPath, ".", "_"),
+	}
+}
+
 // IdxFullName returns the fully-qualified index name for one document type and
 // logical index name.
 func IdxFullName[D Document](idxName string) string {

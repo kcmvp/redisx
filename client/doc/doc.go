@@ -85,30 +85,32 @@ func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 }
 
 // SearchIndex executes SEARCHINDEX using one logical document index name,
-// one document-scoped key pattern, and one optional JSON filter.
+// one document-scoped sealed x.KeyRange, and one optional JSON filter.
 //
 // In effect, the result set is narrowed in two dimensions:
-//   - keyPattern limits which document keys are considered
+//   - scopedKR limits which document keys are considered (6 ctors: KeysBt /
+//     KeysGt / KeysGte / KeysLt / KeysLte / KeysPattern)
 //   - filter limits which JSON documents match within that key range
 //
 // The logical idxName is resolved into the internal full index name from D,
-// while keyPattern is automatically prefixed with the document storage
-// namespace derived from D. idxName must therefore be one logical index name,
-// not an already-prefixed full index name such as "user_age". keyPattern must
-// likewise be a document-scoped sub-pattern, not an already-prefixed storage
-// pattern such as "user:*".
-func SearchIndex[D x.Document](idxName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+// while scopedKR is automatically namespace-prefixed via internal.ScopeKeyRange
+// (carrying any .Limit(N) applied on the input over to the fully-qualified
+// sealed range produced for the server). idxName must be one logical index
+// name, not an already-prefixed full index name such as "user_age". scopedKR
+// field values must likewise be document-scoped, not already-prefixed storage
+// values.
+func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	fullIdxName, err := internal.ValidateIdxName[D](idxName)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	res := client.SearchIndex(fullIdxName, fullKeyPattern, filter, desc)
+	res := client.SearchIndex(fullIdxName, fullKR, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}

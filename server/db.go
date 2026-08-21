@@ -352,19 +352,28 @@ func (db *DB) registerIndexes(defs ...x.Index) error {
 // first; keyPattern only narrows matches within that layer. A concrete
 // keyPattern that points at a different layer is rejected.
 //
+// SearchIndex resolves one sealed x.KeyRange inside a secondary-index BTree
+// sweep. Because the index's first sort dimension is the serialized indexed
+// JSON field (not the storage key), the KeyRange predicate is applied purely
+// as a CALLBACK storage-key filter via the shared MatchesStorageKey helper —
+// identical algorithm to SEARCHINDEX's legacy string-keyPattern path, just
+// with the full 6-ctor expressive power of the sealed KeyRange instead of a
+// single glob. LIMIT truncation fires as an early-stop inside the iterator
+// callback when result count reaches kr.GetLimit() (no post-hoc slice).
+//
 // Ordering rules:
 //   - ascending when desc is false
 //   - descending when desc is true
 //
 // RESP equivalent:
 //
-//	SEARCHINDEX <index_name> <key_pattern> <json_filter> [ASC|DESC]
+//	SEARCHINDEX <index_name> <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 //
 // Example:
 //
 //	res := db.SearchIndex(
 //		"idx_user_age",
-//		"user:*",
+//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
 //		x.And(
 //			x.Gte("age", 18),
 //			x.Eq("status", "active"),
@@ -372,33 +381,46 @@ func (db *DB) registerIndexes(defs ...x.Index) error {
 //		false,
 //	)
 //	users := res.MustGet()
-func (db *DB) SearchIndex(indexName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]string] {
+func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
 	}
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("key pattern is required"))
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	layer, ok := db.indexLayers[indexName]
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 	}
-	patternLayer, constrained, err := resolvePatternLayer(keyPattern)
-	if err != nil {
-		return mo.Err[[]string](err)
+	krLayerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
+		return layerForKey(k)
+	})
+	if !constrained {
+		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
-	if constrained && patternLayer != layer {
-		return mo.Err[[]string](fmt.Errorf("key pattern targets a different storage layer than index %s", indexName))
+	krLayer := krLayerObj.(storageLayer)
+	if krLayer != layer {
+		return mo.Err[[]string](fmt.Errorf("key range targets a different storage layer than index %s", indexName))
 	}
 
+	idxKeySep := "\x00"
+	limit := kr.GetLimit()
+
 	var results []string
-	err = db.store(layer).View(func(tx *buntdb.Tx) error {
+	err := db.store(layer).View(func(tx *buntdb.Tx) error {
 		iter := tx.Ascend
 		if desc {
 			iter = tx.Descend
 		}
-		return iter(indexName, func(key, value string) bool {
-			if !buntdb.Match(key, keyPattern) {
+		return iter(indexName, func(ik, value string) bool {
+			sepIdx := strings.Index(ik, idxKeySep)
+			var storageKey string
+			if sepIdx >= 0 {
+				storageKey = ik[sepIdx+1:]
+			} else {
+				storageKey = ik
+			}
+			if !x.MatchesStorageKey(kr, storageKey) {
 				return true
 			}
 			if !gjson.Valid(value) {
@@ -406,6 +428,9 @@ func (db *DB) SearchIndex(indexName string, keyPattern string, filter x.Filter, 
 			}
 			if filter == nil || filter.Eval(value) {
 				results = append(results, value)
+				if limit > 0 && len(results) == limit {
+					return false
+				}
 			}
 			return true
 		})
@@ -709,9 +734,12 @@ func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
 }
 
 // SearchIndex delegates to the underlying DB index search.
-func (dbx *DBX[D]) SearchIndex(idxName string, keyPattern string, filter x.Filter, desc bool) mo.Result[[]D] {
+func (dbx *DBX[D]) SearchIndex(idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if dbx == nil {
 		return mo.Err[[]D](errors.New("db is nil"))
+	}
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
 	}
 
 	fullIdxName, err := internal.ValidateIdxName[D](idxName)
@@ -719,12 +747,12 @@ func (dbx *DBX[D]) SearchIndex(idxName string, keyPattern string, filter x.Filte
 		return mo.Err[[]D](err)
 	}
 
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	res := (*DB)(dbx).SearchIndex(fullIdxName, fullKeyPattern, filter, desc)
+	res := (*DB)(dbx).SearchIndex(fullIdxName, fullKR, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}

@@ -367,29 +367,37 @@ _ = msg
 Query JSON documents through one registered index.
 
 ```text
-SEARCHINDEX user_age user:* {"age":{"$gte":18}}
+SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}}
 ```
 
 More examples:
 
 ```text
-SEARCHINDEX user_email user:* {"email":"ken@example.com"}
-SEARCHINDEX user_age user:Engineering:* {"$and":[{"age":{"$gte":18}},{"status":"active"}]}
-SEARCHINDEX user_age user:* {"age":{"$gte":18}} DESC
+SEARCHINDEX user_email {"op":"pattern","p":"user:*"} {"email":"ken@example.com"}
+SEARCHINDEX user_age {"op":"pattern","p":"user:Engineering:*"} {"$and":[{"age":{"$gte":18}},{"status":"active"}]}
+SEARCHINDEX user_age {"op":"gte","pivot":"user:engineering:"} {"age":{"$gte":18}} DESC
+SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} LIMIT 100
+SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} DESC LIMIT 50
 ```
 
 Important constraints:
 
 - `index_name` is the full runtime index name, such as `user_age`
-- `key_pattern` is one full storage-key pattern, such as `user:*`
+- the second wire arg is a sealed `KeyRange` JSON payload (see the
+  `SEARCHKEY` section for the full shape: `pattern`, `bt`, `gte`, `lte`,
+  `gt`, `lt`)
 - indexes must be registered at startup
 - the index chooses the storage layer first
-- a conflicting `key_pattern` is rejected
+- a `KeyRange` routing that resolves to a **different storage layer**
+  than the index is rejected
+- `LIMIT N` is accepted both inside the `KeyRange` payload and as a
+  trailing `LIMIT N` wire token (wire override wins)
 
 Go client:
 
 ```go
-res := client.SearchIndex("user_age", "user:*", x.Gte("age", 18), false)
+kr := x.KeysPattern("user:*").Limit(100)
+res := client.SearchIndex("user_age", kr, x.Gte("age", 18), false)
 if res.IsError() {
     panic(res.Error())
 }
@@ -400,8 +408,8 @@ _ = raws
 Typed JSON document API:
 
 ```go
-docs := doc.SearchIndex[UserDoc]("age", "*", x.Gte("age", 18), false)
-typed := dbx.SearchIndex("age", "*", x.Gte("age", 18), false)
+docs := doc.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
+typed := dbx.SearchIndex("age", x.KeysPattern("*"), x.Gte("age", 18), false)
 _ = docs
 _ = typed
 ```
@@ -409,7 +417,7 @@ _ = typed
 Typed API rules:
 
 - `idxName` is logical, such as `age`
-- `keyPattern` is document-scoped, such as `*`
+- `scopedKR` is document-scoped, such as `x.KeysPattern("*")`
 - the namespace prefix comes from `D`
 
 ### `SEARCHKEY`
@@ -514,9 +522,8 @@ _ = docs
 _ = typed
 ```
 
-> TODO — `UPDATE` and `SEARCHINDEX` command signatures still accept the
-> legacy `keyPattern string` form; they will be upgraded to the same sealed
-> `KeyRange` JSON shape in Issue #43 (FR: SEARCHINDEX parity).
+> Note — the `UPDATE` command still accepts the legacy `keyPattern string`
+> form as an intentional write-path exception.
 
 
 
