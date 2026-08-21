@@ -46,6 +46,9 @@ func XIDsFromValues(values []string) []string {
 }
 
 func XRangeIDs(lo, hi int) []string {
+	if hi < lo {
+		return nil
+	}
 	out := make([]string, 0, hi-lo+1)
 	for i := lo; i <= hi; i++ {
 		out = append(out, fmt.Sprintf("p%03d", i))

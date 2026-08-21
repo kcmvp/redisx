@@ -1,6 +1,7 @@
 package x
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -169,4 +170,91 @@ func TestUnmarshalKeyRangeRejectsInvalidOps(t *testing.T) {
 
 func TestNextLex(t *testing.T) {
 	require.Equal(t, "abc\x00", NextLex("abc"))
+	require.Equal(t, "\x00", NextLex(""))
+}
+
+func TestIsLiteral(t *testing.T) {
+	require.True(t, IsLiteral("plain_key:no_metachars"))
+	require.False(t, IsLiteral("has*glob?"))
+}
+
+func TestLayerRoutingAnchor(t *testing.T) {
+	t.Run("pattern uses glob anchor", func(t *testing.T) {
+		kr := KeysPattern("_m_probe:*")
+		require.Equal(t, "_m_probe:*", LayerRoutingAnchor(kr))
+	})
+	t.Run("literal range with non-empty lo uses lo", func(t *testing.T) {
+		kr := KeysBt("_m_probe:p020", "_m_probe:p070")
+		require.Equal(t, "_m_probe:p020", LayerRoutingAnchor(kr))
+	})
+	t.Run("literal range empty lo falls back to hi", func(t *testing.T) {
+		kr := KeysLt("_m_probe:p050")
+		lo, _ := kr.Bounds()
+		require.Empty(t, lo)
+		require.Equal(t, "_m_probe:p050", LayerRoutingAnchor(kr))
+	})
+	t.Run("fully unanchored pure star returns star glob itself (not empty)", func(t *testing.T) {
+		kr := KeysPattern("*")
+		require.Equal(t, "*", LayerRoutingAnchor(kr))
+	})
+}
+
+func TestLayerRoutingConstrained(t *testing.T) {
+	const (
+		memLayer  = "mem-layer"
+		diskLayer = "disk-layer"
+	)
+	layerForKey := func(key string) any {
+		if strings.HasPrefix(key, "_m_") {
+			return memLayer
+		}
+		return diskLayer
+	}
+	t.Run("mem literal pinned for mem prefix Gte", func(t *testing.T) {
+		l, ok := LayerRoutingConstrained(KeysGte("_m_probe:p050"), layerForKey)
+		require.True(t, ok)
+		require.Equal(t, memLayer, l)
+	})
+	t.Run("disk literal pinned for disk prefix KeysLt", func(t *testing.T) {
+		l, ok := LayerRoutingConstrained(KeysLt("disk:user:100"), layerForKey)
+		require.True(t, ok)
+		require.Equal(t, diskLayer, l)
+	})
+	t.Run("leading wildcard rejected (double sweep not ok)", func(t *testing.T) {
+		_, ok := LayerRoutingConstrained(KeysPattern("*:nope"), layerForKey)
+		require.False(t, ok)
+	})
+	t.Run("empty anchor rejected", func(t *testing.T) {
+		_, ok := LayerRoutingConstrained(KeysPattern(""), layerForKey)
+		require.False(t, ok)
+	})
+}
+
+func TestUnmarshalKeyRangeCaseInsensitiveOp(t *testing.T) {
+	upperBytes := []byte(`{"op":"PATTERN","p":"u*"}`)
+	kr, err := UnmarshalKeyRange(upperBytes)
+	require.NoError(t, err)
+	kind, pa, pb, lim := InspectKeyRange(kr)
+	require.Equal(t, KeyRangePattern, kind)
+	require.Equal(t, "u*", pa)
+	require.Empty(t, pb)
+	require.Equal(t, -1, lim)
+}
+
+func TestBoundsPatternAllowableExtents(t *testing.T) {
+	// Pattern("p05*") should give allowable [p05, p05~
+	lo, hi := KeysPattern("p05*").Bounds()
+	require.NotEmpty(t, lo)
+	require.NotEmpty(t, hi)
+	require.Less(t, lo, hi)
+}
+
+func TestKeyRangeKindString(t *testing.T) {
+	require.Equal(t, "bt", KeyRangeBt.String())
+	require.Equal(t, "gt", KeyRangeGt.String())
+	require.Equal(t, "gte", KeyRangeGte.String())
+	require.Equal(t, "lt", KeyRangeLt.String())
+	require.Equal(t, "lte", KeyRangeLte.String())
+	require.Equal(t, "pattern", KeyRangePattern.String())
+	require.Equal(t, "invalid", KeyRangeInvalid.String())
 }
