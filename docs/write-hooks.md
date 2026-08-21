@@ -1,5 +1,11 @@
 # Write Hook Subsystem
 
+> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
+> 🧱 [Architecture & KeyRange convention](architecture.md) ·
+> 🧭 [How-to & examples](howto.md) ·
+> 🏷️ [Typed document helpers](typed-document.md) ·
+> 🔌 [Stream ingest](stream.md)
+
 The Write Hook Subsystem lets you intercept every write through `client.Set` /
 `doc.Set` **without modifying individual call sites**. Register a hook once at
 process boot; it applies globally to every subsequent write.
@@ -19,7 +25,7 @@ nil here even though I’m an observer” bugs.
 For a quick tour and the API summary table, see the **Write Hook Subsystem**
 section of the top-level README.
 
-## 1. Motivation
+## Motivation
 
 Without a framework-level primitive, every consumer project ends up stitching
 the same cross-cutting concerns onto every call site:
@@ -37,7 +43,7 @@ The Write Hook Subsystem centralises these once: register once, globally
 effective, zero business call-site changes, uniform safety net across every
 hook.
 
-## 2. Execution order (mandatory)
+## Execution order
 
 All Before-phase hooks complete their synchronous lifecycle **before** `Set`
 returns — even if the caller uses an outer `context.WithTimeout`. This is a
@@ -78,18 +84,18 @@ This is **non-negotiable per hook type**. If you find yourself wanting
 a TransformHook — the type signatures are the tool that helps you notice the
 semantic mismatch.
 
-## 3. Safety-net composition rules (top-of-file doc block)
+## Safety-net composition rules
 
 The implementation enforces two always-on safety nets **per hook invocation**.
 They compose as follows.
 
-### 3.1 Double recover — innermost-first, stack-safe, no side effects
+### Double recover — innermost-first, stack-safe, no side effects
 
 Each call to a user-supplied hook body runs inside an inner `defer recover()`
 that translates a panic into a returned error (for Abort/Transform) or into a
 logged-and-ignored event (for Observer*). If the dispatch goroutine itself
 also panicked (hypothetical), the outermost scope in the caller treats that
-the same way. The first recover wins (“innermost-first”), so the hook label
+the same way. The first recover wins ("innermost-first"), so the hook label
 remains attached to the panic log.
 
 For end users this means: **a `panic()` inside your hook body can never
@@ -97,7 +103,7 @@ propagate out of the hook infrastructure**. Your `Set(...)` call will at worst
 get a wrapped `fmt.Errorf("hook Abort#0 panic: boom")` error. The stack trace
 is always written to `slog.Error` at key `"stack"`.
 
-### 3.2 Double timeout — user timeout vs framework timeout
+### Double timeout — user timeout vs framework timeout
 
 Each hook runs inside a one-shot goroutine. The dispatcher then does:
 
@@ -129,7 +135,7 @@ Rule of thumb for production: set `SetHookTimeout(T)` to **50–80% of your
 tightest outer `Set` deadline** — that way the hook layer always attributes
 slow hooks before the outer timeout blames “the whole call”.
 
-### 3.3 AbortHook timeout/panic = fail-closed (ABORT)
+### AbortHook and TransformHook timeout/panic = fail-closed (ABORT)
 
 Non-negotiable security default. A policy-gate hook that panics or hangs is
 functionally equivalent to “we can’t verify the policy”; the write is
@@ -138,7 +144,7 @@ rejected until the hook is fixed.
 If you really want “best-effort gating that never blocks”, put that logic
 inside an **ObserverHook** (which never aborts), not inside an AbortHook.
 
-### 3.4 Observer\*Hook timeout/panic = fail-open (LOG ONLY)
+### Observer*Hook timeout/panic = fail-open (LOG ONLY)
 
 Observers are side effects. They must never impact the write. A crash or
 hang in an audit hook or an L1 invalidation hook:
@@ -153,9 +159,9 @@ asynchronous forwarding), handle threading inside the hook itself — the
 framework dispatches hooks synchronously so you can batch internally, or
 spawn a goroutine inside the hook body to fan out.
 
-## 4. Hook-by-hook usage patterns
+## Hook-by-hook usage patterns
 
-### 4.1 AbortHook — “reject bad writes”
+### AbortHook — "reject bad writes"
 
 Use for policy gates that must run before the key touches storage.
 
@@ -210,7 +216,7 @@ Key design notes for AbortHook:
   encryption happens later in TransformHook, so size checks here are against
   the pre-transform value.
 
-### 4.2 TransformHook — “rewrite what gets written”
+### TransformHook — "rewrite what gets written"
 
 Use for AES encryption, gzip/deflate, schema-version prefixing, payload
 normalization, or any other “fresh-copy → store” step.
@@ -288,7 +294,7 @@ client.AddTransformHook(func(key string, value []byte) ([]byte, error) {
 })
 ```
 
-### 4.3 ObserverHook (Before) — “watch what will be written”
+### ObserverHook (Before) — "watch what will be written"
 
 Use for debug capture, metrics counters, test fixtures, and anything that
 needs the *final* bytes before storage but must never block a write.
@@ -339,7 +345,7 @@ and audit snapshots need. If you specifically need the clear-text bytes,
 record them inside TransformHook (where they still exist) and pass them on —
 never re-derive “original input” from the output of another hook.
 
-### 4.4 ObserverAfterHook — “react to a completed write”
+### ObserverAfterHook — "react to a completed write"
 
 Use for CDC, L1 cache invalidation, audit logs that must include the
 success/failure of the Redis op, and gradual dual-write migrations.
@@ -396,7 +402,7 @@ client.AddObserverAfterHook(func(key string, value []byte, committed bool, write
 })
 ```
 
-## 5. Lifecycle: when to add / remove hooks
+## Lifecycle — when to add or remove hooks
 
 - **Add once, early.** All registration functions are O(n) copy-on-write
   slice swaps. Doing thousands of `Add*Hook` / `RemoveHook` in a loop is
@@ -414,7 +420,7 @@ client.AddObserverAfterHook(func(key string, value []byte, committed bool, write
   the work: keep only the fast synchronous check in the hook, and hand the
   heavy work to a worker pool via an `ObserverAfterHook` + goroutine.
 
-## 6. Value READ-ONLY contract (except TransformHook returns fresh copy)
+## Value read-only contract — except TransformHook returns a fresh copy
 
 - `AbortHook(k, value)`: `value` is READ-ONLY. Do not write into it.
 - `TransformHook(k, value)`: `value` is READ-ONLY. You MUST return a
@@ -430,7 +436,7 @@ records the pre/post payload may see a torn, partially-mutated byte array.
 Treat all inputs as immutable; TransformHook is the *only* allowed rewrite
 point, and only via a freshly-returned copy.
 
-## 7. Troubleshooting
+## Troubleshooting
 
 ### Q: My hook is aborting writes but I thought it was “just an observer”
 
@@ -490,7 +496,7 @@ Tests that add/remove in a loop can safely ignore wraparound, and the
 increment uses CAS so concurrent registrations from multiple goroutines all
 receive distinct ids.
 
-## 8. API cheat sheet
+## API cheat sheet
 
 ```go
 // ---- client package (raw key/value bytes) ----

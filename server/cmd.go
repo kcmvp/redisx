@@ -486,15 +486,47 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 }
 
 func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	// UPDATE pattern filter_json update_json
-	if len(cmd.Args) != 4 {
+	// Strict RESP positional argc shape (fr-update-keyrange.mdx §2):
+	//
+	//   argc after cmd word | shape
+	//   -------------------+-----------------------------------------------
+	//   3                  |  <kr_json> <filter_json> <update_json>             (no LIMIT)
+	//   5                  |  <kr_json> <filter_json> <update_json> LIMIT count  (count only, ASC default)
+	//   1 / 2 / 4 / 6+    |  WRONG ARGS
+	nArgs := len(cmd.Args) - 1
+	if nArgs != 3 && nArgs != 5 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
 
-	pattern := string(cmd.Args[1])
+	krJSON := string(cmd.Args[1])
 	filterJSON := string(cmd.Args[2])
 	updateJSON := string(cmd.Args[3])
+	// Zero-legacy: Arg#1 must be a JSON object (not a legacy glob string).
+	if len(krJSON) == 0 || krJSON[0] != '{' {
+		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+		return
+	}
+	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
+	if krErr != nil {
+		conn.WriteError("ERR invalid key range: " + krErr.Error())
+		return
+	}
+
+	if nArgs == 5 {
+		a := strings.ToUpper(string(cmd.Args[4]))
+		if a != "LIMIT" {
+			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
+			return
+		}
+		countStr := string(cmd.Args[5])
+		count, err := strconv.Atoi(countStr)
+		if err != nil || count <= 0 {
+			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
+			return
+		}
+		kr = kr.Limit(count)
+	}
 
 	filter, err := parseFilter(filterJSON)
 	if err != nil {
@@ -508,7 +540,7 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		return
 	}
 
-	res := db.Update(pattern, filter, pairs...)
+	res := db.Update(kr, filter, pairs...)
 	if res.IsError() {
 		conn.WriteError("ERR " + res.Error().Error())
 	} else {

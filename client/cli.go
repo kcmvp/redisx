@@ -939,15 +939,15 @@ func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 // Example:
 //
 //	res := client.Update(
-//		"user:*",
+//		x.KeysPattern("user:*"),
 //		x.Eq("status", "pending"),
 //		x.Set("status", "active"),
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if keyPattern == "" {
-		return mo.Err[[]string](errors.New("key pattern is required"))
+func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	if len(values) == 0 {
 		return mo.Err[[]string](errors.New("no update values provided"))
@@ -960,6 +960,11 @@ func Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[
 
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
+
+	krBytes, krErr := kr.MarshalJSON()
+	if krErr != nil {
+		return mo.Err[[]string](fmt.Errorf("failed to serialize key range: %w", krErr))
+	}
 
 	filterJSON := "{}"
 	if filter != nil {
@@ -975,7 +980,14 @@ func Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[
 		return mo.Err[[]string](fmt.Errorf("failed to serialize updates: %w", err))
 	}
 
-	cmd := client.Do(ctx, proto.CmdUpdate, keyPattern, filterJSON, string(updateJSON))
+	args := make([]interface{}, 0, 6)
+	args = append(args, proto.CmdUpdate, string(krBytes), filterJSON, string(updateJSON))
+
+	if lim := kr.GetLimit(); lim != -1 {
+		args = append(args, "LIMIT", strconv.Itoa(lim))
+	}
+
+	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
 		return mo.Err[[]string](err)
