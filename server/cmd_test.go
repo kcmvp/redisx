@@ -881,7 +881,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "update success",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user:*", `{"id": "1_{id}"}`, `{"name": "updated"}`}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*_{id}"}`, `{"id": "1_{id}"}`, `{"name": "updated"}`}},
 			wantArrays: [][]string{{`user:1_{id}`}},
 			setupDB: func(uid string) {
 				_ = s.db.Set(fmt.Sprintf("user:1_%s", uid), fmt.Sprintf(`{"id":"1_%s", "age":20, "name":"old"}`, uid))
@@ -891,14 +891,56 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "update no valid updates",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{}`}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{}`}},
 			wantErrors: []string{"ERR no valid updates provided"},
 		},
 		{
 			name:       "update invalid json",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{invalid`}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{invalid`}},
 			wantErrors: []string{"ERR invalid update json format"},
+		},
+		{
+			name:       "update argc2_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`}},
+			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
+		},
+		{
+			name:       "update argc4_keyword_not_limit_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`, "{}", `{"a":1}`, "FOO", "1"}},
+			wantErrors: []string{"ERR invalid argument: FOO"},
+		},
+		{
+			name:       "update argc6_extra_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`, "{}", `{"a":1}`, "LIMIT", "1", "extra"}},
+			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
+		},
+		{
+			name:       "update limit0_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{"a":1}`, "LIMIT", "0"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: 0"},
+		},
+		{
+			name:       "update limit_negative5_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{"a":1}`, "LIMIT", "-5"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: -5"},
+		},
+		{
+			name:       "update limit_non_numeric_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{"a":1}`, "LIMIT", "not_a_number"}},
+			wantErrors: []string{"ERR invalid count for LIMIT: not_a_number"},
+		},
+		{
+			name:       "update arg1_plain_glob_not_json_rejects",
+			auth:       true,
+			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{"a":1}`}},
+			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
 		},
 		{
 			name:       "searchkey success",

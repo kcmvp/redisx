@@ -984,7 +984,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 
 	tests := []struct {
 		name      string
-		pattern   string
+		kr        x.KeyRange
 		filter    x.Filter
 		updates   []x.Mutation
 		expectErr bool
@@ -992,21 +992,21 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 		check     func()
 	}{
 		{
-			name:      "missing pattern",
-			pattern:   "",
+			name:      "missing keyrange",
+			kr:        nil,
 			filter:    x.Eq("status", "pending"),
 			updates:   []x.Mutation{x.Set("status", "active")},
 			expectErr: true,
 		},
 		{
 			name:      "missing update values",
-			pattern:   "user:*",
+			kr:        x.KeysPattern("user:*"),
 			filter:    x.Eq("status", "pending"),
 			expectErr: true,
 		},
 		{
 			name:      "update filtered documents",
-			pattern:   "user:*",
+			kr:        x.KeysPattern("user:*"),
 			filter:    x.Eq("status", "pending"),
 			updates:   []x.Mutation{x.Set("status", "active"), x.Set("verified", true), x.Set("profile.age", 18)},
 			expectLen: 2,
@@ -1020,7 +1020,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 		},
 		{
 			name:      "update with nil filter",
-			pattern:   "user:*",
+			kr:        x.KeysPattern("user:*"),
 			filter:    nil,
 			updates:   []x.Mutation{x.Set("version", 2)},
 			expectLen: 3,
@@ -1034,7 +1034,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := Update(tt.pattern, tt.filter, tt.updates...)
+			res := Update(tt.kr, tt.filter, tt.updates...)
 			if tt.expectErr {
 				s.True(res.IsError())
 				return

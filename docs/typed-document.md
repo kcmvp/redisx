@@ -1,5 +1,11 @@
 # Typed Document Helpers
 
+> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
+> 🧱 [Architecture & KeyRange convention](architecture.md) ·
+> 🧭 [How-to & examples](howto.md) ·
+> 🪝 [Write Hook Subsystem](write-hooks.md) ·
+> 🔌 [Stream ingest](stream.md)
+
 `redisx` provides a small document contract (`x.Document`) plus typed helpers
 on both the client and the embedded server side.
 

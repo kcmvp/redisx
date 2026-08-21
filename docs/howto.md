@@ -1,12 +1,20 @@
 # How-To
 
-This guide complements the README with copy-paste oriented examples.
+> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
+> 🧱 [Architecture & KeyRange convention](architecture.md) ·
+> 🏷️ [Typed document helpers](typed-document.md) ·
+> 🪝 [Write Hook Subsystem](write-hooks.md) ·
+> 🔌 [Stream ingest](stream.md)
 
-It covers:
+This guide is copy-paste oriented: RESP command examples plus the
+matching Go client and typed document calls. For background on the dual
+storage layer, server startup, AUTH model, or the `:` namespace
+convention used by `SEARCHINDEX` / `SEARCHKEY` / `UPDATE`, see
+[architecture.md](architecture.md).
 
 - RESP command examples for every supported command
-- the corresponding Go client calls where they help
-- the typed JSON document API entry points for document-centric workflows
+- the matching Go client calls for each command
+- typed document API entry points for document-centric workflows
 
 For intercepting writes (DLP gates, AES encryption, L1 cache invalidation,
 CDC, audit logging, debug-fixture capture) without modifying individual
@@ -383,17 +391,18 @@ SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} DESC LIMI
 Important constraints:
 
 - `index_name` is the full runtime index name, such as `user_age`
-- the second wire arg is a sealed `KeyRange` JSON payload (see the
-  `SEARCHKEY` section for the full shape: `pattern`, `bt`, `gte`, `lte`,
-  `gt`, `lt`)
+- the second wire arg is a sealed `KeyRange` JSON payload. The **6 sealed
+  constructors**, the `:` namespace convention (first `:` splits scope/id),
+  the server-side `scopeGuard` gate, and the wire vs Go representations
+  for `LIMIT N` are all centralised in
+  **[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**;
+  the quick JSON/Go lookup table is kept under
+  **SEARCHKEY "KeyRange JSON shape"](#keyrange-json-shape----one-of-6-sealed-constructors)
+  in this file**.
 - indexes must be registered at startup
 - the index chooses the storage layer first
 - a `KeyRange` routing that resolves to a **different storage layer**
   than the index is rejected
-- `LIMIT N` is accepted in two equivalent forms:
-  - Go API: intrinsic field on the sealed `KeyRange` object via `kr.Limit(N)` (carried on the instance, never serialized into the wire JSON)
-  - RESP wire: sent as a **separate trailing `LIMIT N` two-token pair** (wire override wins if both set)
-  - ⚠️ The JSON wire payload for `KeyRange` itself never includes a `limit` field — 6 constructor fields (`pattern`/`bt`/`ge`/`gt`/`lt`/`le`) only
 
 Go client:
 
@@ -446,32 +455,34 @@ outside 2 / 3 / 4 / 5):
 | 4 | `{kr}` `{filter}` `LIMIT` `N` — count only, direction defaults to ASC |
 | 5 | `{kr}` `{filter}` `ASC\|DESC` `LIMIT` `N` |
 
-#### KeyRange JSON shape — 6 sealed constructors (one-of)
+#### KeyRange JSON shape — one-of 6 sealed constructors
 
-```json
-{"op":"pattern","p":"user:*"}                          // glob: KeysPattern(p)
-{"op":"gte",    "pivot":"user:100"}                    // [pivot, +∞)  KeysGte
-{"op":"gt",     "pivot":"user:100"}                    // (pivot, +∞)  KeysGt
-{"op":"lte",    "pivot":"user:100"}                    // (-∞, pivot]  KeysLte
-{"op":"lt",     "pivot":"user:100"}                    // (-∞, pivot)  KeysLt
-{"op":"bt",     "ge":"user:0100","lt":"user:0200"}     // [ge, lt) half-open KeysBt
-```
+KeyRange is a **sealed one-of algebra**. The exact 6 constructors, the
+`:` namespace convention (first `:` splits scope from id), the
+scopeGuard safety net, and the 4-layer signature parity between
+typed-doc / untyped-client / RESP-wire / server-engine are all defined in
+**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**.
+Copy that reference — do not re-derive the rules locally.
 
-Any `pivot` / `ge` / `lt` / `p` may be a literal key **or** a glob pattern
-containing `* ? [`. Semantic rules you must be aware of:
+This section only gives the quick JSON+Go lookup table:
 
-- `KeysBt` is **half-open** `[ge, lt)` regardless of direction.
-- Single-boundary ctors with a **glob pivot** (`KeysGte("order:p05*")` etc.)
-  apply the **AND** of the dictionary boundary predicate and glob match, so
-  e.g. `KeysLte("order:p04*")` is always empty (lex ≤ and glob match are
-  disjoint sets).
-- Glob patterns starting with a leading wildcard (`*...`, `?...`) are rejected
-  by layer routing (the key range cannot pin a single storage layer).
+| Constructor | JSON wire shape | Go expression |
+|---|---|---|
+| `KeysPattern(p)` | `{"op":"pattern","p":"user:*"}` | `x.KeysPattern("user:*")` |
+| `KeysGte(pivot)` | `{"op":"gte","pivot":"user:100"}` | `x.KeysGte("user:100")` |
+| `KeysGt(pivot)`  | `{"op":"gt", "pivot":"user:100"}` | `x.KeysGt("user:100")` |
+| `KeysLte(pivot)` | `{"op":"lte","pivot":"user:100"}` | `x.KeysLte("user:100")` |
+| `KeysLt(pivot)`  | `{"op":"lt", "pivot":"user:100"}` | `x.KeysLt("user:100")` |
+| `KeysBt(ge, lt)` | `{"op":"bt","ge":"user:0100","lt":"user:0200"}` | `x.KeysBt("user:0100","user:0200")` |
 
-`LIMIT` is accepted **both** as a trailing positional `LIMIT N` wire arg and
-as an intrinsic field carried inside the sealed `KeyRange` object (Go API:
-`kr.Limit(50)`). When both appear, the wire `LIMIT N` overrides (it re-applies
-`kr.Limit(N)` after unmarshaling).
+All 6 accept a chained `.Limit(N)` modifier on the Go side; on the wire
+`LIMIT N` is sent as a **separate trailing two-token pair**, never inside
+the JSON object. Wire wins if both are present.
+
+KeysBt is always **half-open `[ge, lt)`** regardless of direction.
+Literal pivots (any of the 5 non-`pattern` ctors) **cannot** have a
+leading wildcard — layer routing would be ambiguous; use `KeysPattern`
+with a non-wildcard prefix for glob-driven scans.
 
 #### RESP examples
 
@@ -531,30 +542,57 @@ _ = typed
 
 ### `UPDATE`
 
-Patch JSON documents matched by one full storage-key pattern and one filter.
+Patch JSON documents matched by one sealed `x.KeyRange` (the same 6 constructors
+as `SEARCHKEY` / `SEARCHINDEX`), one optional JSON filter, and one JSON object
+of mutations. **Zero-legacy:** the first positional argument after the command
+word must be a JSON object (the KeyRange payload); a raw glob string like
+`"user:*"` is rejected on the wire.
+
+#### RESP wire format
 
 ```text
-UPDATE user:* {"status":"pending"} {"status":"active"}
+UPDATE <keyrange_json> <filter_json> <update_json> [LIMIT count]
 ```
 
-More examples:
+Argument shapes (strict — the server rejects any count of positional args
+outside 3 / 5; UPDATE has **no** `ASC|DESC` keyword because resulting key
+ordering is always ascending after `sort.Strings` on the server):
+
+| argc after cmd word | shape |
+|---|---|
+| 3 | `{kr}` `{filter}` `{update}` — no LIMIT, matched keys truncated at full range |
+| 5 | `{kr}` `{filter}` `{update}` `LIMIT` `count` — LIMIT callback early-stop wins if both set |
+
+The KeyRange JSON payload is identical to the one used by
+[`SEARCHKEY`](#keyrange-json-shape----one-of-6-sealed-constructors) and
+[`SEARCHINDEX`](#searchindex), with the same 6 sealed constructors, the same
+`:` namespace convention (first `:` splits scope from id), and the same
+server-side `scopeGuard` safety net. The full specification, including
+KeysBt half-open semantics, layer routing rules, and the Go/RESP split for
+`Limit` lives in
+**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**.
+
+#### RESP examples
 
 ```text
-UPDATE user:* {"id":"1"} {"profile":{"age":18},"verified":true}
-UPDATE user:* {"region":"us"} {"status":"reviewed"}
+UPDATE {"op":"pattern","p":"user:*"} {"status":"pending"} {"status":"active"}
+UPDATE {"op":"gte","pivot":"order:2024-01-01"} {"region":"us"} {"verified":true}
+UPDATE {"op":"bt","ge":"user:engineering:0100","lt":"user:engineering:0200"} {"status":"review"} {"$set":{"status":"reviewed"}} LIMIT 50
+UPDATE {"op":"pattern","p":"product:*"} {"category":"book"} {"price":{"$mul":0.9}}
 ```
 
 Important constraints:
 
-- `key_pattern` must resolve one concrete storage layer
-- patterns starting with `*` or `?` are rejected
+- `<keyrange_json>` must resolve to one concrete storage layer (anchored prefix; pure leading wildcards rejected)
 - nested objects in `update_json` are supported
+- `LIMIT count` is an optional two-token suffix; server treats it as an early-stop callback truncation on matched keys (never a post-hoc slice)
+- there is **no** `ASC|DESC` keyword on UPDATE — the returned updated-key array is always sorted ascending by storage key on the server before being written back
 
 Go client:
 
 ```go
 res := client.Update(
-    "user:*",
+    x.KeysPattern("user:*"),
     x.Eq("status", "pending"),
     x.Set("status", "active"),
     x.Set("verified", true),
@@ -566,18 +604,31 @@ keys := res.MustGet()
 _ = keys
 ```
 
+Opt-in range iteration:
+
+```go
+_ = client.Update(x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
+    x.Eq("status", "pending"),
+    x.Set("status", "active"))
+```
+
 Typed JSON document API:
 
 ```go
-docs := doc.Update[UserDoc]("*", x.Eq("status", "pending"), x.Set("status", "active"))
-typed := dbx.Update("*", x.Eq("status", "pending"), x.Set("status", "active"))
+docs := doc.Update[UserDoc](x.KeysPattern("*"), x.Eq("status", "pending"), x.Set("status", "active"))
+typed := dbx.Update(x.KeysPattern("*"), x.Eq("status", "pending"), x.Set("status", "active"))
 _ = docs
 _ = typed
 ```
 
 ## Memory-Only Keys
 
-Use the reserved `_m_` prefix for memory-only data:
+Use the reserved `_m_` prefix for memory-only data. This is the
+**layer prefix** half of the dual storage layer; the full routing model,
+key examples, and SK/UPDATE layer-pinning rules live in
+**[architecture.md § Dual storage layer](architecture.md#dual-storage-layer)**.
+
+Short quick-reference examples:
 
 ```text
 SET _m_session:1 {"online":true}
@@ -615,8 +666,8 @@ if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
 _ = doc.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
 
 got, _ := doc.Get[UserDoc]("200")
-idx := doc.SearchIndex[UserDoc]("age", "*", x.Gte("age", 18), false)
-keys := doc.Update[UserDoc]("*", x.Eq("id", "200"), x.Set("name", "Updated"))
+idx := doc.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
+keys := doc.Update[UserDoc](x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
 _ = idx
@@ -631,8 +682,8 @@ dbx := server.As[UserDoc](db)
 _ = dbx.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
 
 got, _ := dbx.Get("200")
-idx := dbx.SearchIndex("age", "*", x.Gte("age", 18), false)
-keys := dbx.Update("*", x.Eq("id", "200"), x.Set("name", "Updated"))
+idx := dbx.SearchIndex("age", x.KeysPattern("*"), x.Gte("age", 18), false)
+keys := dbx.Update(x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
 _ = idx

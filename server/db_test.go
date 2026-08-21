@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -269,7 +270,7 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	suite.True(res.IsError())
 	suite.Contains(res.Error().Error(), "cannot start with wildcard")
 
-	updated := db.Update("*user:*", nil, x.Set("status", "active"))
+	updated := db.Update(x.KeysPattern("*user:*"), nil, x.Set("status", "active"))
 	suite.True(updated.IsError())
 	suite.Contains(updated.Error().Error(), "cannot start with wildcard")
 	suite.Equal("cold", gjson.Get(db.Get("user:1").MustGet(), "status").String())
@@ -358,11 +359,11 @@ func TestDBX(t *testing.T) {
 	require.Error(t, badFullIdxNameRes.Error())
 	require.Contains(t, badFullIdxNameRes.Error().Error(), "fully-qualified index name")
 
-	updRes := dbx.Update("*", x.Eq("age", float64(30)), x.Set("age", 31))
+	updRes := dbx.Update(x.KeysPattern("*"), x.Eq("age", float64(30)), x.Set("age", 31))
 	require.NoError(t, updRes.Error())
 	require.Contains(t, updRes.MustGet(), key)
 
-	badUpdRes := dbx.Update("user:*", nil, x.Set("name", "updated"))
+	badUpdRes := dbx.Update(x.KeysPattern("user:*"), nil, x.Set("name", "updated"))
 	require.Error(t, badUpdRes.Error())
 	require.Contains(t, badUpdRes.Error().Error(), "document-scoped")
 
@@ -398,7 +399,7 @@ func TestDBXTypedWritesRespectDocumentTTL(t *testing.T) {
 	require.NoError(t, err)
 	requireTTLPositive(t, db, secondKey)
 
-	updRes := dbx.Update("*", x.Eq("id", "1"), x.Set("name", "updated"))
+	updRes := dbx.Update(x.KeysPattern("*"), x.Eq("id", "1"), x.Set("name", "updated"))
 	require.NoError(t, updRes.Error())
 	require.Contains(t, updRes.MustGet(), firstKey)
 	requireTTLPositive(t, db, firstKey)
@@ -452,36 +453,42 @@ func (suite *UpdateSuite) TearDownTest() {
 func (suite *UpdateSuite) TestUpdateCases() {
 	tests := []struct {
 		name     string
+		kr       x.KeyRange
 		filter   x.Filter
 		updates  []x.Mutation
 		wantKeys []string
 	}{
 		{
 			name:     "Update existing property",
+			kr:       x.KeysPattern("user:*"),
 			filter:   x.Eq("id", "1"),
 			updates:  []x.Mutation{x.Set("age", 21)},
 			wantKeys: []string{"user:1"},
 		},
 		{
 			name:     "Add new property",
+			kr:       x.KeysPattern("user:*"),
 			filter:   x.Eq("id", "2"),
 			updates:  []x.Mutation{x.Set("active", true)},
 			wantKeys: []string{"user:2"},
 		},
 		{
 			name:     "Update multiple documents",
+			kr:       x.KeysPattern("user:*"),
 			filter:   x.Gt("age", float64(24)),
 			updates:  []x.Mutation{x.Set("status", "verified")},
 			wantKeys: []string{"user:2", "user:3"},
 		},
 		{
 			name:     "Update without filter applies to all",
+			kr:       x.KeysPattern("user:*"),
 			filter:   nil,
 			updates:  []x.Mutation{x.Set("version", 2)},
 			wantKeys: []string{"user:1", "user:2", "user:3"},
 		},
 		{
 			name:   "Update all data types",
+			kr:     x.KeysPattern("user:*"),
 			filter: x.Eq("id", "1"),
 			updates: []x.Mutation{
 				x.Set("int_val", int(-10)),
@@ -494,6 +501,34 @@ func (suite *UpdateSuite) TestUpdateCases() {
 			},
 			wantKeys: []string{"user:1"},
 		},
+		{
+			name:     "KeysBt half-open range excludes upper bound",
+			kr:       x.KeysBt("user:1", "user:3"),
+			filter:   nil,
+			updates:  []x.Mutation{x.Set("ranged", "bt")},
+			wantKeys: []string{"user:1", "user:2"},
+		},
+		{
+			name:     "KeysLte range includes equal",
+			kr:       x.KeysLte("user:2"),
+			filter:   nil,
+			updates:  []x.Mutation{x.Set("ranged", "lte")},
+			wantKeys: []string{"user:1", "user:2"},
+		},
+		{
+			name:     "Limit(1) updates only first match",
+			kr:       x.KeysPattern("user:*").Limit(1),
+			filter:   nil,
+			updates:  []x.Mutation{x.Set("capped", true)},
+			wantKeys: []string{"user:1"},
+		},
+		{
+			name:     "KeysGt + Limit(1)",
+			kr:       x.KeysGt("user:1").Limit(1),
+			filter:   nil,
+			updates:  []x.Mutation{x.Set("capped", true)},
+			wantKeys: []string{"user:2"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -501,7 +536,7 @@ func (suite *UpdateSuite) TestUpdateCases() {
 			suite.TearDownTest()
 			suite.SetupTest()
 
-			res := suite.db.Update("user:*", tt.filter, tt.updates...)
+			res := suite.db.Update(tt.kr, tt.filter, tt.updates...)
 			suite.True(res.IsOk())
 			keys := res.MustGet()
 			suite.ElementsMatch(tt.wantKeys, keys)
@@ -514,19 +549,57 @@ func (suite *UpdateSuite) TestUpdateCases() {
 	}
 }
 
+type DoDUserDoc string
+
+func (d DoDUserDoc) Namespace() string  { return "doduser" }
+func (d DoDUserDoc) Mem() bool          { return false }
+func (d DoDUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (d DoDUserDoc) RawJSON() string    { return string(d) }
+func (d DoDUserDoc) TTL() time.Duration { return time.Hour }
+
+func (suite *UpdateSuite) TestDoD4LayerAlignment() {
+	suite.TearDownTest()
+	suite.SetupTest()
+
+	dbx := As[DoDUserDoc](suite.db)
+	ids := []string{"p010", "p011", "p012", "p013", "p014", "p015"}
+	for _, id := range ids {
+		doc := DoDUserDoc(fmt.Sprintf(`{"id":%q,"tag":"raw","age":10}`, id))
+		err := dbx.Set(doc)
+		suite.NoError(err, "dbx.Set %s", id)
+	}
+
+	scopedLimit3 := x.KeysLte("p015").Limit(3)
+	dbxUpdated := dbx.Update(scopedLimit3, nil, x.Set("tag", "done"))
+	suite.True(dbxUpdated.IsOk(), "dbx.Update err=%v", dbxUpdated.Error())
+	got := dbxUpdated.MustGet()
+	suite.Len(got, 3, "dbx Update Limit(3) should be exactly 3 keys, got %d: %v", len(got), got)
+
+	fullRes := dbx.Update(x.KeysLte("p015"), nil, x.Set("tag", "all"))
+	suite.True(fullRes.IsOk(), "dbx.Update all err=%v", fullRes.Error())
+	all := fullRes.MustGet()
+	sort.Strings(all)
+	sort.Strings(got)
+	suite.Equal(all[:len(got)], got, "Limit(3) prefix-equal: %v should be prefix of %v", got, all)
+
+	suite.Equal(-1, x.KeysLte("p015").GetLimit())
+	suite.Equal(3, x.KeysLte("p015").Limit(3).GetLimit(),
+		"Update[D] via ScopeKeyRange[D] should preserve Limit(N) forward through typed scope injector")
+}
+
 func TestUpdateSuite(t *testing.T) {
 	suite.Run(t, new(UpdateSuite))
 }
 
 func TestDBUpdateEdgeCases(t *testing.T) {
-	t.Run("rejects empty pattern", func(t *testing.T) {
+	t.Run("rejects nil key range", func(t *testing.T) {
 		db := openDB(testutil.DBPath(t))
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 
-		res := db.Update("", nil, x.Set("status", "active"))
+		res := db.Update(nil, nil, x.Set("status", "active"))
 		require.Error(t, res.Error())
-		require.Contains(t, res.Error().Error(), "key pattern is required")
+		require.Contains(t, res.Error().Error(), "key range is required")
 	})
 
 	t.Run("rejects leading wildcard pattern", func(t *testing.T) {
@@ -534,7 +607,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 		require.NotNil(t, db)
 		t.Cleanup(func() { _ = db.Close() })
 
-		res := db.Update("*user:*", nil, x.Set("status", "active"))
+		res := db.Update(x.KeysPattern("*user:*"), nil, x.Set("status", "active"))
 		require.Error(t, res.Error())
 		require.Contains(t, res.Error().Error(), "cannot start with wildcard")
 	})
@@ -545,7 +618,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 		t.Cleanup(func() { _ = db.Close() })
 		require.NoError(t, db.Set("user:1", `{"id":"1","status":"pending"}`))
 
-		res := db.Update("user:*", x.Eq("status", "active"), x.Set("status", "reviewed"))
+		res := db.Update(x.KeysPattern("user:*"), x.Eq("status", "active"), x.Set("status", "reviewed"))
 		require.NoError(t, res.Error())
 		require.Empty(t, res.MustGet())
 
@@ -560,7 +633,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 		require.NoError(t, db.Set("user:1", `{"id":"1","status":"active"}`))
 
 		before := db.Get("user:1").MustGet()
-		res := db.Update("user:*", x.Eq("id", "1"), x.Set("status", "active"))
+		res := db.Update(x.KeysPattern("user:*"), x.Eq("id", "1"), x.Set("status", "active"))
 		require.NoError(t, res.Error())
 		require.Equal(t, []string{"user:1"}, res.MustGet())
 
@@ -576,7 +649,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 
 		requireTTLPositive(t, db, "user:1")
 
-		res := db.Update("user:*", x.Eq("id", "1"), x.Set("status", "active"))
+		res := db.Update(x.KeysPattern("user:*"), x.Eq("id", "1"), x.Set("status", "active"))
 		require.NoError(t, res.Error())
 		require.Equal(t, []string{"user:1"}, res.MustGet())
 		requireTTLPositive(t, db, "user:1")
@@ -593,7 +666,7 @@ func TestDBUpdateEdgeCases(t *testing.T) {
 
 		before := db.Get("user:1").MustGet()
 
-		res := db.Update("user:*", nil, x.Set("", "active"))
+		res := db.Update(x.KeysPattern("user:*"), nil, x.Set("", "active"))
 		require.Error(t, res.Error())
 		require.Contains(t, res.Error().Error(), "failed to set ")
 

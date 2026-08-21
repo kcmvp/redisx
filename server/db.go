@@ -239,24 +239,30 @@ func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func (db *DB) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	layer, constrained, err := resolvePatternLayer(keyPattern)
-	if err != nil {
-		return mo.Err[[]string](err)
+func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if kr == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
 	}
+	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
+		return layerForKey(k)
+	})
 	if !constrained {
-		return mo.Err[[]string](errors.New("key pattern cannot start with wildcard"))
+		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
+	}
+	layer, ok := layerObj.(storageLayer)
+	if !ok {
+		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
 	}
 	var updatedKeys []string
+	var err error
 	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
 		var matchedKeys []string
-		scanErr := tx.AscendKeys(keyPattern, func(key, value string) bool {
+		scanErr := applyKeyRange(tx, kr, x.RangeAsc, func(key, value string) bool {
 			if filter == nil || filter.Eval(value) {
 				matchedKeys = append(matchedKeys, key)
 			}
 			return true
 		})
-
 		if scanErr != nil {
 			return scanErr
 		}
@@ -745,11 +751,11 @@ func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
 }
 
 // SearchIndex delegates to the underlying DB index search.
-func (dbx *DBX[D]) SearchIndex(idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+func (dbx *DBX[D]) SearchIndex(idxName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if dbx == nil {
 		return mo.Err[[]D](errors.New("db is nil"))
 	}
-	if scopedKR == nil {
+	if kr == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
 	}
 
@@ -758,7 +764,7 @@ func (dbx *DBX[D]) SearchIndex(idxName string, scopedKR x.KeyRange, filter x.Fil
 		return mo.Err[[]D](err)
 	}
 
-	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
+	fullKR, err := internal.ScopeKeyRange[D](kr)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
@@ -777,14 +783,14 @@ func (dbx *DBX[D]) SearchIndex(idxName string, scopedKR x.KeyRange, filter x.Fil
 }
 
 // SearchKey returns documents matching the prefixed scoped key range and filter.
-func (dbx *DBX[D]) SearchKey(scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+func (dbx *DBX[D]) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if dbx == nil {
 		return mo.Err[[]D](errors.New("db is nil"))
 	}
-	if scopedKR == nil {
+	if kr == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
 	}
-	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
+	fullKR, err := internal.ScopeKeyRange[D](kr)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
@@ -802,14 +808,14 @@ func (dbx *DBX[D]) SearchKey(scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 	return mo.Ok(out)
 }
 
-// Update applies mutations to documents matching the prefixed key pattern.
-func (dbx *DBX[D]) Update(keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+// Update applies mutations to documents matching the prefixed key range.
+func (dbx *DBX[D]) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if dbx == nil {
 		return mo.Err[[]string](errors.New("db is nil"))
 	}
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	fullKR, err := internal.ScopeKeyRange[D](kr)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}
-	return (*DB)(dbx).Update(fullKeyPattern, filter, values...)
+	return (*DB)(dbx).Update(fullKR, filter, values...)
 }

@@ -105,7 +105,7 @@ func (s *DocTestSuite) TestGenericDocMethods() {
 	s.Require().NoError(idxRes.Error())
 	s.Contains(idxRes.MustGet(), UserDoc(jsonStr))
 
-	updRes := Update[UserDoc]("*", x.Eq("age", 30), x.Set("age", 31))
+	updRes := Update[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), x.Set("age", 31))
 	s.Require().NoError(updRes.Error())
 
 	del, err := Delete(UserDoc(`{"id":"200"}`))
@@ -131,7 +131,7 @@ func (s *DocTestSuite) TestTypedWritesRespectDocumentTTL() {
 	s.Require().NoError(err)
 	s.True(ok)
 
-	updRes := Update[ExpiringUserDoc]("*", x.Eq("id", "1"), x.Set("name", "updated"))
+	updRes := Update[ExpiringUserDoc](x.KeysPattern("*"), x.Eq("id", "1"), x.Set("name", "updated"))
 	s.Require().NoError(updRes.Error())
 
 	time.Sleep(80 * time.Millisecond)
@@ -161,7 +161,7 @@ func (s *DocTestSuite) TestKeysRejectsPrefixedStoragePattern() {
 }
 
 func (s *DocTestSuite) TestUpdateRejectsPrefixedStoragePattern() {
-	res := Update[UserDoc]("user:*", nil, x.Set("name", "updated"))
+	res := Update[UserDoc](x.KeysPattern("user:*"), nil, x.Set("name", "updated"))
 	s.Require().True(res.IsError())
 	s.Contains(res.Error().Error(), "document-scoped")
 }

@@ -1,6 +1,7 @@
 package doc
 
 import (
+	"errors"
 	"time"
 
 	"github.com/kcmvp/redisx/client"
@@ -100,6 +101,9 @@ func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 // field values must likewise be document-scoped, not already-prefixed storage
 // values.
 func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
 	fullIdxName, err := internal.ValidateIdxName[D](idxName)
 	if err != nil {
 		return mo.Err[[]D](err)
@@ -131,6 +135,9 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 // the input scopedKR is preserved through the full-scope key range that
 // internal.ScopeKeyRange produces.
 func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
 	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
@@ -149,11 +156,20 @@ func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 	return mo.Ok(out)
 }
 
-// Update executes UPDATE using the document type prefix and sub-pattern.
-func Update[D x.Document](keyPattern string, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+// Update executes UPDATE using the document type prefix, namespace-scoped
+// key range, optional typed filter, and typed mutations.
+//
+// LIMIT is carried directly on the sealed x.KeyRange via .Limit(n int) —
+// there is no separate parameter on the function signature. Any value set on
+// the input scopedKR is preserved through the full-scope key range that
+// internal.ScopeKeyRange produces.
+func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if scopedKR == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
+	}
+	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}
-	return client.Update(fullKeyPattern, filter, values...)
+	return client.Update(fullKR, filter, values...)
 }
