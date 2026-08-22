@@ -1,9 +1,10 @@
 # Architecture
 
-> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
-> 🧭 [How-to & examples](howto.md) ·
-> 🏷️ [Typed document helpers](typed-document.md) ·
-> 🪝 [Write Hook Subsystem](write-hooks.md) ·
+> ⬅️ [Back to README](../README.md)
+> 📖 [Docs index](index.md)
+> 🧭 [How-to & examples](howto.md)
+> 🏷️ [Typed document helpers](typed-document.md)
+> 🪝 [Write Hook Subsystem](write-hooks.md)
 > 🔌 [Stream ingest](stream.md)
 
 This document explains how redisx is structured: dual storage layer,

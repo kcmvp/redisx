@@ -33,7 +33,7 @@ document layer.
   `x.KeyRange` algebra (6 constructors, Limit, mem/disk routing) and a
   strict `:`-based namespace convention.
   [Command reference & JSON examples](docs/howto.md#searchindex)
-  · [KeyRange & namespace convention](docs/architecture.md#keyrange--namespace-convention)
+  · [KeyRange & namespace convention](docs/architecture.md#keyrange-namespace-convention)
 - **Typed document API (`x.Document`)** — define a doc type once
   (`type UserDoc string`), then write/logical-key/pattern/index inputs are
   scoped automatically.

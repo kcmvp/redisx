@@ -1,9 +1,10 @@
 # Write Hook Subsystem
 
-> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
-> 🧱 [Architecture & KeyRange convention](architecture.md) ·
-> 🧭 [How-to & examples](howto.md) ·
-> 🏷️ [Typed document helpers](typed-document.md) ·
+> ⬅️ [Back to README](../README.md)
+> 📖 [Docs index](index.md)
+> 🧱 [Architecture & KeyRange convention](architecture.md)
+> 🧭 [How-to & examples](howto.md)
+> 🏷️ [Typed document helpers](typed-document.md)
 > 🔌 [Stream ingest](stream.md)
 
 The Write Hook Subsystem lets you intercept every write through `client.Set` /
