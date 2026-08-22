@@ -215,7 +215,7 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemKeyPrefix) {
+	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemNsPrefix) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}

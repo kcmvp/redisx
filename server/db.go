@@ -1,13 +1,16 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
@@ -95,6 +98,13 @@ type DB struct {
 	disk        *buntdb.DB
 	mem         *buntdb.DB
 	indexLayers map[string]storageLayer
+
+	docRegMu   sync.Mutex
+	docRegSpec map[string]x.PersistentDocSpec
+	docRegType map[string]string
+
+	idxRegMu   sync.Mutex
+	idxRegSpec map[string]x.PersistentIndexSpec
 }
 
 // DBX binds one document type to an existing DB.
@@ -163,7 +173,7 @@ func As[D x.Document](db *DB) *DBX[D] {
 // SECTION: Storage Routing
 
 func isMemKey(key string) bool {
-	return strings.HasPrefix(key, contract.MemKeyPrefix)
+	return strings.HasPrefix(key, contract.MemNsPrefix)
 }
 
 func hasLeadingWildcard(keyPattern string) bool {
@@ -315,36 +325,298 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 //
 // Index key patterns must not start with "*" or "?" because the target layer
 // must be decided at startup time without scanning both layers.
-func (db *DB) registerIndexes(defs ...x.Index) error {
+func (db *DB) ensureDocReg() {
+	if db.docRegSpec == nil {
+		db.docRegSpec = map[string]x.PersistentDocSpec{}
+	}
+	if db.docRegType == nil {
+		db.docRegType = map[string]string{}
+	}
+}
+
+func (db *DB) ensureIdxReg() {
+	if db.idxRegSpec == nil {
+		db.idxRegSpec = map[string]x.PersistentIndexSpec{}
+	}
 	if db.indexLayers == nil {
 		db.indexLayers = map[string]storageLayer{}
 	}
-	for _, def := range defs {
-		if def.Name() == "" {
-			return errors.New("index name is required")
-		}
-		if def.KeyPattern() == "" {
-			return errors.New("index key pattern is required")
-		}
-		if def.Path() == "" {
-			return errors.New("index json path is required")
-		}
-		layer, constrained, err := resolvePatternLayer(def.KeyPattern())
-		if err != nil {
-			return fmt.Errorf("index %w", err)
-		}
-		if !constrained {
-			return errors.New("index key pattern cannot start with wildcard")
-		}
-		if _, exists := db.indexLayers[def.Name()]; exists {
-			return fmt.Errorf("index already declared: %s", def.Name())
-		}
-		if err := db.store(layer).CreateIndex(def.Name(), def.KeyPattern(), buntdb.IndexJSON(def.Path())); err != nil {
-			return err
-		}
-		db.indexLayers[def.Name()] = layer
+}
+
+// registerIndexFromSpec creates exactly one BuntDB index and persists the
+// PersistentIndexSpec to storage. It is used by both the boot-time rebuild
+// path (rebuildIndexRegistry, which skips persistence since the key already
+// exists) and the runtime regidx admin path (which writes the key).
+//
+// Calling it twice with the identical PersistentIndexSpec on the same DB is a
+// no-op (idempotent). Conflicting specs for the same FullName return a
+// descriptive error.
+func (db *DB) registerIndexFromSpec(spec x.PersistentIndexSpec, persist bool) error {
+	if spec.FullName == "" {
+		return errors.New("index spec: full_name is required")
+	}
+	if spec.KeyPattern == "" {
+		return fmt.Errorf("index %q: key_pattern is required", spec.FullName)
+	}
+	if spec.Path == "" {
+		return fmt.Errorf("index %q: path is required", spec.FullName)
+	}
+	layer, constrained, err := resolvePatternLayer(spec.KeyPattern)
+	if err != nil {
+		return fmt.Errorf("index %q: %w", spec.FullName, err)
+	}
+	if !constrained {
+		return fmt.Errorf("index %q: key_pattern cannot start with wildcard", spec.FullName)
 	}
 
+	db.idxRegMu.Lock()
+	defer db.idxRegMu.Unlock()
+	db.ensureIdxReg()
+
+	existing, ok := db.idxRegSpec[spec.FullName]
+	if ok {
+		identical := existing.FullName == spec.FullName &&
+			existing.OwnerNs == spec.OwnerNs &&
+			existing.Logical == spec.Logical &&
+			existing.OwnerMem == spec.OwnerMem &&
+			existing.KeyPattern == spec.KeyPattern &&
+			existing.Path == spec.Path
+		if identical {
+			return nil
+		}
+		return fmt.Errorf(
+			"index %q already registered with owner_ns=%q pattern=%q path=%q; "+
+				"conflicting registration requested: owner_ns=%q pattern=%q path=%q",
+			spec.FullName,
+			existing.OwnerNs, existing.KeyPattern, existing.Path,
+			spec.OwnerNs, spec.KeyPattern, spec.Path)
+	}
+
+	if err := db.store(layer).CreateIndex(spec.FullName, spec.KeyPattern, buntdb.IndexJSON(spec.Path)); err != nil {
+		return fmt.Errorf("index %q: create btree: %w", spec.FullName, err)
+	}
+	db.idxRegSpec[spec.FullName] = spec
+	db.indexLayers[spec.FullName] = layer
+
+	if persist {
+		metaKey := contract.IdxMetaNsPrefix + contract.StorageKeySeparator + spec.FullName
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			return fmt.Errorf("index %q: marshal PersistentIndexSpec: %w", spec.FullName, err)
+		}
+		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+			_, _, setErr := tx.Set(metaKey, string(raw), nil)
+			return setErr
+		}); err != nil {
+			return fmt.Errorf("index %q: persist %s: %w", spec.FullName, metaKey, err)
+		}
+	}
+
+	slog.Debug("index registered",
+		"name", spec.FullName, "owner_ns", spec.OwnerNs,
+		"logical", spec.Logical, "mem", spec.OwnerMem,
+		"pattern", spec.KeyPattern, "path", spec.Path)
+	return nil
+}
+
+// CreateIndex converts a legacy x.Index declaration into the canonical
+// PersistentIndexSpec representation (FullName/OwnerNs/Logical all derived
+// via ParseIndexFullName) and installs it on the correct storage layer.
+// Unlike the boot-registration path, it does NOT persist a "_idx_:*" meta
+// key — CreateIndex is retained exclusively for test fixtures that need to
+// stand up a disposable BuntDB index in-process. Production callers should
+// issue the admin CLI regidx command (which writes the "_idx_:*" SSoT meta
+// key so that subsequent restarts automatically rebuild the index via
+// rebuildIndexRegistry).
+func (db *DB) CreateIndex(idx x.Index) error {
+	return db.registerIndexes(idx)
+}
+
+// registerIndexes converts one or more legacy x.Index declarations into the
+// canonical PersistentIndexSpec form (FullName/OwnerNs/Logical all derived
+// via ParseIndexFullName), then forwards them to registerIndexFromSpec
+// without persisting the "_idx_:*" meta key. It exists exclusively to
+// support the legacy internal/db_test suites that still instantiate indexes
+// via the x.Index shorthand; the public boot paths (Start / StartWithConfig /
+// StartForTest) do NOT accept indexes at all — indexes are Admin-CLI-managed
+// "_idx_:*" records rebuilt on every boot via rebuildIndexRegistry.
+//
+// Duplicate semantics: duplicate index names are REJECTED even if the
+// incoming spec is byte-for-byte identical with the already-registered one.
+// This mirrors the behavior of the removed registerIndexes function that was
+// previously invoked from the single-listener legacy boot path and keeps the
+// existing db_test semantics passing.
+func (db *DB) registerIndexes(indexes ...x.Index) error {
+	db.ensureIdxReg()
+	for _, idx := range indexes {
+		fullName := idx.Name()
+		if fullName == "" {
+			return fmt.Errorf("index name is required")
+		}
+		if _, ok := db.idxRegSpec[fullName]; ok {
+			return fmt.Errorf("index already declared: %s", fullName)
+		}
+		ownerNs, logical, err := internal.ParseIndexFullName(fullName)
+		if err != nil {
+			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
+		}
+		ownerMem := strings.HasPrefix(idx.KeyPattern(), contract.MemNsPrefix+contract.StorageKeySeparator) ||
+			strings.HasPrefix(ownerNs, contract.MemNsPrefix)
+		spec := x.PersistentIndexSpec{
+			FullName:   fullName,
+			OwnerNs:    ownerNs,
+			Logical:    logical,
+			OwnerMem:   ownerMem,
+			KeyPattern: idx.KeyPattern(),
+			Path:       idx.Path(),
+		}
+		if err := db.registerIndexFromSpec(spec, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rebuildIndexRegistry scans all "_idx_:*" keys on disk and the in-memory
+// layer, deserializes PersistentIndexSpec, and recreates matching BuntDB
+// indexes on their correct layer. It is invoked on every openDB path; any
+// corrupt "_idx_:*" key triggers a hard error (the database would otherwise
+// silently drop indexes across restarts, which is an integrity violation).
+//
+// "_idx_:*" keys live on the SAME layer as their owner document type: an
+// index over a Mem=true doc is persisted on the mem layer (volatile, matching
+// the doc data) while a regular doc's index is persisted on the disk layer.
+func (db *DB) rebuildIndexRegistry() error {
+	patterns := []struct {
+		layer storageLayer
+		glob  string
+	}{
+		{layer: storageDisk, glob: contract.IdxMetaNsPrefix + contract.StorageKeySeparator + "*"},
+		{layer: storageMem, glob: contract.IdxMetaNsPrefix + contract.StorageKeySeparator + "*"},
+	}
+	for _, p := range patterns {
+		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
+				var spec x.PersistentIndexSpec
+				if err := json.Unmarshal([]byte(value), &spec); err != nil {
+					err = fmt.Errorf("index meta %q: decode PersistentIndexSpec: %w", metaKey, err)
+					slog.Error(err.Error())
+					// Close handled at the top-level via fatal flow; signal upward via non-nil layer error
+					return false
+				}
+				if spec.FullName == "" {
+					err := fmt.Errorf("index meta %q: spec has empty full_name (corrupt _idx_ record)", metaKey)
+					slog.Error(err.Error())
+					return false
+				}
+				if err := db.registerIndexFromSpec(spec, false); err != nil {
+					slog.Error("failed to rebuild index from _idx_ record", "meta_key", metaKey, "error", err)
+					return false
+				}
+				return true
+			})
+		})
+		if err != nil {
+			return err
+		}
+	}
+	slog.Debug("index registry rebuilt", "count", len(db.idxRegSpec))
+	return nil
+}
+
+func (db *DB) registerDocFromSpec(spec x.PersistentDocSpec, rt reflect.Type) error {
+	if rt != nil && rt.Kind() != reflect.String {
+		return fmt.Errorf("doc %q: schema implementors must be ~string types, got %s",
+			spec.Namespace, rt.Kind())
+	}
+	if spec.Namespace == "" {
+		return errors.New("doc schema: namespace is required")
+	}
+	if strings.ContainsAny(spec.Namespace, contract.StorageKeySeparator+"*?_") {
+		return fmt.Errorf("doc %q: namespace must not contain reserved characters %q",
+			spec.Namespace, contract.StorageKeySeparator+"*?_")
+	}
+	for i, p := range spec.KeyAttrs {
+		if p == "" {
+			return fmt.Errorf("doc %q: key_attrs[%d] is empty", spec.Namespace, i)
+		}
+	}
+	storageNs := spec.StorageNs()
+	metaKey := contract.DocMetaNsPrefix + contract.StorageKeySeparator + storageNs
+
+	db.docRegMu.Lock()
+	defer db.docRegMu.Unlock()
+	db.ensureDocReg()
+
+	existing, registered := db.docRegSpec[storageNs]
+	if registered {
+		identical := existing.Namespace == spec.Namespace &&
+			existing.Mem == spec.Mem &&
+			reflect.DeepEqual(existing.KeyAttrs, spec.KeyAttrs) &&
+			existing.TTL == spec.TTL
+		if !identical {
+			return fmt.Errorf(
+				"namespace %q already registered by %q (keyattrs=%v ttl=%s); "+
+					"incompatible with %q (keyattrs=%v ttl=%s)",
+				storageNs, existing.TypeName, existing.KeyAttrs, existing.TTL,
+				spec.TypeName, spec.KeyAttrs, spec.TTL)
+		}
+		return nil
+	}
+
+	if spec.TypeName == "" && rt != nil {
+		spec.TypeName = rt.String()
+	}
+	if spec.TypeName == "" {
+		spec.TypeName = fmt.Sprintf("unknown<ns=%s>", storageNs)
+	}
+
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("doc %q: marshal PersistentDocSpec: %w", storageNs, err)
+	}
+	layer := storageDisk
+	if spec.Mem {
+		layer = storageMem
+	}
+	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		_, _, setErr := tx.Set(metaKey, string(raw), nil)
+		return setErr
+	}); err != nil {
+		return fmt.Errorf("doc %q: persist %s: %w", storageNs, metaKey, err)
+	}
+
+	db.docRegSpec[storageNs] = spec
+	db.docRegType[storageNs] = spec.TypeName
+	slog.Debug("doc schema registered",
+		"namespace", spec.Namespace, "storage_ns", storageNs,
+		"mem", spec.Mem, "keyattrs", spec.KeyAttrs,
+		"ttl", spec.TTL, "type", spec.TypeName)
+	return nil
+}
+
+// registerSchemas eagerly registers a batch of Schema values at server boot.
+// Each schema value is normally the zero-value of a ~string Document alias
+// (e.g. UserDoc("")). It enforces the ~string guard, detects namespace
+// conflicts, writes PersistentDocSpec to "_doc_:<storage_ns>" on the correct
+// storage layer (disk or memory-layer for Mem=true docs), and is idempotent:
+// re-registering the identical schema is a no-op.
+func (db *DB) registerSchemas(schemas ...x.Schema) error {
+	for _, sch := range schemas {
+		rt := reflect.TypeOf(sch)
+		spec := x.PersistentDocSpec{
+			Namespace: sch.Namespace(),
+			Mem:       sch.Mem(),
+			KeyAttrs:  append([]string(nil), sch.KeyAttrs()...),
+			TTL:       sch.TTL(),
+		}
+		if rt != nil {
+			spec.TypeName = rt.String()
+		}
+		if err := db.registerDocFromSpec(spec, rt); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

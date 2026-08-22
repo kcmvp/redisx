@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,9 +27,12 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const clientTestServerAddr = "127.0.0.1:36380"
+var clientTestServerAddr string
+
 const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestAuthLimit = 50
+
+var cliServerSeedOnce sync.Once
 
 type testUserDoc string
 
@@ -82,21 +86,28 @@ func (s *ClientTestSuite) SetupSuite() {
 	idxProbeBucket := x.RawIndex(probeStripped+"_bucket", probeKP, "bucket")
 	idxProbeSparse := x.RawIndex(probeStripped+"_sparse_amt", probeKP, "sparse_amt")
 
-	db := server.Start(
-		clientTestServerAddr,
-		dbPath,
-		x.Idx[testUserDoc]("age", "*", "age"),
-		x.Idx[testUserDoc]("email", "*", "email"),
-		idxProbeScore,
-		idxProbeBucket,
-		idxProbeSparse,
-	)
-	s.Require().NotNil(db)
-	s.Require().NoError(db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50"))
-
-	for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
-		s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
+	cfg := &server.Config{
+		DataPath: dbPath,
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
 	}
+	clientTestServerAddr = cfg.Admin.Addr()
+	db := server.StartWithConfig(cfg)
+	s.Require().NotNil(db)
+
+	cliServerSeedOnce.Do(func() {
+		s.Require().NoError(db.CreateIndex(x.Idx[testUserDoc]("age", "*", "age")))
+		s.Require().NoError(db.CreateIndex(x.Idx[testUserDoc]("email", "*", "email")))
+		s.Require().NoError(db.CreateIndex(idxProbeScore))
+		s.Require().NoError(db.CreateIndex(idxProbeBucket))
+		s.Require().NoError(db.CreateIndex(idxProbeSparse))
+		s.Require().NoError(db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50"))
+
+		for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
+			s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
+		}
+	})
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -107,6 +118,13 @@ func (s *ClientTestSuite) SetupSuite() {
 		time.Sleep(50 * time.Millisecond)
 	}
 	s.T().Fatal("test server did not become ready")
+}
+
+func (s *ClientTestSuite) TearDownSuite() {
+	disconnect()
+	server.Stop()
+	cliServerSeedOnce = sync.Once{}
+	clientTestServerAddr = ""
 }
 
 func TestClientSuite(t *testing.T) {
@@ -695,9 +713,48 @@ func runEmbedSignalChild(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	dbPath := filepath.Join(t.TempDir(), "redisx.db")
-	db := server.Start(addr, dbPath)
+
+	adminHost, adminPortStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("invalid REDISX_CHILD_ADDR=%q: %v", addr, err)
+	}
+	if adminHost == "" {
+		adminHost = "127.0.0.1"
+	}
+	adminPort, pErr := strconv.Atoi(adminPortStr)
+	if pErr != nil {
+		t.Fatalf("invalid admin port %q: %v", adminPortStr, pErr)
+	}
+	// Atomically claim a free App port, then release it and immediately hand
+	// over both App and Admin ports to StartWithConfig for the actual bind.
+	// The App port we just bound is definitely not in active LISTEN state (we
+	// were the last ones to have it open); the Admin port was chosen by the
+	// parent using the same bind+close dance so redcon.ListenAndServe (which
+	// sets SO_REUSEADDR) will re-bind through TIME_WAIT successfully.
+	var appPort int
+	claimedApp, lErr := net.Listen("tcp", net.JoinHostPort(adminHost, "0"))
+	if lErr != nil {
+		t.Fatalf("allocate free app port: %v", lErr)
+	}
+	appPort = claimedApp.Addr().(*net.TCPAddr).Port
+	if appPort == adminPort {
+		_ = claimedApp.Close()
+		claimedApp, lErr = net.Listen("tcp", net.JoinHostPort(adminHost, "0"))
+		if lErr != nil {
+			t.Fatalf("re-allocate free app port (collision): %v", lErr)
+		}
+		appPort = claimedApp.Addr().(*net.TCPAddr).Port
+	}
+	_ = claimedApp.Close()
+
+	cfg := &server.Config{
+		DataPath: dbPath,
+		App:      server.AppConfig{Bind: adminHost, Port: appPort},
+		Admin:    server.AdminConfig{Bind: adminHost, Port: adminPort},
+	}
+	db := server.StartWithConfig(cfg)
 	if db == nil {
-		t.Fatal("server.Start() returned nil")
+		t.Fatalf("server.StartWithConfig() returned nil; appPort=%d adminPort=%d — likely a bind race, retry", appPort, adminPort)
 	}
 
 	if err := ConnectEmbed(addr); err != nil {
@@ -2024,14 +2081,16 @@ func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
 
 func BenchmarkSetNoHooks(b *testing.B) {
 	resetHooks()
-	db := server.Start(
-		clientTestServerAddr,
-		filepath.Join(b.TempDir(), "redisx-bench.db"),
-	)
+	cfg := &server.Config{
+		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+	}
+	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2057,14 +2116,16 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	AddObserverHook(func(key string, value []byte) {})
 	AddObserverHook(func(key string, value []byte) {})
 
-	db := server.Start(
-		clientTestServerAddr,
-		filepath.Join(b.TempDir(), "redisx-bench.db"),
-	)
+	cfg := &server.Config{
+		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+	}
+	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2090,14 +2151,16 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 		return nil
 	})
 
-	db := server.Start(
-		clientTestServerAddr,
-		filepath.Join(b.TempDir(), "redisx-bench.db"),
-	)
+	cfg := &server.Config{
+		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+	}
+	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2125,14 +2188,16 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 		return out, nil
 	})
 
-	db := server.Start(
-		clientTestServerAddr,
-		filepath.Join(b.TempDir(), "redisx-bench.db"),
-	)
+	cfg := &server.Config{
+		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+	}
+	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthKeyPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)

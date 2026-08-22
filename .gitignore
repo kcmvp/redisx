@@ -31,4 +31,5 @@ go.work.sum
 *.txt
 *.db
 fr/*.md
+rdxm
 

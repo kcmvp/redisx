@@ -147,3 +147,139 @@ func ValidateIdxName[D x.Document](idxName string) (string, error) {
 	}
 	return x.IdxFullName[D](idxName), nil
 }
+
+// ——————————————————— §11 SSoT Naming Helpers (Non-Generic, Server & Shell Shared) ———————————————————
+
+// SplitStorageKey splits a fully-qualified storage key (storageNs:pkSuffix or
+// just storageNs with no pk suffix) into its two canonical components.
+//
+// Input forms accepted:
+//   - "user"                  → ("user", "", nil)      — namespace-only, no pk
+//   - "user:acme_0100"        → ("user", "acme_0100", nil)  — namespace : pk-suffix
+//   - "_m_user:tenant5_id99"  → ("_m_user", "tenant5_id99", nil)  — mem prefix included as part of storageNs
+//   - "_doc_user"             → ("_doc_user", "", nil)        — internal meta key (no separator)
+//
+// It returns an error if the key is empty. It does NOT reject internal
+// meta namespaces (callers use [IsInternalStorageNs] for that).
+//
+// NOTE: This is the ONE AND ONLY place a storage key is split on ":". No
+// other file may ad-hoc strings.Split(k, ":"). This is the SSoT.
+func SplitStorageKey(storageKey string) (storageNs string, pkSuffix string, err error) {
+	if storageKey == "" {
+		return "", "", fmt.Errorf("empty storage key")
+	}
+	sep := contract.StorageKeySeparator
+	idx := strings.Index(storageKey, sep)
+	if idx < 0 {
+		return storageKey, "", nil
+	}
+	return storageKey[:idx], storageKey[idx+len(sep):], nil
+}
+
+// IsInternalStorageNs reports whether the given storage namespace (the first
+// component returned by [SplitStorageKey]) refers to an internal meta
+// keyspace reserved by redisx itself, i.e. one of:
+//
+//   - _doc_*   (Doc registry metadata)
+//   - _idx_*   (Index registry metadata)
+//   - _auth_*  (Auth key metadata)
+//
+// NOTE: The memory-layer prefix "_m_" is NOT treated as internal here —
+// "_m_user" is a valid business document namespace routed to the mem layer,
+// and Strict Gate still requires it to be registered. "_m_" is a layer
+// marker, not an internal meta-keyspace in the same sense as _doc_/_idx_/_auth_.
+//
+// This is the SSoT for "internal ns vs business ns". Strict Gate's
+// "No Table = No Op" rule should apply only when this returns false.
+func IsInternalStorageNs(storageNs string) bool {
+	if storageNs == "" {
+		return false
+	}
+	return strings.HasPrefix(storageNs, contract.DocMetaNsPrefix) ||
+		strings.HasPrefix(storageNs, contract.IdxMetaNsPrefix) ||
+		strings.HasPrefix(storageNs, contract.AuthNsPrefix)
+}
+
+// StripMemPrefix strips the leading "_m_" layer marker from a storage
+// namespace or storage key IF present, returning the logical business
+// namespace without the mem-layer hint. If the prefix is absent, the input
+// is returned unchanged.
+//
+// Examples:
+//   - StripMemPrefix("_m_user")       → "user"
+//   - StripMemPrefix("_m_user:abc")   → "user:abc"  (also works for full keys)
+//   - StripMemPrefix("user")          → "user"
+//   - StripMemPrefix("_doc_user")     → "_doc_user"  (_doc_ is NOT a mem prefix, preserved)
+//
+// This is the SSoT for "_m_ stripping". Strict Gate ns resolution should
+// call this before looking up the DocRegistry, so both disk-layer "user" and
+// mem-layer "_m_user" resolve to the same registered Doc.
+func StripMemPrefix(s string) string {
+	if strings.HasPrefix(s, contract.MemNsPrefix) {
+		return s[len(contract.MemNsPrefix):]
+	}
+	return s
+}
+
+// ExtractPKSuffixes splits a composite PK suffix string (joined with
+// contract.KeyAttrsJoin = "_") back into its individual attribute segments,
+// preserving order. Returns a nil slice (not empty) for empty input so
+// range-callers don't need to len-check additionally for nil vs empty.
+//
+// Examples:
+//   - ExtractPKSuffixes("acme_0100")          → ["acme", "0100"]
+//   - ExtractPKSuffixes("just_one")           → ["just_one"]
+//   - ExtractPKSuffixes("tenant5_id99")       → ["tenant5", "id99"]
+//   - ExtractPKSuffixes("")                   → nil, nil
+//
+// This is the SSoT for splitting pk-suffix components. No ad-hoc
+// strings.Split(s, "_") for this job anywhere else.
+//
+// NOTE: We intentionally do NOT perform URL-decoding / unescaping here. If
+// individual pk values are allowed to contain "_" literally (rare), the
+// storage contract should escape them first at write time (future work);
+// MVP SSoT guarantees only the split delimiter location, not value escaping.
+func ExtractPKSuffixes(pkSuffix string) ([]string, error) {
+	if pkSuffix == "" {
+		return nil, nil
+	}
+	return strings.Split(pkSuffix, contract.KeyAttrsJoin), nil
+}
+
+// ParseIndexFullName parses a fully-qualified (lowercase) registered index
+// name like "user_age" or "_m_cache_hitratio" back into its two logical
+// components: owner storageNs (also lowercased, mem-prefix preserved) and
+// the index's logical (short) name.
+//
+// Formally, for registered index name = JoinKeyAttrs(lower(storageNs), lower(logical)):
+//
+//	ParseIndexFullName(JoinKeyAttrs(ns, log)) == (ns, log, nil)
+//
+// Examples:
+//   - ParseIndexFullName("user_age")           → ("user",       "age",       nil)
+//   - ParseIndexFullName("_m_cache_hitratio")  → ("_m_cache",   "hitratio",  nil)
+//   - ParseIndexFullName("a_b_c")              → ("a_b",        "c",         nil)   // last "_" is separator; multi-underscore owner ns handled correctly
+//   - ParseIndexFullName("no_underscores")     → ("", "", error) // fails: no join char
+//   - ParseIndexFullName("_just_prefix_")      → ("", "", error) // fails: empty suffix part
+//
+// This is the SSoT for index-name decomposition. !DROPINDEX UX flow and
+// registry lookup must use this instead of hand-written SplitN(..., "_", 2).
+func ParseIndexFullName(fullIndexName string) (ownerStorageNs string, logicalIdxName string, err error) {
+	if fullIndexName == "" {
+		return "", "", fmt.Errorf("empty index full name")
+	}
+	join := contract.KeyAttrsJoin
+	idx := strings.LastIndex(fullIndexName, join)
+	if idx < 0 {
+		return "", "", fmt.Errorf("index full name %q has no join separator %q (expected shape <storageNs>%s<logical>)", fullIndexName, join, join)
+	}
+	ownerNs := fullIndexName[:idx]
+	logical := fullIndexName[idx+len(join):]
+	if ownerNs == "" {
+		return "", "", fmt.Errorf("index full name %q has empty owner storage namespace", fullIndexName)
+	}
+	if logical == "" {
+		return "", "", fmt.Errorf("index full name %q has empty logical suffix", fullIndexName)
+	}
+	return ownerNs, logical, nil
+}

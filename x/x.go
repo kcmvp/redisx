@@ -237,29 +237,21 @@ func Set[T ScalarType](path string, value T) Mutation {
 
 // SECTION: Document And Index
 
-// Document declares the metadata contract for one JSON document type.
+// Schema declares the runtime-passable metadata contract for one JSON document
+// type. A zero-value of your string-alias type (e.g. UserDoc("")) fully
+// implements Schema — the receiver is never read, only used for interface
+// dispatch.
 //
-// It defines:
-//   - the storage key prefix
-//   - the storage layer
-//   - which JSON attributes form the key suffix
-//   - the raw JSON used to derive one concrete key
-//   - the default TTL used by typed writes
+// Schema is intentionally free of type elements (no ~string) so it can be used
+// as a value type: variadic params, slices, fields all work.
 //
 // Example:
 //
-//	type UserDoc string
-//
-//	func (UserDoc) Namespace() string  { return "user" }
-//	func (UserDoc) Mem() bool          { return false }
-//	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
-//	func (u UserDoc) RawJSON() string  { return string(u) }
-//	func (UserDoc) TTL() time.Duration { return time.Hour }
-//
-// Documents are JSON string aliases. The `~string` constraint guarantees typed
-// helpers can cast loaded raw JSON payloads back to the concrete document type.
-type Document interface {
-	~string
+//	server.Start("redisx.yaml",
+//	    UserDoc(""),
+//	    OrderDoc(""),
+//	)
+type Schema interface {
 	// Namespace returns the key prefix of this document type, such as "user".
 	//
 	// Final keys are stored as:
@@ -271,24 +263,109 @@ type Document interface {
 	// Mem reports whether this document type lives in the memory-only layer.
 	//
 	// When true, the final key is automatically prefixed with "_m_" before
-	// [Document.Namespace], so:
+	// [Schema.Namespace], so:
 	//
 	//	user:1   -> _m_user:1
 	Mem() bool
-	// KeyAttrs returns the ordered JSON paths used to derive the key suffix from
-	// [Document.RawJSON], such as []string{"tenant", "id"}.
+	// KeyAttrs returns the ordered JSON paths used to derive the key suffix,
+	// such as []string{"tenant", "id"}.
 	//
 	// Their resolved values are joined with ":" in order.
 	KeyAttrs() []string
-	// RawJSON returns the raw JSON payload of this document value.
-	//
-	// [StorageKey] reads it together with [Document.KeyAttrs] to build one full
-	// storage key for the current document instance.
-	RawJSON() string
 	// TTL returns the default TTL used by typed write helpers.
 	//
 	// It does not participate in key derivation.
 	TTL() time.Duration
+}
+
+// Document declares the full generic-constraint contract for one JSON document
+// type. It extends Schema with ~string (so typed helpers can cast loaded raw
+// JSON payloads back to the concrete alias type) and RawJSON (needed to build
+// storage keys from a populated payload instance).
+//
+// A string-alias type that implements Document automatically satisfies Schema
+// as well — there is zero extra code to write when defining a new document.
+//
+// Example:
+//
+//	type UserDoc string
+//
+//	func (UserDoc) Namespace() string  { return "user" }
+//	func (UserDoc) Mem() bool          { return false }
+//	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
+//	func (u UserDoc) RawJSON() string  { return string(u) }
+//	func (UserDoc) TTL() time.Duration { return time.Hour }
+type Document interface {
+	~string
+	Schema
+	// RawJSON returns the raw JSON payload of this document value.
+	//
+	// [StorageKey] reads it together with [Schema.KeyAttrs] to build one full
+	// storage key for the current document instance.
+	RawJSON() string
+}
+
+// PersistentDocSpec is the byte-for-byte on-disk representation of a document
+// schema stored at storage key "_doc_:<storage_namespace>".
+//
+// It is intentionally the SSoT for the registry: both eager registration at
+// boot via Start(schemas...) and dynamic runtime registration via
+// db.RegisterDocFromSpec produce identical PersistentDocSpec values and write
+// them to the same _doc_:* keys.
+type PersistentDocSpec struct {
+	Namespace string        `json:"namespace"`
+	Mem       bool          `json:"mem"`
+	KeyAttrs  []string      `json:"key_attrs"`
+	TTL       time.Duration `json:"ttl_ns"`
+	TypeName  string        `json:"type_name"`
+}
+
+// StorageNs returns the full storage namespace prefix used to persist both
+// the _doc_ schema key and all data rows of this document type. It equals
+// Namespace when Mem=false; contract.MemNsPrefix+Namespace when Mem=true.
+func (p PersistentDocSpec) StorageNs() string {
+	if p.Mem {
+		return contract.MemNsPrefix + p.Namespace
+	}
+	return p.Namespace
+}
+
+// PersistentIndexSpec is the byte-for-byte on-disk representation of one JSON
+// index, stored at storage key "_idx_:<full_index_name>".
+//
+// <full_index_name> matches the SSoT shape produced by [IdxFullName]:
+//
+//	[_m_:]<namespace>_<logical>
+//
+// It is the single source of truth for the index registry. Indexes are no
+// longer declared as Go parameters to server.Start; instead they are created
+// at runtime via the admin CLI (regidx command) which writes a
+// PersistentIndexSpec. Subsequent server starts scan all "_idx_:*" keys and
+// rebuild BuntDB native indexes on the correct storage layer (disk or
+// memory-layer) according to OwnerMem.
+type PersistentIndexSpec struct {
+	// FullName is the fully-qualified registered index name; equals the key
+	// suffix "_idx_:<FullName>". It is persisted as a field for symmetry with
+	// the IdxFullName helper (so the spec is self-describing).
+	FullName string `json:"full_name"`
+	// OwnerNs is the storage namespace of the owning document type:
+	// "user" for disk-doc, "_m_cache" for a mem-doc, etc. Equivalent to
+	// ParseIndexFullName(FullName) first return value.
+	OwnerNs string `json:"owner_ns"`
+	// Logical is the user-supplied short name such as "age" or "email".
+	Logical string `json:"logical"`
+	// OwnerMem reports whether the owning document type lives in the
+	// in-memory layer. Together with OwnerNs this lets the startup rebuild
+	// step route the BuntDB index onto db.disk or db.mem without doing a
+	// prefix dance on FullName.
+	OwnerMem bool `json:"owner_mem"`
+	// KeyPattern is the full storage-key glob used by BuntDB for this
+	// index, e.g. "user:*" or "_m_cache:*".
+	KeyPattern string `json:"key_pattern"`
+	// Path is the JSON path normalized by the "dots → underscores" rule,
+	// e.g. "contact_email" for the original "contact.email". This value is
+	// passed verbatim to buntdb.IndexJSON(Path).
+	Path string `json:"path"`
 }
 
 type documentMeta struct {
@@ -426,10 +503,10 @@ func StorageKeyValue[D Document](v string) string {
 // The returned key uses the reserved "_m_" prefix. If key already uses that
 // prefix, it is returned unchanged.
 func MemKey(key string) string {
-	if strings.HasPrefix(key, contract.MemKeyPrefix) {
+	if strings.HasPrefix(key, contract.MemNsPrefix) {
 		return key
 	}
-	return contract.MemKeyPrefix + key
+	return contract.MemNsPrefix + key
 }
 
 // Index describes one registered JSON index definition.

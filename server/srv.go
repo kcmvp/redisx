@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,10 +40,69 @@ const (
 	cmdClient          = "client"
 )
 
+func startWithConfig(cfg *Config, schemas []x.Schema) *DB {
+	appAddr := cfg.App.Addr()
+	adminAddr := cfg.Admin.Addr()
+	appAuthLabel := "unset"
+	adminAuthLabel := "unset"
+	if cfg.App.Auth != "" {
+		appAuthLabel = "set"
+	}
+	if cfg.Admin.Auth != "" {
+		adminAuthLabel = "set"
+	}
+	slog.Info("redisx dual-port config",
+		"app_addr", appAddr,
+		"admin_addr", adminAddr,
+		"app_auth", appAuthLabel,
+		"admin_auth", adminAuthLabel,
+		"doc_schemas", len(schemas),
+	)
+
+	watchShutdownSignals()
+	var db *DB
+	srvOnce.Do(func() {
+		opened, ok := onceSetupDB(cfg.DataPath, schemas)
+		if !ok {
+			return
+		}
+		db = opened
+	})
+
+	// Apply runtime knobs (auth keys + TCP listeners) on EVERY invocation of
+	// startWithConfig, not just the first one that wins srvOnce.Do. The DB
+	// handle (opened storage + registry maps) is intentionally singleton via
+	// srvOnce, but each table-driven subtest / harness may legitimately want
+	// its own pair of distinct free ports and its own app/admin auth
+	// configuration so that Gate0 assertions against "the configured user
+	// auth for this port role" operate on the values the caller actually
+	// passed — not the values captured by whichever goroutine won the
+	// srvOnce.Do race in a parallel t.Run() matrix.
+	ConfigureAuthKeys(cfg.App.Auth, cfg.Admin.Auth)
+	if db == nil {
+		globalMu.RLock()
+		db = currentDB
+		globalMu.RUnlock()
+	}
+	if db != nil {
+		var ps redcon.PubSub
+		go bootOneListener(portRoleApp, appAddr, db, &ps)
+		go bootOneListener(portRoleAdmin, adminAddr, db, &ps)
+		time.Sleep(10 * time.Millisecond)
+	}
+	return db
+}
+
 var (
 	cmdUpdate      = strings.ToLower(proto.CmdUpdate)
 	cmdSearchIndex = strings.ToLower(proto.CmdSearchIndex)
 	cmdSearchKey   = strings.ToLower(proto.CmdSearchKey)
+	cmdRegDoc      = strings.ToLower(proto.CmdRegisterDoc)
+	cmdLsDoc       = strings.ToLower(proto.CmdListDocs)
+	cmdDesDoc      = strings.ToLower(proto.CmdDescribeDoc)
+	cmdLsIdx       = strings.ToLower(proto.CmdListIndexes)
+	cmdRegIdx      = strings.ToLower(proto.CmdRegisterIndex)
+	cmdDelIdx      = strings.ToLower(proto.CmdDropIndex)
 )
 
 type commandHandler func(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
@@ -68,6 +126,14 @@ var commandRegistry = map[string]commandHandler{
 	cmdUpdate:      updateCommand,
 	cmdSearchIndex: searchIndexCommand,
 	cmdSearchKey:   searchKeyCommand,
+	// admin-only: Doc family (*doc suffix)
+	cmdRegDoc: regDocCommand,
+	cmdLsDoc:  lsDocCommand,
+	cmdDesDoc: desDocCommand,
+	// admin-only: Index family (*idx suffix)
+	cmdLsIdx:  lsIdxCommand,
+	cmdRegIdx: regIdxCommand,
+	cmdDelIdx: delIdxCommand,
 }
 
 var (
@@ -78,7 +144,7 @@ var (
 	authKeyMaxConns   = map[string]int{}
 	authKeyConnCounts = map[string]int{}
 	serverMu          sync.Mutex
-	serverListener    net.Listener
+	serverListeners   = map[portRole]net.Listener{}
 	shutdownOnce      sync.Once
 	shutdownMu        sync.Mutex
 	shutdownSignalCh  chan os.Signal
@@ -99,26 +165,26 @@ func getOsExitFn() func(int) {
 	return osExitFn
 }
 
-func getListenAndServeFn() func(string, func(redcon.Conn, redcon.Command), func(redcon.Conn) bool, func(redcon.Conn, error)) error {
+func getListenAndServeFn() func(portRole, string, func(redcon.Conn, redcon.Command), func(redcon.Conn) bool, func(redcon.Conn, error)) error {
 	globalMu.RLock()
 	defer globalMu.RUnlock()
 	return listenAndServeFn
 }
 
 func authLimitStoreKey(key string) string {
-	return contract.AuthKeyPrefix + contract.StorageKeySeparator + key
+	return contract.AuthNsPrefix + contract.StorageKeySeparator + key
 }
 
 func loadAuthKeyLimits(db *DB) error {
 	limits := map[string]int{}
 
-	keysRes := db.Keys(contract.AuthKeyPrefix + contract.StorageKeySeparator + "*")
+	keysRes := db.Keys(contract.AuthNsPrefix + contract.StorageKeySeparator + "*")
 	if keysRes.IsError() {
 		return keysRes.Error()
 	}
 
 	for _, storeKey := range keysRes.MustGet() {
-		key := strings.TrimPrefix(storeKey, contract.AuthKeyPrefix+contract.StorageKeySeparator)
+		key := strings.TrimPrefix(storeKey, contract.AuthNsPrefix+contract.StorageKeySeparator)
 		valRes := db.Get(storeKey)
 		if valRes.IsError() {
 			if errors.Is(valRes.Error(), buntdb.ErrNotFound) {
@@ -178,6 +244,12 @@ func releaseAuthConn(key string) {
 	if key == "" || key == internalAuthKey {
 		return
 	}
+	appAuth, adminAuth, configured := getAuthConfig()
+	if configured {
+		if (appAuth != "" && key == appAuth) || (adminAuth != "" && key == adminAuth) {
+			return
+		}
+	}
 
 	authStateMu.Lock()
 	defer authStateMu.Unlock()
@@ -193,7 +265,17 @@ func acquireAuthConn(db *DB, key string) error {
 	if key == internalAuthKey {
 		return nil
 	}
-
+	// Startup-level auth keys (--auth / --admin-auth) are in-memory only,
+	// never persisted to the auth NS rows. They don't participate in the
+	// per-key connection-limit accounting — so Gate0 can still validate that
+	// a client authenticated with the RIGHT key for the RIGHT port and emit
+	// WRONGPASS on a port-role mismatch.
+	appAuth, adminAuth, configured := getAuthConfig()
+	if configured {
+		if (appAuth != "" && key == appAuth) || (adminAuth != "" && key == adminAuth) {
+			return nil
+		}
+	}
 	limit, ok, err := refreshAuthLimit(db, key)
 	if err != nil {
 		return err
@@ -216,78 +298,9 @@ func acquireAuthConn(db *DB, key string) error {
 	return nil
 }
 
-func acceptCon(conn redcon.Conn) bool {
-	conn.SetContext("")
-	return true
-}
-
-// PrivateIPs returns all non-loopback private IPs on the current host, ordered
-// by preferred LAN usage: 192.168/16 first, then 10/8, then 172.16/12, then
-// any remaining private addresses.
-func PrivateIPs() ([]string, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil, err
-	}
-	return collectPrivateIPs(addrs), nil
-}
-
-func collectPrivateIPs(addrs []net.Addr) []string {
-	seen := map[string]struct{}{}
-	ips := make([]string, 0, len(addrs))
-
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		default:
-			continue
-		}
-
-		if ip == nil || ip.IsLoopback() || !ip.IsPrivate() {
-			continue
-		}
-		if ip4 := ip.To4(); ip4 != nil {
-			ip = ip4
-		}
-
-		s := ip.String()
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		ips = append(ips, s)
-	}
-
-	sort.Slice(ips, func(i, j int) bool {
-		li, ri := privateIPRank(ips[i]), privateIPRank(ips[j])
-		if li != ri {
-			return li < ri
-		}
-		return ips[i] < ips[j]
-	})
-	return ips
-}
-
-func privateIPRank(s string) int {
-	ip := net.ParseIP(s)
-	if ip4 := ip.To4(); ip4 != nil {
-		switch {
-		case ip4[0] == 192 && ip4[1] == 168:
-			return 0
-		case ip4[0] == 10:
-			return 1
-		case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
-			return 2
-		}
-	}
-	return 3
-}
-
 func closeCon(conn redcon.Conn, err error) {
+	clearConnPortRole(conn)
+
 	ctx := conn.Context()
 	var prevAuth string
 	if ctx != nil {
@@ -300,27 +313,28 @@ func closeCon(conn redcon.Conn, err error) {
 	current := authKeyConnCounts[prevAuth]
 	authStateMu.Unlock()
 
+	role := connPortRole(conn)
 	if err != nil {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current, "error", err)
+		slog.Info("connection closed", "port_role", role.String(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current, "error", err)
 	} else {
-		slog.Info("connection closed", "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current)
+		slog.Info("connection closed", "port_role", role.String(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current)
 	}
 }
-func listenAndServeWithStop(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+
+func listenAndServeWithStop(role portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
 	serverMu.Lock()
-	serverListener = ln
+	serverListeners[role] = ln
 	serverMu.Unlock()
 
-	// cleanup on exit
 	defer func() {
 		serverMu.Lock()
-		if serverListener == ln {
-			serverListener = nil
+		if cur, ok := serverListeners[role]; ok && cur == ln {
+			delete(serverListeners, role)
 		}
 		serverMu.Unlock()
 	}()
@@ -360,7 +374,7 @@ func watchShutdownSignals() {
 		shutdownMu.Unlock()
 
 		signalNotifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
-		go handleShutdownSignals(sigCh, doneCh, stop)
+		go handleShutdownSignals(sigCh, doneCh, Stop)
 	})
 }
 
@@ -372,14 +386,56 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 
 	cmdName := strings.ToLower(string(cmd.Args[0]))
 
-	// Enforce strict auth: only AUTH is allowed before a connection is authenticated.
+	// ── 4-layer Admin Gate framework (gate.go) ──────────────────────────────
+	// Any gate returning reject=true has already written a RESP error on the
+	// connection, so we must return immediately without touching dispatcher
+	// or performing further AUTH checks. Order is strictly:
+	//   Gate 0 auth ↔ port-role match (MVP identity, D3 enabled)
+	//   Gate 1 command-word allowlist (app-port rejects ADMIN words, D3 enabled)
+	//   Gate 2 mTLS / source-IP (MVP pass-through, Caddy+mTLS future)
+	//   Gate 3 argc shape (proto.Registry SSoT — 6 ADMIN cmds already validated)
+	if gate0AuthAndPortRoleMatch(conn, cmdName) {
+		return
+	}
+	if gate1CommandWordByPortRole(conn, cmdName) {
+		return
+	}
+	if gate2MTLSAndSourceIP(conn, cmdName) {
+		return
+	}
+	if gate3ArgcShape(conn, cmd) {
+		return
+	}
+
+	// Enforce strict auth: only AUTH/HELLO/CLIENT are allowed before a
+	// connection is authenticated. Internal per-process bootstrap auth key
+	// (used by embedded client ↔ embedded server traffic) always bypasses
+	// this check entirely because it sets conn.Context during the AUTH
+	// handshake. For user-facing roles (app / admin), NOAUTH fires only
+	// when the corresponding port's configured auth key is non-empty —
+	// "no user passwords configured" means dev-mode anonymous access is
+	// permitted so the rdxm REPL works without `-a` / `--admin-auth` flags.
 	if cmdName != cmdAuth && cmdName != cmdHello && cmdName != cmdClient {
 		connAuthKey, _ := conn.Context().(string)
 		if conn.Context() == nil || connAuthKey == "" {
-			conn.WriteError("NOAUTH authentication required")
-			slog.Warn("unauthenticated command attempt", "remote", conn.RemoteAddr(), "cmd", cmdName)
-			_ = conn.Close()
-			return
+			appAuth, adminAuth, _ := getAuthConfig()
+			role := connPortRole(conn)
+			var authRequired bool
+			switch role {
+			case portRoleAdmin:
+				authRequired = adminAuth != ""
+			case portRoleApp:
+				authRequired = appAuth != ""
+			default:
+				authRequired = (appAuth != "") || (adminAuth != "")
+			}
+			if authRequired {
+				conn.WriteError("NOAUTH authentication required")
+				slog.Warn("unauthenticated command attempt on port that requires AUTH",
+					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String())
+				_ = conn.Close()
+				return
+			}
 		}
 	}
 
@@ -390,10 +446,13 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	}
 }
 
-func stop() error {
+func Stop() error {
 	serverMu.Lock()
-	ln := serverListener
-	serverListener = nil
+	listeners := make([]net.Listener, 0, len(serverListeners))
+	for _, ln := range serverListeners {
+		listeners = append(listeners, ln)
+	}
+	clear(serverListeners)
 	serverMu.Unlock()
 
 	shutdownMu.Lock()
@@ -411,9 +470,12 @@ func stop() error {
 	}
 
 	var err error
-	if ln != nil {
-		err = ln.Close()
-		// Sleep a bit more to ensure TCP TIME_WAIT is not an issue locally during rapid test restarts.
+	for _, ln := range listeners {
+		if closeErr := ln.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	if len(listeners) > 0 {
 		time.Sleep(50 * time.Millisecond)
 	}
 
@@ -439,102 +501,156 @@ func stop() error {
 	return err
 }
 
-// Start initializes and starts the Redis-compatible server on the given
-// address.
+// Start boots a redisx dual-port server using the redisx.yaml configuration
+// file located in the current working directory, and eagerly registers any
+// passed doc schemas before listeners accept traffic.
 //
-// redisx always opens two underlying BuntDB instances:
-//   - one primary layer from dbPath
-//   - one dedicated memory-only layer for keys prefixed with "_m_"
+// Call site idiom (zero-value string alias of your Document types):
 //
-// dbPath configures only the primary layer. Use one real database file path
-// such as "/tmp/redisx.db" for on-disk persistence. Missing parent
-// directories are created automatically, and the database file itself is
-// created on first open when it does not already exist. Directory paths are
-// rejected. The special value ":memory:" is also rejected because redisx
-// already has a dedicated memory-only layer for "_m_" keys.
+//	db := server.Start(
+//	    UserDoc(""),
+//	    OrderDoc(""),
+//	)
 //
-// This function returns immediately after the server has successfully started
-// binding to the port, as the server runs in a background goroutine. The
-// service itself is long-running and will remain active until interrupted by a
-// system signal (SIGINT/SIGTERM) or a programmatic shutdown.
-func Start(address string, dbPath string, indexes ...x.Index) *DB {
-	watchShutdownSignals()
-
-	srvOnce.Do(func() {
-		db := openDB(dbPath)
-		if db == nil {
-			slog.Error("failed to open storage")
-			if exitFn := getOsExitFn(); exitFn != nil {
-				exitFn(1)
-			}
-			return
+// Schemas are registered exactly once per process lifetime, and written to
+// the "_doc_:<storage_ns>" SSoT keys on the matching storage layer (disk or
+// in-memory, according to Schema.Mem). Conflicting namespace registrations
+// cause a hard process exit with a descriptive error.
+//
+// When redisx.yaml is missing or unreadable (except YAML syntax errors) the
+// zero-config defaults kick in: App 7379 on auto-selected RFC1918 bind,
+// Admin 7381 on 127.0.0.1, and database file at ~/.redisx/redisx.db.
+//
+// To supply a Config struct directly (e.g. from tests or harnesses) instead
+// of loading a file, use StartWithConfig.
+func Start(schemas ...x.Schema) *DB {
+	cfg, err := LoadConfig("redisx.yaml")
+	if err != nil {
+		slog.Error("redisx startup failed", "phase", "load_config", "error", err)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
 		}
+		return nil
+	}
+	return StartWithConfig(cfg, schemas...)
+}
 
+// StartWithConfig boots a redisx dual-port server from a Go-native Config
+// struct and eagerly registers any passed doc schemas before listeners
+// accept traffic. It is the single Go-API counterpart to Start (which loads
+// redisx.yaml from disk).
+//
+// Config is always run through Config.validate: defaults are populated,
+// security gates (equal auth / non-loopback admin / port range / duplicate
+// ports) trigger a hard exit, and the database path is created and probed
+// for writability before any listeners open. Passing nil is equivalent to
+// the empty Config{} (pure system defaults).
+//
+// On boot, redisx automatically rebuilds its BuntDB index registry by
+// scanning all "_idx_:*" meta keys stored on disk and in the volatile
+// mem-layer. Indexes are NO LONGER declared as Go parameters passed to any
+// Start variant; they must be created via the admin CLI (regidx command).
+//
+// Example (harness-style direct embed):
+//
+//	cfg := &server.Config{
+//	    App: server.AppConfig{Bind: "127.0.0.1", Port: 7379},
+//	    Admin: server.AdminConfig{Bind: "127.0.0.1", Port: 7381, DangerBindAny: true},
+//	    DataPath: "/tmp/redisx.test.db",
+//	}
+//	db := server.StartWithConfig(cfg, UserDoc(""))
+//	_ = db
+//	defer server.Stop()
+func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	icfg := &Config{
+		App:      cfg.App,
+		Admin:    cfg.Admin,
+		DataPath: cfg.DataPath,
+		Logging:  cfg.Logging,
+	}
+	if err := icfg.validate(""); err != nil {
+		slog.Error(err.Error())
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return nil
+	}
+	return startWithConfig(icfg, schemas)
+}
+
+func onceSetupDB(dbPath string, schemas []x.Schema) (*DB, bool) {
+	db := openDB(dbPath)
+	if db == nil {
+		slog.Error("failed to open storage")
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return nil, false
+	}
+	globalMu.Lock()
+	currentDB = db
+	globalMu.Unlock()
+	if err := loadAuthKeyLimits(db); err != nil {
+		slog.Error("failed to load auth key limits", "error", err)
+		_ = db.Close()
 		globalMu.Lock()
-		currentDB = db
+		currentDB = nil
 		globalMu.Unlock()
-
-		if err := loadAuthKeyLimits(db); err != nil {
-			slog.Error("failed to load auth key limits", "error", err)
-			_ = db.Close()
-			globalMu.Lock()
-			currentDB = nil
-			globalMu.Unlock()
-			if exitFn := getOsExitFn(); exitFn != nil {
-				exitFn(1)
-			}
-			return
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
 		}
-		if err := db.registerIndexes(indexes...); err != nil {
-			slog.Error("failed to register indexes", "error", err)
-			_ = db.Close()
-			globalMu.Lock()
-			currentDB = nil
-			globalMu.Unlock()
-			if exitFn := getOsExitFn(); exitFn != nil {
-				exitFn(1)
-			}
-			return
+		return nil, false
+	}
+	if err := db.rebuildIndexRegistry(); err != nil {
+		slog.Error("failed to rebuild index registry from _idx_:* records", "error", err)
+		_ = db.Close()
+		globalMu.Lock()
+		currentDB = nil
+		globalMu.Unlock()
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
 		}
-
-		resolvedAddr := address
-		if resolvedAddr == "" {
-			resolvedAddr = privateAddr
+		return nil, false
+	}
+	if err := db.registerSchemas(schemas...); err != nil {
+		slog.Error("failed to register doc schemas", "error", err)
+		_ = db.Close()
+		globalMu.Lock()
+		currentDB = nil
+		globalMu.Unlock()
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
 		}
+		return nil, false
+	}
+	slog.Info("generated internal bootstrap token")
+	return db, true
+}
 
-		slog.Info("generated internal bootstrap token")
-		var ps redcon.PubSub
-
-		startedCh := make(chan struct{})
-
-		go func() {
-			listenFn := getListenAndServeFn()
-			err := listenFn(resolvedAddr,
-				func(conn redcon.Conn, cmd redcon.Command) {
-					handleCommand(conn, cmd, db, &ps)
-				},
-				acceptCon,
-				closeCon,
-			)
-
-			if err != nil && !isServerShutdownErr(err) {
-				slog.Error("redisx server stopped", "error", err)
-				if exitFn := getOsExitFn(); exitFn != nil {
-					exitFn(1)
-				}
-			} else if err != nil {
-				slog.Info("redisx server stopped")
-			}
-			close(startedCh)
-		}()
-
-		// Wait for server to bind or error
-		time.Sleep(10 * time.Millisecond)
-	})
-
-	globalMu.RLock()
-	db := currentDB
-	globalMu.RUnlock()
-
-	return db
+func bootOneListener(role portRole, address string, db *DB, ps *redcon.PubSub) {
+	listenFn := getListenAndServeFn()
+	acceptFn := func(conn redcon.Conn) bool {
+		setConnPortRole(conn, role)
+		conn.SetContext("")
+		return true
+	}
+	slog.Info("starting listener", "port_role", role.String(), "addr", address)
+	err := listenFn(role, address,
+		func(conn redcon.Conn, cmd redcon.Command) {
+			handleCommand(conn, cmd, db, ps)
+		},
+		acceptFn,
+		closeCon,
+	)
+	if err != nil && !isServerShutdownErr(err) {
+		slog.Error("redisx listener stopped", "port_role", role.String(), "error", err)
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+	} else if err != nil {
+		slog.Info("redisx listener stopped", "port_role", role.String())
+	}
 }

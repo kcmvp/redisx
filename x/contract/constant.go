@@ -2,6 +2,9 @@ package contract
 
 const (
 	StorageKeySeparator = ":"
-	MemKeyPrefix        = "_m_"
-	AuthKeyPrefix       = "_auth_"
+	MemNsPrefix         = "_m_"
+	AuthNsPrefix        = "_auth_"
+	DocMetaNsPrefix     = "_doc_"
+	IdxMetaNsPrefix     = "_idx_"
+	KeyAttrsJoin        = "_"
 )

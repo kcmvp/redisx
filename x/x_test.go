@@ -93,7 +93,7 @@ func (invalidPrefixDoc) TTL() time.Duration { return time.Hour }
 
 type bareMemPrefixDoc string
 
-func (bareMemPrefixDoc) Namespace() string  { return contract.MemKeyPrefix }
+func (bareMemPrefixDoc) Namespace() string  { return contract.MemNsPrefix }
 func (bareMemPrefixDoc) Mem() bool          { return false }
 func (bareMemPrefixDoc) KeyAttrs() []string { return []string{"id"} }
 func (u bareMemPrefixDoc) RawJSON() string  { return string(u) }
