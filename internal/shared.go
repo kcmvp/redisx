@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 )
 
 var (
@@ -32,7 +31,7 @@ func AuthKey() string {
 // document type itself already determines the namespace prefix.
 func ValidateKeyPattern[D x.Document](keyPattern string) (string, error) {
 	fullNamespace := x.StorageKeyValue[D]("")
-	fullPrefix := fullNamespace + contract.StorageKeySeparator
+	fullPrefix := fullNamespace + x.StorageKeySeparator
 	if keyPattern == fullNamespace || strings.HasPrefix(keyPattern, fullPrefix) {
 		return "", fmt.Errorf("key pattern must be document-scoped, got storage pattern: %s", keyPattern)
 	}
@@ -59,7 +58,7 @@ type scopeWireKeyRangeShape struct {
 // is carried onto the returned sealed range via .Limit(old).
 func ScopeKeyRange[D x.Document](scopedKR x.KeyRange) (x.KeyRange, error) {
 	fullNamespace := x.StorageKeyValue[D]("")
-	fullPrefix := fullNamespace + contract.StorageKeySeparator
+	fullPrefix := fullNamespace + x.StorageKeySeparator
 
 	checkPrefixed := func(fieldName, v string) error {
 		if v == fullNamespace || strings.HasPrefix(v, fullPrefix) {
@@ -168,7 +167,7 @@ func SplitStorageKey(storageKey string) (storageNs string, pkSuffix string, err 
 	if storageKey == "" {
 		return "", "", fmt.Errorf("empty storage key")
 	}
-	sep := contract.StorageKeySeparator
+	sep := x.StorageKeySeparator
 	idx := strings.Index(storageKey, sep)
 	if idx < 0 {
 		return storageKey, "", nil
@@ -195,9 +194,9 @@ func IsInternalStorageNs(storageNs string) bool {
 	if storageNs == "" {
 		return false
 	}
-	return strings.HasPrefix(storageNs, contract.DocMetaNsPrefix) ||
-		strings.HasPrefix(storageNs, contract.IdxMetaNsPrefix) ||
-		strings.HasPrefix(storageNs, contract.AuthNsPrefix)
+	return strings.HasPrefix(storageNs, x.DocMetaNsPrefix) ||
+		strings.HasPrefix(storageNs, x.IdxMetaNsPrefix) ||
+		strings.HasPrefix(storageNs, x.AuthNsPrefix)
 }
 
 // StripMemPrefix strips the leading "_m_" layer marker from a storage
@@ -215,14 +214,14 @@ func IsInternalStorageNs(storageNs string) bool {
 // call this before looking up the DocRegistry, so both disk-layer "user" and
 // mem-layer "_m_user" resolve to the same registered Doc.
 func StripMemPrefix(s string) string {
-	if strings.HasPrefix(s, contract.MemNsPrefix) {
-		return s[len(contract.MemNsPrefix):]
+	if strings.HasPrefix(s, x.MemNsPrefix) {
+		return s[len(x.MemNsPrefix):]
 	}
 	return s
 }
 
 // ExtractPKSuffixes splits a composite PK suffix string (joined with
-// contract.KeyAttrsJoin = "_") back into its individual attribute segments,
+// x.KeyAttrsJoin = "_") back into its individual attribute segments,
 // preserving order. Returns a nil slice (not empty) for empty input so
 // range-callers don't need to len-check additionally for nil vs empty.
 //
@@ -243,7 +242,7 @@ func ExtractPKSuffixes(pkSuffix string) ([]string, error) {
 	if pkSuffix == "" {
 		return nil, nil
 	}
-	return strings.Split(pkSuffix, contract.KeyAttrsJoin), nil
+	return strings.Split(pkSuffix, x.KeyAttrsJoin), nil
 }
 
 // ParseIndexFullName parses a fully-qualified (lowercase) registered index
@@ -268,7 +267,7 @@ func ParseIndexFullName(fullIndexName string) (ownerStorageNs string, logicalIdx
 	if fullIndexName == "" {
 		return "", "", fmt.Errorf("empty index full name")
 	}
-	join := contract.KeyAttrsJoin
+	join := x.KeyAttrsJoin
 	idx := strings.LastIndex(fullIndexName, join)
 	if idx < 0 {
 		return "", "", fmt.Errorf("index full name %q has no join separator %q (expected shape <storageNs>%s<logical>)", fullIndexName, join, join)

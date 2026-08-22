@@ -21,7 +21,6 @@ import (
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/gjson"
@@ -102,7 +101,7 @@ func (s *ClientTestSuite) SetupSuite() {
 		s.Require().NoError(db.CreateIndex(idxProbeScore))
 		s.Require().NoError(db.CreateIndex(idxProbeBucket))
 		s.Require().NoError(db.CreateIndex(idxProbeSparse))
-		s.Require().NoError(db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50"))
+		s.Require().NoError(db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50"))
 
 		for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
 			s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
@@ -2090,7 +2089,7 @@ func BenchmarkSetNoHooks(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2125,7 +2124,7 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2160,7 +2159,7 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2197,7 +2196,7 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(contract.AuthNsPrefix+contract.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)

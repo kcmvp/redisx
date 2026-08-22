@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 )
@@ -322,10 +321,10 @@ type PersistentDocSpec struct {
 
 // StorageNs returns the full storage namespace prefix used to persist both
 // the _doc_ schema key and all data rows of this document type. It equals
-// Namespace when Mem=false; contract.MemNsPrefix+Namespace when Mem=true.
+// Namespace when Mem=false; MemNsPrefix+Namespace when Mem=true.
 func (p PersistentDocSpec) StorageNs() string {
 	if p.Mem {
-		return contract.MemNsPrefix + p.Namespace
+		return MemNsPrefix + p.Namespace
 	}
 	return p.Namespace
 }
@@ -384,7 +383,7 @@ func validateDocumentNamespace(namespace string) {
 	if namespace == "" {
 		panic("document namespace is required")
 	}
-	if strings.ContainsAny(namespace, contract.StorageKeySeparator+"*?_") {
+	if strings.ContainsAny(namespace, StorageKeySeparator+"*?_") {
 		panic("document namespace must not contain reserved characters")
 	}
 }
@@ -471,7 +470,7 @@ func StorageKey[D Document](d D) (string, error) {
 		parts = append(parts, keyAttrValue(result))
 	}
 
-	return StorageKeyValue[D](strings.Join(parts, contract.StorageKeySeparator)), nil
+	return StorageKeyValue[D](strings.Join(parts, StorageKeySeparator)), nil
 }
 
 // keyAttrValue normalizes one extracted key attr into its storage-key form.
@@ -495,7 +494,7 @@ func StorageKeyValue[D Document](v string) string {
 	if v == "" {
 		return meta.storageNamespace
 	}
-	return meta.storageNamespace + contract.StorageKeySeparator + v
+	return meta.storageNamespace + StorageKeySeparator + v
 }
 
 // MemKey returns a key routed to the memory-only storage layer.
@@ -503,10 +502,10 @@ func StorageKeyValue[D Document](v string) string {
 // The returned key uses the reserved "_m_" prefix. If key already uses that
 // prefix, it is returned unchanged.
 func MemKey(key string) string {
-	if strings.HasPrefix(key, contract.MemNsPrefix) {
+	if strings.HasPrefix(key, MemNsPrefix) {
 		return key
 	}
-	return contract.MemNsPrefix + key
+	return MemNsPrefix + key
 }
 
 // Index describes one registered JSON index definition.
@@ -593,7 +592,7 @@ func Idx[D Document](idxName string, keyPattern string, jsonPath string) Index {
 	if keyPattern == "" {
 		panic("index key pattern is required")
 	}
-	if strings.HasPrefix(keyPattern, contract.StorageKeySeparator) {
+	if strings.HasPrefix(keyPattern, StorageKeySeparator) {
 		panic("index key pattern must not start with separator")
 	}
 	if jsonPath == "" {

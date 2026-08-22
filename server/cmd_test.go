@@ -12,7 +12,6 @@ import (
 
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -245,11 +244,11 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:     "keys_allow_mem_namespace",
 			auth:     true,
-			commands: [][]string{{cmdSet, contract.MemNsPrefix + "k_{id}", "v"}, {cmdKeys, contract.MemNsPrefix + "*"}},
+			commands: [][]string{{cmdSet, x.MemNsPrefix + "k_{id}", "v"}, {cmdKeys, x.MemNsPrefix + "*"}},
 			wantStrings: []string{
 				"OK",
 			},
-			wantArrays: [][]string{{contract.MemNsPrefix + "k_{id}"}},
+			wantArrays: [][]string{{x.MemNsPrefix + "k_{id}"}},
 		},
 		{
 			name:     "del non-existent",

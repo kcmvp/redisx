@@ -10,7 +10,6 @@ import (
 
 	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
@@ -215,7 +214,7 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemNsPrefix) {
+	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, x.MemNsPrefix) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
