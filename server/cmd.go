@@ -10,7 +10,6 @@ import (
 
 	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
@@ -215,7 +214,7 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemKeyPrefix) {
+	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, x.MemNsPrefix) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
@@ -645,4 +644,30 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 			conn.WriteBulkString(val)
 		}
 	}
+}
+
+const adminSkeletonFmt = "ERR %s is not implemented yet — schema registry (D5) and admin command wiring still pending"
+
+func regDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regdoc"))
+}
+
+func lsDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsdoc"))
+}
+
+func desDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "desdoc"))
+}
+
+func lsIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsidx"))
+}
+
+func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regidx"))
+}
+
+func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "delidx"))
 }

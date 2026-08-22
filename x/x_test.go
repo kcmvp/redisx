@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -93,7 +92,7 @@ func (invalidPrefixDoc) TTL() time.Duration { return time.Hour }
 
 type bareMemPrefixDoc string
 
-func (bareMemPrefixDoc) Namespace() string  { return contract.MemKeyPrefix }
+func (bareMemPrefixDoc) Namespace() string  { return MemNsPrefix }
 func (bareMemPrefixDoc) Mem() bool          { return false }
 func (bareMemPrefixDoc) KeyAttrs() []string { return []string{"id"} }
 func (u bareMemPrefixDoc) RawJSON() string  { return string(u) }

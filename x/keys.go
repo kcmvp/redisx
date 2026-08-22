@@ -541,7 +541,7 @@ func LayerRoutingAnchor(kr KeyRange) string {
 // pinned layer.
 //
 // caller is responsible for providing a layerForKey function that mirrors
-// db.go's storageLayer routing (strings.HasPrefix(key, MemKeyPrefix) vs.
+// db.go's storageLayer routing (strings.HasPrefix(key, MemNsPrefix) vs.
 // not). This avoids importing the server package from x.
 func LayerRoutingConstrained(kr KeyRange, layerForKey func(string) any) (any /*storageLayer*/, bool) {
 	anchor := LayerRoutingAnchor(kr)

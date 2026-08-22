@@ -168,3 +168,142 @@ func TestScopeKeyRange(t *testing.T) {
 		require.ErrorContains(t, derr, "unknown key range op")
 	})
 }
+
+// ————— §11 SSoT Naming Helpers tests —————
+
+func TestSplitStorageKey(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantNs   string
+		wantPk   string
+		wantErr  bool
+		errMatch string
+	}{
+		{in: "user", wantNs: "user", wantPk: ""},
+		{in: "user:acme_0100", wantNs: "user", wantPk: "acme_0100"},
+		{in: "_m_user:tenant5_id99", wantNs: "_m_user", wantPk: "tenant5_id99"},
+		{in: "_doc_user", wantNs: "_doc_user", wantPk: ""},
+		{in: "a:b:c:multi", wantNs: "a", wantPk: "b:c:multi"}, // only FIRST colon separates ns/pk
+		{in: "", wantErr: true, errMatch: "empty storage key"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			ns, pk, err := SplitStorageKey(c.in)
+			if c.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), c.errMatch)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, c.wantNs, ns)
+			require.Equal(t, c.wantPk, pk)
+		})
+	}
+}
+
+func TestIsInternalStorageNs(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"_doc_user", true},
+		{"_idx_user_age", true},
+		{"_auth_default", true},
+		{"_doc_", true}, // prefix match, even without suffix
+		{"_idx_", true},
+		{"user", false},
+		{"_m_user", false},  // mem layer marker is NOT internal meta
+		{"doc_user", false}, // missing leading underscore
+		{"idx_user_age", false},
+		{"auth_foo", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			require.Equal(t, c.want, IsInternalStorageNs(c.in))
+		})
+	}
+}
+
+func TestStripMemPrefix(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"_m_user", "user"},
+		{"_m_user:abc", "user:abc"},
+		{"_m__m_double", "_m_double"},
+		{"user", "user"},
+		{"_doc_user", "_doc_user"}, // _doc_ preserved
+		{"_idx_user_age", "_idx_user_age"},
+		{"auth_foo", "auth_foo"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			require.Equal(t, c.want, StripMemPrefix(c.in))
+		})
+	}
+}
+
+func TestExtractPKSuffixes(t *testing.T) {
+	// empty in → nil slice, nil err
+	out, err := ExtractPKSuffixes("")
+	require.NoError(t, err)
+	require.Nil(t, out)
+
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"acme_0100", []string{"acme", "0100"}},
+		{"just_one", []string{"just", "one"}}, // "_" in pk-suffixes is the delimiter, not literal
+		{"tenant5_id99", []string{"tenant5", "id99"}},
+		{"a_b_c", []string{"a", "b", "c"}},
+		{"_leading", []string{"", "leading"}},
+		{"trailing_", []string{"trailing", ""}},
+		{"no-delimiter", []string{"no-delimiter"}}, // no underscores → 1-element slice
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			out, err := ExtractPKSuffixes(c.in)
+			require.NoError(t, err)
+			require.Equal(t, c.want, out)
+		})
+	}
+}
+
+func TestParseIndexFullName(t *testing.T) {
+	good := []struct {
+		in          string
+		wantNs      string
+		wantLogical string
+	}{
+		{"user_age", "user", "age"},
+		{"_m_cache_hitratio", "_m_cache", "hitratio"},
+		{"a_b_c", "a_b", "c"},                           // LAST underscore separates owner/logical
+		{"__under_ns_logical", "__under_ns", "logical"}, // leading underscores in ns OK
+	}
+	for _, c := range good {
+		t.Run("ok/"+c.in, func(t *testing.T) {
+			ns, log, err := ParseIndexFullName(c.in)
+			require.NoError(t, err)
+			require.Equal(t, c.wantNs, ns)
+			require.Equal(t, c.wantLogical, log)
+		})
+	}
+
+	bad := []struct {
+		in       string
+		errMatch string
+	}{
+		{"", "empty index full name"},
+		{"nouderscores", "no join separator"},
+		{"_trailing_", "empty logical suffix"},
+		{"_prefix_", "empty logical suffix"},
+		{"_emptyowner", "empty owner storage namespace"},
+	}
+	for _, c := range bad {
+		t.Run("err/"+c.in, func(t *testing.T) {
+			_, _, err := ParseIndexFullName(c.in)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), c.errMatch)
+		})
+	}
+}
