@@ -1,9 +1,10 @@
 # Stream Ingest
 
-> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
-> 🧱 [Architecture & KeyRange convention](architecture.md) ·
-> 🧭 [How-to & examples](howto.md) ·
-> 🏷️ [Typed document helpers](typed-document.md) ·
+> ⬅️ [Back to README](../README.md)
+> 📖 [Docs index](index.md)
+> 🧱 [Architecture & KeyRange convention](architecture.md)
+> 🧭 [How-to & examples](howto.md)
+> 🏷️ [Typed document helpers](typed-document.md)
 > 🪝 [Write Hook Subsystem](write-hooks.md)
 
 `stream` is a small reconnecting websocket ingestion layer for `x.Document`

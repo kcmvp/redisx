@@ -30,4 +30,4 @@ item lives under the linked section of
   Pattern-based scans never cross namespaces by construction; typed helpers
   scope into your document's namespace so you never need to think about it.
   See
-  [KeyRange & namespace convention](architecture.md#keyrange--namespace-convention).
+  [KeyRange & namespace convention](architecture.md#keyrange-namespace-convention).

@@ -1,9 +1,10 @@
 # How-To
 
-> 📖 [Docs index](index.md) · ⬅️ [Back to README](../README.md) ·
-> 🧱 [Architecture & KeyRange convention](architecture.md) ·
-> 🏷️ [Typed document helpers](typed-document.md) ·
-> 🪝 [Write Hook Subsystem](write-hooks.md) ·
+> ⬅️ [Back to README](../README.md)
+> 📖 [Docs index](index.md)
+> 🧱 [Architecture & KeyRange convention](architecture.md)
+> 🏷️ [Typed document helpers](typed-document.md)
+> 🪝 [Write Hook Subsystem](write-hooks.md)
 > 🔌 [Stream ingest](stream.md)
 
 This guide is copy-paste oriented: RESP command examples plus the
@@ -395,7 +396,7 @@ Important constraints:
   constructors**, the `:` namespace convention (first `:` splits scope/id),
   the server-side `scopeGuard` gate, and the wire vs Go representations
   for `LIMIT N` are all centralised in
-  **[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**;
+  **[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**;
   the quick JSON/Go lookup table is kept under
   **[SEARCHKEY "KeyRange JSON shape"](#keyrange-json-shape-one-of-6-sealed-constructors)**
   in this file.
@@ -461,7 +462,7 @@ KeyRange is a **sealed one-of algebra**. The exact 6 constructors, the
 `:` namespace convention (first `:` splits scope from id), the
 scopeGuard safety net, and the 4-layer signature parity between
 typed-doc / untyped-client / RESP-wire / server-engine are all defined in
-**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**.
+**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**.
 Copy that reference — do not re-derive the rules locally.
 
 This section only gives the quick JSON+Go lookup table:
@@ -570,7 +571,7 @@ The KeyRange JSON payload is identical to the one used by
 server-side `scopeGuard` safety net. The full specification, including
 KeysBt half-open semantics, layer routing rules, and the Go/RESP split for
 `Limit` lives in
-**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange--namespace-convention)**.
+**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**.
 
 #### RESP examples
 
