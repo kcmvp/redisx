@@ -1,12 +1,32 @@
 package proto
 
 const (
+	CmdAuth         = "AUTH"
+	CmdHello        = "HELLO"
+	CmdClient       = "CLIENT"
+	CmdPing         = "PING"
+	CmdQuit         = "QUIT"
+	CmdSelect       = "SELECT"
+	CmdCommand      = "COMMAND"
+	CmdReset        = "RESET"
+	CmdSubscribe    = "SUBSCRIBE"
+	CmdUnsubscribe  = "UNSUBSCRIBE"
+	CmdPSubscribe   = "PSUBSCRIBE"
+	CmdPUnsubscribe = "PUNSUBSCRIBE"
+	CmdPublish      = "PUBLISH"
+
+	CmdSet    = "SET"
+	CmdSetEx  = "SETEX"
+	CmdSetNX  = "SETNX"
+	CmdGet    = "GET"
+	CmdDel    = "DEL"
+	CmdExists = "EXISTS"
+	CmdKeys   = "KEYS"
+
 	CmdUpdate      = "UPDATE"
 	CmdSearchIndex = "SEARCHINDEX"
 	CmdSearchKey   = "SEARCHKEY"
 
-	// Admin-only commands（App-port allowlist 拒绝，Gate1 fail-closed）
-	// 按 Doc 族 *doc / Index 族 *idx 分两组命名；语义缩写：reg=register, ls=list, des=describe, del=delete
 	CmdRegisterDoc   = "regdoc"
 	CmdListDocs      = "lsdoc"
 	CmdDescribeDoc   = "desdoc"
@@ -83,13 +103,13 @@ var Registry = map[string]CommandSpec{
 
 // BaseHandshakeCommands —— Base 握手命令（已在 proto 之前有了，这里只列名称给 Gate1 Allowlist 用，不在 Registry 放 argc，因为每一条 argc 历史上是 handler 自己判）
 var BaseHandshakeCommands = []string{
-	"AUTH", "HELLO", "CLIENT", "PING", "QUIT", "SELECT", "COMMAND", "RESET",
-	"SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH",
+	CmdAuth, CmdHello, CmdClient, CmdPing, CmdQuit, CmdSelect, CmdCommand, CmdReset,
+	CmdSubscribe, CmdUnsubscribe, CmdPSubscribe, CmdPUnsubscribe, CmdPublish,
 }
 
 // SharedBizCommands —— Shared 业务命令（Strict Gate 共享）
 var SharedBizCommands = []string{
-	"SET", "SETEX", "SETNX", "GET", "DEL", "EXISTS", "KEYS", CmdSearchKey, CmdSearchIndex, CmdUpdate,
+	CmdSet, CmdSetEx, CmdSetNX, CmdGet, CmdDel, CmdExists, CmdKeys, CmdSearchKey, CmdSearchIndex, CmdUpdate,
 }
 
 // IsAdminOnly 辅助：Shell dispatcher / Server Gate1 Allowlist 构建时都用

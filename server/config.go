@@ -22,6 +22,9 @@ const (
 
 	defaultAppPort   = 7379
 	defaultAdminPort = 7381
+
+	minAllowedPort = 7001
+	maxAllowedPort = 65535
 )
 
 type AppConfig struct {
@@ -130,11 +133,6 @@ func normalizeLogFormat(raw string) (string, error) {
 	return "text", fmt.Errorf("unknown logging.format %q, fallback text", raw)
 }
 
-const (
-	minAllowedPort = 7001
-	maxAllowedPort = 65535
-)
-
 func validatePort(port int, field string) error {
 	if port < minAllowedPort || port > maxAllowedPort {
 		return fmt.Errorf("invalid %s=%d: must be %d..%d (ports below %d are reserved; avoid collisions with stock Redis 6379 / default admin 6381)",
@@ -157,7 +155,7 @@ func resolveOne(bind string, role string) (explicit string, err error) {
 	return bind, nil
 }
 
-func (c *Config) validate(configDir string) error {
+func (c *Config) validate() error {
 	c.applyDefaults()
 
 	if err := validatePort(c.App.Port, "app.port"); err != nil {
@@ -199,8 +197,12 @@ func (c *Config) validate(configDir string) error {
 	}
 
 	dbPath := c.DataPath
-	if !filepath.IsAbs(dbPath) && configDir != "" {
-		dbPath = filepath.Join(configDir, dbPath)
+	if !filepath.IsAbs(dbPath) {
+		wd, wdErr := os.Getwd()
+		if wdErr != nil {
+			return fmt.Errorf("STARTUP FATAL: os.Getwd for relative data_path: %w", wdErr)
+		}
+		dbPath = filepath.Join(wd, dbPath)
 	}
 	dbDir := filepath.Dir(dbPath)
 	if info, err := os.Stat(dbDir); err != nil {
@@ -230,7 +232,6 @@ func (c *Config) validate(configDir string) error {
 
 	if slog.Default() != nil {
 		slog.Debug("config validated",
-			"config_dir", configDir,
 			"app", map[string]string{
 				"bind": c.App.Bind, "port": strconv.Itoa(c.App.Port), "auth_set": strconv.FormatBool(c.App.Auth != ""),
 			},
@@ -265,7 +266,10 @@ func LoadConfig(yamlPath string) (*Config, error) {
 		slog.Warn("config file unavailable, applying system defaults",
 			"path", yamlPath, "err", readErr)
 	}
-	if err := cfg.validate(configDir); err != nil {
+	if cfg.DataPath != "" && !filepath.IsAbs(cfg.DataPath) {
+		cfg.DataPath = filepath.Join(configDir, cfg.DataPath)
+	}
+	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil

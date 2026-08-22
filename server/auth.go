@@ -69,7 +69,7 @@ func connPortRole(conn redcon.Conn) portRole {
 	return r
 }
 
-func ConfigureAuthKeys(appAuth, adminAuth string) {
+func configureAuthKeys(appAuth, adminAuth string) {
 	authCfgMu.Lock()
 	activeAppAuth = appAuth
 	activeAdminAuth = adminAuth
@@ -83,16 +83,10 @@ func getAuthConfig() (appAuth, adminAuth string, configured bool) {
 	return activeAppAuth, activeAdminAuth, authConfigured
 }
 
-func gate0AuthAndPortRoleMatch(conn redcon.Conn, cmdName string) (reject bool) {
+func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
 	cmdLower := strings.ToLower(cmdName)
-	// The only three commands allowed to cross Gate0 without a port-role
-	// matched auth key are the handshake trio (AUTH / HELLO / CLIENT).
-	// PING and QUIT are no longer pre-authenticated: PING still requires
-	// AUTH when the listener's key is configured, so mis-matched AUTH keys
-	// between app/admin ports trigger WRONGPASS immediately during the
-	// rdxm NewShell handshake instead of leaking PONGs on the wrong port.
 	switch cmdLower {
-	case "auth", "hello", "client":
+	case strings.ToLower(proto.CmdAuth), strings.ToLower(proto.CmdHello), strings.ToLower(proto.CmdClient):
 		return false
 	}
 	appAuth, adminAuth, configured := getAuthConfig()

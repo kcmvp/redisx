@@ -345,7 +345,7 @@ func (db *DB) ensureIdxReg() {
 
 // registerIndexFromSpec creates exactly one BuntDB index and persists the
 // PersistentIndexSpec to storage. It is used by both the boot-time rebuild
-// path (rebuildIndexRegistry, which skips persistence since the key already
+// path (buildIndexes, which skips persistence since the key already
 // exists) and the runtime regidx admin path (which writes the key).
 //
 // Calling it twice with the identical PersistentIndexSpec on the same DB is a
@@ -427,7 +427,7 @@ func (db *DB) registerIndexFromSpec(spec x.PersistentIndexSpec, persist bool) er
 // stand up a disposable BuntDB index in-process. Production callers should
 // issue the admin CLI regidx command (which writes the "_idx_:*" SSoT meta
 // key so that subsequent restarts automatically rebuild the index via
-// rebuildIndexRegistry).
+// buildIndexes).
 func (db *DB) CreateIndex(idx x.Index) error {
 	return db.registerIndexes(idx)
 }
@@ -439,7 +439,7 @@ func (db *DB) CreateIndex(idx x.Index) error {
 // support the legacy internal/db_test suites that still instantiate indexes
 // via the x.Index shorthand; the public boot paths (Start / StartWithConfig /
 // StartForTest) do NOT accept indexes at all — indexes are Admin-CLI-managed
-// "_idx_:*" records rebuilt on every boot via rebuildIndexRegistry.
+// "_idx_:*" records rebuilt on every boot via buildIndexes.
 //
 // Duplicate semantics: duplicate index names are REJECTED even if the
 // incoming spec is byte-for-byte identical with the already-registered one.
@@ -477,7 +477,7 @@ func (db *DB) registerIndexes(indexes ...x.Index) error {
 	return nil
 }
 
-// rebuildIndexRegistry scans all "_idx_:*" keys on disk and the in-memory
+// buildIndexes scans all "_idx_:*" keys on disk and the in-memory
 // layer, deserializes PersistentIndexSpec, and recreates matching BuntDB
 // indexes on their correct layer. It is invoked on every openDB path; any
 // corrupt "_idx_:*" key triggers a hard error (the database would otherwise
@@ -486,7 +486,7 @@ func (db *DB) registerIndexes(indexes ...x.Index) error {
 // "_idx_:*" keys live on the SAME layer as their owner document type: an
 // index over a Mem=true doc is persisted on the mem layer (volatile, matching
 // the doc data) while a regular doc's index is persisted on the disk layer.
-func (db *DB) rebuildIndexRegistry() error {
+func (db *DB) buildIndexes() error {
 	patterns := []struct {
 		layer storageLayer
 		glob  string

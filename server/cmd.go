@@ -646,3 +646,29 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 		}
 	}
 }
+
+const adminSkeletonFmt = "ERR %s is not implemented yet — schema registry (D5) and admin command wiring still pending"
+
+func regDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regdoc"))
+}
+
+func lsDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsdoc"))
+}
+
+func desDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "desdoc"))
+}
+
+func lsIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsidx"))
+}
+
+func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regidx"))
+}
+
+func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "delidx"))
+}
