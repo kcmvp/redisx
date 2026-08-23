@@ -98,11 +98,17 @@ func DialAndHandshake(o Options) (*DialResult, error) {
 			firstCaps = ParseHelloCapabilities(v)
 		}
 	} else {
-		pingCtx, cancelPing := context.WithTimeout(context.Background(), to)
-		defer cancelPing()
-		if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
+		helloErr := raw.Err()
+		if !strings.Contains(helloErr.Error(), "NOAUTH") {
+			pingCtx, cancelPing := context.WithTimeout(context.Background(), to)
+			defer cancelPing()
+			if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
+				_ = client.Close()
+				return nil, WrapAdminErr(pingErr, authProvided)
+			}
+		} else {
 			_ = client.Close()
-			return nil, WrapAdminErr(pingErr, authProvided)
+			return nil, WrapAdminErr(helloErr, authProvided)
 		}
 	}
 	caps := ProbeCapabilities(context.Background(), client, to)

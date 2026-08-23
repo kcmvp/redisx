@@ -500,7 +500,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		return
 	}
 
-	if cmdName != cmdAuth && cmdName != cmdHello && cmdName != cmdClient {
+	if cmdName != cmdAuth && cmdName != cmdClient {
 		connAuthKey, _ := conn.Context().(string)
 		if conn.Context() == nil || connAuthKey == "" {
 			appAuth, adminAuth, _ := getAuthConfig()
@@ -515,6 +515,12 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 				authRequired = (appAuth != "") || (adminAuth != "")
 			}
 			if authRequired {
+				if cmdName == cmdHello || cmdName == cmdPing || cmdName == cmdQuit {
+					conn.WriteError("NOAUTH authentication required")
+					slog.Warn("unauthenticated handshake/status command on port that requires AUTH",
+						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String())
+					return
+				}
 				conn.WriteError("NOAUTH authentication required")
 				slog.Warn("unauthenticated command attempt on port that requires AUTH",
 					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String())

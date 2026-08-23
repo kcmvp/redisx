@@ -101,8 +101,6 @@ func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 	}
 	basicGroup := []any{
 		map[string]any{"name": "ping", "usage": "PING — round-trip latency check"},
-		map[string]any{"name": "raw", "usage": "raw <cmd> [args...]  — forward raw RESP and print the reply"},
-		map[string]any{"name": "!banner", "aliases": []any{"banner"}, "usage": "banner — print redisx banner"},
 		map[string]any{"name": "!version", "aliases": []any{"version"}, "usage": "version — print redisx server version"},
 		map[string]any{"name": "!clear", "aliases": []any{"clear", "cls"}, "usage": "clear — clear terminal screen"},
 		map[string]any{"name": "!help", "aliases": []any{"help", "commands", "?"}, "usage": "commands [cmd]  — list all commands (optionally one command detail)"},
