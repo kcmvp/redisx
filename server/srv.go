@@ -540,31 +540,33 @@ func setupDB(dbPath string, schemas []x.Schema) (*DB, bool) {
 		}
 		return nil, false
 	}
-	globalMu.Lock()
-	currentDB = db
-	globalMu.Unlock()
+	if err := db.loadIndexes(); err != nil {
+		slog.Error("failed to load indexes from _idx_:* records", "error", err)
+		_ = db.Close()
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return nil, false
+	}
+	if err := db.loadDocSpecs(); err != nil {
+		slog.Error("failed to load doc specs from _doc_:* records", "error", err)
+		_ = db.Close()
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return nil, false
+	}
 	if err := loadAuthKeyLimits(db); err != nil {
 		slog.Error("failed to load auth key limits", "error", err)
 		_ = db.Close()
-		globalMu.Lock()
-		currentDB = nil
-		globalMu.Unlock()
 		if exitFn := getOsExitFn(); exitFn != nil {
 			exitFn(1)
 		}
 		return nil, false
 	}
-	if err := db.buildIndexes(); err != nil {
-		slog.Error("failed to build indexes from _idx_:* records", "error", err)
-		_ = db.Close()
-		globalMu.Lock()
-		currentDB = nil
-		globalMu.Unlock()
-		if exitFn := getOsExitFn(); exitFn != nil {
-			exitFn(1)
-		}
-		return nil, false
-	}
+	globalMu.Lock()
+	currentDB = db
+	globalMu.Unlock()
 	if err := db.registerSchemas(schemas...); err != nil {
 		slog.Error("failed to register schemas", "error", err)
 		_ = db.Close()

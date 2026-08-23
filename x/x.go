@@ -3,10 +3,7 @@ package x
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
-	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/samber/lo"
@@ -304,146 +301,6 @@ type Document interface {
 	RawJSON() string
 }
 
-// PersistentDocSpec is the byte-for-byte on-disk representation of a document
-// schema stored at storage key "_doc_:<storage_namespace>".
-//
-// It is intentionally the SSoT for the registry: both eager registration at
-// boot via Start(schemas...) and dynamic runtime registration via
-// db.RegisterDocFromSpec produce identical PersistentDocSpec values and write
-// them to the same _doc_:* keys.
-type PersistentDocSpec struct {
-	Namespace string        `json:"namespace"`
-	Mem       bool          `json:"mem"`
-	KeyAttrs  []string      `json:"key_attrs"`
-	TTL       time.Duration `json:"ttl_ns"`
-	TypeName  string        `json:"type_name"`
-}
-
-// StorageNs returns the full storage namespace prefix used to persist both
-// the _doc_ schema key and all data rows of this document type. It equals
-// Namespace when Mem=false; MemNsPrefix+Namespace when Mem=true.
-func (p PersistentDocSpec) StorageNs() string {
-	if p.Mem {
-		return MemNsPrefix + p.Namespace
-	}
-	return p.Namespace
-}
-
-// PersistentIndexSpec is the byte-for-byte on-disk representation of one JSON
-// index, stored at storage key "_idx_:<full_index_name>".
-//
-// <full_index_name> matches the SSoT shape produced by [IdxFullName]:
-//
-//	[_m_:]<namespace>_<logical>
-//
-// It is the single source of truth for the index registry. Indexes are no
-// longer declared as Go parameters to server.Start; instead they are created
-// at runtime via the admin CLI (regidx command) which writes a
-// PersistentIndexSpec. Subsequent server starts scan all "_idx_:*" keys and
-// rebuild BuntDB native indexes on the correct storage layer (disk or
-// memory-layer) according to OwnerMem.
-type PersistentIndexSpec struct {
-	// FullName is the fully-qualified registered index name; equals the key
-	// suffix "_idx_:<FullName>". It is persisted as a field for symmetry with
-	// the IdxFullName helper (so the spec is self-describing).
-	FullName string `json:"full_name"`
-	// OwnerNs is the storage namespace of the owning document type:
-	// "user" for disk-doc, "_m_cache" for a mem-doc, etc. Equivalent to
-	// ParseIndexFullName(FullName) first return value.
-	OwnerNs string `json:"owner_ns"`
-	// Logical is the user-supplied short name such as "age" or "email".
-	Logical string `json:"logical"`
-	// OwnerMem reports whether the owning document type lives in the
-	// in-memory layer. Together with OwnerNs this lets the startup rebuild
-	// step route the BuntDB index onto db.disk or db.mem without doing a
-	// prefix dance on FullName.
-	OwnerMem bool `json:"owner_mem"`
-	// KeyPattern is the full storage-key glob used by BuntDB for this
-	// index, e.g. "user:*" or "_m_cache:*".
-	KeyPattern string `json:"key_pattern"`
-	// Path is the JSON path normalized by the "dots → underscores" rule,
-	// e.g. "contact_email" for the original "contact.email". This value is
-	// passed verbatim to buntdb.IndexJSON(Path).
-	Path string `json:"path"`
-}
-
-type documentMeta struct {
-	typeName         string
-	storageNamespace string
-	keyAttrs         []string
-	ttl              time.Duration
-}
-
-var (
-	documentRegistry     sync.Map
-	documentTypeRegistry sync.Map
-)
-
-func validateDocumentNamespace(namespace string) {
-	if namespace == "" {
-		panic("document namespace is required")
-	}
-	if strings.ContainsAny(namespace, StorageKeySeparator+"*?_") {
-		panic("document namespace must not contain reserved characters")
-	}
-}
-
-func storageNamespace[D Document](d D) string {
-	if d.Mem() {
-		return MemKey(d.Namespace())
-	}
-	return d.Namespace()
-}
-
-func documentMetaFor[D Document]() documentMeta {
-	typeKey := reflect.TypeFor[D]()
-	if cached, ok := documentTypeRegistry.Load(typeKey); ok {
-		return cached.(documentMeta)
-	}
-
-	var d D
-
-	meta := documentMeta{
-		typeName:         typeKey.String(),
-		storageNamespace: storageNamespace(d),
-		keyAttrs:         append([]string(nil), d.KeyAttrs()...),
-		ttl:              d.TTL(),
-	}
-
-	validateDocumentNamespace(d.Namespace())
-	for _, path := range meta.keyAttrs {
-		if path == "" {
-			panic("document key attr path is empty")
-		}
-	}
-
-	cached, _ := documentTypeRegistry.LoadOrStore(typeKey, meta)
-	return cached.(documentMeta)
-}
-
-func requireRegistered[D Document]() documentMeta {
-	meta := documentMetaFor[D]()
-
-	existing, loaded := documentRegistry.LoadOrStore(meta.storageNamespace, meta)
-	if !loaded {
-		return meta
-	}
-
-	registered := existing.(documentMeta)
-	if registered.storageNamespace == meta.storageNamespace &&
-		slices.Equal(registered.keyAttrs, meta.keyAttrs) &&
-		registered.ttl == meta.ttl {
-		return meta
-	}
-
-	panic(fmt.Sprintf(
-		"document namespace %q already registered by %s, incompatible with %s",
-		meta.storageNamespace,
-		registered.typeName,
-		meta.typeName,
-	))
-}
-
 // StorageKey resolves one full storage key directly from the document.
 //
 // Each path declared by [Document.KeyAttrs] must exist in [Document.RawJSON].
@@ -487,14 +344,34 @@ func keyAttrValue(result gjson.Result) string {
 	return result.String()
 }
 
+func validateStorageNs[D Document]() string {
+	var d D
+	ns := d.Namespace()
+	if ns == "" {
+		panic("document namespace is required")
+	}
+	if strings.ContainsAny(ns, StorageKeySeparator+"*?_") {
+		panic("document namespace must not contain reserved characters")
+	}
+	for _, p := range d.KeyAttrs() {
+		if p == "" {
+			panic("document key attr path is empty")
+		}
+	}
+	if d.Mem() {
+		return MemNsPrefix + ns
+	}
+	return ns
+}
+
 // StorageKeyValue joins a resolved key value with the document namespace
 // derived from the document metadata type.
 func StorageKeyValue[D Document](v string) string {
-	meta := requireRegistered[D]()
+	storageNs := validateStorageNs[D]()
 	if v == "" {
-		return meta.storageNamespace
+		return storageNs
 	}
-	return meta.storageNamespace + StorageKeySeparator + v
+	return storageNs + StorageKeySeparator + v
 }
 
 // MemKey returns a key routed to the memory-only storage layer.
@@ -573,9 +450,9 @@ func IdxFullName[D Document](idxName string) string {
 		panic("index name is required")
 	}
 	fullName := strings.ToLower(idxName)
-	meta := requireRegistered[D]()
-	if meta.storageNamespace != "" {
-		fullName = strings.ToLower(meta.storageNamespace) + "_" + fullName
+	storageNs := validateStorageNs[D]()
+	if storageNs != "" {
+		fullName = strings.ToLower(storageNs) + "_" + fullName
 	}
 	return fullName
 }

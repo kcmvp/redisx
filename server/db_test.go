@@ -129,17 +129,21 @@ func (suite *DBSuite) TestRawHandlesExposeBothLayers() {
 }
 
 func (suite *DBSuite) TestRegisterIndexes() {
-	suite.Run("initializes nil index layer map", func() {
-		suite.db.indexLayers = nil
+	suite.Run("registers disk layer index on pre-initialized idxRegSpec", func() {
+		suite.NotNil(suite.db.idxRegSpec)
 		err := suite.db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age"))
 		suite.NoError(err)
-		suite.Equal(storageDisk, suite.db.indexLayers[x.Idx[testUserDoc]("age", "*", "age").Name()])
+		idx, ok := suite.db.idxRegSpec[x.Idx[testUserDoc]("age", "*", "age").Name()]
+		suite.True(ok)
+		suite.False(idx.OwnerMem)
 	})
 
 	suite.Run("registers memory layer index", func() {
 		err := suite.db.registerIndexes(x.Idx[testMemUserDoc]("age", "*", "age"))
 		suite.NoError(err)
-		suite.Equal(storageMem, suite.db.indexLayers[x.Idx[testMemUserDoc]("age", "*", "age").Name()])
+		idx, ok := suite.db.idxRegSpec[x.Idx[testMemUserDoc]("age", "*", "age").Name()]
+		suite.True(ok)
+		suite.True(idx.OwnerMem)
 	})
 
 	suite.Run("rejects empty index name", func() {
@@ -152,6 +156,250 @@ func (suite *DBSuite) TestRegisterIndexes() {
 		suite.NoError(suite.db.registerIndexes(idx))
 		err := suite.db.registerIndexes(idx)
 		suite.EqualError(err, "index already declared: user_dup")
+	})
+}
+
+func (suite *DBSuite) TestLoadIndexes() {
+	suite.Run("loads disk index meta and builds BTree", func() {
+		spec := idxSpec{
+			FullName:   "user_age",
+			OwnerNs:    "user",
+			Logical:    "age",
+			OwnerMem:   false,
+			KeyPattern: "user:*",
+			Path:       "age",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadIndexes())
+		loaded, ok := suite.db.idxRegSpec[spec.FullName]
+		suite.True(ok, "index should be registered")
+		suite.Equal(spec.FullName, loaded.FullName)
+		suite.Equal(spec.Path, loaded.Path)
+		suite.False(loaded.OwnerMem)
+
+		suite.NoError(suite.db.Set("user:1", `{"id":"1","age":20}`))
+		suite.NoError(suite.db.Set("user:2", `{"id":"2","age":30}`))
+		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern("user:*"), nil, false)
+		suite.True(res.IsOk())
+		suite.Len(res.MustGet(), 2)
+	})
+
+	suite.Run("loads mem index meta and builds BTree", func() {
+		spec := idxSpec{
+			FullName:   "_m_user_rank",
+			OwnerNs:    "_m_user",
+			Logical:    "rank",
+			OwnerMem:   true,
+			KeyPattern: "_m_user:*",
+			Path:       "rank",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadIndexes())
+		loaded, ok := suite.db.idxRegSpec[spec.FullName]
+		suite.True(ok, "mem index should be registered")
+		suite.True(loaded.OwnerMem)
+
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set("_m_user:x1", `{"id":"x1","rank":5}`, nil)
+			return e
+		}))
+		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern("_m_user:*"), nil, false)
+		suite.True(res.IsOk())
+		suite.Len(res.MustGet(), 1)
+	})
+
+	suite.Run("corrupt meta record returns error", func() {
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_broken"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, "{not json", nil)
+			return e
+		}))
+
+		err := suite.db.loadIndexes()
+		suite.Error(err)
+		suite.Contains(err.Error(), "index _idx_:user_broken: unmarshal idxSpec")
+	})
+
+	suite.Run("index with empty FullName returns error", func() {
+		spec := idxSpec{
+			OwnerNs: "user", Logical: "x", OwnerMem: false,
+			KeyPattern: "user:*", Path: "x",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_bad"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		err = suite.db.loadIndexes()
+		suite.Error(err)
+		suite.Contains(err.Error(), "index _idx_:user_bad: empty name")
+	})
+}
+
+func (suite *DBSuite) TestLoadDocSpecs() {
+	suite.Run("loads disk doc meta and registers namespace", func() {
+		spec := docSpec{
+			Namespace: "profile",
+			Mem:       false,
+			KeyAttrs:  []string{"uid"},
+			TTL:       2 * time.Hour,
+			TypeName:  "package.ProfileDoc",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadDocSpecs())
+		loaded, ok := suite.db.docRegSpec[spec.StorageNs()]
+		suite.True(ok, "doc should be registered")
+		suite.Equal("profile", loaded.Namespace)
+		suite.Equal([]string{"uid"}, loaded.KeyAttrs)
+		suite.Equal(2*time.Hour, loaded.TTL)
+		suite.Equal("package.ProfileDoc", loaded.TypeName)
+	})
+
+	suite.Run("loads mem doc meta", func() {
+		spec := docSpec{
+			Namespace: "session",
+			Mem:       true,
+			KeyAttrs:  []string{"sid"},
+			TTL:       0,
+			TypeName:  "mem.SessionDoc",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadDocSpecs())
+		loaded, ok := suite.db.docRegSpec[spec.StorageNs()]
+		suite.True(ok)
+		suite.True(loaded.Mem)
+		suite.Equal("session", loaded.Namespace)
+	})
+
+	suite.Run("applying later same-namespace doc with different TTL merges update", func() {
+		older := docSpec{
+			Namespace: "account", Mem: false, KeyAttrs: []string{"id"},
+			TTL: time.Hour, TypeName: "pkg.OldAccount",
+		}
+		raw, err := json.Marshal(older)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + older.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+
+		incoming := docSpec{
+			Namespace: "account", Mem: false, KeyAttrs: []string{"id"},
+			TTL: 48 * time.Hour, TypeName: "pkg.NewAccount",
+		}
+		suite.NoError(suite.db.applyDocSpec(incoming, nil))
+		merged, ok := suite.db.docRegSpec[older.StorageNs()]
+		suite.True(ok)
+		suite.Equal(48*time.Hour, merged.TTL)
+		suite.Equal("pkg.NewAccount", merged.TypeName)
+
+		got := ""
+		suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+			v, err := tx.Get(metaKey)
+			got = v
+			return err
+		}))
+		var persisted docSpec
+		suite.NoError(json.Unmarshal([]byte(got), &persisted))
+		suite.Equal(48*time.Hour, persisted.TTL)
+		suite.Equal("pkg.NewAccount", persisted.TypeName)
+	})
+
+	suite.Run("re-applying identical schema is no-op", func() {
+		spec := docSpec{
+			Namespace: "static", Mem: false, KeyAttrs: []string{"k"},
+			TTL: time.Minute, TypeName: "pkg.Static",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+		suite.NoError(suite.db.applyDocSpec(spec, nil))
+	})
+
+	suite.Run("applying incompatible KeyAttrs returns error", func() {
+		spec := docSpec{
+			Namespace: "conflict", Mem: false, KeyAttrs: []string{"a"},
+			TTL: time.Hour, TypeName: "pkg.One",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+
+		bad := docSpec{
+			Namespace: "conflict", Mem: false, KeyAttrs: []string{"b"},
+			TTL: time.Hour, TypeName: "pkg.Two",
+		}
+		err = suite.db.applyDocSpec(bad, nil)
+		suite.Error(err)
+		suite.Contains(err.Error(), "incompatible with")
+	})
+
+	suite.Run("corrupt meta record returns error", func() {
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "broken_ns"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, "not a json", nil)
+			return e
+		}))
+		err := suite.db.loadDocSpecs()
+		suite.Error(err)
+		suite.Contains(err.Error(), "doc _doc_:broken_ns: unmarshal docSpec")
+	})
+
+	suite.Run("empty Namespace in meta returns error", func() {
+		spec := docSpec{KeyAttrs: []string{"id"}, TTL: time.Hour, TypeName: "pkg.X"}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "bad"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		err = suite.db.loadDocSpecs()
+		suite.Error(err)
+		suite.Contains(err.Error(), "doc _doc_:bad: empty namespace")
 	})
 }
 

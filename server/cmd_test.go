@@ -87,7 +87,7 @@ func (s *CmdTestSuite) TestCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
-	if err := s.db.registerIndexFromSpec(x.PersistentIndexSpec{
+	if err := s.db.applyIndexSpec(idxSpec{
 		FullName:   "user_age",
 		OwnerNs:    "user",
 		Logical:    "age",
@@ -708,7 +708,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
-	if err := s.db.registerIndexFromSpec(x.PersistentIndexSpec{
+	if err := s.db.applyIndexSpec(idxSpec{
 		FullName:   "user_age",
 		OwnerNs:    "user",
 		Logical:    "age",
