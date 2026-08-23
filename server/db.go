@@ -1,23 +1,26 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/match"
 	"github.com/tidwall/sjson"
 
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 )
 
 type storageLayer uint8
@@ -27,20 +30,32 @@ const (
 	storageMem
 )
 
+type docSpec struct {
+	Namespace string        `json:"namespace"`
+	Mem       bool          `json:"mem"`
+	KeyAttrs  []string      `json:"key_attrs"`
+	TTL       time.Duration `json:"ttl_ns"`
+	TypeName  string        `json:"type_name"`
+}
+
+func (p docSpec) StorageNs() string {
+	if p.Mem {
+		return x.MemNsPrefix + p.Namespace
+	}
+	return p.Namespace
+}
+
+type idxSpec struct {
+	FullName   string `json:"full_name"`
+	OwnerNs    string `json:"owner_ns"`
+	Logical    string `json:"logical"`
+	OwnerMem   bool   `json:"owner_mem"`
+	KeyPattern string `json:"key_pattern"`
+	Path       string `json:"path"`
+}
+
 // SECTION: Open
 
-// openDB creates one hybrid DB instance backed by:
-//   - one primary layer opened from path
-//   - one dedicated memory-only layer used by keys prefixed with "_m_"
-//
-// path is passed through to buntdb.Open(path).
-//
-// Use one real database file path such as "/tmp/redisx.db". The special value
-// ":memory:" is rejected because redisx already opens its own dedicated
-// memory-only layer for keys prefixed with "_m_". For filesystem paths,
-// missing parent directories are created automatically, and the database file
-// itself is created on first open when it does not already exist. An empty
-// path is invalid. Directory paths are rejected.
 func openDB(path string) *DB {
 	if path == "" {
 		slog.Error("failed to open storage", "error", "db path is required")
@@ -73,9 +88,10 @@ func openDB(path string) *DB {
 	}
 
 	return &DB{
-		disk:        disk,
-		mem:         mem,
-		indexLayers: map[string]storageLayer{},
+		disk:       disk,
+		mem:        mem,
+		docRegSpec: map[string]docSpec{},
+		idxRegSpec: map[string]idxSpec{},
 	}
 }
 
@@ -92,33 +108,20 @@ func openDB(path string) *DB {
 //
 // For lower-level or BuntDB-specific operations, use [DB.Raw].
 type DB struct {
-	disk        *buntdb.DB
-	mem         *buntdb.DB
-	indexLayers map[string]storageLayer
-}
+	disk *buntdb.DB
+	mem  *buntdb.DB
 
-// DBX binds one document type to an existing DB.
-//
-// It keeps the DB-side API symmetric with client/doc while avoiding passing the
-// same DB value on every call.
-type DBX[D x.Document] DB
+	docRegMu   sync.Mutex
+	docRegSpec map[string]docSpec
+
+	idxRegMu   sync.Mutex
+	idxRegSpec map[string]idxSpec
+}
 
 // SECTION: Core DB
 
-// Raw exposes the primary storage layer for advanced use cases.
-//
-// This is useful when your application needs direct transactions, indexes,
-// or iteration APIs that are intentionally not re-exposed by redisx.
-//
+// Raw exposes the primary (disk) BuntDB instance for advanced/native use.
 // This is the layer opened from dbPath.
-//
-// Example:
-//
-//	raw := db.Raw()
-//	err := raw.Update(func(tx *buntdb.Tx) error {
-//		_, _, err := tx.Set("native:key", "value", nil)
-//		return err
-//	})
 func (db *DB) Raw() *buntdb.DB {
 	return db.disk
 }
@@ -151,19 +154,10 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
-// TODO(Go 1.27): when generic methods are available in the project toolchain,
-// fold this helper into (*DB).As[D]() so the typed view is exposed directly
-// from DB instead of a package-level helper.
-//
-// As returns a typed view over db without creating a new wrapper object.
-func As[D x.Document](db *DB) *DBX[D] {
-	return (*DBX[D])(db)
-}
-
 // SECTION: Storage Routing
 
 func isMemKey(key string) bool {
-	return strings.HasPrefix(key, contract.MemKeyPrefix)
+	return strings.HasPrefix(key, x.MemNsPrefix)
 }
 
 func hasLeadingWildcard(keyPattern string) bool {
@@ -177,20 +171,8 @@ func layerForKey(key string) storageLayer {
 	return storageDisk
 }
 
-// resolvePatternLayer parses one full storage-key pattern and reports whether
-// the pattern itself constrains the operation to a concrete storage layer.
-//
-// It answers the single routing question shared by all key/index operations:
-// can this pattern alone determine the target layer?
-//
-// The return values mean:
-//   - layer: the resolved layer when constrained is true
-//   - constrained: whether keyPattern itself pins the operation to one layer
-//   - error: syntactic validation failure such as an empty pattern
-//
-// A leading wildcard does not identify one layer, so it is treated as
-// unconstrained rather than as an error. Callers that require a single layer
-// must reject constrained == false themselves.
+// resolvePatternLayer reports whether keyPattern alone pins the target layer.
+// A leading wildcard is treated as unconstrained, not an error.
 func resolvePatternLayer(keyPattern string) (storageLayer, bool, error) {
 	if keyPattern == "" {
 		return storageDisk, false, errors.New("key pattern is required")
@@ -218,27 +200,9 @@ func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
 
 // SECTION: Query And Update
 
-// The target values must be valid JSON documents. Each x.Mutation is applied
-// with sjson semantics, so the path may address top-level or nested fields.
-// keyPattern must be one full storage-key pattern, using key glob matching such
-// as "*" and "?".
-//
-// RESP equivalent:
-//
-//	UPDATE <key_pattern> <json_filter> <update_json>
-//
-// Example:
-//
-//	res := db.Update(
-//		"user:*",
-//		x.And(
-//			x.Gte("age", 18),
-//			x.Eq("status", "pending"),
-//		),
-//		x.Set("status", "active"),
-//		x.Set("verified", true),
-//	)
-//	updatedKeys := res.MustGet()
+// Update applies one or more x.Mutation values to every doc matched by kr
+// and filter. Each mutation uses sjson path semantics. keyPattern must be
+// one full storage-key glob (cannot start with wildcard).
 func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
@@ -306,87 +270,355 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 	return mo.Ok(updatedKeys)
 }
 
-// registerIndexes creates all declared SEARCHINDEX indexes on the correct
-// storage layer.
+// applyIndexSpec is the atomic executor that applies a single idxSpec to
+// the running DB: it creates one BuntDB BTree index, records the spec in
+// idxRegSpec, and optionally persists it as "_idx_:*" metadata.
 //
-// Routing rules:
-//   - key patterns starting with "_m_" are created on the in-memory layer
-//   - all other patterns are created on the persistent layer
+// It is used by both the boot-time load path (loadIndexes, which skips
+// persistence since the key already exists on disk) and the runtime
+// regidx admin path (which writes the key).
 //
-// Index key patterns must not start with "*" or "?" because the target layer
-// must be decided at startup time without scanning both layers.
-func (db *DB) registerIndexes(defs ...x.Index) error {
-	if db.indexLayers == nil {
-		db.indexLayers = map[string]storageLayer{}
+// Calling it twice with the identical idxSpec on the same DB is a
+// no-op (idempotent). Conflicting specs for the same FullName return a
+// descriptive error.
+func (db *DB) applyIndexSpec(spec idxSpec, persist bool) error {
+	if spec.FullName == "" {
+		return errors.New("index spec: full_name is required")
 	}
-	for _, def := range defs {
-		if def.Name() == "" {
-			return errors.New("index name is required")
-		}
-		if def.KeyPattern() == "" {
-			return errors.New("index key pattern is required")
-		}
-		if def.Path() == "" {
-			return errors.New("index json path is required")
-		}
-		layer, constrained, err := resolvePatternLayer(def.KeyPattern())
-		if err != nil {
-			return fmt.Errorf("index %w", err)
-		}
-		if !constrained {
-			return errors.New("index key pattern cannot start with wildcard")
-		}
-		if _, exists := db.indexLayers[def.Name()]; exists {
-			return fmt.Errorf("index already declared: %s", def.Name())
-		}
-		if err := db.store(layer).CreateIndex(def.Name(), def.KeyPattern(), buntdb.IndexJSON(def.Path())); err != nil {
-			return err
-		}
-		db.indexLayers[def.Name()] = layer
+	if spec.KeyPattern == "" {
+		return fmt.Errorf("index %q: key_pattern is required", spec.FullName)
+	}
+	if spec.Path == "" {
+		return fmt.Errorf("index %q: path is required", spec.FullName)
+	}
+	layer, constrained, err := resolvePatternLayer(spec.KeyPattern)
+	if err != nil {
+		return fmt.Errorf("index %q: %w", spec.FullName, err)
+	}
+	if !constrained {
+		return fmt.Errorf("index %q: key_pattern cannot start with wildcard", spec.FullName)
 	}
 
+	db.idxRegMu.Lock()
+	defer db.idxRegMu.Unlock()
+
+	existing, ok := db.idxRegSpec[spec.FullName]
+	if ok {
+		identical := existing.FullName == spec.FullName &&
+			existing.OwnerNs == spec.OwnerNs &&
+			existing.Logical == spec.Logical &&
+			existing.OwnerMem == spec.OwnerMem &&
+			existing.KeyPattern == spec.KeyPattern &&
+			existing.Path == spec.Path
+		if identical {
+			return nil
+		}
+		return fmt.Errorf(
+			"index %q already registered with owner_ns=%q pattern=%q path=%q; "+
+				"conflicting registration requested: owner_ns=%q pattern=%q path=%q",
+			spec.FullName,
+			existing.OwnerNs, existing.KeyPattern, existing.Path,
+			spec.OwnerNs, spec.KeyPattern, spec.Path)
+	}
+
+	if err := db.store(layer).CreateIndex(spec.FullName, spec.KeyPattern, buntdb.IndexJSON(spec.Path)); err != nil {
+		return fmt.Errorf("index %q: create btree: %w", spec.FullName, err)
+	}
+	db.idxRegSpec[spec.FullName] = spec
+
+	if persist {
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			return fmt.Errorf("index %q: marshal idxSpec: %w", spec.FullName, err)
+		}
+		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+			_, _, setErr := tx.Set(metaKey, string(raw), nil)
+			return setErr
+		}); err != nil {
+			return fmt.Errorf("index %q: persist %s: %w", spec.FullName, metaKey, err)
+		}
+	}
+
+	slog.Debug("index registered",
+		"name", spec.FullName, "owner_ns", spec.OwnerNs,
+		"logical", spec.Logical, "mem", spec.OwnerMem,
+		"pattern", spec.KeyPattern, "path", spec.Path)
 	return nil
 }
 
-// SearchIndex scans one registered full index name on its bound storage layer,
-// narrows results by one full storage-key pattern, applies the optional filter,
-// and returns the matched JSON documents ordered by that index.
+// CreateIndex converts legacy x.Index declarations into idxSpec
+// and registers them without persisting "_idx_:*" meta keys. It exists for
+// test fixtures; production indexes are Admin-CLI-managed "_idx_:*" records
+// reloaded on every boot via loadIndexes.
+func (db *DB) CreateIndex(idx x.Index) error {
+	return db.registerIndexes(idx)
+}
+
+// registerIndexes converts legacy x.Index declarations into idxSpec
+// and forwards them to applyIndexSpec without persisting "_idx_:*" meta
+// keys. Duplicate specs are rejected (idempotent: only exact duplicates pass).
+func (db *DB) registerIndexes(indexes ...x.Index) error {
+	for _, idx := range indexes {
+		fullName := idx.Name()
+		if fullName == "" {
+			return fmt.Errorf("index name is required")
+		}
+		if _, ok := db.idxRegSpec[fullName]; ok {
+			return fmt.Errorf("index already declared: %s", fullName)
+		}
+		ownerNs, logical, err := internal.ParseIndexFullName(fullName)
+		if err != nil {
+			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
+		}
+		ownerMem := strings.HasPrefix(idx.KeyPattern(), x.MemNsPrefix+x.StorageKeySeparator) ||
+			strings.HasPrefix(ownerNs, x.MemNsPrefix)
+		spec := idxSpec{
+			FullName:   fullName,
+			OwnerNs:    ownerNs,
+			Logical:    logical,
+			OwnerMem:   ownerMem,
+			KeyPattern: idx.KeyPattern(),
+			Path:       idx.Path(),
+		}
+		if err := db.applyIndexSpec(spec, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadIndexes rebuilds BuntDB indexes from persisted "_idx_:*" meta records.
+// A corrupt "_idx_:*" record is a hard error. applyIndexSpec is intentionally
+// invoked outside the View transaction to avoid deadlocking on nested
+// write-transaction requirements of CreateIndex inside an AscendKeys callback.
+func (db *DB) loadIndexes() error {
+	type kv struct {
+		metaKey string
+		raw     string
+	}
+	patterns := []struct {
+		layer storageLayer
+		glob  string
+	}{
+		{layer: storageDisk, glob: x.IdxMetaNsPrefix + x.StorageKeySeparator + "*"},
+		{layer: storageMem, glob: x.IdxMetaNsPrefix + x.StorageKeySeparator + "*"},
+	}
+	for _, p := range patterns {
+		var collected []kv
+		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
+				collected = append(collected, kv{metaKey: metaKey, raw: value})
+				return true
+			})
+		})
+		if err != nil {
+			return err
+		}
+		for _, c := range collected {
+			var spec idxSpec
+			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
+				return fmt.Errorf("index %s: unmarshal idxSpec: %w", c.metaKey, err)
+			}
+			if spec.FullName == "" {
+				return fmt.Errorf("index %s: empty name", c.metaKey)
+			}
+			if err := db.applyIndexSpec(spec, false); err != nil {
+				return fmt.Errorf("index %s: apply: %w", c.metaKey, err)
+			}
+		}
+	}
+	slog.Debug("index registry loaded", "count", len(db.idxRegSpec))
+	return nil
+}
+
+// loadDocSpecs rebuilds the in-memory doc registry from persisted "_doc_:*"
+// meta records. A corrupt "_doc_:*" record is a hard error. Runtime type
+// information is intentionally not restored (reflect.Type of the caller's
+// ~string is only available at the process that eagerly registers via
+// Start's schemas argument); the registries' schemas are sufficient for
+// the strict gate. applyDocSpec is invoked outside the View transaction
+// to avoid deadlocking on the nested persist-write transaction.
+func (db *DB) loadDocSpecs() error {
+	type kv struct {
+		metaKey string
+		raw     string
+	}
+	patterns := []struct {
+		layer storageLayer
+		glob  string
+	}{
+		{layer: storageDisk, glob: x.DocMetaNsPrefix + x.StorageKeySeparator + "*"},
+		{layer: storageMem, glob: x.DocMetaNsPrefix + x.StorageKeySeparator + "*"},
+	}
+	for _, p := range patterns {
+		var collected []kv
+		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
+				collected = append(collected, kv{metaKey: metaKey, raw: value})
+				return true
+			})
+		})
+		if err != nil {
+			return err
+		}
+		for _, c := range collected {
+			var spec docSpec
+			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
+				return fmt.Errorf("doc %s: unmarshal docSpec: %w", c.metaKey, err)
+			}
+			if spec.Namespace == "" {
+				return fmt.Errorf("doc %s: empty namespace", c.metaKey)
+			}
+			if err := db.applyDocSpec(spec, nil); err != nil {
+				return fmt.Errorf("doc %s: apply: %w", c.metaKey, err)
+			}
+		}
+	}
+	slog.Debug("doc registry loaded", "count", len(db.docRegSpec))
+	return nil
+}
+
+// applyDocSpec is the atomic executor that applies a single docSpec to
+// the running DB: it performs schema conflict checks against docRegSpec,
+// records the spec in docRegSpec, and persists the spec as "_doc_:*"
+// metadata on the correct storage layer (disk or memory) dictated by
+// the spec itself.
 //
-// The index must be declared during server startup with x.Idx[D](...). The
-// indexName argument must be the internal full index name, while keyPattern
-// must be one full storage-key pattern. indexName chooses the storage layer
-// first; keyPattern only narrows matches within that layer. A concrete
-// keyPattern that points at a different layer is rejected.
-//
-// SearchIndex resolves one sealed x.KeyRange inside a secondary-index BTree
-// sweep. Because the index's first sort dimension is the serialized indexed
-// JSON field (not the storage key), the KeyRange predicate is applied purely
-// as a CALLBACK storage-key filter via the shared MatchesStorageKey helper —
-// identical algorithm to SEARCHINDEX's legacy string-keyPattern path, just
-// with the full 6-ctor expressive power of the sealed KeyRange instead of a
-// single glob. LIMIT truncation fires as an early-stop inside the iterator
-// callback when result count reaches kr.GetLimit() (no post-hoc slice).
-//
-// Ordering rules:
-//   - ascending when desc is false
-//   - descending when desc is true
-//
-// RESP equivalent:
-//
-//	SEARCHINDEX <index_name> <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
-//
-// Example:
-//
-//	res := db.SearchIndex(
-//		"idx_user_age",
-//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
-//		x.And(
-//			x.Gte("age", 18),
-//			x.Eq("status", "active"),
-//		),
-//		false,
-//	)
-//	users := res.MustGet()
+// rt is optional: if non-nil it must be a ~string type and is used to
+// fill spec.TypeName when the caller had compile-time type info
+// (e.g. Start's schemas variadic). When restoring from persisted meta
+// via loadDocSpecs, rt is nil and type-name derivation is skipped.
+func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
+	if rt != nil && rt.Kind() != reflect.String {
+		return fmt.Errorf("doc %q: schema implementors must be ~string types, got %s",
+			spec.Namespace, rt.Kind())
+	}
+	if spec.Namespace == "" {
+		return errors.New("doc schema: namespace is required")
+	}
+	if strings.ContainsAny(spec.Namespace, x.StorageKeySeparator+"*?_") {
+		return fmt.Errorf("doc %q: namespace must not contain reserved characters %q",
+			spec.Namespace, x.StorageKeySeparator+"*?_")
+	}
+	for i, p := range spec.KeyAttrs {
+		if p == "" {
+			return fmt.Errorf("doc %q: key_attrs[%d] is empty", spec.Namespace, i)
+		}
+	}
+	storageNs := spec.StorageNs()
+	metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + storageNs
+
+	if spec.TypeName == "" && rt != nil {
+		spec.TypeName = rt.String()
+	}
+
+	db.docRegMu.Lock()
+	defer db.docRegMu.Unlock()
+
+	existing, ok := db.docRegSpec[storageNs]
+	if ok {
+		compatible := existing.Namespace == spec.Namespace &&
+			existing.Mem == spec.Mem &&
+			reflect.DeepEqual(existing.KeyAttrs, spec.KeyAttrs)
+		if !compatible {
+			return fmt.Errorf(
+				"namespace %q already registered by %q (keyattrs=%v ttl=%s); "+
+					"incompatible with %q (keyattrs=%v ttl=%s)",
+				storageNs, existing.TypeName, existing.KeyAttrs, existing.TTL,
+				spec.TypeName, spec.KeyAttrs, spec.TTL)
+		}
+		if spec.TypeName == "" || strings.HasPrefix(spec.TypeName, "unknown<") {
+			spec.TypeName = existing.TypeName
+		}
+		if existing.TTL == spec.TTL && existing.TypeName == spec.TypeName {
+			return nil
+		}
+		raw, err := json.Marshal(spec)
+		if err != nil {
+			return fmt.Errorf("doc %q: marshal updated docSpec: %w", storageNs, err)
+		}
+		layer := storageDisk
+		if spec.Mem {
+			layer = storageMem
+		}
+		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+			_, _, setErr := tx.Set(metaKey, string(raw), nil)
+			return setErr
+		}); err != nil {
+			return fmt.Errorf("doc %q: persist updated %s: %w", storageNs, metaKey, err)
+		}
+		db.docRegSpec[storageNs] = spec
+		if existing.TTL != spec.TTL {
+			slog.Debug("doc schema TTL updated",
+				"namespace", spec.Namespace, "storage_ns", storageNs,
+				"mem", spec.Mem, "old_ttl", existing.TTL, "new_ttl", spec.TTL)
+		}
+		if existing.TypeName != spec.TypeName {
+			slog.Debug("doc schema type label updated",
+				"namespace", spec.Namespace, "storage_ns", storageNs,
+				"old_type", existing.TypeName, "new_type", spec.TypeName)
+		}
+		return nil
+	}
+
+	if spec.TypeName == "" {
+		spec.TypeName = fmt.Sprintf("unknown<ns=%s>", storageNs)
+	}
+
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("doc %q: marshal docSpec: %w", storageNs, err)
+	}
+	layer := storageDisk
+	if spec.Mem {
+		layer = storageMem
+	}
+	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		_, _, setErr := tx.Set(metaKey, string(raw), nil)
+		return setErr
+	}); err != nil {
+		return fmt.Errorf("doc %q: persist %s: %w", storageNs, metaKey, err)
+	}
+
+	db.docRegSpec[storageNs] = spec
+	slog.Debug("doc schema applied",
+		"namespace", spec.Namespace, "storage_ns", storageNs,
+		"mem", spec.Mem, "keyattrs", spec.KeyAttrs,
+		"ttl", spec.TTL, "type", spec.TypeName)
+	return nil
+}
+
+// registerSchemas eagerly applies a batch of Schema values at server boot
+// by converting each Schema interface into a docSpec and forwarding it to
+// applyDocSpec. Each schema value is normally the zero-value of a ~string
+// Document alias (e.g. UserDoc("")). Conflict detection, namespace
+// validation, ~string guard, and persistence are all delegated to
+// applyDocSpec; this wrapper exists purely to bridge the type-level
+// interface world (x.Schema) into the runtime spec world (docSpec).
+func (db *DB) registerSchemas(schemas ...x.Schema) error {
+	for _, sch := range schemas {
+		rt := reflect.TypeOf(sch)
+		spec := docSpec{
+			Namespace: sch.Namespace(),
+			Mem:       sch.Mem(),
+			KeyAttrs:  append([]string(nil), sch.KeyAttrs()...),
+			TTL:       sch.TTL(),
+		}
+		if rt != nil {
+			spec.TypeName = rt.String()
+		}
+		if err := db.applyDocSpec(spec, rt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SearchIndex scans one registered index on its bound storage layer,
+// narrows by kr and optional filter, and returns matched JSON documents in
+// index order. The kr KeyRange cannot start with wildcard and must target
+// the same layer as the index.
 func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
@@ -394,9 +626,15 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
-	layer, ok := db.indexLayers[indexName]
+	idxSpec, ok := db.idxRegSpec[indexName]
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
+	}
+	var layer storageLayer
+	if idxSpec.OwnerMem {
+		layer = storageMem
+	} else {
+		layer = storageDisk
 	}
 	krLayerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
 		return layerForKey(k)
@@ -446,11 +684,6 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	})
 
 	if err != nil {
-		// Defense-in-depth branch: normally unreachable because the
-		// preceding `db.indexLayers[indexName]` check (L391) already
-		// rejects unknown indexes before calling buntdb.Ascend/Descend.
-		// Kept intentionally to guard against future concurrent DropIndex
-		// or TTL-on-index implementations that could race this path.
 		if errors.Is(err, buntdb.ErrNotFound) {
 			return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 		}
@@ -459,30 +692,10 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	return mo.Ok(results)
 }
 
-// SearchKey resolves one sealed x.KeyRange to one storage layer first, then
-// walks the matching default storage-index key range using buntdb's native
-// six BTree iterators, applies the optional x.Filter to each JSON value, and
-// returns matched documents in key order (ASC or DESC). LIMIT truncation is
-// applied inside the native iterator callback via kr.GetLimit() when set.
-//
-// The KeyRange itself must pin exactly one storage layer: either a literal
-// anchor via its Bounds().Lo, or a non-leading-wildcard glob pattern via
-// Pattern(). Unanchored KeyRanges (leading-wildcard pattern such as "*foo")
-// are rejected with an error exactly as the legacy string-keyPattern path
-// used to reject them via resolvePatternLayer.
-//
-// RESP equivalent:
-//
-//	SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
-//
-// Example:
-//
-//	res := db.SearchKey(
-//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
-//		x.Eq("region", "us"),
-//		true,
-//	)
-//	users := res.MustGet()
+// SearchKey resolves one sealed x.KeyRange to a single storage layer, walks
+// the matching default storage-index key range using native BTree iterators,
+// applies the optional filter, and returns matched JSON documents in ASC or
+// DESC key order. The KeyRange must pin exactly one storage layer.
 func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
@@ -679,143 +892,219 @@ func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
 	return mo.Ok(keys)
 }
 
-// SECTION: Typed Document View
-
-// Get loads one document by its document-level key value.
-//
-// The input key is the resolved JSON-layer key value, not the final storage
-// key. The storage namespace is derived from D automatically.
-func (dbx *DBX[D]) Get(key string) (D, error) {
-	var zero D
-	if dbx == nil {
-		return zero, errors.New("db is nil")
+func withLimit(limit int, fn func(key, value string) bool) func(key, value string) bool {
+	if limit <= 0 {
+		return fn
 	}
-
-	res := (*DB)(dbx).Get(x.StorageKeyValue[D](key))
-	if res.IsError() {
-		return zero, res.Error()
+	consumed := 0
+	return func(key, value string) bool {
+		if !fn(key, value) {
+			return false
+		}
+		consumed++
+		return consumed < limit
 	}
-	return D(res.MustGet()), nil
 }
 
-// Set stores one document using its derived storage key and document TTL.
-func (dbx *DBX[D]) Set(d D) error {
-	if dbx == nil {
-		return errors.New("db is nil")
+func nsGuard(pivot string, fn func(k, v string) bool) func(k, v string) bool {
+	i := strings.IndexByte(pivot, ':')
+	if i < 0 {
+		return fn
 	}
-
-	key, err := x.StorageKey(d)
-	if err != nil {
-		return err
+	scope := pivot[:i+1]
+	n := i + 1
+	return func(k, v string) bool {
+		if len(k) <= n || k[:n] != scope {
+			return true
+		}
+		return fn(k, v)
 	}
-	return (*DB)(dbx).SetWithTtl(key, d.RawJSON(), d.TTL())
 }
 
-// SetNX stores one document only when its key does not already exist, using
-// the document TTL.
-func (dbx *DBX[D]) SetNX(d D) (bool, error) {
-	if dbx == nil {
-		return false, errors.New("db is nil")
+func matchFilter(predicate func(key string) bool, fn func(key, value string) bool) func(key, value string) bool {
+	return func(key, value string) bool {
+		if !predicate(key) {
+			return true
+		}
+		return fn(key, value)
 	}
-
-	key, err := x.StorageKey(d)
-	if err != nil {
-		return false, err
-	}
-	return (*DB)(dbx).SetNXWithTtl(key, d.RawJSON(), d.TTL())
 }
 
-// Delete removes one document by its derived storage key.
-func (dbx *DBX[D]) Delete(d D) (bool, error) {
-	if dbx == nil {
-		return false, errors.New("db is nil")
+func upperBoundCutoff(hi string, fn func(key, value string) bool) func(key, value string) bool {
+	if hi == "" {
+		return fn
 	}
-
-	key, err := x.StorageKey(d)
-	if err != nil {
-		return false, err
+	return func(key, value string) bool {
+		if key >= hi {
+			return false
+		}
+		return fn(key, value)
 	}
-	return (*DB)(dbx).Delete(key)
 }
 
-// Keys returns keys matching the document namespace and key sub-pattern.
-func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
-	if dbx == nil {
-		return mo.Err[[]string](errors.New("db is nil"))
+func lowerBoundCutoff(lo string, fn func(key, value string) bool) func(key, value string) bool {
+	if lo == "" {
+		return fn
 	}
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
-	if err != nil {
-		return mo.Err[[]string](err)
+	return func(key, value string) bool {
+		if key < lo {
+			return false
+		}
+		return fn(key, value)
 	}
-	return (*DB)(dbx).Keys(fullKeyPattern)
 }
 
-// SearchIndex delegates to the underlying DB index search.
-func (dbx *DBX[D]) SearchIndex(idxName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
-	if dbx == nil {
-		return mo.Err[[]D](errors.New("db is nil"))
+func applyBtRange(tx *buntdb.Tx, ge, lt string, limit int, dir x.RangeDirection, fn func(key, value string) bool) error {
+	cb := withLimit(limit, fn)
+	if x.IsLiteral(ge) && x.IsLiteral(lt) {
+		cb = nsGuard(ge, cb)
+		if dir == x.RangeAsc {
+			return tx.AscendRange("", ge, lt, cb)
+		}
+		return tx.DescendLessOrEqual("", x.NextLex(lt), func(k, v string) bool {
+			if k >= lt {
+				return true
+			}
+			if k < ge {
+				return false
+			}
+			return cb(k, v)
+		})
 	}
-	if kr == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
+	loGe, _ := match.Allowable(ge)
+	_, hiLt := match.Allowable(lt)
+	pred := func(k string) bool {
+		geOK := k >= ge || !x.IsLiteral(ge) && match.Match(k, ge)
+		ltOK := k < lt || !x.IsLiteral(lt) && match.Match(k, lt)
+		return geOK && ltOK
 	}
-
-	fullIdxName, err := internal.ValidateIdxName[D](idxName)
-	if err != nil {
-		return mo.Err[[]D](err)
+	cb = matchFilter(pred, cb)
+	if dir == x.RangeAsc {
+		return tx.AscendGreaterOrEqual("", loGe, upperBoundCutoff(hiLt, cb))
 	}
-
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]D](err)
-	}
-
-	res := (*DB)(dbx).SearchIndex(fullIdxName, fullKR, filter, desc)
-	if res.IsError() {
-		return mo.Err[[]D](res.Error())
-	}
-
-	raws := res.MustGet()
-	out := make([]D, 0, len(raws))
-	for _, raw := range raws {
-		out = append(out, D(raw))
-	}
-	return mo.Ok(out)
+	return tx.DescendLessOrEqual("", hiLt, lowerBoundCutoff(loGe, cb))
 }
 
-// SearchKey returns documents matching the prefixed scoped key range and filter.
-func (dbx *DBX[D]) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
-	if dbx == nil {
-		return mo.Err[[]D](errors.New("db is nil"))
+func applySingleBoundaryLiteralASC(tx *buntdb.Tx, op string, pivot string, cb func(k, v string) bool) error {
+	cb = nsGuard(pivot, cb)
+	switch op {
+	case "gt":
+		return tx.AscendGreaterOrEqual("", x.NextLex(pivot), cb)
+	case "gte":
+		return tx.AscendGreaterOrEqual("", pivot, cb)
+	case "lt":
+		return tx.AscendLessThan("", pivot, cb)
+	case "lte":
+		return tx.AscendLessThan("", x.NextLex(pivot), cb)
 	}
-	if kr == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
-	}
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]D](err)
-	}
-
-	res := (*DB)(dbx).SearchKey(fullKR, filter, desc)
-	if res.IsError() {
-		return mo.Err[[]D](res.Error())
-	}
-
-	raws := res.MustGet()
-	out := make([]D, 0, len(raws))
-	for _, raw := range raws {
-		out = append(out, D(raw))
-	}
-	return mo.Ok(out)
+	panic("applySingleBoundaryLiteralASC: unknown op " + op)
 }
 
-// Update applies mutations to documents matching the prefixed key range.
-func (dbx *DBX[D]) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if dbx == nil {
-		return mo.Err[[]string](errors.New("db is nil"))
+func applySingleBoundaryLiteralDESC(tx *buntdb.Tx, op string, pivot string, cb func(k, v string) bool) error {
+	cb = nsGuard(pivot, cb)
+	switch op {
+	case "gt":
+		return tx.DescendRange("", "\xFF\xFF\xFF\xFF", pivot, cb)
+	case "gte":
+		return tx.DescendLessOrEqual("", "\xFF\xFF\xFF\xFF",
+			lowerBoundCutoff(pivot, cb))
+	case "lt":
+		return tx.DescendLessOrEqual("", x.NextLex(pivot), func(k, v string) bool {
+			if k >= pivot {
+				return true
+			}
+			return cb(k, v)
+		})
+	case "lte":
+		return tx.DescendLessOrEqual("", pivot, cb)
 	}
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]string](err)
+	panic("applySingleBoundaryLiteralDESC: unknown op " + op)
+}
+
+func applySingleBoundaryPattern(tx *buntdb.Tx, dir x.RangeDirection, op string, pivot string, limit int, fn func(k, v string) bool) error {
+	lo, hi := match.Allowable(pivot)
+	var pred func(k string) bool
+	switch op {
+	case "gt":
+		pred = func(k string) bool { return k > pivot && match.Match(k, pivot) }
+	case "gte":
+		pred = func(k string) bool { return k >= pivot && match.Match(k, pivot) }
+	case "lt":
+		pred = func(k string) bool { return k < pivot && match.Match(k, pivot) }
+	case "lte":
+		pred = func(k string) bool { return k <= pivot && match.Match(k, pivot) }
+	default:
+		panic("applySingleBoundaryPattern: unknown op " + op)
 	}
-	return (*DB)(dbx).Update(fullKR, filter, values...)
+	if dir == x.RangeAsc {
+		return tx.AscendGreaterOrEqual("", lo,
+			upperBoundCutoff(hi, matchFilter(pred, withLimit(limit, fn))))
+	}
+	return tx.DescendLessOrEqual("", hi,
+		lowerBoundCutoff(lo, matchFilter(pred, withLimit(limit, fn))))
+}
+
+func applySingleBoundary(tx *buntdb.Tx, op string, pivot string, limit int, dir x.RangeDirection, fn func(key, value string) bool) error {
+	if x.IsLiteral(pivot) {
+		cb := withLimit(limit, fn)
+		if dir == x.RangeAsc {
+			return applySingleBoundaryLiteralASC(tx, op, pivot, cb)
+		}
+		return applySingleBoundaryLiteralDESC(tx, op, pivot, cb)
+	}
+	return applySingleBoundaryPattern(tx, dir, op, pivot, limit, fn)
+}
+
+func applyPatternRange(tx *buntdb.Tx, p string, limit int, dir x.RangeDirection, fn func(key, value string) bool) error {
+	if dir == x.RangeAsc {
+		if p == "" {
+			return nil
+		}
+		if p[0] == '*' {
+			if p == "*" {
+				return tx.Ascend("", withLimit(limit, fn))
+			}
+			cb := matchFilter(func(k string) bool { return match.Match(k, p) }, withLimit(limit, fn))
+			return tx.Ascend("", cb)
+		}
+		min, max := match.Allowable(p)
+		cb := upperBoundCutoff(max,
+			matchFilter(func(k string) bool { return match.Match(k, p) },
+				withLimit(limit, fn)))
+		return tx.AscendGreaterOrEqual("", min, cb)
+	}
+	if p == "" {
+		return nil
+	}
+	if p[0] == '*' {
+		if p == "*" {
+			return tx.Descend("", withLimit(limit, fn))
+		}
+		cb := matchFilter(func(k string) bool { return match.Match(k, p) }, withLimit(limit, fn))
+		return tx.Descend("", cb)
+	}
+	min, max := match.Allowable(p)
+	cb := lowerBoundCutoff(min,
+		matchFilter(func(k string) bool { return match.Match(k, p) },
+			withLimit(limit, fn)))
+	return tx.DescendLessOrEqual("", max, cb)
+}
+
+func applyKeyRange(tx *buntdb.Tx, kr x.KeyRange, dir x.RangeDirection, fn func(key, value string) bool) error {
+	kind, pa, pb, limit := x.InspectKeyRange(kr)
+	switch kind {
+	case x.KeyRangeBt:
+		return applyBtRange(tx, pa, pb, limit, dir, fn)
+	case x.KeyRangeGt:
+		return applySingleBoundary(tx, "gt", pa, limit, dir, fn)
+	case x.KeyRangeGte:
+		return applySingleBoundary(tx, "gte", pa, limit, dir, fn)
+	case x.KeyRangeLt:
+		return applySingleBoundary(tx, "lt", pa, limit, dir, fn)
+	case x.KeyRangeLte:
+		return applySingleBoundary(tx, "lte", pa, limit, dir, fn)
+	case x.KeyRangePattern:
+		return applyPatternRange(tx, pa, limit, dir, fn)
+	}
+	panic("applyKeyRange: unhandled KeyRangeKind " + kind.String())
 }

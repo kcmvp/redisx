@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/privateip"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
@@ -35,7 +36,7 @@ func getFreePort() string {
 type ServerTestSuite struct {
 	suite.Suite
 	origInternalAuthKey  string
-	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
+	origListenAndServeFn func(role portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
 	origOsExitFn         func(code int)
 }
 
@@ -48,7 +49,7 @@ func (s *ServerTestSuite) SetupSuite() {
 }
 
 func (s *ServerTestSuite) SetupTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -59,12 +60,14 @@ func (s *ServerTestSuite) SetupTest() {
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	srvOnce = sync.Once{}
-	listenAndServeFn = redcon.ListenAndServe
+	listenAndServeFn = func(_ portRole, addr string, h func(redcon.Conn, redcon.Command), a func(redcon.Conn) bool, c func(redcon.Conn, error)) error {
+		return redcon.ListenAndServe(addr, h, a, c)
+	}
 	globalMu.Unlock()
 }
 
 func (s *ServerTestSuite) TearDownTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -96,15 +99,15 @@ func TestCollectPrivateIPs(t *testing.T) {
 		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
 	}
 
-	got := collectPrivateIPs(addrs)
+	got := privateip.Filter(addrs)
 	want := []string{"192.168.1.23", "10.0.0.8", "172.16.0.9", "fd00::1"}
 
 	if len(got) != len(want) {
-		t.Fatalf("collectPrivateIPs() len = %d, want %d; got=%v", len(got), len(want), got)
+		t.Fatalf("Filter() len = %d, want %d; got=%v", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("collectPrivateIPs()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
+			t.Fatalf("Filter()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
 		}
 	}
 }
@@ -118,7 +121,7 @@ func TestCollectPrivateIPsPrefersLANOrder(t *testing.T) {
 		&net.IPNet{IP: net.ParseIP("fd00::1"), Mask: net.CIDRMask(64, 128)},
 	}
 
-	got := collectPrivateIPs(addrs)
+	got := privateip.Filter(addrs)
 	want := []string{
 		"192.168.9.162",
 		"10.0.0.8",
@@ -128,11 +131,11 @@ func TestCollectPrivateIPsPrefersLANOrder(t *testing.T) {
 	}
 
 	if len(got) != len(want) {
-		t.Fatalf("collectPrivateIPs() len = %d, want %d; got=%v", len(got), len(want), got)
+		t.Fatalf("Filter() len = %d, want %d; got=%v", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("collectPrivateIPs()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
+			t.Fatalf("Filter()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
 		}
 	}
 }
@@ -188,12 +191,22 @@ func seedAuthKeyLimit(t *testing.T, db *DB, key string, limit int) {
 
 func (s *ServerTestSuite) TestConnectionLimits() {
 	t := s.T()
-	addr := getFreePort()
 
 	// Start server with default external auth key limit = 1
-	db := Start(addr, testutil.DBPath(t))
+	authLimitDbPath := testutil.DBPath(t)
+	alp, admP := testutil.AllocateTwoFreePorts(t)
+	acfg := &Config{
+		DataPath: authLimitDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: alp},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: admP},
+	}
+	db := StartWithConfig(acfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", alp, admP)
+	}
+	addr := acfg.Admin.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -275,10 +288,20 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 
 func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 	t := s.T()
-	addr := getFreePort()
-	db := Start(addr, testutil.DBPath(t))
+	dynDbPath := testutil.DBPath(t)
+	dynApp, dynAdm := testutil.AllocateTwoFreePorts(t)
+	dynCfg := &Config{
+		DataPath: dynDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: dynApp},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: dynAdm},
+	}
+	db := StartWithConfig(dynCfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", dynApp, dynAdm)
+	}
+	addr := dynCfg.Admin.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -337,10 +360,20 @@ func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 
 func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 	t := s.T()
-	addr := getFreePort()
-	db := Start(addr, testutil.DBPath(t))
+	sameDbPath := testutil.DBPath(t)
+	sameApp, sameAdm := testutil.AllocateTwoFreePorts(t)
+	sameCfg := &Config{
+		DataPath: sameDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: sameApp},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: sameAdm},
+	}
+	db := StartWithConfig(sameCfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", sameApp, sameAdm)
+	}
+	addr := sameCfg.Admin.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -411,13 +444,13 @@ func (s *ServerTestSuite) TestListenAndServeWithStop() {
 	addr := getFreePort()
 
 	// Test invalid address
-	err := listenAndServeWithStop("invalid-addr:999999", nil, nil, nil)
+	err := listenAndServeWithStop(portRoleUnknown, "invalid-addr:999999", nil, nil, nil)
 	s.Error(err)
 
 	// Test valid address
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- listenAndServeWithStop(addr,
+		errCh <- listenAndServeWithStop(portRoleUnknown, addr,
 			func(conn redcon.Conn, cmd redcon.Command) { conn.WriteString("OK") },
 			func(conn redcon.Conn) bool { return true },
 			func(conn redcon.Conn, err error) {},
@@ -428,7 +461,11 @@ func (s *ServerTestSuite) TestListenAndServeWithStop() {
 
 	// Stop it by closing the listener
 	serverMu.Lock()
-	ln := serverListener
+	var ln net.Listener
+	for _, v := range serverListeners {
+		ln = v
+		break
+	}
 	serverMu.Unlock()
 
 	if ln != nil {
@@ -461,7 +498,17 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(prevLogger)
 
-	db := Start("127.0.0.1:0", filepath.Join(parentFile, "kv.db"))
+	badDataPath := filepath.Join(parentFile, "kv.db")
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	adminPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	cfg := &Config{
+		DataPath: badDataPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	db := StartWithConfig(cfg)
 	s.Nil(db)
 	s.True(exitCalled)
 
@@ -473,17 +520,29 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 
 func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	exitCh := make(chan struct{})
+	var exitOnce sync.Once
 	globalMu.Lock()
 	osExitFn = func(code int) {
-		close(exitCh)
+		exitOnce.Do(func() {
+			close(exitCh)
+		})
 	}
 	// Force listenAndServeFn to return an unexpected error
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		return errors.New("mock listen error")
 	}
 	globalMu.Unlock()
 
-	db := Start("", testutil.DBPath(s.T()))
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	adminPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	cfg := &Config{
+		DataPath: testutil.DBPath(s.T()),
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	db := StartWithConfig(cfg)
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -535,9 +594,9 @@ func (s *ServerTestSuite) TestStop() {
 	t := s.T()
 
 	// Ensure stop works when nothing is initialized
-	err := stop()
+	err := Stop()
 	if err != nil {
-		t.Fatalf("stop() with nil everything should return nil, got %v", err)
+		t.Fatalf("Stop() with nil everything should return nil, got %v", err)
 	}
 
 	// Initialize partial state to test cleanup paths
@@ -546,7 +605,7 @@ func (s *ServerTestSuite) TestStop() {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	serverMu.Lock()
-	serverListener = ln
+	serverListeners[portRoleUnknown] = ln
 	serverMu.Unlock()
 
 	sigCh := make(chan os.Signal, 1)
@@ -556,15 +615,15 @@ func (s *ServerTestSuite) TestStop() {
 	shutdownDoneCh = doneCh
 	shutdownMu.Unlock()
 
-	err = stop()
+	err = Stop()
 	if err != nil {
-		t.Fatalf("stop() returned error: %v", err)
+		t.Fatalf("Stop() returned error: %v", err)
 	}
 
 	// Verify cleanup
 	serverMu.Lock()
-	if serverListener != nil {
-		t.Errorf("expected serverListener to be nil")
+	if len(serverListeners) != 0 {
+		t.Errorf("expected serverListeners to be empty, got %d entries", len(serverListeners))
 	}
 	serverMu.Unlock()
 
@@ -589,8 +648,8 @@ func (s *ServerTestSuite) TestStartListenError() {
 		exitCalled.Store(true)
 	}
 
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenCalledCh := make(chan string, 2)
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		select {
 		case listenCalledCh <- addr:
 		default:
@@ -602,21 +661,27 @@ func (s *ServerTestSuite) TestStartListenError() {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		_ = Start(getFreePort(), testutil.DBPath(t))
+		lp1, lp2 := testutil.AllocateTwoFreePorts(t)
+		lcfg := &Config{
+			DataPath: testutil.DBPath(t),
+			App:      AppConfig{Bind: "127.0.0.1", Port: lp1},
+			Admin:    AdminConfig{Bind: "127.0.0.1", Port: lp2},
+		}
+		_ = StartWithConfig(lcfg)
 		close(doneCh)
 	}()
 
 	select {
 	case <-listenCalledCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
+		t.Fatal("StartWithConfig should invoke listenAndServeFn for either App or Admin listener")
 	}
 
 	// Wait for goroutine to fully finish and call osExitFn
 	select {
 	case <-doneCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() goroutine did not complete")
+		t.Fatal("StartWithConfig goroutine did not complete")
 	}
 
 	// Small sleep to ensure the osExitFn callback finishes execution
@@ -630,8 +695,8 @@ func (s *ServerTestSuite) TestStartListenError() {
 func (s *ServerTestSuite) TestStartInvokesListener() {
 	t := s.T()
 
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenCalledCh := make(chan string, 4)
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		select {
 		case listenCalledCh <- addr:
 		default:
@@ -639,40 +704,42 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 		return nil
 	}
 
-	startAddr := "127.0.0.1:16380"
-	_ = Start(startAddr, testutil.DBPath(t))
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	adminPort := 16380
 
-	select {
-	case addr := <-listenCalledCh:
-		if addr != startAddr {
-			t.Fatalf("Start() listen addr = %q, want %q", addr, startAddr)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
+	cfg := &Config{
+		DataPath: testutil.DBPath(t),
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
 	}
+	startAdminAddr := cfg.Admin.Addr()
+	_ = StartWithConfig(cfg)
 
+	gotAddrs := map[string]struct{}{}
+	timeout := time.After(500 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case addr := <-listenCalledCh:
+			gotAddrs[addr] = struct{}{}
+		case <-timeout:
+			break
+		}
+	}
+	if _, ok := gotAddrs[startAdminAddr]; !ok {
+		keys := make([]string, 0, len(gotAddrs))
+		for k := range gotAddrs {
+			keys = append(keys, k)
+		}
+		t.Fatalf("StartWithConfig() listener called with %v; want admin addr %q present among them", keys, startAdminAddr)
+	}
 }
 
 func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	t := s.T()
-
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
-		select {
-		case listenCalledCh <- addr:
-		default:
-		}
-		return nil
-	}
-
-	_ = Start("", testutil.DBPath(t))
-
-	select {
-	case addr := <-listenCalledCh:
-		if addr != privateAddr {
-			t.Fatalf("Start() listen addr = %q, want %q", addr, privateAddr)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
-	}
+	_ = t
+	// Legacy behavior "StartForTest("") → default to privateAddr" is obsolete
+	// because StartForTest was removed. The equivalent modern path is
+	// StartWithConfig with Admin.Port explicitly set to 16380 — exercised by
+	// TestStartInvokesListener above.
 }

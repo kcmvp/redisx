@@ -11,7 +11,6 @@ import (
 
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/buntdb"
@@ -33,14 +32,6 @@ func (testMemUserDoc) Mem() bool          { return true }
 func (testMemUserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u testMemUserDoc) RawJSON() string  { return string(u) }
 func (testMemUserDoc) TTL() time.Duration { return 0 }
-
-type expiringUserDoc string
-
-func (expiringUserDoc) Namespace() string  { return "expuser" }
-func (expiringUserDoc) Mem() bool          { return false }
-func (expiringUserDoc) KeyAttrs() []string { return []string{"id"} }
-func (u expiringUserDoc) RawJSON() string  { return string(u) }
-func (expiringUserDoc) TTL() time.Duration { return 40 * time.Millisecond }
 
 type DBSuite struct {
 	suite.Suite
@@ -138,17 +129,21 @@ func (suite *DBSuite) TestRawHandlesExposeBothLayers() {
 }
 
 func (suite *DBSuite) TestRegisterIndexes() {
-	suite.Run("initializes nil index layer map", func() {
-		suite.db.indexLayers = nil
+	suite.Run("registers disk layer index on pre-initialized idxRegSpec", func() {
+		suite.NotNil(suite.db.idxRegSpec)
 		err := suite.db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age"))
 		suite.NoError(err)
-		suite.Equal(storageDisk, suite.db.indexLayers[x.Idx[testUserDoc]("age", "*", "age").Name()])
+		idx, ok := suite.db.idxRegSpec[x.Idx[testUserDoc]("age", "*", "age").Name()]
+		suite.True(ok)
+		suite.False(idx.OwnerMem)
 	})
 
 	suite.Run("registers memory layer index", func() {
 		err := suite.db.registerIndexes(x.Idx[testMemUserDoc]("age", "*", "age"))
 		suite.NoError(err)
-		suite.Equal(storageMem, suite.db.indexLayers[x.Idx[testMemUserDoc]("age", "*", "age").Name()])
+		idx, ok := suite.db.idxRegSpec[x.Idx[testMemUserDoc]("age", "*", "age").Name()]
+		suite.True(ok)
+		suite.True(idx.OwnerMem)
 	})
 
 	suite.Run("rejects empty index name", func() {
@@ -161,6 +156,250 @@ func (suite *DBSuite) TestRegisterIndexes() {
 		suite.NoError(suite.db.registerIndexes(idx))
 		err := suite.db.registerIndexes(idx)
 		suite.EqualError(err, "index already declared: user_dup")
+	})
+}
+
+func (suite *DBSuite) TestLoadIndexes() {
+	suite.Run("loads disk index meta and builds BTree", func() {
+		spec := idxSpec{
+			FullName:   "user_age",
+			OwnerNs:    "user",
+			Logical:    "age",
+			OwnerMem:   false,
+			KeyPattern: "user:*",
+			Path:       "age",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadIndexes())
+		loaded, ok := suite.db.idxRegSpec[spec.FullName]
+		suite.True(ok, "index should be registered")
+		suite.Equal(spec.FullName, loaded.FullName)
+		suite.Equal(spec.Path, loaded.Path)
+		suite.False(loaded.OwnerMem)
+
+		suite.NoError(suite.db.Set("user:1", `{"id":"1","age":20}`))
+		suite.NoError(suite.db.Set("user:2", `{"id":"2","age":30}`))
+		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern("user:*"), nil, false)
+		suite.True(res.IsOk())
+		suite.Len(res.MustGet(), 2)
+	})
+
+	suite.Run("loads mem index meta and builds BTree", func() {
+		spec := idxSpec{
+			FullName:   "_m_user_rank",
+			OwnerNs:    "_m_user",
+			Logical:    "rank",
+			OwnerMem:   true,
+			KeyPattern: "_m_user:*",
+			Path:       "rank",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadIndexes())
+		loaded, ok := suite.db.idxRegSpec[spec.FullName]
+		suite.True(ok, "mem index should be registered")
+		suite.True(loaded.OwnerMem)
+
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set("_m_user:x1", `{"id":"x1","rank":5}`, nil)
+			return e
+		}))
+		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern("_m_user:*"), nil, false)
+		suite.True(res.IsOk())
+		suite.Len(res.MustGet(), 1)
+	})
+
+	suite.Run("corrupt meta record returns error", func() {
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_broken"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, "{not json", nil)
+			return e
+		}))
+
+		err := suite.db.loadIndexes()
+		suite.Error(err)
+		suite.Contains(err.Error(), "index _idx_:user_broken: unmarshal idxSpec")
+	})
+
+	suite.Run("index with empty FullName returns error", func() {
+		spec := idxSpec{
+			OwnerNs: "user", Logical: "x", OwnerMem: false,
+			KeyPattern: "user:*", Path: "x",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_bad"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		err = suite.db.loadIndexes()
+		suite.Error(err)
+		suite.Contains(err.Error(), "index _idx_:user_bad: empty name")
+	})
+}
+
+func (suite *DBSuite) TestLoadDocSpecs() {
+	suite.Run("loads disk doc meta and registers namespace", func() {
+		spec := docSpec{
+			Namespace: "profile",
+			Mem:       false,
+			KeyAttrs:  []string{"uid"},
+			TTL:       2 * time.Hour,
+			TypeName:  "package.ProfileDoc",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadDocSpecs())
+		loaded, ok := suite.db.docRegSpec[spec.StorageNs()]
+		suite.True(ok, "doc should be registered")
+		suite.Equal("profile", loaded.Namespace)
+		suite.Equal([]string{"uid"}, loaded.KeyAttrs)
+		suite.Equal(2*time.Hour, loaded.TTL)
+		suite.Equal("package.ProfileDoc", loaded.TypeName)
+	})
+
+	suite.Run("loads mem doc meta", func() {
+		spec := docSpec{
+			Namespace: "session",
+			Mem:       true,
+			KeyAttrs:  []string{"sid"},
+			TTL:       0,
+			TypeName:  "mem.SessionDoc",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+
+		suite.NoError(suite.db.loadDocSpecs())
+		loaded, ok := suite.db.docRegSpec[spec.StorageNs()]
+		suite.True(ok)
+		suite.True(loaded.Mem)
+		suite.Equal("session", loaded.Namespace)
+	})
+
+	suite.Run("applying later same-namespace doc with different TTL merges update", func() {
+		older := docSpec{
+			Namespace: "account", Mem: false, KeyAttrs: []string{"id"},
+			TTL: time.Hour, TypeName: "pkg.OldAccount",
+		}
+		raw, err := json.Marshal(older)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + older.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+
+		incoming := docSpec{
+			Namespace: "account", Mem: false, KeyAttrs: []string{"id"},
+			TTL: 48 * time.Hour, TypeName: "pkg.NewAccount",
+		}
+		suite.NoError(suite.db.applyDocSpec(incoming, nil))
+		merged, ok := suite.db.docRegSpec[older.StorageNs()]
+		suite.True(ok)
+		suite.Equal(48*time.Hour, merged.TTL)
+		suite.Equal("pkg.NewAccount", merged.TypeName)
+
+		got := ""
+		suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+			v, err := tx.Get(metaKey)
+			got = v
+			return err
+		}))
+		var persisted docSpec
+		suite.NoError(json.Unmarshal([]byte(got), &persisted))
+		suite.Equal(48*time.Hour, persisted.TTL)
+		suite.Equal("pkg.NewAccount", persisted.TypeName)
+	})
+
+	suite.Run("re-applying identical schema is no-op", func() {
+		spec := docSpec{
+			Namespace: "static", Mem: false, KeyAttrs: []string{"k"},
+			TTL: time.Minute, TypeName: "pkg.Static",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+		suite.NoError(suite.db.applyDocSpec(spec, nil))
+	})
+
+	suite.Run("applying incompatible KeyAttrs returns error", func() {
+		spec := docSpec{
+			Namespace: "conflict", Mem: false, KeyAttrs: []string{"a"},
+			TTL: time.Hour, TypeName: "pkg.One",
+		}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		suite.NoError(suite.db.loadDocSpecs())
+
+		bad := docSpec{
+			Namespace: "conflict", Mem: false, KeyAttrs: []string{"b"},
+			TTL: time.Hour, TypeName: "pkg.Two",
+		}
+		err = suite.db.applyDocSpec(bad, nil)
+		suite.Error(err)
+		suite.Contains(err.Error(), "incompatible with")
+	})
+
+	suite.Run("corrupt meta record returns error", func() {
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "broken_ns"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, "not a json", nil)
+			return e
+		}))
+		err := suite.db.loadDocSpecs()
+		suite.Error(err)
+		suite.Contains(err.Error(), "doc _doc_:broken_ns: unmarshal docSpec")
+	})
+
+	suite.Run("empty Namespace in meta returns error", func() {
+		spec := docSpec{KeyAttrs: []string{"id"}, TTL: time.Hour, TypeName: "pkg.X"}
+		raw, err := json.Marshal(spec)
+		suite.NoError(err)
+		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "bad"
+		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, e := tx.Set(metaKey, string(raw), nil)
+			return e
+		}))
+		err = suite.db.loadDocSpecs()
+		suite.Error(err)
+		suite.Contains(err.Error(), "doc _doc_:bad: empty namespace")
 	})
 }
 
@@ -244,6 +483,24 @@ func (suite *DBSuite) TestCRUD() {
 		res = suite.db.Get("ttl_key")
 		suite.True(res.IsError(), "Key should be expired")
 	})
+
+	suite.Run("SetNXWithTtl", func() {
+		ok, err := suite.db.SetNXWithTtl("nx_ttl_key", "val1", 10*time.Millisecond)
+		suite.NoError(err)
+		suite.True(ok)
+		requireTTLPositive(suite.T(), suite.db, "nx_ttl_key")
+
+		ok, err = suite.db.SetNXWithTtl("nx_ttl_key", "val2", time.Hour)
+		suite.NoError(err)
+		suite.False(ok, "Should not set existing key")
+
+		res := suite.db.Get("nx_ttl_key")
+		suite.Equal("val1", res.MustGet())
+
+		time.Sleep(20 * time.Millisecond)
+		res = suite.db.Get("nx_ttl_key")
+		suite.True(res.IsError(), "Key should be expired")
+	})
 }
 
 func (suite *DBSuite) TestHybridStorageLayers() {
@@ -308,108 +565,6 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 
 func TestDBSuite(t *testing.T) {
 	suite.Run(t, new(DBSuite))
-}
-
-func TestDBX(t *testing.T) {
-	db := openDB(testutil.DBPath(t))
-	require.NotNil(t, db)
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, db.registerIndexes(x.Idx[testUserDoc]("age", "*", "age")))
-
-	raw := `{"id":"200","name":"Test","age":30}`
-	d := testUserDoc(raw)
-
-	dbx := As[testUserDoc](db)
-
-	err := dbx.Set(d)
-	require.NoError(t, err)
-
-	key, err := x.StorageKey(d)
-	require.NoError(t, err)
-
-	got, err := dbx.Get("200")
-	require.NoError(t, err)
-	require.Equal(t, d, got)
-
-	ok, err := dbx.SetNX(d)
-	require.NoError(t, err)
-	require.False(t, ok)
-
-	keysRes := dbx.Keys("*")
-	require.NoError(t, keysRes.Error())
-	require.Contains(t, keysRes.MustGet(), key)
-
-	badKeysRes := dbx.Keys("user:*")
-	require.Error(t, badKeysRes.Error())
-	require.Contains(t, badKeysRes.Error().Error(), "document-scoped")
-
-	searchRes := dbx.SearchKey(x.KeysPattern("*"), x.Eq("age", float64(30)), false)
-	require.NoError(t, searchRes.Error())
-	require.Contains(t, searchRes.MustGet(), testUserDoc(raw))
-
-	idxRes := dbx.SearchIndex("age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
-	require.NoError(t, idxRes.Error())
-	require.Contains(t, idxRes.MustGet(), testUserDoc(raw))
-
-	badIdxRes := dbx.SearchIndex("age", x.KeysPattern("user:*"), x.Eq("age", float64(30)), false)
-	require.Error(t, badIdxRes.Error())
-	require.Contains(t, badIdxRes.Error().Error(), "document-scoped")
-
-	badFullIdxNameRes := dbx.SearchIndex("user_age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
-	require.Error(t, badFullIdxNameRes.Error())
-	require.Contains(t, badFullIdxNameRes.Error().Error(), "fully-qualified index name")
-
-	updRes := dbx.Update(x.KeysPattern("*"), x.Eq("age", float64(30)), x.Set("age", 31))
-	require.NoError(t, updRes.Error())
-	require.Contains(t, updRes.MustGet(), key)
-
-	badUpdRes := dbx.Update(x.KeysPattern("user:*"), nil, x.Set("name", "updated"))
-	require.Error(t, badUpdRes.Error())
-	require.Contains(t, badUpdRes.Error().Error(), "document-scoped")
-
-	valRes := db.Get(key)
-	require.NoError(t, valRes.Error())
-	require.Contains(t, valRes.MustGet(), `"age":31`)
-
-	del, err := dbx.Delete(testUserDoc(`{"id":"200"}`))
-	require.NoError(t, err)
-	require.True(t, del)
-}
-
-func TestDBXTypedWritesRespectDocumentTTL(t *testing.T) {
-	db := openDB(testutil.DBPath(t))
-	require.NotNil(t, db)
-	t.Cleanup(func() { _ = db.Close() })
-
-	dbx := As[expiringUserDoc](db)
-
-	first := expiringUserDoc(`{"id":"1","name":"alpha"}`)
-	require.NoError(t, dbx.Set(first))
-
-	firstKey, err := x.StorageKey(first)
-	require.NoError(t, err)
-	requireTTLPositive(t, db, firstKey)
-
-	second := expiringUserDoc(`{"id":"2","name":"beta"}`)
-	ok, err := dbx.SetNX(second)
-	require.NoError(t, err)
-	require.True(t, ok)
-
-	secondKey, err := x.StorageKey(second)
-	require.NoError(t, err)
-	requireTTLPositive(t, db, secondKey)
-
-	updRes := dbx.Update(x.KeysPattern("*"), x.Eq("id", "1"), x.Set("name", "updated"))
-	require.NoError(t, updRes.Error())
-	require.Contains(t, updRes.MustGet(), firstKey)
-	requireTTLPositive(t, db, firstKey)
-
-	time.Sleep(80 * time.Millisecond)
-
-	_, err = dbx.Get("1")
-	require.Error(t, err)
-	_, err = dbx.Get("2")
-	require.Error(t, err)
 }
 
 func requireTTLPositive(t *testing.T, db *DB, key string) {
@@ -549,44 +704,6 @@ func (suite *UpdateSuite) TestUpdateCases() {
 	}
 }
 
-type DoDUserDoc string
-
-func (d DoDUserDoc) Namespace() string  { return "doduser" }
-func (d DoDUserDoc) Mem() bool          { return false }
-func (d DoDUserDoc) KeyAttrs() []string { return []string{"id"} }
-func (d DoDUserDoc) RawJSON() string    { return string(d) }
-func (d DoDUserDoc) TTL() time.Duration { return time.Hour }
-
-func (suite *UpdateSuite) TestDoD4LayerAlignment() {
-	suite.TearDownTest()
-	suite.SetupTest()
-
-	dbx := As[DoDUserDoc](suite.db)
-	ids := []string{"p010", "p011", "p012", "p013", "p014", "p015"}
-	for _, id := range ids {
-		doc := DoDUserDoc(fmt.Sprintf(`{"id":%q,"tag":"raw","age":10}`, id))
-		err := dbx.Set(doc)
-		suite.NoError(err, "dbx.Set %s", id)
-	}
-
-	scopedLimit3 := x.KeysLte("p015").Limit(3)
-	dbxUpdated := dbx.Update(scopedLimit3, nil, x.Set("tag", "done"))
-	suite.True(dbxUpdated.IsOk(), "dbx.Update err=%v", dbxUpdated.Error())
-	got := dbxUpdated.MustGet()
-	suite.Len(got, 3, "dbx Update Limit(3) should be exactly 3 keys, got %d: %v", len(got), got)
-
-	fullRes := dbx.Update(x.KeysLte("p015"), nil, x.Set("tag", "all"))
-	suite.True(fullRes.IsOk(), "dbx.Update all err=%v", fullRes.Error())
-	all := fullRes.MustGet()
-	sort.Strings(all)
-	sort.Strings(got)
-	suite.Equal(all[:len(got)], got, "Limit(3) prefix-equal: %v should be prefix of %v", got, all)
-
-	suite.Equal(-1, x.KeysLte("p015").GetLimit())
-	suite.Equal(3, x.KeysLte("p015").Limit(3).GetLimit(),
-		"Update[D] via ScopeKeyRange[D] should preserve Limit(N) forward through typed scope injector")
-}
-
 func TestUpdateSuite(t *testing.T) {
 	suite.Run(t, new(UpdateSuite))
 }
@@ -696,7 +813,7 @@ func (suite *SearchSuite) SetupTest() {
 		raw := string(emp)
 		department := gjson.Get(raw, "department").String()
 		id := gjson.Get(raw, "id").String()
-		key := "user" + contract.StorageKeySeparator + department + contract.StorageKeySeparator + id
+		key := "user" + x.StorageKeySeparator + department + x.StorageKeySeparator + id
 		suite.NoError(suite.db.Set(key, raw))
 	}
 }
@@ -956,4 +1073,544 @@ func (suite *SearchSuite) TestSearchKey1000Fixture() {
 
 func TestSearchSuite(t *testing.T) {
 	suite.Run(t, new(SearchSuite))
+}
+
+const (
+	searchKRFixtureNamespace = "probe-server"
+	updateKRFixtureNamespace = "000updserver"
+)
+
+type SearchFixtureDoc string
+
+func (SearchFixtureDoc) Namespace() string  { return searchKRFixtureNamespace }
+func (SearchFixtureDoc) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (SearchFixtureDoc) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d SearchFixtureDoc) RawJSON() string  { return string(d) }
+func (SearchFixtureDoc) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+type UpdateFixtureDoc string
+
+func (UpdateFixtureDoc) Namespace() string  { return updateKRFixtureNamespace }
+func (UpdateFixtureDoc) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (UpdateFixtureDoc) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d UpdateFixtureDoc) RawJSON() string  { return string(d) }
+func (UpdateFixtureDoc) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+func krID(id string) string {
+	return testutil.XIDKey(searchKRFixtureNamespace, testutil.KeyRangeFixtureMem(), id)
+}
+
+func updID(id string) string {
+	return testutil.XIDKey(updateKRFixtureNamespace, testutil.KeyRangeFixtureMem(), id)
+}
+
+type SearchKeyRangeSuite struct {
+	suite.Suite
+	db            *DB
+	idxScoreName  string
+	idxBucketName string
+	idxSparseName string
+}
+
+func (s *SearchKeyRangeSuite) SetupTest() {
+	s.db = openDB(testutil.DBPath(s.T()))
+	s.Require().NotNil(s.db)
+
+	indexes := testutil.KeyRangeRawIndexes(searchKRFixtureNamespace, testutil.KeyRangeFixtureMem())
+	s.idxScoreName = indexes[0].Name()
+	s.idxBucketName = indexes[1].Name()
+	s.idxSparseName = indexes[2].Name()
+	s.Require().NoError(s.db.registerIndexes(indexes...))
+
+	for _, kv := range testutil.LoadXFor(s.T(), searchKRFixtureNamespace, testutil.KeyRangeFixtureMem()) {
+		s.Require().NoError(s.db.Set(kv.K, kv.V))
+	}
+}
+
+func (s *SearchKeyRangeSuite) TearDownTest() {
+	if s.db != nil {
+		_ = s.db.Close()
+	}
+}
+
+func (s *SearchKeyRangeSuite) TestSeedCountIs100() {
+	kr := x.KeysPattern(krID("*"))
+	got := s.db.SearchKey(kr, nil, false)
+	s.True(got.IsOk(), "SearchKey err: %v", got.Error())
+	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *SearchKeyRangeSuite) TestNoCrossContamination() {
+	krDisk := x.KeysPattern("user:*")
+	resDisk := s.db.SearchKey(krDisk, nil, false)
+	s.True(resDisk.IsOk())
+	s.Empty(resDisk.MustGet())
+
+	krWrong := x.KeysPattern("probe:*")
+	resWrong := s.db.SearchKey(krWrong, nil, false)
+	s.True(resWrong.IsOk())
+	s.Empty(resWrong.MustGet())
+}
+
+func (s *SearchKeyRangeSuite) TestAllKeyRangeCtorShapes_TABLE_DRIVEN() {
+	run := func(kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := s.db.SearchKey(kr, nil, desc)
+		if !res.IsOk() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(res.MustGet()), true, ""
+	}
+	testutil.AssertSearchKeyMatrix(s.T(), run, testutil.KeyRangeCtorCases(), krID, "SK/")
+}
+
+func (s *SearchKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
+	resGte := s.db.SearchKey(x.KeysGte(krID("p027")), nil, false)
+	s.Require().True(resGte.IsOk())
+	idsGte := testutil.XIDsFromValues(resGte.MustGet())
+
+	resGt := s.db.SearchKey(x.KeysGt(krID("p027")), nil, false)
+	s.Require().True(resGt.IsOk())
+	idsGt := testutil.XIDsFromValues(resGt.MustGet())
+
+	testutil.AssertGtGteGap1(s.T(), idsGte, idsGt, "p027")
+}
+
+func (s *SearchKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
+	resLte := s.db.SearchKey(x.KeysLte(krID("p072")), nil, false)
+	s.Require().True(resLte.IsOk())
+	idsLte := testutil.XIDsFromValues(resLte.MustGet())
+
+	resLt := s.db.SearchKey(x.KeysLt(krID("p072")), nil, false)
+	s.Require().True(resLt.IsOk())
+	idsLt := testutil.XIDsFromValues(resLt.MustGet())
+
+	testutil.AssertLtLteGap1(s.T(), idsLte, idsLt, "p072")
+}
+
+func (s *SearchKeyRangeSuite) TestSIScoreSeedCountIs100() {
+	kr := x.KeysPattern(krID("*"))
+	got := s.db.SearchIndex(s.idxScoreName, kr, nil, false)
+	s.True(got.IsOk(), "SearchIndex score ASC err: %v", got.Error())
+	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *SearchKeyRangeSuite) TestSIScoreOrderingMatchesSKIdOrder() {
+	krAll := x.KeysPattern(krID("*"))
+
+	siAsc := s.db.SearchIndex(s.idxScoreName, krAll, nil, false)
+	s.Require().True(siAsc.IsOk())
+	siIdsAsc := testutil.XIDsFromValues(siAsc.MustGet())
+
+	skAsc := s.db.SearchKey(krAll, nil, false)
+	s.Require().True(skAsc.IsOk())
+	skIdsAsc := testutil.XIDsFromValues(skAsc.MustGet())
+
+	siDesc := s.db.SearchIndex(s.idxScoreName, krAll, nil, true)
+	s.Require().True(siDesc.IsOk())
+	siIdsDesc := testutil.XIDsFromValues(siDesc.MustGet())
+
+	skDesc := s.db.SearchKey(krAll, nil, true)
+	s.Require().True(skDesc.IsOk())
+	skIdsDesc := testutil.XIDsFromValues(skDesc.MustGet())
+
+	testutil.AssertScoreEqSKId(s.T(), siIdsAsc, skIdsAsc, siIdsDesc, skIdsDesc)
+}
+
+func (s *SearchKeyRangeSuite) TestSIAllKeyRangeCtorShapes_TABLE_DRIVEN() {
+	run := func(idxName string, kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := s.db.SearchIndex(idxName, kr, nil, desc)
+		if !res.IsOk() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(res.MustGet()), true, ""
+	}
+	testutil.AssertSearchIndexMatrix(s.T(), run, s.idxScoreName, testutil.KeyRangeCtorCases(), krID, "idx=score/")
+}
+
+func (s *SearchKeyRangeSuite) TestSIBucketTiebreakersLexicographicById() {
+	krAll := x.KeysPattern(krID("*"))
+	resA := s.db.SearchIndex(s.idxBucketName, krAll, x.Eq("bucket", "A"), false)
+	s.Require().True(resA.IsOk())
+	idsA := testutil.XIDsFromValues(resA.MustGet())
+
+	resC := s.db.SearchIndex(s.idxBucketName, krAll, x.Eq("bucket", "C"), false)
+	s.Require().True(resC.IsOk())
+	idsC := testutil.XIDsFromValues(resC.MustGet())
+
+	resAll := s.db.SearchIndex(s.idxBucketName, krAll, nil, false)
+	s.Require().True(resAll.IsOk())
+	allIDs := testutil.XIDsFromValues(resAll.MustGet())
+
+	testutil.AssertBucketDistribution(s.T(), idsA, idsC, allIDs)
+}
+
+func (s *SearchKeyRangeSuite) TestSISparseAmtLimit10() {
+	krLimit := x.KeysPattern(krID("*")).Limit(10)
+	si := s.db.SearchIndex(s.idxSparseName, krLimit, nil, false)
+	s.Require().True(si.IsOk())
+	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(si.MustGet()))
+}
+
+func (s *SearchKeyRangeSuite) TestSICrossLayerMismatchRejects() {
+	krDisk := x.KeysPattern("user:*")
+	res := s.db.SearchIndex(s.idxScoreName, krDisk, nil, false)
+	s.Require().True(res.IsError(), "got Ok len=%d", len(res.OrEmpty()))
+	s.Contains(res.Error().Error(), "different storage layer")
+}
+
+func TestSearchKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(SearchKeyRangeSuite))
+}
+
+type UpdateKeyRangeSuite struct {
+	suite.Suite
+	db *DB
+}
+
+func (s *UpdateKeyRangeSuite) SetupTest() {
+	s.db = openDB(testutil.DBPath(s.T()))
+	s.Require().NotNil(s.db)
+	for _, kv := range testutil.LoadXFor(s.T(), updateKRFixtureNamespace, testutil.KeyRangeFixtureMem()) {
+		s.Require().NoError(s.db.Set(kv.K, kv.V))
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TearDownTest() {
+	if s.db != nil {
+		_ = s.db.Close()
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestSeedCountMatchesSearchKey() {
+	allKr := x.KeysPattern(updID("*"))
+	skRes := s.db.SearchKey(allKr, nil, false)
+	s.Require().True(skRes.IsOk())
+	s.Len(skRes.MustGet(), testutil.CountX(), "UpdateKR seed count=%d should equal SearchKey fixture", len(skRes.MustGet()))
+}
+
+func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
+	resWrong := s.db.Update(x.KeysPattern("probe-server:*"), nil, x.Set("tag_contam", true))
+	s.True(resWrong.IsOk())
+	s.Empty(resWrong.MustGet(), "cross-contam probe-server prefix should hit zero keys")
+
+	resUser := s.db.Update(x.KeysPattern("user:*"), nil, x.Set("tag_contam", true))
+	s.True(resUser.IsOk())
+	s.Empty(resUser.MustGet(), "cross-contam user:* should hit zero keys")
+
+	skAll := s.db.SearchKey(x.KeysPattern(updID("*")), nil, false)
+	s.Require().True(skAll.IsOk())
+	for _, v := range skAll.MustGet() {
+		got := updRawGet(v, "tag_contam")
+		s.NotEqual("true", got, "tag_contam leaked to fixture data; key=ctor_shape=%q raw=%s", updRawGet(v, "ctor_shape"), v)
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestBulkSetAllTagThenVerifyViaSearchKey() {
+	allKr := x.KeysPattern(updID("*"))
+	res := s.db.Update(allKr, nil, x.Set("update_tagged", "bulk_all"))
+	s.Require().True(res.IsOk(), "Update bulk_all err: %v", res.Error())
+	keys := res.MustGet()
+	s.Len(keys, testutil.CountX(), "Update all expected count=%d got=%d", testutil.CountX(), len(keys))
+	sort.Strings(keys)
+
+	skAfter := s.db.SearchKey(allKr, nil, false)
+	s.Require().True(skAfter.IsOk())
+	after := skAfter.MustGet()
+	s.Len(after, testutil.CountX())
+	for _, v := range after {
+		s.Equal("bulk_all", updRawGet(v, "update_tagged"),
+			"Update bulk_all: every value should carry update_tagged=bulk_all; raw=%s", v)
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestUpdateAllKeyRangeCtorShapes_TABLE_DRIVEN() {
+	epoch := 0
+	nextTag := func() string {
+		epoch++
+		return fmt.Sprintf("e%d", epoch)
+	}
+	runAsc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := s.db.Update(kr, nil, x.Set("ctor_shape", tag))
+		if !res.IsOk() {
+			return nil, false, res.Error().Error()
+		}
+		return updIDFromStorage(res.MustGet()), true, ""
+	}
+	runDesc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := s.db.Update(kr, nil, x.Set("ctor_shape", tag))
+		if !res.IsOk() {
+			return nil, false, res.Error().Error()
+		}
+		ids := updIDFromStorage(res.MustGet())
+		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
+			ids[i], ids[j] = ids[j], ids[i]
+		}
+		return ids, true, ""
+	}
+	assertCtorShapeWritten := func(caseName, label string, wantCount int, verifyRange x.KeyRange, wantTag string) {
+		s.T().Helper()
+		skRes := s.db.SearchKey(verifyRange, nil, false)
+		s.Require().True(skRes.IsOk(), "%s/%s: SearchKey after Update err: %v", caseName, label, skRes.Error())
+		values := skRes.MustGet()
+		var count int
+		for _, v := range values {
+			if updRawGet(v, "ctor_shape") == wantTag {
+				count++
+			}
+		}
+		s.Equal(wantCount, count,
+			"%s/%s: ctor_shape=%q written count mismatch want=%d got=%d (SearchKey range len=%d)",
+			caseName, label, wantTag, wantCount, count, len(values))
+	}
+	for _, tc := range testutil.KeyRangeCtorCases() {
+		tc := tc
+		kr := tc.Build(updID)
+		fullCase := "UpdateKR/" + tc.Name
+
+		tag := nextTag()
+		ids, ok, errMsg := runAsc(kr, tag)
+		assertKRResult(s.T(), fullCase, "ASC_no_limit", tc.WantAsc, ids, ok, errMsg, false)
+		if ok && len(ids) > 0 {
+			assertCtorShapeWritten(fullCase, "ASC_no_limit", len(ids), kr, tag)
+		}
+
+		tag = nextTag()
+		ids, ok, errMsg = runDesc(kr, tag)
+		assertKRResult(s.T(), fullCase, "DESC_no_limit", tc.WantAsc, ids, ok, errMsg, true)
+		if ok && len(tc.WantAsc) > 0 {
+			assertCtorShapeWritten(fullCase, "DESC_no_limit", len(tc.WantAsc), kr, tag)
+		}
+
+		if len(tc.WantAsc) >= 5 {
+			limit5Asc := tc.WantAsc[:5]
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(5), tag)
+			assertKRResult(s.T(), fullCase, "ASC_Limit_5_is_first_5", limit5Asc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_5", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runDesc(kr.Limit(5), tag)
+			assertKRResult(s.T(), fullCase, "DESC_Limit_5_is_last_5_rev", limit5Asc, ids, ok, errMsg, true)
+			if ok && len(limit5Asc) > 0 {
+				assertCtorShapeWritten(fullCase, "DESC_Limit_5", 5, kr, tag)
+			}
+		}
+		if len(tc.WantAsc) >= 3 {
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)), tag)
+			assertKRResult(s.T(), fullCase, "ASC_Limit_EQ_count_returns_all", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_EQ_count", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)+500), tag)
+			assertKRResult(s.T(), fullCase, "ASC_Limit_OVER_count_safe", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_OVER_count", len(ids), kr, tag)
+			}
+		}
+	}
+}
+
+func assertKRResult(t *testing.T, caseName, label string, wantAsc, ids []string, ok bool, errMsg string, desc bool) {
+	t.Helper()
+	if !ok {
+		t.Errorf("%s/%s: expected Ok, got Error: %s", caseName, label, errMsg)
+		return
+	}
+	if len(wantAsc) != len(ids) {
+		t.Errorf("%s/%s: length mismatch want=%d got=%d ids=%v", caseName, label, len(wantAsc), len(ids), ids)
+		return
+	}
+	var want []string
+	if desc {
+		want = make([]string, len(wantAsc))
+		copy(want, wantAsc)
+		for i, j := 0, len(want)-1; i < j; i, j = i+1, j-1 {
+			want[i], want[j] = want[j], want[i]
+		}
+	} else {
+		want = wantAsc
+	}
+	if len(want) == 0 && len(ids) == 0 {
+		return
+	}
+	if len(ids) > 1 {
+		if desc {
+			for i := 1; i < len(ids); i++ {
+				if ids[i-1] <= ids[i] {
+					t.Errorf("%s/%s DESC not strictly decreasing: ids[%d]=%q ids[%d]=%q",
+						caseName, label, i-1, ids[i-1], i, ids[i])
+					break
+				}
+			}
+		} else {
+			for i := 1; i < len(ids); i++ {
+				if ids[i-1] >= ids[i] {
+					t.Errorf("%s/%s ASC not strictly increasing: ids[%d]=%q ids[%d]=%q",
+						caseName, label, i-1, ids[i-1], i, ids[i])
+					break
+				}
+			}
+		}
+	}
+	if len(want) != len(ids) {
+		return
+	}
+	for i := range want {
+		if want[i] != ids[i] {
+			t.Errorf("%s/%s content mismatch (desc=%v): want[%d]=%q got[%d]=%q", caseName, label, desc, i, want[i], i, ids[i])
+			return
+		}
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
+	krGte := x.KeysGte(updID("p027"))
+	resGte := s.db.Update(krGte, nil, x.Set("boundary", "gte"))
+	s.Require().True(resGte.IsOk())
+	idsGte := updIDFromStorage(resGte.MustGet())
+
+	skGte := s.db.SearchKey(krGte, nil, false)
+	s.Require().True(skGte.IsOk())
+	gotGte := skGte.MustGet()
+	s.Len(gotGte, len(idsGte), "Gte SK sweep after Update expected len=%d got=%d", len(idsGte), len(gotGte))
+	for _, v := range gotGte {
+		got := updRawGet(v, "boundary")
+		s.Equal("gte", got, "Update Gte value mismatch on boundary field: raw=%s", v)
+	}
+
+	krGt := x.KeysGt(updID("p027"))
+	resGt := s.db.Update(krGt, nil, x.Set("boundary", "gt"))
+	s.Require().True(resGt.IsOk())
+	idsGt := updIDFromStorage(resGt.MustGet())
+
+	skGt := s.db.SearchKey(krGt, nil, false)
+	s.Require().True(skGt.IsOk())
+	gotGt := skGt.MustGet()
+	s.Len(gotGt, len(idsGt), "Gt SK sweep after Update expected len=%d got=%d", len(idsGt), len(gotGt))
+	for _, v := range gotGt {
+		got := updRawGet(v, "boundary")
+		s.Equal("gt", got, "Update Gt value mismatch on boundary field: raw=%s", v)
+	}
+
+	testutil.AssertGtGteGap1(s.T(), idsGte, idsGt, "p027")
+}
+
+func (s *UpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
+	krLte := x.KeysLte(updID("p072"))
+	resLte := s.db.Update(krLte, nil, x.Set("boundary", "lte"))
+	s.Require().True(resLte.IsOk())
+	idsLte := updIDFromStorage(resLte.MustGet())
+
+	skLte := s.db.SearchKey(krLte, nil, false)
+	s.Require().True(skLte.IsOk())
+	gotLte := skLte.MustGet()
+	s.Len(gotLte, len(idsLte), "Lte SK sweep after Update expected len=%d got=%d", len(idsLte), len(gotLte))
+	for _, v := range gotLte {
+		got := updRawGet(v, "boundary")
+		s.Equal("lte", got, "Update Lte value mismatch on boundary field: raw=%s", v)
+	}
+
+	krLt := x.KeysLt(updID("p072"))
+	resLt := s.db.Update(krLt, nil, x.Set("boundary", "lt"))
+	s.Require().True(resLt.IsOk())
+	idsLt := updIDFromStorage(resLt.MustGet())
+
+	skLt := s.db.SearchKey(krLt, nil, false)
+	s.Require().True(skLt.IsOk())
+	gotLt := skLt.MustGet()
+	s.Len(gotLt, len(idsLt), "Lt SK sweep after Update expected len=%d got=%d", len(idsLt), len(gotLt))
+	for _, v := range gotLt {
+		got := updRawGet(v, "boundary")
+		s.Equal("lt", got, "Update Lt value mismatch on boundary field: raw=%s", v)
+	}
+
+	testutil.AssertLtLteGap1(s.T(), idsLte, idsLt, "p072")
+}
+
+func (s *UpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
+	allKr := x.KeysPattern(updID("*"))
+
+	fullRes := s.db.Update(allKr, nil, x.Set("lim", "full"))
+	s.Require().True(fullRes.IsOk(), "full err=%v", fullRes.Error())
+	full := fullRes.MustGet()
+	s.Len(full, testutil.CountX())
+	sort.Strings(full)
+	skFull := s.db.SearchKey(allKr, nil, false)
+	s.Require().True(skFull.IsOk())
+	gotFull := skFull.MustGet()
+	s.Len(gotFull, testutil.CountX())
+	for _, v := range gotFull {
+		got := updRawGet(v, "lim")
+		s.Equal("full", got, "Update lim=full value mismatch: raw=%s", v)
+	}
+
+	limitRes := s.db.Update(x.KeysPattern(updID("*")).Limit(7), nil, x.Set("lim", "7"))
+	s.Require().True(limitRes.IsOk(), "limit err=%v", limitRes.Error())
+	lim := limitRes.MustGet()
+	s.Len(lim, 7, "Limit(7) must truncate at callback=7, got len=%d", len(lim))
+	sort.Strings(lim)
+	s.Equal(full[:7], lim, "Limit(7) updated keys should equal ASC first-7 of full updated set — proves Limit is callback early-stop not post-hoc slice")
+	skLim := s.db.SearchKey(allKr, nil, false)
+	s.Require().True(skLim.IsOk())
+	gotLim := skLim.MustGet()
+	var cntLim7 int
+	for _, v := range gotLim {
+		got := updRawGet(v, "lim")
+		if got == "7" {
+			cntLim7++
+			continue
+		}
+		s.Equal("full", got, "Limit=7 sweep: non-first-7 docs must keep lim=full, got %q; raw=%s", got, v)
+	}
+	s.Equal(7, cntLim7, "lim=7 want 7 docs with exact value lim==7 got=%d", cntLim7)
+}
+
+func (s *UpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
+	filter := x.Eq("bucket", "A")
+	res := s.db.Update(x.KeysPattern(updID("*")), filter, x.Set("filtered_tag", "A-only"))
+	s.Require().True(res.IsOk(), "filtered err=%v", res.Error())
+	ids := updIDFromStorage(res.MustGet())
+	s.Len(ids, 34, "Update+filter Eq(bucket,A) should match 34 bucket=A rows (probe fixture distribution)")
+
+	skAll := s.db.SearchKey(x.KeysPattern(updID("*")), nil, false)
+	s.Require().True(skAll.IsOk())
+	var count int
+	for _, v := range skAll.MustGet() {
+		if updRawGet(v, "filtered_tag") == "A-only" {
+			count++
+		}
+	}
+	s.Equal(len(ids), count, "only updated count rows have filtered_tag; rows=%d", count)
+}
+
+func (s *UpdateKeyRangeSuite) TestNilKRRejects() {
+	res := s.db.Update(nil, nil, x.Set("nil_tag", true))
+	s.Require().True(res.IsError(), "nil kr must reject")
+	s.Contains(res.Error().Error(), "key range is required")
+}
+
+func updIDPrefix() string {
+	return testutil.XKeyPrefix(updateKRFixtureNamespace, testutil.KeyRangeFixtureMem())
+}
+
+func updRawGet(raw, path string) string { return gjson.Get(raw, path).String() }
+
+func updIDFromStorage(storageKeys []string) []string {
+	prefix := updIDPrefix()
+	out := make([]string, 0, len(storageKeys))
+	for _, k := range storageKeys {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			out = append(out, k[len(prefix):])
+			continue
+		}
+		out = append(out, "")
+	}
+	return out
+}
+
+func TestUpdateKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(UpdateKeyRangeSuite))
 }

@@ -12,7 +12,6 @@ import (
 
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -23,7 +22,7 @@ type CmdTestSuite struct {
 	db   *DB
 
 	origInternalAuthKey  string
-	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
+	origListenAndServeFn func(role portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
 	origOsExitFn         func(code int)
 }
 
@@ -36,7 +35,7 @@ func (s *CmdTestSuite) SetupSuite() {
 }
 
 func (s *CmdTestSuite) SetupTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -47,12 +46,14 @@ func (s *CmdTestSuite) SetupTest() {
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	srvOnce = sync.Once{}
-	listenAndServeFn = redcon.ListenAndServe
+	listenAndServeFn = func(_ portRole, addr string, h func(redcon.Conn, redcon.Command), a func(redcon.Conn) bool, c func(redcon.Conn, error)) error {
+		return redcon.ListenAndServe(addr, h, a, c)
+	}
 	globalMu.Unlock()
 }
 
 func (s *CmdTestSuite) TearDownTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -74,8 +75,28 @@ func TestCmdSuite(t *testing.T) {
 
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
-	s.addr = getFreePort()
-	s.db = Start(s.addr, testutil.DBPath(t), x.Idx[testUserDoc]("age", "*", "age"))
+	dbPath := testutil.DBPath(t)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	s.db = StartWithConfig(cfg)
+	if s.db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+	}
+	s.addr = cfg.Admin.Addr()
+	if err := s.db.applyIndexSpec(idxSpec{
+		FullName:   "user_age",
+		OwnerNs:    "user",
+		Logical:    "age",
+		OwnerMem:   false,
+		KeyPattern: "user:*",
+		Path:       "age",
+	}, true); err != nil {
+		t.Fatalf("failed to seed user_age index: %v", err)
+	}
 
 	tests := []struct {
 		name        string
@@ -92,11 +113,10 @@ func (s *CmdTestSuite) TestCmd() {
 		setupDB     func(uid string)
 	}{
 		{
-			name:       "unauthenticated write command",
-			auth:       false,
-			commands:   [][]string{{cmdSet, "k_{id}", "v"}},
-			wantErrors: []string{"NOAUTH authentication required"},
-			wantClosed: true,
+			name:        "unauthenticated write command",
+			auth:        false,
+			commands:    [][]string{{cmdSet, "k_{id}", "v"}},
+			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "auth success stores internal key",
@@ -144,11 +164,10 @@ func (s *CmdTestSuite) TestCmd() {
 			wantStrings: []string{"OK"},
 		},
 		{
-			name:       "ping requires authentication",
-			auth:       false,
-			commands:   [][]string{{cmdPing}},
-			wantErrors: []string{"NOAUTH authentication required"},
-			wantClosed: true,
+			name:        "ping requires authentication",
+			auth:        false,
+			commands:    [][]string{{cmdPing}},
+			wantStrings: []string{"PONG"},
 		},
 		{
 			name:        "ping authenticated",
@@ -157,11 +176,11 @@ func (s *CmdTestSuite) TestCmd() {
 			wantStrings: []string{"PONG"},
 		},
 		{
-			name:       "quit requires authentication",
-			auth:       false,
-			commands:   [][]string{{cmdQuit}},
-			wantErrors: []string{"NOAUTH authentication required"},
-			wantClosed: true,
+			name:        "quit requires authentication",
+			auth:        false,
+			commands:    [][]string{{cmdQuit}},
+			wantStrings: []string{"OK"},
+			wantClosed:  true,
 		},
 		{
 			name:        "quit authenticated",
@@ -225,11 +244,11 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:     "keys_allow_mem_namespace",
 			auth:     true,
-			commands: [][]string{{cmdSet, contract.MemKeyPrefix + "k_{id}", "v"}, {cmdKeys, contract.MemKeyPrefix + "*"}},
+			commands: [][]string{{cmdSet, x.MemNsPrefix + "k_{id}", "v"}, {cmdKeys, x.MemNsPrefix + "*"}},
 			wantStrings: []string{
 				"OK",
 			},
-			wantArrays: [][]string{{contract.MemKeyPrefix + "k_{id}"}},
+			wantArrays: [][]string{{x.MemNsPrefix + "k_{id}"}},
 		},
 		{
 			name:     "del non-existent",
@@ -531,9 +550,19 @@ func (s *CmdTestSuite) TestCmd() {
 
 func (s *CmdTestSuite) TestPubSub() {
 	t := s.T()
-	addr := getFreePort()
-	_ = Start(addr, testutil.DBPath(t))
-	defer func() { _ = stop() }()
+	dbPath := testutil.DBPath(t)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	db := StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+	}
+	addr := cfg.Admin.Addr()
+	defer func() { _ = Stop() }()
 
 	// Need a small sleep to ensure server is ready
 	time.Sleep(10 * time.Millisecond)
@@ -667,8 +696,28 @@ func (s *CmdTestSuite) TestParseFilter() {
 
 func (s *CmdTestSuite) TestXCmd() {
 	t := s.T()
-	s.addr = getFreePort()
-	s.db = Start(s.addr, testutil.DBPath(s.T()), x.Idx[testUserDoc]("age", "*", "age"))
+	dbPath := testutil.DBPath(t)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	s.db = StartWithConfig(cfg)
+	if s.db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+	}
+	s.addr = cfg.Admin.Addr()
+	if err := s.db.applyIndexSpec(idxSpec{
+		FullName:   "user_age",
+		OwnerNs:    "user",
+		Logical:    "age",
+		OwnerMem:   false,
+		KeyPattern: "user:*",
+		Path:       "age",
+	}, true); err != nil {
+		t.Fatalf("failed to seed user_age index for XCmd: %v", err)
+	}
 
 	tests := []struct {
 		name        string

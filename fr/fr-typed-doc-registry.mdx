@@ -1,0 +1,854 @@
+# FR: Typed Document Registry + Strict Mode (MVP)
+
+- **Status:** Draft
+- **Author:** kcmvp & Trae
+- **Date:** 2026-08-22
+- **Target issue(s):** TBD — to be created via `gh issue create` after review
+
+---
+
+## 1. Background & Motivation
+
+redisx 目前的 typed document 体系（`x.Document` [x.go#L261-L292](file:///Users/kcmvp/sandbox/redisx/x/x.go#L261-L292)）存在如下 4 个结构性缺口：
+
+### 1.1 缺口一：Doc 注册是「懒加载 & 无全局注册表守卫」
+
+今天的 `requireRegistered[D]`（由 `StorageKey/StorageKeyValue` 等触发）是 **lazy per-type 首次调用 panic 冲突**：两张 Doc 表共用一个 `Namespace()` 但 `KeyAttrs/TTL` 不一致时，只有在两张表**都被用到时**才会 panic —— 这会让上线几周后的生产流量触发首次 panic，失败窗口太晚，没有「启动期 eager 检测」的门控。
+
+### 1.2 缺口二：Index 和 Doc 的关系是「隐式通过泛型参数 [D] 关联」，不是一等关系
+
+注册 index 的唯一入口是 `server.Start(address, dbPath, indexes ...x.Index)` [srv.go#L460-L488](file:///Users/kcmvp/sandbox/redisx/server/srv.go#L460-L488)，而 index 与 D 的绑定是靠用户**记得**用 `x.Idx[D]()` 构造（内部走 `IdxFullName[D]`），没有任何 registry 层断言「这个 index 名属于哪个 ns，ns 有没有对应的 Doc schema」。
+
+### 1.3 缺口三：原生 RESP wire 协议侧（SET/UPDATE/DEL/SEARCHINDEX）无法反向路由到 Doc 类型
+
+用户用 `redis-cli SET user:0100 '...'` 时，今天的实现**完全不知道 `user:` 这个 ns 对应了哪张表**，所以享受不到：
+- `D.TTL()` 默认 TTL 自动应用
+- `D.KeyAttrs` 与 JSON 内容一致性校验（防止 `user:0100` 存的 JSON id=9999）
+- 「未注册 ns 直接写入」的严格性 —— 相当于裸 KV 可以随便绕过表定义
+
+### 1.4 缺口四：没有「动态 CREATE TABLE / CREATE INDEX」
+
+今天的 D 类型只能在 Go 编译期定义、只能在 `Start()` 参数里 eager 注册 Index；没有对应的运行时 RESP 命令，也就没有「!cmd 引导用户建表 + 元数据持久化 + 崩溃重启自动恢复」这条链路。
+
+---
+
+## 2. Design Goals
+
+本 FR 把 redisx 重新定位为「**embedded typed JSON document store with RESP wire protocol compatibility**」。对齐以下 4 条硬目标：
+
+| ID | 目标 | 验证方式 |
+|---|---|---|
+| G1 | **Doc = Table。Namespace = Table Name。** 所有写入/删除/索引查询命令 → namespace 未注册 = 直接 ERR，不做任何数据变更。 | RESP SET/UPDATE/DEL/SEARCHINDEX 针对未注册 ns → 错误码和错误信息符合第 6 节；零行数变更。 |
+| G2 | **注册双通道**：启动时 eager + 运行时 dynamic；两种通道语义完全等价（CREATE TABLE IF NOT EXISTS 幂等）。 | `server.Start(..., server.Doc[UserDoc]())` 和运行时 `db.RegisterDoc[UserDoc]()` 两次连续调用 → 都返回 success 且注册表一致。 |
+| G3 | **Index 一等关系**：Index 与 Doc 解耦（不写进 `x.Document` 接口），但通过 `RegisterIndex[D](logical, jsonPath)` 绑定；支持 RESP `REGISTER INDEX` 动态建索引、`DROP INDEX` 删索引；buntdb 原生回填能力直接复用。 | 先写入 10k 行 `user:*` 数据 → `REGISTER INDEX ON user(age, age)` → SEARCHINDEX 能立刻在全量数据上返回结果，无需重启/重放。 |
+| G4 | **全链路严格校验（无任何兼容模式 / 无逃生舱）**：<br/>- Client 对外只有 8 个 typed `[D]` API public，raw CRUD 全 private（P1-A）<br/>- Strict DEL 预检查全 key，任一 ns 未注册 → 整体 ERR（原子不半写）<br/>- KeyAttrs 严格匹配，storage key 后缀与 JSON KeyAttrs 值不一致 → 写入前 ERR，整体不写 | 见第 7 节「MVP DoD」。 |
+
+**Non-Goals（MVP 不做，卡位接口即可）：**
+- 不做 `REGISTERTABLE <ns> <schema JSON>` RESP 命令（仅做 Go 端 `DocFromSpec` + `!cmd` 引导的后续接口卡位）
+- 不做跨 Doc 的事务 / ACID rollback
+- 不做 per-Doc Hook 路由（只在 `server.Doc[D](hooks ...DocHook[D])` 的签名上卡位）
+- 不做 `DROP DOC <ns>` / `DROPTABLE` RESP 命令（只在 Strict 矩阵里假设不存在，所有删表只能靠直接删 key + 后续补命令）
+- **不做 `OrphanNamespaces() → []string` admin helper（用户 2026-08-22 决策：先不考虑）**。现有用户升级时的临时 workaround：运维用原生 `KEYS *` 全扫后，脚本里按 §11 `SplitStorageKey` 拆 storageNs → dedupe → 与 `db.RegisteredDocs()` storageNs 列表 diff，找出 orphan 手工处理。MVP 交付后如果升级体验反馈差，再下一个 patch 版本补 OrphanNamespaces。
+- 不做 `REINDEX` / 索引一致性校验工具（后续版本）
+
+---
+
+## 3. Core Model (Doc ↔ Index ↔ Storage Layer)
+
+> ⚠️ **架构前置依赖**：在实现任何 Core Model 逻辑之前，**必须先完整阅读并实现 §11「系统级全局分隔符 & 命名规范 SSoT」**。本节所有键形状示例、IdxFullName 推论、KeyAttrs 多段拼接、mem 层双层 namespace、Strict 白名单判定、ScopeGuard 拆分算法 —— 全部直接建立在 §11 的 3 条**底线分隔符约定**和 3 条**推论**之上。不先实现 §11，本节所有示例会全部失效。
+
+### 3.1 类比锚定（保持数据库直觉一致）
+
+| redisx 概念 | SQL 对应 | 约束（MVP 严格） |
+|---|---|---|
+| `x.Document` 类型 D | `CREATE TABLE` 表定义 | 1 D = 1 ns；Mem/KeyAttrs/TTL 是表级属性 |
+| Namespace（D.Namespace()） | TABLE_NAME | 全局唯一；在 registry 和 storage 层用同一个「§11 定义的 storage namespace 拆分算法」（见 [architecture.md SSoT](file:///Users/kcmvp/sandbox/redisx/docs/architecture.md)） |
+| KeyAttrs | PRIMARY KEY (composite, multi-segment) | 多段用 **`_` 连接**（§11 约定 3，`KeyAttrsJoin`），如 KeyAttrs=[tenant,id] → storage key = `<ns>:<tenant>_<id>` |
+| DocIndex（logical index on D） | `CREATE INDEX` on a table | 1 D ↔ N logical indexes；**full index name = `[_m_:]<ns>_<logical>`**（§11 推论 1，IdxFullName 新格式） |
+| RegisterDoc[D]() | `CREATE TABLE IF NOT EXISTS` | 幂等；schema 不兼容 → 明确报错并列出差异 |
+| RegisterIndex[D](name, path) / `REGISTER INDEX` | `CREATE INDEX` | 动态可加；buntdb 即时回填已有数据 |
+| Strict Mode（默认，无开关） | `sql_mode=STRICT_TRANS_TABLES` | 未注册 ns 的写/删/索引查询 → ERR |
+
+### 3.2 「Index 挂 Doc」模型：A1 外部关系一等化
+
+**关键设计决策：`x.Document` 接口**维持今天的 [x.go#L261-L292](file:///Users/kcmvp/sandbox/redisx/x/x.go#L261-L292) 5 个方法**完全不变**，不新增 `Indexes()` 方法。Index 与 Doc 的关系通过**外部 registry** 一等关联，不是 Doc struct 的字段/方法：
+
+```
+                    ┌───────────────────────────────────────────────────────────────┐
+                    │        Doc Registry (global — memory only, non-SSoT)          │
+                    │                                                                 │
+                    │  ns -> RegistryDocEntry{                                       │
+                    │    PersistentDocSpec (ssot snapshot, NO indexes field)         │
+                    │    + IndexesRuntimeCache: []IndexSpec  ← 非持久化，非 SSoT     │
+                    │                              每次 DescribeDoc 强制重算，不用 trust │
+                    │    CreatedAt, TypeName                                         │
+                    │  }                                                              │
+                    └────▲─────────────────────────────────────▲─────────────────────┘
+                         │                                     │
+         RegisterDoc[D]() │            RegisterIndex[D](name,path)│
+          (Go typed API)  │         (Go typed / RESP cmd)        │
+                         │                                     │
+     ┌──────────────┐    │     ┌──────────────────────────────┐
+     │  x.Document  │    │     │  x.Index (existing)           │
+     │  interface   │    │     │  name/keyPattern/path         │
+     │  (unchanged) │    │     │  (underlying impl, unchanged) │
+     └──────────────┘    │     └──────────────────────────────┘
+                         │
+              ┌──────────┴─────────────────────────────────────────────────┐
+              │  storage (buntdb two-layer — 真正 SSoT, 永远两套分开)          │
+              │  ① 用户数据行:                                               │
+              │      <ns>:<pk>                        → disk JSON rows      │
+              │      _m_:<ns>:<pk>                    → mem JSON rows       │
+              │  ② 元数据 (两套独立, 绝对不合并):                                │
+              │      _doc_:<storageNs>                → PersistentDocSpec   │
+              │                                              (NO indexes)   │
+              │      _idx_:<[_m_:]<ns>_<logical>>     → IndexSpec           │
+              │                                              (独立 KV)     │
+              └─────────────────────────────────────────────────────────────┘
+```
+
+> **三套 struct 严格分离（A1 模型的核心保障，用户 2026-08-22 决策：元数据分开）**：
+>
+> | Go 结构体 | 出现位置 | 是否持久化（_doc_:* / _idx_:*） | 是否允许出现 `indexes` 字段 | SSoT 来源 |
+> |---|---|---|---|---|
+> | **`x.PersistentDocSpec`** | `_doc_:<ns>` 磁盘 JSON / `db.RegisterDocFromSpec(spec)` 入参 / RESP `REGISTERTABLE <ns> <json>` 入参 / `!CREATEDOC` 输出 | ✅ 是（= 磁盘格式 byte-for-byte）| ❌ **绝对禁止**（任何包含 `indexes` 字段的 spec → `ERR PersistentDocSpec must not contain indexes; use REGISTER INDEX separately`）| 用户决策：元数据分开，Index 可以后定义 |
+> | **`x.IndexSpec`** | `_idx_:<full>` 磁盘 JSON / `db.RegisterIndexFromSpec(spec)` 入参 / RESP `REGISTER INDEX <full> <json>` 入参 / `!REGISTER INDEX` 输出 | ✅ 是 | *(不适用，独立 struct)* | Index 自身独立存在，通过 `full = [_m_:]<ns>_<logical>` 中的 `<ns>` 段天然归属 Doc（§11 推论 1）|
+> | **`x.DescribeDocResult`** | `db.DescribeDoc(ns)` 返回给业务层 / RESP `DESCRIBEDOC <ns>` 返回值 | ❌ 不持久化（运行时拼装）| ✅ **允许**（聚合返回给用户看）| 运行时先读 `_doc_:<storageNs>` = PersistentDocSpec → 再 glob `_idx_:<ns>_*` 列齐所有 IndexSpec → 两者拼成 DescribeDocResult。**永远不把 DescribeDocResult 序列化回磁盘**（否则就会出现 schema 冲突）。|
+> | **`internal.registryDocEntry`** (internal 包私有，不 export) | 内存 registry map ns→entry 的 value | ❌ 纯内存 | 可带 `indexesRuntimeCache`，但每次 DescribeDoc 必须**忽略 cache** 重新 glob 重算（cache 仅作 debug 用，非 SSoT）| - |
+
+A1 模型为什么是 MVP 正确的选择（vs A2 Indexes() 写进 D 接口）：
+
+1. **Doc 是「宽泛的表形状」** — 只定义关键属性（Namespace/KeyAttrs/Mem/TTL/RawJSON），符合你最初的直觉；Index 是「可选加速结构」，与 shape 解耦。
+2. **动态 CREATE INDEX 在类型层面天然可行** — Index 不是 D 的编译期属性，运行时加不需要改 Go 类型定义。
+3. **零破坏** — 任何已有的 `type UserDoc string` 实现代码不需要改一行；index 迁移是纯加功能。
+
+### 3.3 「Namespace 约定」与 ScopeGuard 关系
+
+Namespace 的**拆分与拼接规则**（含 mem 层两层 namespace + Strict 白名单 + scope 防越界）**全部以 §11 System-Level SSoT 为唯一 SSoT**，architecture.md 只引用不重述。对齐要点：
+
+- 全局 storage key 形状（disk / mem / internal 统一格式）：**`<storageNs>:<pk-suffix>`**，其中 `<storageNs>` =
+  - Disk 用户 Doc = `<namespace>`（纯 ns 名，如 `user`、`trade`）
+  - Memory 用户 Doc = **`_m_:<namespace>`**（§11 约定 2，**中间有冒号**，是两层 namespace 节点：`_m_` → `user` → pk）
+  - Internal 元数据 Doc / Index = **`_doc_` / `_idx_`**（本身就是完整 storageNs，再用 `:` 接 suffix → 得到 `_doc_:user` / `_idx_:user_age`）
+- `<pk-suffix>` 拼接：单段 KeyAttrs → 直接值；**多段 KeyAttrs=[tenant,id] → tenant 与 id 用 `_` 连接**（§11 约定 3，KeyAttrsJoin）→ 整体 storage key = `<storageNs>:<tenant>_<id>`；**pk-suffix 内部永远不出现 `:`，只出现 `_` 分隔。**
+- Strict 检查、KeyAttrs 一致性校验、REGISTRY 反向 lookup、ScopeGuard（[server/key_range.go#L25-L53](file:///Users/kcmvp/sandbox/redisx/server/key_range.go#L25-L53)）全部复用 §11 推论 3 导出的同一个共享 helper（未来在 `internal/shared.go` 新增，不得散落硬编码），确保不漂移。
+
+---
+
+## 4. Two Registration Channels (Eager + Dynamic)
+
+### 4.1 Channel 1 — Start / Open: Eager Bulk Registration（启动时）
+
+将今天的 `server.Start(address string, dbPath string, indexes ...x.Index)` [srv.go#L460](file:///Users/kcmvp/sandbox/redisx/server/srv.go#L460) 升级为 **functional options 风格**（向后可迁移）：
+
+```go
+func Start(address, dbPath string, opts ...StartOption) *DB
+
+// Start options:
+func Doc[D x.Document](hooks ...DocHook[D]) StartOption   // ← CREATE TABLE eager
+func DocFromSpec(spec x.PersistentDocSpec) StartOption       // ← non-generic CREATE TABLE (for tooling)
+func RawIndex(def x.Index) StartOption                     // ← 仍然保留作为 helper；Strict 下如果与 D 的 registry 冲突则整体报错
+func IndexOn[D x.Document](logicalName string, jsonPath string) StartOption // ← CREATE INDEX eager
+```
+
+**调用例子（MVP 最终用户体验）：**
+
+```go
+server.Start(":6379", "/data/redisx.db",
+    // Eager 注册 3 张表（等价三张 CREATE TABLE IF NOT EXISTS）
+    server.Doc[UserDoc](),
+    server.Doc[OrderDoc](),
+    server.Doc[TradeDoc](),
+
+    // Eager 挂索引（等价 CREATE INDEX）；也可以完全不写这里，运行时 REGISTER INDEX 动态建
+    server.IndexOn[UserDoc]("age", "age"),
+    server.IndexOn[UserDoc]("email", "contact.email"),
+
+    // RawIndex 兼容：如果 RawIndex 挂的 ns 已注册 D 且 D.Indexes 列表（运行时）
+    // 没有对应条目 → 启动期整体 ERR（fail closed，不留灰区）
+    server.RawIndex(x.RawIndex("external_log_lvl", "ext:*", "level")),
+)
+```
+
+**启动期关键执行顺序（在 srvOnce.Do 内，srv.go L464-530）：**
+
+```
+1. openDB(dbPath)                              — 不变
+2. loadAuthKeyLimits(db)                        — 不变
+3. loadSchemaRegistryFromDB(db)                 — [新增] 扫 `_doc_:*` + `_idx_:*` 两个 glob key pattern，
+                                                     自动从磁盘元数据重建 Doc/Index 注册
+4. process opts:
+     a. Doc[D]() / DocFromSpec()                → 调 RegisterDoc / RegisterDocFromSpec（与 channel 2 同一实现，冲突即 ERR）
+     b. IndexOn[D]()                            → 调 RegisterIndex[D]（同一实现）
+     c. RawIndex(...)                           → 调 db.registerIndexes；冲突即 ERR
+5. srv.ListenServe(addr)                        — 不变
+```
+
+**关键性质：** step 3 与 step 4 任一失败 → `db.Close()` + slog.Error + `exitFn(1)`（启动失败不服务，fail closed 对齐 Strict 精神）。
+
+### 4.2 Channel 2 — Runtime Dynamic Registration（运行时）
+
+在 `*DB` 上挂 4 个一等方法：
+
+```go
+// ─── CREATE TABLE 家族 ───
+func (db *DB) RegisterDoc[D x.Document]() error
+func (db *DB) RegisterDocFromSpec(spec x.PersistentDocSpec) error
+
+// ─── CREATE/DROP INDEX 家族 ───
+func (db *DB) RegisterIndex[D x.Document](logicalName string, jsonPath string) error
+func (db *DB) DropIndex[D x.Document](logicalName string) error
+```
+
+以及 admin 可观测性：
+
+```go
+func (db *DB) RegisteredDocs() []x.PersistentDocSpec                    // SHOW TABLES NAMES+SCHEMA（仅持久化 schema，不含 indexes）
+func (db *DB) DescribeDoc(namespace string) (x.DescribeDocResult, bool)  // DESCRIBE <ns>（聚合快照：PersistentDocSpec + 此时刻所有 indexes）
+func (db *DB) ClassifyKey(storageKey string) (ns string, registered bool, spec x.PersistentDocSpec) // debug helper（只需要 schema 不需要 indexes）
+func (db *DB) RegisteredIndexes(ofNamespace string) []x.IndexSpec        // SHOW INDEX FROM <ns>（等价单独 glob _idx_:ns_*）
+```
+
+**4.2.1 RegisterDoc[D] 严格语义：**
+
+```
+RegisterDoc[D]() 执行步骤
+  ① lock(registryMutex) 持全局写锁
+  ② 计算 DocSpecFor[D]()：
+       storageNs = Mem() ? "_m_" + Namespace() : Namespace()
+       keyattrs, ttl, typeName 从 D 反射/调用得到
+       indexes = 当前 D 已通过 RegisterIndex 绑定的 logical indexes
+  ③ documentRegistry CAS ns → spec:
+       - 未存在 → 写入；写 `_doc_<ns>` = spec JSON 到 buntdb disk；返回 nil
+       - 已存在 → 全等对比（keyattrs/ttl/mem/typeName）
+            * 全等 → 幂等成功（CREATE TABLE IF NOT EXISTS）
+            * 任一不同 → 返回结构化 ERR（列出所有差异字段：期望 A，实际 B）
+  ④ unlock
+```
+
+**4.2.2 RegisterIndex[D] 严格语义：**
+
+```
+RegisterIndex[D](name, path)
+  ① lock(registryMutex)
+  ② 确认 ns = storageNamespace[D] 已在 documentRegistry 中注册
+     → 未注册 → ERR："cannot register index 'age' on table 'user': table not registered (call RegisterDoc[UserDoc]() first)"
+     → 注册好了 → 继续
+  ③ 拼 full index name = IdxFullName[D](name)
+     拼 keyPattern   = storageNs + ":*"
+     拼 buntdb path  = strings.ReplaceAll(path, ".", "_")
+  ④ buntdb.Tx.CreateIndex(fullName, keyPattern, buntdb.IndexJSON(path))
+     → 已存在同名 fullName 且 path 相同 → 幂等 OK
+     → 已存在同名 fullName 但 path 不同 → ERR（buntdb 报错向上冒泡）
+  ⑤ registry 里 D.DocSpec.Indexes append((name, path, full))
+     写 `_idx_<full>` = spec JSON 到 disk
+  ⑥ unlock
+```
+
+**重要实现说明（buntdb 回填利用）：** step ④ 的 `CreateIndex` 在 buntdb 里是 O(n log n) 的同步建索引操作 —— **已有的全量 `<ns>:*` 行立刻进入 BTree**，无需 redisx 自己重扫数据。MVP 直接依赖这个原生能力，不自己写回填 loop。
+
+### 4.3 RESP wire 的 REGISTER / DROP 命令（MVP 对齐 Index）+ 传统 Redis SET/GET 语义糖扩展
+
+MVP 就落地 2 条 RESP 扩展命令（对应 Channel 2 的 Index 家族）。注意：**REGISTER/DROP 官方命令词是 UI 糖（人类 Shell 输入读），RESP 线上实际命令字统一为 ADM 前缀 regidx / delidx**（见 Admin Shell Child FR §7）。原因：① 和 Doc 管理命令（regdoc 等）风格统一 ② Server 端 Gate1 App-port 构建显式白名单：遍历 proto.Registry Role==AdminOnly 的全部命令字（regdoc/lsdoc/desdoc/lsidx/regidx/delidx）— Fail-Closed，不会漏判以后加的 Admin 命令。③ 未来业务命令如果要加 CREATE 动词不会和管理命令命名空间冲突。
+
+**人类 UI 糖（Shell / 文档阅读友好）：**
+```
+REGISTER INDEX ON <namespace> (<logical_name>, <json_path>)
+DROP INDEX     <namespace>.<logical_name>
+```
+
+**例子（redis-cli 发送 ADM 前缀实命令字）：**
+```redis-cli
+regidx user (age, age)
+regidx user (email, contact.email)
+delidx user email
+```
+
+> Child FR §7 有 Sugar-Command → RESP-args 的完整映射表；Shell 端实现 sugar-to-wire 转换，Server 端只认 ADM 前缀，不认 REGISTER/DROP 命令字。
+
+> Doc 家族的 RESP `REGISTERTABLE <ns> <schema JSON>` MVP 先不做，但在 cmd.go 解析器中**预留关键字**，收到后返回 `ERR REGISTERTABLE is not implemented yet; use db.RegisterDocFromSpec(spec) or !CREATEDOC`。未来 `!cmd` 体系落地后再打通。
+
+---
+
+**4.3.2 MVP 命令最终形状总表（22 条，用户 2026-08-22 拍板 Q1/Q2/Q3 + C2/C4，Fail-Closed）**
+
+> **MVP 硬约束（Fail-Closed 总原则，handleCommand 入口处统一预检，不进入具体 handler）：**
+> 1. **Q2（结论 3 5 条核心命令 = SET/SETEX/SETNX/GET/DEL）：第 1 参数只能是 storageNs（纯 namespace，不能含 `:`；mem 层 storageNs 整体为 `_m_:<ns>`，允许 ns 参数整体含一个 `_m_:` 前缀，除此外不允许其他形式含 `:`）。旧形式「第 1 参数 = full storageKey `<ns>:<pk>`」直接 ERR，不做任何回退兼容。**
+> 2. **Q1（SEARCHKEY）：保留命令字不改，但参数形状强制为两参数 `<storageNs> <pk-range_json>`，旧单参数「完整 KeyRange JSON」形式直接 ERR。**
+> 3. **Q3（KEYS）：仅接受单参数 `<storageNs>`（不接受任何 glob pattern，不论 `user:*` 还是 `abc*`，全部直接 ERR）— 避免「通配符匹配时还要区分 mem/disk 层」的歧义复杂度。**
+> 4. **C2（SEARCHINDEX）：仅参数 `<index_full_name> <filter_json>`（表面维持今日两参数形状，内部新增 2 道 pre-check：① index name 必须能按 §11 规则反向解析出 storageNs ② 解析出的 ns 必须已注册 + `_idx_:<full>` 元数据必须存在）**
+> 5. **C4（UPDATE）：维持今日 `UPDATE <full_storageKey> <mutation_json>` 两参数形状不变（等价传统数据库 UPDATE ... WHERE key = ...），仅内部加 2 道 Strict Gate（① ns 注册校验 ② mutation 后 KeyAttrs 一致性校验）。**
+
+---
+
+#### 🟢 类别 1：完全不变（8 条，零改动 — Infra + PubSub）
+
+| 命令字 | MVP 参数形状（byte-for-byte 现状）| 说明 |
+|---|---|---|
+| `AUTH` | `AUTH <password>` 或 `AUTH <user> <password>` | 账号认证链路与 Doc/Index 正交；不变 |
+| `HELLO` | `HELLO [protover [AUTH user pass] [SETNAME clientname]]` | RESP3 握手；不变 |
+| `CLIENT` | `CLIENT <subcommand> [args...]` | CLIENT 子命令集合预留；不变 |
+| `PING` | `PING [msg]` | 心跳；不变 |
+| `QUIT` | `QUIT` | 关闭连接；不变 |
+| `PUBLISH` | `PUBLISH <channel> <message>` | 纯 redcon 内存 PubSub 分发，不进 buntdb storage；不变 |
+| `SUBSCRIBE` | `SUBSCRIBE <channel> [<channel> ...]` | PubSub 订阅；不变 |
+| `PSUBSCRIBE` | `PSUBSCRIBE <pattern> [<pattern> ...]` | PubSub pattern 订阅；不变 |
+
+#### 🟡 类别 2：Strict Gate 加强（5 条 — KEYS Q3 + SEARCHKEY Q1=Y + SEARCHINDEX C2 + UPDATE C4）
+
+| 命令字 | MVP 最终参数形状（严格格式）| Fail-Closed 校验点 & 错误文案范例 |
+|---|---|---|
+| `KEYS` | `KEYS <storageNs>`（单参数，**不接受 glob，不接受通配符**；Q3 拍板） | ① arg#1 必须是合法 storageNs（形如 `user` 或 mem 层整体 `_m_:hot`，不允许包含 `*` / `?` / 任何 glob 字符，不允许包含其他 `:` 除 `_m_:` 前缀外）→ **违例 ERR 文案**：`ERR KEYS command accepts <storageNs> only; glob patterns like 'user:*' or 'abc*' are not supported in MVP to avoid mem/disk scope ambiguity. Use 'SEARCHKEY <ns> <keyrange_json>' for scoped pagination.`<br>② storageNs 未注册且非 internal `_auth_` / `_doc_` / `_idx_` / `_m_` 前缀 → **ERR 文案**：`ERR table '<ns>' does not exist. Use db.RegisterDoc[D]() or REGISTERTABLE first.`<br>③ 白名单：`KEYS _doc_` → 返回所有 Doc 元数据；`KEYS _idx_` → 返回所有 Index 元数据；`KEYS _m_:hot` → 返回 mem 层 hot 表所有行 |
+| `SEARCHKEY` | `SEARCHKEY <storageNs> <pk-range_json>`（Q1=Y：**保留命令字，不重命名**；参数强制为两参数）| ① arg#1 storageNs 未注册 & 非 internal → ERR table does not exist<br>② `<pk-range_json>` 必须合法（仅允许 `$gt/$gte/$lt/$lte/$eq/$bt/$pattern/$limit` 顶层 key；不允许 `$and/$or` 嵌套）→ 非法 → ERR `SEARCHKEY pk-range_json invalid: <parse_err>`<br>③ **严格禁止 pivot 里含 storageNs 前缀**：如 `{"$gte":"user:0100"}`（pivot 写了 `user:` 前缀）→ ERR `SEARCHKEY pivot must be pk-suffix only (no storageNs prefix like 'user:'); storageNs '<ns>' was already provided as the first argument, server automatically prepends it`<br>④ 内部实际执行：scopeGuard 强制 prefix = `<storageNs>:` 扫 buntdb AscendRange |
+| `SEARCHINDEX` | `SEARCHINDEX <index_full_name_or_logical_name_under_ns> <filter_json>`（**C2：两参数表面形式维持今日不变**，内部加 2 道强推断） | ① index name 必须按 §11 规则能反向解析出 storageNs 和 logical name：解析规则 = 若 index 以 `_m_:` 开头先剥 → 再在**剩余字符串取第一个 `_` 之前 = ns，之后 = logical**。示例：`user_age` → ns=user, logical=age；`_m_:hot_price` → ns=hot, mem=true, logical=price。解析不出来 → ERR `SEARCHINDEX invalid index name format: expected [_m_:]<ns>_<logical>. Got: '<raw>'`<br>② 解析出的 ns 必须已注册 → ERR 同上文<br>③ `_idx_:<full>` 元数据必须存在于 registry（即使 buntdb 物理 index 存在，registry 没注册也拦）→ ERR `SEARCHINDEX index '<full>' belongs to unregistered namespace '<ns>' or index was dropped. Re-register via REGISTER INDEX ON <ns>(<logical>,<path>).`<br>④ filter JSON 非法 → ERR `SEARCHINDEX filter parse error: <raw>` |
+| `UPDATE` | `UPDATE <full_storageKey> <mutation_json>`（**C4：两参数形式维持今日 byte-for-byte 不变**，等价传统数据库 UPDATE WHERE key = ...）| ① `<full_storageKey>` 必须符合 §11 完整 storageKey 格式 = `<storageNs>:<pk-suffix>`（能用 SplitStorageKey last-colon 正确拆开）→ 格式不对 → ERR `UPDATE first argument must be a full storageKey format '<storageNs>:<pk-suffix>'. Got: '<raw>'`<br>② storageNs 必须已注册 → ERR 同上文<br>③ mutation_json 必须是合法 JSON object（顶层浅 merge 语义，今日不变）→ 非法 → ERR `UPDATE mutation_json must be a valid JSON object`<br>④ mutation 应用后重新跑 KeyAttrs 一致性校验：从新文档顶层 KeyAttrs 值生成 pk-suffix → 必须与原始 full_storageKey 的 pk-suffix 部分 **byte-for-byte 相等** → 不相等 → ERR `UPDATE KeyAttrs mismatch after mutation: computed pk-suffix '<computed>' from document KeyAttrs values does not equal original '<original_pk_suffix>'. 0 rows updated.`（不写半状态）<br>⑤ TTL 继承旧 key，不允许 mutation 改 TTL（MVP 不新增 EXAT/PXAT 选项） |
+
+#### 🔴 类别 3：核心 Breaking（5 条结论 3 — SET/SETEX/SETNX/GET/DEL — Q2 拍板：第 1 参数=ns，第 2 JSON，旧 full key 含 `:` 直接 ERR）
+
+| 命令字 | MVP 最终参数形状（严格格式，Fail-Closed）| 校验点 & 原子性 / 语义 / 典型 ERR 文案 |
+|---|---|---|
+| `SET` | `SET <storageNs> <JSON_doc_or_docs> [EX <seconds>] [PX <milliseconds>] [NX]` | **Pre-check（handleCommand 入口层，进 setCommand 之前就拦）**：<br>① arg#1 必须是纯 storageNs（不含 `:`，mem 层特例 `_m_:hot` 整体作为一个 ns 参数允许）→ **旧形式违例**：`SET user:0100 '...'`（第 1 参数含 `:`）→ **ERR 文案**：`ERR SET first argument must be storageNs only; full storageKey '<ns>:<pk>' (with ':') is NOT accepted in MVP. Correct form: SET <ns> <JSON_doc> and server derives pk via KeyAttrs. E.g.: SET user '{"id":"0100",...}'.`<br>② storageNs 未注册 → ERR 同上文<br>③ arg#2 必须是合法 JSON：<br>　✅ 单对象 → **单文档**：按 KeyAttrs 从 JSON 顶层取 pk 值 → 多段按 `_` 拼 → storageKey = `<ns>:<pk>` → 写 1 条。<br>　✅ JSON array of objects → **批量**：每条拆，**同批内 pk collision 检测**（两条算出同一个 storageKey → 整体 abort）<br>　❌ 既不是对象也不是数组（plain string / number）→ ERR：`ERR SET value must be a JSON document (object) or array of JSON documents. Got plain string/number.`<br>④ **KeyAttrs 强校验（单条和批量都跑）**：pk 拼好后 **反向再跑一次 SplitStorageKey + ExtractPKSuffixes** → 与 JSON 顶层 KeyAttrs 值逐字段 match（case/type/empty-sensitive）→ mismatch → ERR `SET KeyAttrs mismatch at document <position>: document KeyAttrs values <values> do not match pk suffix '<pk_suffix>'`。<br>⑤ **批量原子性 = DEL（你之前拍板的 Strict DEL 原子策略零半写）**：any 一条 JSON invalid / KeyAttrs 缺失 / pk collision → 整体 ERR，**0 条写入**。ERR 文案精确指出第几条：`ERR SET batch aborted at array index #<i>: <err_reason>. All 0 rows were written (atomic no-half-write guarantee).`<br>⑥ NX（批量）= 所有 pk 都不存在才写，任一存在 → 整体 0 行；NX（单条）= pk 不存在才写 → 存在写回 Null（与今日 SETNX 语义对齐）<br>⑦ EX/PX TTL 作用于每条单文档粒度（buntdb 原生 TTL）|
+| `SETEX` | `SETEX <storageNs> <ttl_seconds> <JSON_doc_or_docs>`（固定 TTL 秒，单参数位置）| 同 SET 全部校验 + 额外：<br>① arg#2 必须是整数秒（否则 ERR `SETEX ttl_seconds must be integer seconds. Got: '<raw>'`）<br>② storageNs 未注册 / JSON validity / KeyAttrs / 批量原子性 = 同 SET，全部一致。<br>**旧违例**：`SETEX user:0100 3600 '...'` → ERR（第 1 参数含 `:`）|
+| `SETNX` | `SETNX <storageNs> <JSON_doc_or_docs>`（无 TTL，语义 = SET ... NX；内部强制与 SET NX 走同一条代码路径，避免 drift）| 同 SET NX 全部校验：<br>① storageNs 注册 / JSON validity / KeyAttrs / pk collision → 同 SET<br>② **单条**：pk 不存在才写 → 返回 1；pk 已存在 → 返回 0（写 0 行）<br>③ **批量**：所有 pk 都不存在才写 → 返回 N；任一 pk 存在 → 整体返回 0（0 行写）<br>④ 不允许 EX/PX（想 TTL + NX 用 SET ... NX EX）<br>**旧违例**：`SETNX user:0100 '...'` → ERR（第 1 参数含 `:`）|
+| `GET` | `GET <storageNs> [<pk-suffix>]`（两种格式严格区分分支） | **Pre-check（入口层）**：<br>① arg#1 必须是纯 storageNs（不含 `:`，mem 层 `_m_:hot` 整体允许）→ **旧违例**：`GET user:0100`（第 1 参数含 `:`）→ **ERR 文案**：`ERR GET first argument must be storageNs only; full storageKey '<ns>:<pk>' is NOT accepted in MVP. Correct forms: GET <ns> (full collection JSON array) or GET <ns> <pk-suffix> (single doc).`<br>② storageNs 未注册 → **ERR 文案**：`ERR table '<ns>' does not exist (GET requires registered namespace for both collection and single-document forms). Hint: KeyAttrs values cannot be reconstructed from raw key without Doc spec.`（**不再返回 Null**，严格区分「ns 不存在」和「key 不存在」两类空结果）<br><br>**分支 1 — 两参数（集合糖）：**`GET <storageNs>`<br>③ AscendKeys `<ns>:*` → 全量单文档 → **拼成单个 JSON array**（用 redis WriteBulk 写整个 `[{...},{...},...]` 字符串返回，**不是 Redis WriteArray of bulks**；与 SET 入参 JSON array 形状 1:1 对齐）<br>④ `max_rows` 默认上限 10,000（超 → ERR `GET collection max_rows=10000 exceeded for '<ns>'; use SEARCHKEY <ns> <keyrange_json> with pagination`）<br>⑤ 0 行 → 返回 `[]`（JSON 空数组 WriteBulk）<br><br>**分支 2 — 三参数（单条读）：**`GET <storageNs> <pk-suffix>`<br>③ pk-suffix 不允许含 `:`（多段用 `_` 连的 §11 约定）→ 含 `:` → ERR `GET <pk-suffix> must not contain ':'; multi-segment KeyAttrs composite pk must join with '_' per §11`<br>④ server 拼 full = `<ns>:<pk-suffix>` → buntdb Get → 不存在 → WriteNull；存在 → WriteBulk 写回**单对象 JSON**（与 SET 单文档 object 形状完全 1:1 对齐，不可能返回 plain string）|
+| `DEL` | `DEL <storageNs> <pk-suffix> [<pk-suffix> ...]`（**至少 2 参数**；严格禁止「删整个集合」糖；跨 ns 混传严格禁止）| **Pre-check（入口层，Phase 1 预检查零写入）**：<br>① arg#1 必须是纯 storageNs（不含 `:`，mem 层允许整体 `_m_:hot`）→ **旧违例**：`DEL user:0100`（第 1 参数含 `:`）或 `DEL user:0100 cart:001`（跨 ns 混传 full keys）→ **ERR 文案**：`ERR DEL first argument must be storageNs only; full storageKeys (with ':') and cross-namespace DEL are NOT accepted. Correct form: DEL <ns> <pk1> [pk2 ...]. If you need cross-namespace deletion, send separate DEL commands.`<br>② storageNs 未注册 → 即使 pk 真实存在 → **整体 ERR（你之前拍板的 Strict DEL 原子预检查不半写）**：`ERR DEL aborted: namespace '<ns>' is not registered (Strict MVP: all keys in a single DEL call must belong to a single, already-registered namespace). 0 rows deleted (atomic guarantee).`<br>③ 必须至少传 1 个 pk-suffix（len >= 2 args 即 >= 1 pk）→ ERR `DEL requires at least one pk-suffix; to delete the entire collection use future DROP DOC <ns> CONFIRM (not available in MVP) or explicitly enumerate keys.`<br>④ 每个 pk-suffix 不含 `:`（同 GET 单条分支规则）→ 违例 → ERR `DEL pk-suffix '#<i>: <raw>' contains illegal ':'; multi-segment composite pk must join with '_' per §11.`<br><br>**Phase 2 实际删除（Phase 1 100% 通过后才执行）：**<br>⑤ 遍历所有 pk-suffix → full key = `<ns>:<pk>` → buntdb Delete → 汇总成功删除行数 → Redis WriteInt(count)。<br>**禁止糖：绝不允许 `DEL <storageNs>` 不传 pk 直接删整个集合**（运维手滑风险极高；想删全表 → 将来补 DROP DOC <ns> CONFIRM 显式双确认命令）。|
+
+#### 🔵 类别 4：Channel 2 扩展命令（2 条，MVP 只加 REGISTER INDEX / DROP INDEX，REGISTERTABLE 先不落地）
+
+| 命令字 | MVP 参数形状 | 校验点 & 语义 |
+|---|---|---|
+| `REGISTER INDEX` | `REGISTER INDEX ON <storageNs> (<logical_name>, <json_path>)` | ① ns 必须已注册 → ERR<br>② logical 不允许含 `_` / `:`（避免命名约定歧义）→ ERR `REGISTER INDEX logical index name must be alphanumeric only; '_' and ':' are reserved for IdxFullName encoding per §11`<br>③ path 是合法 JSON dotted path（`contact.email`）→ 内部转 `_` 连接（§11）<br>④ 与已存在的 `_idx_:<full>` 冲突（同 ns 同 logical 不同 path）→ ERR 精确列出冲突：`REGISTER INDEX conflict: index '<full>' already registered with path=<old>; requested path=<new>. Use DROP INDEX first.`<br>⑤ 通过后：同步 buntdb CreateIndex 回填 + 落盘 `_idx_:<full>` + 幂等（同 ns+logical+path 重复调 → OK 无操作）|
+| `DROP INDEX` | `DROP INDEX <storageNs>.<logical_name>`（ns 与 logical 用 `.` 分隔；不用 `_` 因为 `_` 已经被 IdxFullName 作为连接符保留了，避免歧义）| ① ns 必须已注册 → ERR<br>② `<ns>.<logical>` 对应的 `_idx_:<full>` 元数据不存在 → ERR `DROP INDEX '<ns>.<logical>' not found; if you intended to drop by raw full index name use the canonical <ns>.<logical> dotted form instead.`<br>③ 通过后：buntdb.DropIndex → 删 `_idx_:<full>` → registry 移除 → DescribeDoc(ns) 不再列出。|
+
+---
+
+**4.3.3 Internal shared helpers（所有命令的实现依赖，§11 推论 3 再次强化）**：
+上文 4 类 22 条命令的参数解析、storageNs 定位、pk-suffix 合法性校验、KeyAttrs 反向重匹配 — **全部依赖 §11 推论 3 列出的 4 个共享 Go helper**（放在 `internal/shared.go` 或 `x/contract/shared.go`，不允许散落写在每个 handler 里）：
+- `SplitStorageKey(raw) → (storageNs string, pkSuffix string, ok bool)`（last-colon 拆分，处理 mem 层 `_m_:hot:p1_p2`）
+- `IsInternalStorageNs(storageNs) → bool`（前缀白名单 `_auth_`/`_doc_`/`_idx_`/`_m_`）
+- `StripMemPrefix(storageNs) → (underlyingNs string, mem bool)`（判断是否 mem 层并剥 `_m_:`）
+- `ExtractPKSuffixes(pkSuffix string, segCount int) → ([]string, bool)`（按 `_` 拆 pk 多段，segCount 与 KeyAttrs len 对齐）
+- **新增 `ParseIndexFullName(raw string) → (storageNs string, logical string, mem bool, ok bool)`**（§11 IdxFullName 反向解析器：先检测 `_m_:` 前缀，然后在剩余部分取**第一个 `_` 之前 = storageNs，之后 = logical**；专门供 SEARCHINDEX / REGISTER INDEX / DROP INDEX 三个命令使用，不许散落写字符串 split 代码）
+
+Typed client API（`DBX[D].Set(doc)` / `SearchIndex[D]` / 等）**完全复用 server 侧同一套 helper 的反向实现**（StorageKeyValue[D] 现在的 `:` + `_` 拼接）：保证 wire command（糖放在 server 算 pk）和 typed client（放在 client 算 pk）**两条路径 byte-for-byte 一致，不会各算各 bug**。
+
+### 4.4 `!cmd` 引导入口的元数据规范卡位
+
+你提到的「会有一个 !cmd 引导用户创建 Doc」，MVP 只**卡位元数据的磁盘格式**，不实现 !cmd shell 本身：
+
+```
+_doc_:user      = { "ns":"user", "mem":false,
+                    "keyattrs":["id"],
+                    "ttl_ns":604800000000000,
+                    "type_name":"main.UserDoc",
+                    "created_at":"2026-08-22T12:00:00Z" }
+
+_idx_:user_age = { "ns":"user",
+                   "logical":"age",
+                   "path":"age",
+                   "full":"user_age",
+                   "created_at":"..." }
+```
+
+> **关键命名约定（解决 Index 归属定位 + 冲突零可能）（与 §11 SSoT 对齐）：**
+> 1. **Doc 元数据键** = **`_doc_:<namespace>`**（§11 约定 1 + `_doc_` 是 internal storageNs，再接 `:` suffix）。示例：`_doc_:user`, `_doc_:order`, `_doc_:_m_:hot`（hot 在 mem 层，mem 模式下 storageNs = `_m_:hot`，所以整体 = `_doc_:_m_:hot` —— 注意 **仍然遵循「`<storageNs>` + `:` + suffix」的全局形状**，只是 storageNs 本身是 mem 层的 `_m_:hot`，所以会出现两个 `:`。）
+> 2. **Index 元数据键** = **`_idx_:<full_index_name>`**。而 `<full_index_name>` = **`[_m_:]<namespace>_<logical>`**（§11 推论 1，byte-by-byte 与 IdxFullName[D] 一致）。示例：
+>    - `_idx_:user_age`（namespace=user，logical=age，full=user_age）→ 归属定位只需取 `<full_index_name>` 的 `<ns>` 段；**不再需要解析 `_idx_` 后最后一个 `_` 前缀拆分，命名约定已经把归属编码进 full name。**
+>    - `_idx_:_m_:hot_price`（namespace=hot, mem=true，logical=price，full=`_m_:hot_price`）
+> 3. 因为 Index full_name 天然带 `<namespace>_` 前缀 → **零可能与其他 doc 的 index 键冲突**，不需要任何额外唯一约束守卫；同时「DescribeDoc(user) 找 user 的所有 index」不用扫全库 `_idx_:*`，直接用 buntdb AscendKeys 匹配 `_idx_:user_*` 这个 key pattern 就能列齐 — 完全等价于方案 1 的 join，但性能和扫描范围都受控。
+> 4. Doc spec JSON 内**不冗余存 `indexes` 字段**。DescribeDoc(user) 的 `Indexes: []` 返回值由 `_idx_:user_*` 扫描结果动态拼装。
+
+- `_doc_` / `_idx_` 两个 internal storageNs（所有 Strict 检查对「以 `_` 开头的 storageNs」**或**「key 以 `_auth_:` 前缀开头」全部跳过，见第 5.3 节）
+- 崩溃重启后 step 3 的 `loadSchemaRegistryFromDB()` 扫 `KEYS _doc_:*` + `KEYS _idx_:*` 两个 glob → 100% 恢复 registry，不需要用户重新执行 `Doc[D]()` 或 `REGISTER INDEX`。
+
+> **`!REGISTER INDEX` shell UX 流程卡位（用户 2026-08-22 决策）**：
+> Index 与 Doc 的**唯一绑定关系 = doc namespace**（不在 Doc struct/接口里存任何 index 列表）；因此管理程序/`!cmd` shell 在引导用户「新建 Index」时，**必须严格按以下 4 步顺序走（不可换顺序，不可跳过）**：
+> 1. **第 1 步（强制首先选 Doc）**：shell 列出 `db.RegisteredDocs()` 所有已注册的 Doc（ns + type_name + mem? + keyattrs + ttl），要求用户**必须先选定一个目标 Doc（namespace）**。不允许先填 Index 属性再回头选 Doc（避免「先写 index name 再绑定 ns」导致的冲突可能性）。
+> 2. **第 2 步（填 logical index name）**：用户输入 `logical`（在该 Doc ns 下唯一，不要求全局唯一）→ shell 立即根据 §11 推论 1 自动拼出 `full = [_m_:]<ns>_<logical>` 并展示给用户确认，**如果 full 已在 `_idx_:*` 中存在则立即报错，不让用户进入下一页**。
+> 3. **第 3 步（填 Index JSON path + KeyPattern）**：用户填 `path`（JSON path，自动 normalize `.` → `_`），默认 KeyPattern = `*`（全表索引）；用户可改为 `user:*` / `_m_:hot:*` 等 Doc-scoped pattern，但 shell 必须校验 KeyPattern 必须以 `<storageNs>:` 开头（第 1 步选的 Doc 的 storageNs），禁止跨 Doc。
+> 4. **第 4 步（执行 + 回填 + 落盘）**：用户点确认 → 同步调用 `db.RegisterIndex[D]()` / `REGISTER INDEX` → buntdb 同步回填已有 `<ns>:*` 行 → 落 `_idx_:<full>` meta JSON → 返回成功或失败（回填冲突：index 数据类型不一致，buntdb 错误向上冒泡）。
+>
+> 这条 UX 规则**同时适用于 RESP REGISTER INDEX 命令的参数解析顺序**：`REGISTER INDEX` 的第 1 个参数必须是 Doc ns（或 `Doc type_name`），第 2 个才是 logical name，第 3 个是 path —— 不允许省略第 1 个参数（因为 ns 是 SSoT）。
+
+> **`!CREATEDOC / !SETDOCS` shell 的糖语义（自动 pk 生成，不用手拼 storage key）**：
+> 既然 §4.3.2 已经把「糖 SET namespace + 单/多 JSON」定义为 server 级 Wire Command，那么 `!cmd` shell 在引导用户「写入真实数据」的步骤里，同样完全对齐：
+> 1. **`!CREATEDOC` 第 2 页（填内容）**：用户选择了 Doc namespace=user 之后 → shell 的大文本框默认只填 `[{...}, {...}]` 或单 object，不需要用户写 `user:0100` 这种 storage key。shell 提交时直接调用糖 SET：`SET user <用户粘贴的 JSON>`（server 侧按 KeyAttrs 自动 pk 拼 storage key）。
+> 2. **`!SETDOCS <ns>`（如果将来做批处理）** = 等价于 `SET <ns> <JSON array>`（糖 SET 多文档）。同样不需要填 storage key。
+> 这条规则让「管理程序写 Index 先选 Doc、写 Doc 数据只贴文档内容」的两条链路体验完全一致（都不需要人工知道 pk 拼法/冒号/下划线），而底层 server 侧的 KeyAttrs pk 派生算法 + storageKey 拼接（`SplitStorageKey` last-colon + `ExtractPKSuffixes` §4.3.3 共享 helper）100% 复用，不会出现 !cmd shell 和 RESP wire 两条不兼容路径。
+>
+> Q2 单通路严格模式下 MVP **完全不提供人工直接拼 full storageKey 的逃生舱**；任何想直接写 `SET user:acme_0100 …` 形式（第 1 参数含 `:`）都会在 handleCommand 参数级 Gate 直接 ERR（精确文案见 §7.4.1）。storage key 拼法 **100% 由 server 侧 KeyAttrs 派生算法作为 SSoT**，杜绝人工拼法引入的 KeyAttrs 字段不一致 silent bug（人工写 `tenant=acme,id=0100` 却拼出 `user:acme:0100` 而不是 §11 要求的 `user:acme_0100` 这种分隔符级别错误，由 server 单点生成彻底消除）。
+
+---
+
+## 5. Strict Mode: Command Matrix（MVP 全覆盖，无兼容模式）
+
+Strict Mode 是**默认唯一模式**，不提供开关。所有命令的严格度矩阵：
+
+### 5.1 严格校验类（未注册 ns = 整体 ERR，零数据变更）
+
+> **关键前置（用户 2026-08-22 Q2 最终拍板）：MVP **取消双通路**，单通路严格模式，Fail-Closed at handleCommand 入口层。**
+> - **Q2：通路 A（旧显式 pk `SET user:0100 …`）永久移除**。所有旧的「第 1 参数 = full storageKey 含 `:`」形式（SET/SETEX/SETNX/GET/DEL）在 MVP 下**直接精确 ERR，不做任何回退兼容**。
+> - **Q2：新的单通路严格格式（5 条核心命令）** = 第 1 参数永远 = `storageNs`（纯 namespace，mem 层 `_m_:hot` 作为一个**整体 ns 参数**允许含 `_m_:` 前缀；除此之外不允许其他形式含 `:`）；第 2 参数 = 完整 JSON（单对象/数组批量）或 pk-suffix。
+> - **Q1（SEARCHKEY）：保留命令字不改，但参数形状强制为两参数 `<storageNs> <pk-range_json>`；旧单参数「完整 KeyRange JSON」形式直接 ERR**。
+> - **Q3（KEYS）：仅接受单参数 `<storageNs>`（不接受任何 glob pattern，`user:*` / `abc*` 全部直接 ERR）**— 避免通配符匹配时还要区分 mem/disk 层的歧义复杂度。
+> - **C2（SEARCHINDEX）/ C4（UPDATE）：** 两参数表面形状维持今日字节级不变，但内部新增 Strict pre-check（ns 注册 + KeyAttrs 一致性），具体校验点与 §4.3.2 表格字节级一致。
+> - **统一 Fail-Closed 执行顺序（handleCommand 入口预检，不进具体 handler）：**
+>   ```
+>   handleCommand(conn, cmd, db, ps)
+>     L368  db nil check            (现状)
+>     L375  NOAUTH check            (现状, AUTH/HELLO/CLIENT 放行)
+>     L385  [NEW MVP LAYER: 统一参数级预检]
+>           ① 按命令字分类 → 结论3 / 结论2 / 其他
+>           ② 按 §4.3.2 的 Q1/Q2/Q3/C2/C4 规则分别跑参数级校验
+>           ③ 任何失败 → conn.WriteError(精确格式ERR文案) + return（不进入业务 handler，零数据变更）
+>     L386  commandRegistry 查表进入具体 handler
+>   ```
+> - **Registry SSoT 不可绕过原则：** 即使 buntdb 物理 key/index 存在，只要 registry 没有对应 ns / `_idx_:<full>` 元数据 → 命令一律 ERR，不允许 silent fallback。
+> - **Storage 层 SSoT 原则（与 Q2 完全兼容，无破坏）：** server 侧按 KeyAttrs 推导 pk 拼出的 **buntdb key 形状 = `<storageNs>:<pk-suffix>`（单文档单 key）**，与 §11 定义字节级一致，因此 buntdb 原生 CreateIndex 回填 / TTL per-key / AscendRange 能力 100% 复用，不会破坏 M1~M7 任何一条已锁定设计。
+
+### MVP Strict 命令矩阵（逐命令精确校验点 + 错误文案范例，与 §4.3.2 字节级对齐）
+
+| 命令 | MVP 严格校验点（Fail-Closed 全通过才能进入业务层）| 定位 ns / 校验失败 → 精确 ERR 文案范例 |
+|---|---|---|
+| `SET <storageNs> <JSON_doc_or_docs> [EX s] [PX ms] [NX]` | ① arg#1 = 纯 storageNs（**禁止含 `:`，mem 层特例 `_m_:hot` 整体允许**）；② storageNs 已注册或 internal `_*` 前缀；③ arg#2 = 合法 JSON object 或 array of objects（plain string/number → ERR）；④ 单条 → 取 KeyAttrs 顶层值拼 pk → 多段 `_` 连 → 反向 ExtractPKSuffixes 与 JSON 值 1-1 match（case/type/empty-sensitive）；⑤ 批量 → 逐行预校验 + **同批内 pk collision 检测** + **整体原子性 = DEL 策略**（any 失败 → 0 条写入，ERR 精确指出数组下标 i）；⑥ NX 批量 = 全 pk 不存在才写，任一存在 → 0 行。 | **定位 ns**：arg#1 = storageNs（无需拆分）<br>**旧违例 ERR**：`ERR SET first argument must be storageNs only; full storageKey '<ns>:<pk>' (with ':') is NOT accepted in MVP. Correct form: SET <ns> <JSON_doc>. E.g.: SET user '{"id":"0100",...}'.`<br>**KeyAttrs 不匹配 ERR**：`ERR SET KeyAttrs mismatch at batch index #2: document KeyAttrs values [tenant=acme,id=202] produce pk-suffix 'acme_202', but pk-suffix parsed from derived key does not byte-for-byte match. 0 rows written.`<br>**批量原子性失败 ERR**：`ERR SET batch aborted at array index #1: JSON missing KeyAttrs top-level field 'tenant'. All 0 rows were written (atomic no-half-write guarantee).` |
+| `SETEX <storageNs> <ttl_secs> <JSON_doc_or_docs>` | 同 SET 全部校验 + 额外：arg#2 必须是整数秒（否则 ERR）；arg#1 ns 注册 / JSON validity / KeyAttrs / 批量原子性 → 全部字节级同 SET；旧 full key（arg#1 含 `:`）直接 ERR。 | 同 SET；加 **TTL 非整数 ERR**：`ERR SETEX ttl_seconds must be integer seconds. Got: 'thirty-six-hundred'.` |
+| `SETNX <storageNs> <JSON_doc_or_docs>` | 字节级等价于 `SET ... NX`（内部强制走同一条代码，禁止 SETNX 与 SET NX 两条实现 drift）；单条 = pk 不存在写 1；批量 = **所有 pk 不存在才写**（任一存在 → 整体返回 0，0 行）；旧 full key（arg#1 含 `:`）直接 ERR。 | 同 SET；**内部去重门禁**：M2 单元测试必须验证 `SETNX user ...` 和 `SET user ... NX` 返回值、pk 碰撞行为、TTL 行为字节级 100% 一致。 |
+| `GET <storageNs> [<pk-suffix>]`（严格 2 分支：无 pk = 集合糖；有 pk = 单条读） | 预检查：① arg#1 = 纯 storageNs（禁止含 `:`，mem 层整体 `_m_:hot` 允许）；② storageNs **必须已注册或 internal 前缀**（**不再返回 Null**，严格区分「ns 不存在」与「key 不存在」）；<br>分支 1 集合糖（无 pk）：③ AscendKeys `<ns>:*` → 拼 JSON array（WriteBulk 单字符串返回，**不是 Redis WriteArray**）；④ `max_rows` 硬上限 10,000（超 → ERR）；⑤ 0 行 → 返回 `[]`（不是 WriteNull，也不是 WriteArray(0)）<br>分支 2 单条读（有 pk）：③ pk-suffix **禁止含 `:`**（§11 多段 KeyAttrs 必须用 `_` 连）；④ server 拼 `<ns>:<pk>` → buntdb Get → 不存在写 Null / 存在写回单对象 JSON（与 SET 入参字节级对齐，不可能返回 plain string） | **旧违例 ERR**：`ERR GET first argument must be storageNs only; full storageKey '<ns>:<pk>' is NOT accepted in MVP. Correct forms: GET <ns> (full collection array) or GET <ns> <pk-suffix> (single doc).`<br>**ns 未注册 ERR**：`ERR table '<ns>' does not exist (GET requires registered namespace for both collection and single-document forms). Hint: KeyAttrs values cannot be reconstructed from raw key without Doc spec.`<br>**超 max_rows ERR**：`ERR GET collection max_rows=10000 exceeded for '<ns>'; use SEARCHKEY <ns> <keyrange_json> with explicit pagination. Narrow down before retrying.`<br>**pk 含 `:` ERR**：`ERR GET pk-suffix must not contain ':'; multi-segment KeyAttrs composite pk must join with '_' per §11. Got: 'tenant_01:id_02' (contains ':').` |
+| `DEL <storageNs> <pk-suffix> [<pk-suffix> ...]`（≥2 参数；严格禁止删空 ns 集合糖；严格禁止跨 ns 混传） | Phase 1 预检查（0 删除）：① arg#1 = 纯 storageNs（禁止含 `:`，mem 层允许整体）；② storageNs 必须已注册（**即使 pk 真实存在也必须过这道门 — Strict DEL 原子策略，Fail-Closed**）；③ ≥1 pk-suffix 参数（len(cmd.Args) ≥ 3 → ≥1 pk）；④ 每个 pk-suffix **禁止含 `:`**（§11）；<br>Phase 2 实际删除（Phase 1 100% 通过才执行）：⑤ 逐个拼 `<ns>:<pk>` → buntdb Delete → 汇总 count → WriteInt(count)；**绝不允许「0 pk → 删整个集合」**（运维手滑防炸）。 | **旧 full key / 跨 ns ERR**：`ERR DEL first argument must be storageNs only; full storageKeys (with ':') and cross-namespace DEL are NOT accepted. Correct form: DEL <ns> <pk1> [pk2 ...]. To delete an entire collection, use future DROP DOC <ns> CONFIRM (not available in MVP). Cross-namespace deletion requires separate DEL commands per namespace.`<br>**ns 未注册 + 原子预检查 ERR**（典型场景：DEL user 0100 orphan:0100 → 先检测 arg#1=user 已注册？OK；但现在是单 ns 形式 → 不会遇到跨 ns，此场景想跨 ns 必须两条命令。下面是另一个典型：`DEL orphan:0100` → arg#1=orphan，orphan 未注册 → 直接 ERR 0 行）：`ERR DEL aborted: namespace 'orphan' is not registered (Strict MVP: all pk-suffix in a single DEL must belong to a single, already-registered namespace). 0 rows deleted (atomic guarantee — no half-state).`<br>**缺少 pk ERR**：`ERR DEL requires at least one pk-suffix argument (total args ≥3). To drop an entire table, use future DROP DOC <ns> CONFIRM (not available in MVP).` |
+| `KEYS <storageNs>`（单参数，Q3 拍板：**不接受任何 glob**） | ① arg#1 = 纯 storageNs（mem 层整体 `_m_:hot` 允许）；② **禁止包含 `*` / `?` / 任何 glob 字符**，禁止包含除 `_m_:` 前缀以外的多余 `:`；③ storageNs 未注册且非 internal 前缀白名单 → ERR；④ 内部实际执行 glob = `<storageNs>:*`（AscendKeys 范围受控，不会全扫）。白名单放行：`KEYS _doc_` / `KEYS _idx_` / `KEYS _m_:hot` → 正常工作。 | **glob 传进来 ERR**：`ERR KEYS command accepts <storageNs> only; glob patterns like 'user:*' or 'abc*' are not supported in MVP to avoid mem/disk scope ambiguity. Use SEARCHKEY <ns> <keyrange_json> to do scoped pagination with explicit $gte/$lte pivots.`<br>**ns 未注册 ERR**：`ERR KEYS aborted: namespace '<ns>' not registered. Use registered namespace or internal prefix (_doc_ / _idx_ / _auth_ / _m_:<ns_mem>).` |
+| `SEARCHKEY <storageNs> <pk-range_json>`（Q1=Y：**保留命令字，两参数形状**） | ① arg#1 storageNs 已注册或 internal；② `<pk-range_json>` 合法（仅顶层 `$gt/$gte/$lt/$lte/$eq/$bt/$pattern/$limit` 白名单 key；非法 key → unknown key abort）；③ **strictly 禁止 pivot 里写 storageNs 前缀**（如 `{"$gte":"user:0100"}` → pivot 含 `user:` 前缀 → ERR，因为 ns 已经单独传了）；④ scopeGuard 内部强制 prefix = `<storageNs>:`（防止跨 ns 泄漏）。 | **旧单参数 KeyRange JSON ERR**：`ERR SEARCHKEY MVP requires two arguments: SEARCHKEY <storageNs> <pk-range_json>. Old single-argument 'full KeyRange JSON' form is not accepted in MVP. First argument must be storageNs only, not a full storageKey or JSON. E.g.: SEARCHKEY user '{"$gte":"0100","$lte":"0199"}' (pivots are pk-suffixes, no storageNs prefix).`<br>**pivot 含 ns 前缀 ERR**：`ERR SEARCHKEY pivot must be pk-suffix only (no storageNs prefix like 'user:0100' in '$gte' value); storageNs 'user' was already provided as first argument and server will automatically prepend scope prefix. Got: '$gte' = 'user:0100' (contains illegal ':').` |
+| `SEARCHINDEX <index_full_name_or_logical_name_under_ns> <filter_json>`（**C2：两参数表面形状维持今日字节级不变**；内部新增 2 道强推断） | ① index name 必须能用 `ParseIndexFullName`（§4.3.3 新增共享 helper，规则：先剥可能的 `_m_:` → 剩余字符串取**第一个 `_` 之前 = storageNs，之后 = logical**）反向解析；解析失败 → ERR；② 解析出的 storageNs 必须已注册；③ `_idx_:<full>` 元数据必须存在于 registry（即使 buntdb 物理 CreateIndex 存在，没注册也拦）；④ filter JSON 合法。 | **index name 反解析失败 ERR**：`ERR SEARCHINDEX invalid index name format. Canonical form expected [_m_:]<ns>_<logical> (e.g. 'user_age', '_m_:hot_price'). Got: 'user_without_underscore_age'.`<br>**ns 未注册 / index 元数据不存在 ERR**：`ERR SEARCHINDEX index 'user_age' blocked: either the owning namespace 'user' is not yet registered, or '_idx_:user_age' index metadata entry is missing (was DROP INDEX called?). Re-register via: REGISTER INDEX ON user (age, age).` |
+| `UPDATE <full_storageKey> <mutation_json>`（**C4：两参数形状维持今日字节级不变** — 等价传统数据库 UPDATE WHERE key=...） | ① arg#1 必须能用 SplitStorageKey（last-colon）正确拆出 storageNs 与 pk-suffix；拆失败 → ERR；② storageNs 必须已注册；③ mutation_json 必须合法 object（顶层浅 merge 语义不变）；④ mutation 应用后 **重新跑 KeyAttrs 一致性校验**：从新文档 KeyAttrs 顶层值生成 pk-suffix → 必须与原始 full_key 的 pk-suffix 字节级相等 → 不相等 → 0 行更新 ERR；⑤ TTL 继承旧 key，不允许 mutation 改 TTL。 | **full storageKey 格式不对 ERR**：`ERR UPDATE first argument must be a full storageKey format '<storageNs>:<pk-suffix>' (last colon splits the two parts). Got: 'user-no-colon-0100' (no ':').`<br>**KeyAttrs mutation 后不一致 ERR**：`ERR UPDATE KeyAttrs mismatch after mutation: original full storageKey pk-suffix='0100' (expected id=0100 per KeyAttrs), but mutation produced new doc with KeyAttrs id='9999' → computed pk-suffix='9999' which does NOT match original. 0 rows updated. Re-send as a sequence of DELETE + SET if you intend to move a document to a different primary key.` |
+| `REGISTER INDEX ON <storageNs> (<logical>, <json_path>)`（扩展命令，Channel 2） | ① ns 已注册；② logical 纯字母数字（**禁止含 `_` 或 `:`**，避免 IdxFullName 解析歧义）→ 否则 ERR；③ `<logical>` 已存在且 path 不同 → 冲突 ERR；④ 相同 ns+logical+path 重复调用 → 幂等 OK。 | **logical 名含保留分隔符 ERR**：`ERR REGISTER INDEX logical index name must be alphanumeric only; '_' and ':' are reserved separators for IdxFullName canonical encoding per §11 naming convention. Got: 'my_index_name' (contains '_').` |
+| `DROP INDEX <storageNs>.<logical_name>`（ns 与 logical 用 `.` 分隔，不用 `_` 因为 `_` 是 IdxFullName 保留连接符） | ① ns 已注册；② `_idx_:<full>` 元数据存在 → 否则 ERR；③ 成功：buntdb.DropIndex + 删 `_idx_:<full>` + registry 移除。 | **找不到 ERR**：`ERR DROP INDEX 'user.emails' not found. Canonical form must be <ns>.<logical> (dotted separator). If you passed raw IdxFullName (e.g. 'user_email'), re-send as DROP INDEX user.email (dotted form between ns and logical name).` |
+| **Infra / PubSub 8 条：** AUTH / HELLO / CLIENT / PING / QUIT / PUBLISH / SUBSCRIBE / PSUBSCRIBE | — 字节级现状不变，不进入 MVP Strict 预检流程。 | — （与 Doc/Index 正交，无新增校验）|
+
+### 5.2 KeyAttrs 一致性校验（MVP 严格，无开关，无松动）
+
+在 SET/UPDATE 写入前执行：
+
+```
+Inputs: storageKey (string), rawJSON (string), DocSpec (from registry)
+Output: OK or ERR (整体 abort, 不写)
+
+For (i, keyAttr) in DocSpec.KeyAttrs:
+   1. expected = extract i-th pk-segment from storageKey:
+        storageKey = "order:acme:0100", keyattrs = ["tenant","id"]
+        → segment 1 (tenant) = "acme", segment 2 (id) = "0100"
+   2. actual   = gjson.Get(rawJSON, keyAttr).String()
+        → if !ok (missing field) → ERR: "missing JSON field 'tenant'"
+   3. expected == actual → continue
+        → else ERR: "KeyAttrs mismatch for table 'order': segment #1 (tenant) expected 'acme' from storage key, got 'evil' from JSON"
+
+Special case: DocSpec.KeyAttrs == [] (empty) → 直接跳过这道门（允许用户定义「无 KeyAttrs 校验的宽松 Doc」，比如纯 key/value blob）
+```
+
+**UPDATE 命令的特殊处理：** mutation 可能改 KeyAttrs 字段本身（例如 `SET id = 9999`）。KeyAttrs 校验**在 mutation 之后**对「新值」执行 — 防止把某行改成 `storageKey=user:0100` 但 JSON id=9999 的脏状态。校验失败 → 整个 UPDATE 0 行变更，回滚。
+
+### 5.3 不做 Strict 校验的例外（白名单 3 类）
+
+1. **所有「storageNs 以 `_` 开头」或「key 直接以 internal 前缀 + `:` 开头」的 metadata 命名空间**：
+   - `_auth_:*`（账号配置，已经是「前缀 + `:`」形式 → storageNs = `_auth_` 以 `_` 开头 → 白名单 ✅）
+   - `_doc_:*`（Doc 元数据）→ storageNs = `_doc_` → 白名单 ✅
+   - `_idx_:*`（Index 元数据）→ storageNs = `_idx_` → 白名单 ✅
+   - `_m_:`（mem 层 user 行**不**在这里白名单：`_m_:user:0100` 的 storageNs = `_m_:user`；白名单只给「真正的 internal metadata 前缀」如 `_doc_`/`_idx_`/`_auth_`）。mem 层 user 行仍然必须有对应 Doc 在 registry 内。
+   - 白名单判定 = **SplitStorageKey(key) → storageNs.HasPrefix("_")**（§11 推论 3 的共享 helper 统一出口，不得散落硬编码 `strings.HasPrefix(key, "_")`）
+2. **运维读命令**：`GET k`（空值返回 nil，不报错 / `KEYS pattern`（全可见，包括未注册 ns 的「幽灵数据」 —— 运维命令保留全量可见性作诊断）
+3. **No-Doc 基础设施**：`PING/AUTH/SUBSCRIBE/PUBLISH`（PubSub/连接/鉴权 全与 Doc 无关）
+
+### 5.4 TTL 自动路由
+
+无论 Strict 模式下（MVP 只有 Strict）：
+
+```
+If SET command has EX/PX explicitly in args → use user's TTL (explicit wins, minimal surprise)
+Else (no TTL in SET)
+   → LookupDocByKey(key) in registry
+     → found: use DocSpec.TTL as buntdb TTL
+     → not found: would already fail in the "table does not exist" gate anyway (strict mode)
+```
+
+**Client 侧冗余：** typed `Set[D](d)` 在发送前也做一次 `ttl = d.TTL()` 作为本地前置。Server 侧仍然以自己第 2 步 gate 计算出的 TTL 为最终值 —— 不信任客户端输入（安全边界在 server）。
+
+---
+
+## 6. Client Layer Refactor (P1-A Enforced)
+
+### 6.1 Package Reorg
+
+| 之前 | 之后 | 说明 |
+|---|---|---|
+| `client/cli.go` + `client/doc/doc.go` (两包) | `client/cli.go` + `client/doc.go` (一包) | Doc typed API 8 个泛型函数直接合并进 `package client` |
+| Public raw: `client.Get/Set/...` | **Private**: `getRaw/setRaw/...`（10 个，命名 `*Raw`） | 对外只留 typed CRUD；只有 client 包内（doc.go + 白盒测试）可以调 raw |
+
+### 6.2 Final Public Surface (client 包)
+
+**19 个 public 符号 = 11 (infrastructure) + 8 (typed CRUD [D])：**
+
+```
+// Infrastructure (no-D, forever public)
+Connect(respAddr, authKey string) error
+ConnectEmbed(respAddr string) error
+Auth(authKey string) error
+Publish(topic, msg string) bool
+Subscribe(topic string) mo.Result[<-chan *ReceivedMessage]
+SetHookTimeout(d time.Duration)
+AddAbortHook(h AbortHook) HookID
+AddTransformHook(h TransformHook) HookID
+AddObserverHook(h ObserverHook) HookID
+AddObserverAfterHook(h ObserverAfterHook) HookID
+RemoveHook(id HookID)
+
+// Typed CRUD [D] (the ONLY public CRUD surface)
+Get      [D x.Document](key string) (D, error)
+Set      [D x.Document](d D) error
+SetNX    [D x.Document](d D) (bool, error)
+Delete   [D x.Document](d D) (bool, error)
+Keys     [D x.Document](keyPattern string) mo.Result[[]string]
+SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D]
+SearchKey  [D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D]
+Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string]
+```
+
+### 6.3 Test Reorg
+
+- `key_range_client_test.go` + `key_range_doc_test.go` **合并**为 `client/key_range_test.go`，声明为 `package client`（白盒测试），可以同时断言：
+  - typed API 输出（`[]D`）
+  - raw wire 输出（`searchKeyRaw(...)` → `[]string` raw JSON 行 + gjson 字段精确校验）
+- `client/doc/` 子目录若需要过渡保留 1 个 minor 版本，加 `client/doc/shim.go` deprecated 转发到 `client.Get[D]` 等，`go doc` 显示 Deprecated 删除线。
+
+---
+
+## 7. MVP Definition of Done (验收标准)
+
+### 7.1 Three-Gate Acceptance (项目三门，无例外)
+
+- [ ] **G1 Build:** `go build ./...` — exit 0
+- [ ] **G2 Vet:** `go vet ./...` — exit 0
+- [ ] **G3 Test:** `go test ./...` — all packages PASS, including
+
+### 7.2 Doc Registry (Channel 1 + Channel 2)
+
+- [ ] `server.Doc[UserDoc](), server.Doc[OrderDoc]()` passed to Start → after startup, `db.RegisteredDocs()` contains both specs (ns, keyattrs, ttl 全匹配)
+- [ ] `RegisterDoc[UserDoc]()` called twice → second call succeeds (idempotent)
+- [ ] `type LegacyUserDoc string` defines the same ns=`user` but different KeyAttrs=`["uid"]` → `RegisterDoc[LegacyUserDoc]()` returns error that clearly lists the schema differences: "namespace 'user' already registered by 'UserDoc' (keyattrs=[id] ttl=168h), incompatible with 'LegacyUserDoc' (keyattrs=[uid] ttl=0h)"
+- [ ] **No lazy registration path exists**: today's `requireRegistered[D]` is removed. If UserDoc ns not registered, any typed `client.Set[UserDoc](d)` or RESP `SET user:0100 ...` → error at server strict gate, NOT auto-created.
+
+### 7.3 Index on Doc (A1 Model)
+
+- [ ] `x.Document` interface unchanged (5 methods, same signatures as x.go#L261-L292). No `Indexes()` method required or expected.
+- [ ] `server.IndexOn[UserDoc]("age", "age")` in Start → buntdb has index `user_age` with pattern `user:*` and JSON path `age`. Full index name equals IdxFullName[D] output byte-by-byte (backward compatible with disk data).
+- [ ] Runtime: Insert 1000 rows of `user:*` with various `age` values → then call `db.RegisterIndex[UserDoc]("age", "age")` → `SEARCHINDEX user_age KeysGte("18")` returns all users >= 18 immediately (buntdb's CreateIndex did the backfill correctly; no restart required)
+- [ ] `REGISTER INDEX ON user(age, age)` RESP cmd works same as Go RegisterIndex[UserDoc]("age", "age")
+- [ ] `DROP INDEX user.age` → `DescribeDoc("user")` no longer lists `age` index. `SEARCHINDEX user_age ...` → ERR `index belongs to unregistered namespace or index was dropped`
+- [ ] RawIndex conflict: UserDoc registered, then someone passes `x.RawIndex("user_age", "user:*", "contact.email")` (same full name but DIFFERENT path) → Start aborts during option processing with clear error.
+
+### 7.4 Strict Command Matrix (Q1/Q2/Q3/C2/C4 — MVP Fail-Closed Gate Level)
+
+#### 7.4.1 Parameter-Level Gate (handleCommand 统一入口层 — 业务 handler 之前执行，零数据变更)
+
+- [ ] **Q2 — SET/SETEX/SETNX 第 1 参数含 `:` → 立即 ERR**：`SET user:0100 '{"id":"0100"}'`（第 1 参数含冒号，无论 ns 是否注册） → 返回精确错误文案：`ERR first argument must be storageNs only, got 'user:0100' (contains ':'). Correct form: SET <storageNs> <full_json_doc>, full_key=<storageNs>:<pk_suffix>`. 零行写入，`KEYS user` 返回空。
+- [ ] **Q2 — GET 第 1 参数含 `:` → 立即 ERR**：`GET user:0100` → 返回与上面 SET 完全相同的 ERR 文案。`KEYS user` 返回空。
+- [ ] **Q2 — DEL 第 1 参数含 `:` → 立即 ERR**：`DEL user:0001` → 返回与上面完全相同的 ERR 文案。`KEYS user` 返回空。
+- [ ] **Q3 — KEYS 传 glob pattern → 立即 ERR**：`KEYS user:*` → 精确错误：`ERR KEYS only accepts a single storageNs argument (no glob patterns allowed). Got 'user:*' detected a glob pattern.` `KEYS abc*` → 同样 ERR 精确错误。`KEYS user` 成功（合法正确用法）。
+- [ ] **Q1 — SEARCHKEY 单参数旧形式 → 立即 ERR**：`SEARCHKEY '{"op":"gte","pivot":"0100"}'`（只有 1 个参数） → 精确错误：`ERR SEARCHKEY requires exactly 2 arguments: SEARCHKEY <storageNs> <pk-range_json>. Old single-argument full-KeyRange form is NOT supported.` pivot 里带 storageNs 前缀 → ERR：`SEARCHKEY user '{"$gte":"user:0100"}'`（pivot 字段含 `:` 前缀） → 精确错误：`ERR SEARCHKEY pk-range_json pivot must be pk-suffix only, must not contain storageNs prefix ':'. Got 'user:0100'. scopeGuard auto-injects '<storageNs>:' prefix internally.`
+- [ ] **C2 — SEARCHINDEX index_full_name 解析失败 → 立即 ERR**：`SEARCHINDEX badname '{}'`（badname 不含 `_` 分隔符，ParseIndexFullName 失败） → 精确错误：`ERR SEARCHINDEX cannot parse index full_name 'badname': must match pattern '[_m_:]<ns>_<logical>' (first '_' after optional '_m_:' prefix splits ns vs logical).`
+- [ ] **C4 — UPDATE full_storageKey 无法用 last-colon 拆分 → 立即 ERR**：`UPDATE no_colon_key '{"$set":{}}'`（第 1 参数不含任何 `:`，SplitStorageKey 失败） → 精确错误：`ERR UPDATE requires first argument as full_storageKey = '<storageNs>:<pk-suffix>' (last ':' separates ns vs suffix). Got 'no_colon_key' which contains no colon.`
+
+#### 7.4.2 Registry-Level Gate (参数级 Gate 之后，Registry 校验)
+
+- [ ] **Q2 — SET ns 未注册 → ERR**：`SET orphan_ns '{"id":"0100"}'`（orphan_ns 未 REGISTERDOC） → 精确错误：`ERR table 'orphan_ns' does not exist`. 零行写入。
+- [ ] **Q2 — SETNX ns 未注册 → ERR**：`SETNX orphan_ns '{"id":"0100"}'` → 同上 ERR。
+- [ ] **Q2 — GET ns 未注册 → ERR**：`GET orphan_ns`（集合糖形式，无第 2 参数） → 同上 ERR。`GET orphan_ns 0100`（带 pk-suffix 形式） → 同上 ERR（不允许读未注册的表，即使单条）。
+- [ ] **Q2 — DEL ns 未注册 → ERR**：`DEL orphan_ns 0001` → 同上 ERR，零行删除（所有预检查全过才执行删除，原子性保证零半写）。
+- [ ] **Q3 — KEYS ns 未注册 → ERR**：`KEYS orphan_ns` → 同上 ERR（除 `_doc_`/`_idx_`/`_auth_`/`_m_:<mem_ns>` 白名单放行外一律拦）。
+- [ ] **C2 — SEARCHINDEX index 属于未注册 ns → ERR**：即使 buntdb 物理存在 `user_age` 索引，但 `user` ns 不在 registry → `SEARCHINDEX user_age '{}'` → 精确错误：`ERR index 'user_age' belongs to unregistered namespace 'user' (registry is SSoT, physical index presence alone is NOT sufficient).`
+- [ ] **C4 — UPDATE full_key 属于未注册 ns → ERR**：`UPDATE evil:0001 '{"$set":{"x":1}}'`（SplitStorageKey 拆出 ns=`evil` 未注册） → `ERR table 'evil' does not exist`。0 行更新。
+
+#### 7.4.3 Business-Level Gate (Registry Gate 之后，业务逻辑级 Fail-Closed)
+
+- [ ] **Q2 — SET 单文档 KeyAttrs mismatch → 0 行 ERR**：`SET user '{"id":"9999","age":20}'`（UserDoc.KeyAttrs=["id"]），server 侧派生 pk=`9999`，后续写 `_` 之后写 `user:9999` OK。现在 KeyAttrs 一致性校验没问题 — 改为校验 KeyAttrs 缺失 ERR：`SET user '{"age":20}'`（JSON 无 `id` 字段，KeyAttrs 值提取失败） → 精确错误：`ERR SET aborted: cannot extract KeyAttrs '["id"]' from JSON doc. KeyAttrs fields are REQUIRED and MUST be present at top-level of every document.` 0 行写入；`GET user` 集合糖返回空数组。
+- [ ] **Q2 — SET 批量 JSON Array 原子性（任一失败 → 0 行）**：`SET user '[{"id":"0100"},{"id":"0101"},{"age":99},{"id":"0103"}]'`（数组 #2 缺 id 字段） → ERR 精确错误：`ERR batch SET aborted at array index #2: cannot extract KeyAttrs '["id"]' from JSON doc — 0 rows were written`. 之后 `KEYS user` 返回与调用前完全相同的基数（0100/0101/0103 全部不存在，原子性保证）。
+- [ ] **Q2 — SET 批量同批 pk 冲突 → 0 行 ERR**：`SET user '[{"id":"0100","x":1},{"id":"0100","x":2}]'`（同批两文档 pk 相同） → 精确错误：`ERR batch SET aborted at array index #1: duplicate pk 'user:0100' derived from different documents in same batch call — 0 rows written`（防止同批 silent overwrite）。
+- [ ] **Q2 — SETNX 批量语义：任一 pk 已存在 → 整体 0 行 ERR**：先 `SET user '[{"id":"0100"},{"id":"0101"}]'` 成功写入，然后 `SETNX user '[{"id":"0102"},{"id":"0100"}]'` → ERR 精确错误：`ERR batch SETNX aborted: pk 'user:0100' already exists (SETNX requires ALL-or-NOTHING batch semantic — 0 rows written, including 'user:0102' which did not exist before).` 之后检查 `GET user 0102` → nil（证明原子性）。
+- [ ] **Q2 — SET 单 JSON / 批量 JSON 非 JSON 输入 → ERR**：`SET user 'plain-string-not-json'` → 精确错误：`ERR SET second argument must be valid JSON (single object OR array of objects). Got plain string (no leading '{' or '[').` `SET user '123'`（number） → 同样 ERR。
+- [ ] **Q2 — DEL 0 个 pk-suffix → ERR**：`DEL user`（只有 ns，无后续参数） → 精确错误：`ERR DEL requires at least one pk-suffix argument after <storageNs>. To delete ALL documents in a namespace, use client typed API (DANGEROUS operation not available via raw RESP for safety).`（严禁 DEL 整个集合糖，防止误操作删表）。
+- [ ] **Q2 — GET 集合糖 max_rows 防 OOM**：先灌 15000 条 user 文档（通过 SET 批量 + pipeline）。`GET user`（缺省 max_rows=10000） → ERR 精确错误：`ERR GET <storageNs> (collection form) exceeded max_rows=10000 (actual=15000). Use SEARCHKEY for pagination or set via typed API.` 0 行返回。之后调用 `db.SugarGetMaxRows(20000)`（或等价 RESP CONFIG 命令）重设后重试 → 返回 JSON 数组 len=15000。
+- [ ] **C4 — UPDATE mutation 后 KeyAttrs 新值 != 原 pk → 0 行 ERR**：先写入 `SET user '{"id":"0100","age":20}'` → 成功（pk=user:0100）。然后 `UPDATE user:0100 '{"$set":{"id":"9999"}}'`（把 KeyAttrs id 从 0100 改成 9999） → 精确错误：`ERR UPDATE aborted: KeyAttrs mismatch after mutation applied. Original pk derived from storageKey='user:0100'`, new pk re-derived from mutated JSON='{"id":"9999",...}='user:9999'. Mutation MUST NOT change KeyAttrs field values. 0 rows updated`。后续 `GET user 0100` 返回原始 JSON（id=0100 age=20），证明 0 行变更。
+- [ ] **TTL 注入规则（Server 侧 SSoT，不信任客户端输入）**：UserDoc.TTL=168h，调用 `SET user '{"id":"0100"}'`（无 EX/PX 参数）→ 写 buntdb key `user:0100` 的 TTL = 168h（通过 TTL 命令验证）。再调 `SET user '{"id":"0101"}' EX 1`（显式 EX 1 秒）→ TTL = 1s（显式覆盖默认）。SETEX 等价于 SET + EX（SETEX user 1 '{"id":"0102"}' → TTL=1s）。
+- [ ] **Q1 — SEARCHKEY 两参数正常工作 + scopeGuard 正确注入**：写入 user:0098 / user:0099 / user:0100 / order:0100 → `SEARCHKEY user '{"op":"gte","pivot":"0100"}'` → 返回仅 `[user:0100]（只有 user 命名空间，order:0100 被 scopeGuard 过滤，证明 pivot 只接受 pk-suffix，内部自动拼 `<ns>:`前缀）。
+- [ ] **C2 — SEARCHINDEX ParseIndexFullName 反推 ns + registry 双重校验**：`REGISTER INDEX ON user(age, age)` → `SEARCHINDEX user_age '{"op":"gte","value":18}'` → ParseIndexFullName 剥 _m_:（无）→ 取第一个 `_` 前=`user` 后=`age` → 通过。对 Mem 层 HotDoc：`REGISTER INDEX ON _m_:hot(temp, temperature)` → IdxFullName=`_m_:hot_temp`，SEARCHINDEX 剥 `_m_:` → 剩 `hot_temp` → 第一个 `_` 前=`hot` 后=`temp` → 通过。
+
+### 7.5 `_doc_:*` / `_idx_:*` Persistence + Crash Recovery
+
+- [ ] After `RegisterDoc[UserDoc]()` and `RegisterIndex[UserDoc]("age", "age")` → `KEYS _doc_:*` returns 1 entry (`_doc_:user`), JSON valid; `KEYS _idx_:*` returns `_idx_:user_age`.
+- [ ] **Mem layer internal ns is double-coloned**: For a Mem=true HotDoc (Namespace="hot"), `RegisterDoc[HotDoc]()` → `KEYS _doc_:*` shows `_doc_:_m_:hot` (storageNs = `_m_:hot`).
+- [ ] **KeyAttrs multi-segment pk suffix uses `_` per §11**: KeyAttrs=[tenant,id] Doc (tenant="acme", id="202") → actual storage key = `<ns>:acme_202`, NOT `<ns>:acme:202`. Subsequence `SEARCHKEY KeysGte("<ns>:acme_200")` returns it correctly; scope guard does NOT mistake `<ns>:acme_202` for a cross-ns leak.
+- [ ] **Crash recovery**: Kill server process, restart with `Start(addr, path)` (NO Doc/Index options passed) → `db.RegisteredDocs()` and `db.DescribeDoc("user")` still show UserDoc + age index (registry rebuilt purely from `_doc_:*` + `_idx_:*` on disk). Subsequent `REGISTER INDEX ON user(email, contact.email)` still works normally on top of recovered registry.
+- [ ] **Index ownership by naming convention**: For Doc `user`, `KEYS _idx_:user_*` returns exactly `_idx_:user_age`, `_idx_:user_email` etc. (all indexes belonging to user). No full `_idx_:*` scan is needed to enumerate a single doc's indexes.
+- [ ] **PersistentDocSpec strictly NO indexes field** (用户 2026-08-22 决策：元数据分开): After `RegisterDoc[UserDoc]()`, `GET _doc_:user` JSON response is parsed and MUST NOT contain a key named "indexes" at top level. Presence of any "indexes" key at any depth is NOT required but at top-level is FAIL with specific error "PersistentDocSpec must not contain indexes; create them separately via REGISTER INDEX". Verify via unit test: passing `{"ns":"user","mem":false,"keyattrs":["id"],"indexes":[{"name":"age","path":"age"}]}` to `db.RegisterDocFromSpec(spec)` → ERR with message exactly as defined in §10.2 Strict Door #1.
+- [ ] **DescribeDocResult join consistency**: After `RegisterDoc[UserDoc]()` + 3 `RegisterIndex[UserDoc](a/b/c, ...)`, collect `keys := KEYS _idx_:user_* → len(keys)=3`. Then collect `res := db.DescribeDoc("user") → len(res.Indexes)=3`. Assert `{keys[i] stripped of "_idx_:" prefix} == set(res.Indexes[j].Full)` **set equality** (order-independent). Subsequent DROP INDEX user_b → re-verify len=2 and sets still match. This proves DescribeDoc does NOT rely on any cached index list, always re-globbed.
+- [ ] **DescribeDocResult never persisted back** (fail-closed to prevent schema pollution): Take a valid `db.DescribeDoc("user")` result (with spec + indexes + row_count fields), serialize to JSON verbatim, then try to pass it raw to `db.RegisterDocFromSpec(json.Unmarshal(...))` → MUST ERR with "PersistentDocSpec contains unknown field 'indexes'" (from §10.2 Door #2 — unknown key whitelist). Same applies to RESP `REGISTERTABLE user <that_JSON>`. Proves the 3-struct separation is enforced at API boundary not just in docs.
+- [ ] **Three-struct separation enforceable via Go vet/staticcheck**: `x.PersistentDocSpec` Go struct definition must explicitly NOT declare an `Indexes` field (unit test using `reflect.TypeOf(PersistentDocSpec{}).FieldByName("Indexes")` returns `!ok`); `x.DescribeDocResult` MUST declare nested Spec and Indexes fields (reflect check ok). `x.IndexSpec` struct reflects independently. No shared embedding between PersistentDocSpec and DescribeDocResult (enforces they are distinct types).
+#### 7.5.1 MVP Wire Command Happy Path（Fail-Closed Gate 全部通过后的正常行为）
+
+- [ ] **Q2 — SET 单文档 happy path**：`RegisterDoc[UserDoc]()` 后 → `SET user '{"id":"0100","name":"alice","age":25}'`（第 1 参数 storageNs=`user` 无冒号，第 2 参数单 JSON 对象） → OK 成功写入。然后 `GET user 0100` 返回该 JSON 字节级相等。然后 `KEYS _doc_:user` 存在，且 `KEYS user` 返回 `["user:0100"]`（证明 server 侧 KeyAttrs 派生 pk = 0100，拼 storageKey = `user:0100`，正确落盘）。
+- [ ] **Q2 — SET 批量 JSON Array happy path**：`RegisterDoc[UserDoc]()` 后 → `SET user '[{"id":"0100","name":"a"},{"id":"0101","name":"b"},{"id":"0102","name":"c"}]'`（3 对象数组） → OK 成功写入，返回字符串 "3 rows inserted"（或等价批量 OK 提示）。然后 `GET user`（集合糖无第 2 参数） → JSON 数组 len=3，`.id` 集合 = {"0100","0101","0102"}（顺序无关）。
+- [ ] **Q2 — SETNX 单 + 批量 happy path**：先 `SETNX user '{"id":"0100"}'` → OK 返回 true。再调一次同样 `SETNX user '{"id":"0100"}'` → OK 返回 false（原文档内容保持不变 = 第一次写入的字节）。批量：`SETNX user '[{"id":"0101"},{"id":"0102"}]'` → 第一次 → true 2 inserted；再加一个同样 → false 0 inserted。
+- [ ] **Q2 — GET 单条 / 集合糖 happy path + 顺序**：写 3 条（0100/0101/0102）→ `GET user 0101` → 返回单 JSON（不是数组） = `{"id":"0101",...}`。`GET user`（集合糖） → 返回 3 条 JSON 数组（BTree AscendKeys 序保证按 pk 字典序升序）。
+- [ ] **Q2 — DEL 多 pk-suffix happy path + 原子预检查**：写 4 条（0100/0101/0102/0103）→ `DEL user 0100 0101 0102` → OK "3 rows deleted"。然后 `GET user` 集合糖 len=1（只剩 0103）。原子预检查测试：`DEL user 0103 not_exist_key_id_9999` → 全部 pk-suffix 在 user ns 下先查 registry（ns 已注册 ✓），再检查每个 pk 对应的 KeyAttrs 是否存在？ → MVP 版本：DEL 严格检查所有 pk 全部在 db 内存在才删？不，DEL 语义：DEL 命令 Redis 的语义是「忽略不存在的 key，返回实际删除数」，但我们在 MVP 严格模式下：**原子预检查仅检查 ns 注册性 + 所有 pk 跨 ns 混合（DEL 所有 pk 的第 1 参数=user，所以都属于 user ns → 安全），不存在的 key 直接跳过不报错，返回实际删除数 = 存在且成功删除的条数。但若任一 pk 的 KeyAttrs 拼出的 pk-suffix 与 pk 自身 不匹配（比如用户传 `DEL user evil:999`（pk 带冒号）在参数级 Gate 已拦，所以业务级 DEL 收到的所有 pk-suffix 参数都已保证不含冒号。
+- [ ] **Q3 — KEYS storageNs happy path**：写 3 条 user + 2 条 order → `KEYS user` → 返回数组 = 3 条（严格匹配 `user:*` 范围，不含任何 `order:*` 混入）。Mem 层：写 `_m_:hot` ns 下 5 条 → `KEYS _m_:hot` → 返回 5 条（白名单放行 `_m_:` 前缀，符合 Q3 特例：`_m_:hot` 作为一个 storageNs 整体允许第 1 参数带冒号）。Internal 白名单：`KEYS _doc_` / `KEYS _idx_` / `KEYS _auth_` → 分别返回各自内部 storageNs 下的所有 key（作为运维调试专用，不走业务 registry 门）。
+- [ ] **Q1 — SEARCHKEY 两参数 happy path**：写入 user:0098 (id=0098, age=17) / user:0099 (id=0099, age=18) / user:0100 (id=0100, age=25) / order:0100（跨 ns）→ `SEARCHKEY user '{"op":"gte","pivot":"0099"}'`（pk-range 只传 pk-suffix 0099 段）→ 返回集合糖 JSON 数组 = 2 条（0099 + 0100，id>=0099），**不含 user:0098、不含跨 ns 的 order:0100）。scopeGuard 内部自动强制 pivot = `user:0099` 作为 BTree 左端点下界。
+- [ ] **C2 — SEARCHINDEX happy path + ParseIndexFullName 反推 ns**：`REGISTER INDEX ON user(age, age)` → 写入 10 条 user 数据 age 10~19 → `SEARCHINDEX user_age '{"op":"gte","value":18}'` → ParseIndexFullName 正确拆出 ns=`user`, logical=`age` → registry 有 → 返回所有 age>=18 的 user JSON 数组，且严格只含 user:*（即使物理 order:* 的其他表行（证明 ns 反推正确，绝不会跨 ns 混入 泄漏）。
+- [ ] **C4 — UPDATE full key happy path + KeyAttrs 保持不变**：写入 `SET user '{"id":"0100","age":20,"name":"old"}'` → pk=user:0100 → `UPDATE user:0100 '{"$set":{"name":"new","age":21}}'` → OK，返回 "1 rows updated"。mutation 没改 KeyAttrs（id 还是 0100）。再 `GET user 0100` → `{"id":"0100","age":21,"name":"new"}`。KeyAttrs 一致性校验（从 mutated JSON 重新派生 pk = user:0100，与原始 UPDATE 的 full storageKey 拆出的 pk 相同 → byte-for-byte 相等 → 通过。
+- [ ] **TTL 注入 happy path**：UserDoc.TTL=168h，`SET user '{"id":"0100"}'` → TTL 命令 `TTL user:0100` 返回 ≈168h 秒数（通过 buntdb 原生 TTL 能力）。`SETEX user 3600 '{"id":"0101"}'` → `TTL user:0101` 返回 ≈3600。`SET user '{"id":"0102"}' PX 1000` → `PTTL user:0102` 返回 ≈1000 毫秒。
+- [ ] **REGISTER/DROP INDEX happy path**：`REGISTER INDEX ON user(email, contact.email)`（logical 名 `email`，JSON path `contact.email`，logical 名禁止含 `_` / `:`（尝试 REGISTER INDEX ON user(my_age, age)` → 参数级 Gate ERR：`logical name 'my_age' contains '_' which is reserved separator for IdxFullName, not allowed`。`DROP INDEX user.email` → `DescribeDoc("user").indexes 不再列 email；`SEARCHINDEX user_email` → registry 级 ERR。
+
+### 7.6 Client P1-A Conformance
+
+- [ ] `grep -E '^func (Get|Set|SetNX|Delete|Keys|SearchIndex|SearchKey|Update)\b' client/*.go` — all 10 raw CRUD are lowercase/private (`*Raw` naming). No public raw CRUD functions remain.
+- [ ] User-facing example code in README / howto.md / typed-document.md exclusively uses typed APIs: `client.Get[UserDoc]("0100")` etc. Zero references to `client.Get(key)`.
+- [ ] KeyRange parity tests still pass in both tiers: typed `[]D` assertions and raw wire `[]string` gjson assertions are covered in the merged whitebox key_range_test.go.
+
+### 7.7 Architecture SSoT Alignment
+
+- [ ] `docs/architecture.md` updated to reflect:
+  - Doc = Table, Namespace = Table Name mapping
+  - **§11 System-Level Naming SSoT is byte-for-byte migrated from this FR into architecture.md**（4 规则：`:` namespace 分隔、`_m_:` mem 双层、`_` KeyAttrs join、internal storageNs 格式；3 推论：IdxFullName、Index ownership glob、scopeGuard 拆分算法）— 此段不得散落重复，architecture.md 只保留一份 SSoT，其它章节引用链接。
+  - `_doc_:*` / `_idx_:*` internal schema storage namespace（strict 白名单内：`_doc_` / `_idx_` storageNs 以 `_` 开头 → 跳过）
+  - naming convention on index ownership encoded in `_idx_:<ns>_*` glob（DescribeDoc(ns) 无需全量扫）
+  - Strict command matrix and KeyAttrs consistency rules as a dedicated § section
+  - KeyAttrs 多段 join = `_`：architecture.md 明记：「KeyAttrs 多段 = composite pk，用 `_` 作为 pk-suffix 内部连接符，避免与全局 `:` namespace 分隔符语义冲突，因此 storage key = `<storageNs>:<a>_<b>_<c>`（除最后一次 storageNs separator 外，pk 内不再出现 `:`）」
+  - Index registry SSoT rule: `buntdb` physical indexes without a corresponding registered `_idx_:<full>` entry + owning Doc registered (`_doc_:<ns>`) are treated as orphans and SEARCHINDEX blocks them.
+
+### 7.8 Linting / Formatting
+
+- [ ] `gofmt -s` produces zero diff on all touched Go files
+- [ ] staticcheck (S1008, etc.) clean; no unused variables or types
+
+---
+
+## 8. Milestones (for Issue breakdown)
+
+| M | 名称 | 主要交付 | 对应验收项 |
+|---|---|---|---|
+| M1 | **Infra: 3 Structs + StartOptions + Registry** | `x.PersistentDocSpec` / `x.IndexSpec` / `x.DescribeDocResult` 三套 struct 定义与类型级隔离（reflect 门禁）；`Start(..., opts...)` 签名；`RegisterDoc[D]` / `RegisterDocFromSpec`；registryMutex + documentRegistry 升级（移除 lazy path）| §3.2 分离表, §7.2, 三门, §7.5 最后 4 条断言 |
+| M2 | **Strict Gates 1: SET/UPDATE/DEL + KeyAttrs** | RESP cmd.go 改造：SET/UPDATE/DEL 的预检查与错误信息；KeyAttrs 一致性校验（含 UPDATE mutation 后门） | §7.4 (前 6 条), §5.2 |
+| M3 | **Strict Gates 2: SEARCHINDEX/SEARCHKEY + TTL auto-apply** | SEARCHINDEX registry-first, SEARCHKEY broad pattern filter, TTL 自动路由 | §7.4 (最后 3 条), §5.4 |
+| M4 | **Index: Register/Drop/Dynamic + REGISTER INDEX cmd** | `RegisterIndex[D]`, `DropIndex[D]`, RESP `REGISTER INDEX`/`DROP INDEX`; 复用 buntdb CreateIndex backfill | §7.3 |
+| M5 | **_doc_* / _idx_* Persistence + Recovery** | 持久化两套分离 schema + `loadSchemaRegistryFromDB()` 在 Start 里的正确顺序；三套 struct 严格分离门禁 | §7.5, §4.1 执行顺序, §3.2 struct 分离表 |
+| M6 | **Client P1-A Refactor** | 合并包、raw → `*Raw` private、测试合并、deprecated shim、README/howto 示例全量替换 | §7.6, §6.3 |
+| M7 | **Docs** | architecture.md SSoT 更新；typed-document.md 示例修正；index.md 导航；index SSoT 说明 | §7.7 |
+
+---
+
+## 9. Risks & Mitigations
+
+| 风险 | 概率 | 影响 | 缓解措施 |
+|---|---|---|---|
+| **buntdb `CreateIndex` 对已有 100k+ 行回填阻塞写操作** | 中 | 生产动态 CREATE INDEX 期间抖动 | MVP 文档警告："REGISTER INDEX 会同步扫描已有 `<ns>:*` 行，建议低峰期执行"；未来补异步 `CREATE INDEX CONCURRENTLY` cmd（非 MVP） |
+| **DEL 预检查存在 TOCTOU**：预检查通过后、真正执行 tx.Delete 前，另一协程 DropIndex / DropDoc 把 registry 清空了 | 低 | registry 没了 → strict gate 在 tx 内的实际 Set/Del 入口再 gate 一次（双保险）| `registerMutex` 保护所有 registry 变更；tx 内部在实际写操作前再走一次 LookupDocByKey；极端情况下即使 registry 变了，仍然 ERR，不写脏数据 |
+| **KeyAttrs 多段解析与 StorageKeyValue 生成算法漂移** | 低 | storage key 生成的 pk-segment 与 strict gate 解析不一致 → 合法写入被误拒 / 非法写入漏过 | StorageKeyValue、KeyAttrs 一致性校验、ScopeGuard 三处全部共享同一个 internal helper `ExtractPKSuffixes(storageKey, segCount)`；单测 matrix 覆盖 2-segment PK 下的所有边界 |
+| **旧客户存储了 10GB 未注册 ns 的裸 KV 数据，升级后 Strict Mode 下 KEYS 仍然可见，用户要清理「幽灵数据」很痛苦** | 中 | 技术债体验差 | 提供 admin helper：`db.OrphanNamespaces() → []string`（用 KEYS `*` 扫所有 ns，和 registry 对比，列出未注册的 ns 列表）；用户可以据此手动 DROP 或 `REGISTER DOC` 认领 |
+
+---
+
+## 10. Open Items (Pending Reviewer Confirmation)
+
+1. **✅ 已解决：Doc/Index 元数据存法 & 命名规范（原 Open Item 1）**
+   - 方案：**方案 1 干净无冗余** — `_doc_:<namespace>` 只存 Doc schema（不包含 indexes 字段）；DescribeDoc(ns) 在返回结果拼装时，通过 buntdb `AscendKeys "_idx_:<ns>_*"` 列齐该 ns 下所有 index spec 动态 join。
+   - 命名规范（完全对齐 §11 System-Level SSoT，**底线分隔符约定 1+2+3 全部生效**）：
+     - Doc 元数据键 = `_doc_:<namespace>`（storageNs = `_doc_` + `:` suffix）
+     - Index 元数据键 = `_idx_:<full_index_name>`（storageNs = `_idx_` + `:` suffix）
+     - `<full_index_name>` = **`[_m_:]<namespace>_<logical>`**（§11 推论 1，IdxFullName 新格式，mem 层带中间 `_m_:`）
+   - 解决的两个问题：
+     ① 归属定位零歧义（index full name 天然带 `<ns>_` 前缀，不可能跨 doc 冲突，也不需要额外唯一约束守卫）
+     ② 性能受控（DescribeDoc(user) 不需要扫全库 `_idx_:*`，只扫 `_idx_:user_*` 一个窄范围 glob）
+   - **完整命名示例**（对齐 §11 规则，所有层级都带 `:` 分隔）：
+     | 概念 | 格式 | 示例 (disk) | 示例 (mem layer) |
+     |---|---|---|---|
+     | Doc 元数据键 | `_doc_:<namespace>` | `_doc_:user` | `_doc_:_m_:hot`（mem 层 storageNs = `_m_:hot` → 整体 key 有两个 `:`）|
+     | Index 元数据键 | `_idx_:<full_index_name>` | `_idx_:user_age` (full = `user_age`) | `_idx_:_m_:hot_price` (full = `_m_:hot_price`) |
+     | 用户数据 storage key (multi-segment KeyAttrs=[tenant,id]) | `<storageNs>:<tenant>_<id>` | `tenantuser:acme_202` | `_m_:hot:acme_202`（pk-suffix 内部用 `_`，storageNs 分隔用 `:`，绝对不混淆）|
+     | IdxFullName (index 名字) | `[_m_:]<ns>_<logical>` | `user_byage` | `_m_:hot_byprice` |
+
+2. **✅ 已解决：REGISTERTABLE JSON 格式卡位（用户 2026-08-22 决策：元数据分开，Index 可后定义）**
+   - **核心原则**：Doc / Index 元数据是两套**完全独立、分别持久化**的 KV（`_doc_:user` 与 `_idx_:user_age` 分开），因此 **`REGISTERTABLE` 入参 JSON = 严格等于 `x.PersistentDocSpec`（_doc_:user 的磁盘格式 byte-for-byte），绝对不允许出现 `indexes` 字段**。
+   - **精确 JSON Schema（= `_doc_:storageNs` 磁盘上的完整格式）**：
+     ```jsonc
+     // _doc_:user 磁盘上存储的内容 / REGISTERTABLE <ns> <这个JSON> 入参
+     // / db.RegisterDocFromSpec(spec) 的 spec（go struct x.PersistentDocSpec）
+     // / !CREATEDOC 最后一步输出的 JSON（直接 copy paste 给 RegisterDocFromSpec 即可）
+     {
+       "ns":           "user",                // string, 必须. D.Namespace() 等价物
+       "storage_ns":   "user",                // string, 必须. §11 定义的完整 storageNs
+                                                        // = Mem() ? "_m_:<ns>" : "<ns>"
+                                                        // disk doc = 等价于 ns；mem doc 才会带 _m_:
+       "mem":          false,                 // bool, 必须. D.Mem()
+       "keyattrs":     ["id"],                // []string, 必须. 单/多段，顺序即为拼接顺序
+                                                       // 至少 1 个元素；空数组 → ERR
+       "ttl_ns":       604800000000000,       // int64, 可选. TTL 单位 nanoseconds；
+                                                       // nil / 0 → 无过期，persist
+       "type_name":    "main.UserDoc",        // string, 可选(仅 Go typed API 有, !cmd/RESP 没有时为 "")
+                                                       // 仅用于 debug/DescribeDoc 展示
+       "created_at":   "2026-08-22T12:00:00Z" // string RFC3339, 必须由 server 填；客户端传的话校验一致即可，不一致覆盖为 server 时间
+     }
+     ```
+   - **严格门禁（错误输入 → 直接 ERR，不接受）**：
+     ① JSON 里**出现 `indexes` 字段** → `ERR: PersistentDocSpec must not contain 'indexes' field. Create indexes separately via REGISTER INDEX / !REGISTER INDEX after REGISTERTABLE completes.`
+     ② JSON 里**出现任何不在上面字段白名单内的未知 key** → `ERR: PersistentDocSpec contains unknown field 'xxx'. Only {ns, storage_ns, mem, keyattrs, ttl_ns, type_name, created_at} are allowed.`（Fail-closed，防止将来有人想偷偷塞字段进去搞脏 SSoT）
+     ③ `keyattrs` 空数组 → `ERR: keyattrs must have ≥1 elements.`（MVP 要求 Doc 至少有一个 PK 属性，否则无法生成 storage key）
+   - **IndexSpec JSON Schema（= `_idx_:full_index_name` 磁盘上的内容，独立于 DocSpec）**：
+     ```jsonc
+     // _idx_:user_age 的磁盘内容；单独通过 REGISTER INDEX / !REGISTER INDEX 写入；
+     // 永远不会出现在 _doc_:* 里
+     {
+       "ns":           "user",       // string, 必须. 归属 Doc 的逻辑 namespace（不含 _m_:）
+       "logical":      "age",        // string, 必须. 在该 Doc ns 下唯一的 index logical name
+       "path":         "age",        // string, 必须. JSON path 提取索引值
+       "full":         "user_age",   // string, 必须. §11 推论 1 拼出的完整 index name = [_m_:]<ns>_<logical>
+       "mem":          false,        // bool, 必须. 与 owning Doc 的 D.Mem() 一致
+       "storage_ns":   "user",       // string, 必须. owning Doc 的 storageNs
+       "key_pattern":  "user:*",     // string, 必须. buntdb AscendRange 用的 key pattern；
+                                                  // 必须以 "<storageNs>:" 开头（防止跨 Doc）
+       "created_at":   "..."
+     }
+     ```
+   - **两条通道的零转换原则**：
+     - `!CREATEDOC` shell 引导用户填完字段 → 输出的最终 JSON = 上面 PersistentDocSpec Schema → 用户直接把这段 JSON 贴给 `db.RegisterDocFromSpec(json.Unmarshal(...))` 即可**零字段转换**，不需要改任何 key name。
+     - `REGISTER INDEX` 完成后 `GET _idx_:user_age` 吐出来的 JSON = 上面 IndexSpec Schema → 与 `!REGISTER INDEX` 的输出 JSON byte-for-byte 一致，不需要二次映射。
+   - **DescribeDoc(ns) 返回值（x.DescribeDocResult = 运行时拼装，非持久化）**：
+     ```jsonc
+     // db.DescribeDoc("user") 返回 / RESP DESCRIBEDOC user 返回
+     // 这个 struct 只在内存里存在，永远不写回磁盘；
+     // indexes 字段 = 此时刻 glob _idx_:user_* 结果的即时快照
+     {
+       "spec":       < PersistentDocSpec — _doc_:user 读出来原样放这儿 >,
+       "indexes":    [ < IndexSpec 1 >, < IndexSpec 2 >, ... ],
+       "row_count":  < 此时刻 <storageNs>:* 下的行数（可选，运维用） >
+     }
+     ```
+3. **✅ 已标记 OUT OF SCOPE: `OrphanNamespaces()` admin helper（用户 2026-08-22 决策：先不考虑）**
+   - **不进 MVP**。原因：运维/升级体验问题可通过临时 workaround 解决（`KEYS *` 全扫后按 §11 `SplitStorageKey` 拆 storageNs → dedupe → 与 `db.RegisteredDocs()` storageNs 列表 diff → 手工 REGISTER 或 DROP 清理）。
+   - **后续补入的触发条件**（任一满足即可在下个 patch 版本加）：
+     ① 发布后 ≥2 个独立用户反馈「升级 Strict 模式后找不到哪些是 orphan key」；
+     ② §4.3 Q2 定义的「`GET <storageNs> <pk-suffix>` 单条 + `GET <storageNs>` 集合糖」两种形式，加上 `SEARCHKEY <storageNs> <pk-range>` 范围扫描，仍然无法覆盖运维需要的「全局 orphan 跨 ns 全库枚举」；
+     ③ 实现 `DROP DOC <ns>` 命令时，需要单元测试断言「DROP DOC user 后 storageNs=user 不应出现在 orphan list」—— 此时为了测试工具链完整，OrphanNamespaces() 一起补入。
+   - **与本 FR 其他部分的关系**：本节是唯一 Non-Goals 声明，其他章节（§5 Strict 矩阵、§7 DoD、§8 Milestones）**不引用本工具、不依赖其存在、不预留 API 签名**（防止实现阶段有人误用或依赖不存在的函数）。
+
+---
+
+## 11. System-Level SSoT: Global Separators & Naming Convention（系统级全局分隔符 & 命名规范 — 绝对底线）
+
+> ⚠️ **本节是本 FR 的「宪法底线」**。本节内容是架构级的**非可选、非协商、零歧义**的约定。任何实现（M1-M7）都**不允许偏离本节的任何一条规则**。如果实现与本节冲突，必须以本节为准修改实现；反之则永远不允许出现「特殊 case」破坏此约定。一旦进入 M1 Implementation，本节内容要**byte-for-byte 迁移到 docs/architecture.md 作为全项目唯一 SSoT**，本文档只保留超链接引用。
+
+### 11.1 底线分隔符约定（3 条 — 用户 2026-08-22 最终决策，一字不改）
+
+| # | 约定 | 精确格式 | 常量名（实现时） | 语义说明 & 反例 |
+|---|---|---|---|---|
+| **1** | **Namespace（storageNs 之间）与 suffix 之间用 `:`** | `<storageNs>:<suffix>` | `contract.StorageKeySeparator = ":"`（已存在，不变） | `user:0100` → storageNs=`user`, suffix=`0100`。**这是整个 buntdb key 空间里唯一的「层级分隔符」**。任何「不同 namespace 节点间的分界」都只能用 `:`，不能用 `_` 或其它字符。**反例：storageNs 与 suffix 之间不能写 `user_0100`（会被解析成一个整体 storageNs=`user_0100` + 空 suffix，非法）**。 |
+| **2** | **存在内存（`Mem()=true`）时，storageNs 前面自动前置 `_m_:`（两层 namespace）** | mem storageNs = **`_m_:<namespace>`** → 完整 mem user key = `_m_:<namespace>:<pk>` | 实现时在 `storageNamespace[D]` 里写：`if d.Mem() { return MemNsPrefix + StorageKeySeparator + d.Namespace() }` | 等价于「`_m_` 是一棵独立的 virtual root tree，下面再挂所有 user 的 namespace」。因此 mem 层 user 行永远有**两个 `:`**，即 `_m_:hot:0100`（第一层 `_m_:` 表示 in-memory 层；第二层 `hot:` 表示 user 定义的 doc namespace = `hot`；第三层 `0100` = pk-suffix）。**反例：旧格式 `_m_hot:0100`（无中间 `:`，把 `_m_hot` 当成了一个整体 storageNs）在此约定下是非法的**，必须淘汰。 |
+| **3** | **Key 的属性（KeyAttrs 多段）连接时用 `_`** | pk-suffix = `seg1_seg2_..._segN` | `contract.KeyAttrsJoin = "_"`（实现时新增，不得与 StorageKeySeparator 混用） | KeyAttrs = [tenant, id] → storage key = `<storageNs>:<tenant>_<id>`。例如：`tenantuser:acme_202`（disk）/ `_m_:hot:acme_202`（mem）。** pk-suffix 内部绝对不允许出现 `:`**，所有多段拼接一律用 `_`；这样才能保证「**整个 storage key 中只有 storageNs 边界有 `:`，suffix 里永远没有 `:`**」→ scopeGuard 按冒号切一次就能正确拿到 storageNs 边界，零歧义。**反例：旧格式 `<ns>:acme:202`（KeyAttrs 多段也用 `:`）在此约定下非法**，会被 scopeGuard 误判成 storageNs=`acme` 下的 `202` 而越界。 |
+
+### 11.2 约定的直接推论（3 条 — 从 11.1 自动导出，实现时同样强制）
+
+> 下面 3 条都**不是独立决策**，只是把 11.1 套在 Index/Internal/Scope 三个具体场景下的必然结果。如果 11.1 不改，这 3 条也没有任何讨论空间。
+
+#### 推论 1：IdxFullName 的生成规则（Index full name 与 storageNs 对应）
+
+```
+IdxFullName[D](logical) = storageNs + "_" + strings.ToLower(logical)
+其中 storageNs = Mem() ? "_m_:<namespace>" : "<namespace>"
+```
+
+**结果形状**：`<full_index_name>` = **`[_m_:]<namespace>_<logical>`**（注意 mem 层 `_m_:` 后面跟 `<namespace>`，再跟 `_` 接 logical）。
+
+**示例矩阵**：
+
+| D.Namespace | D.Mem() | logical name | IdxFullName 输出 | 反例（非法） |
+|---|---|---|---|---|
+| `user` | false | `ByAge` | `user_byage` | `User_ByAge`（大小写不一致；未统一 lowercase）|
+| `hot` | true | `Price` | `_m_:hot_price` | `_m_hot_price`（缺中间 `:`）/ `_m_:hot:price`（用 `:` 而非 `_` 接 logical）|
+
+**同步约束**：
+- `_idx_` internal 元数据键 = `_idx_:<full_index_name>`（`_idx_` 作为 internal storageNs → 再接 `:` suffix = full name）。示例：`_idx_:user_age`、`_idx_:_m_:hot_price`。
+- `_doc_` internal 元数据键 = `_doc_:<storageNs>`（因为一张 Doc 在 storage 层的唯一标识就是它的 storageNs）。示例：`_doc_:user`、`_doc_:_m_:hot`。
+
+#### 推论 2：DescribeDoc(ns) 精确查询前缀（无需全扫）
+
+因为推论 1 已经把 `<ns>_` 编码到 `<full_index_name>`，且 Index 元数据键是 `_idx_:<full_index_name>`，所以 **DescribeDoc(ns = "user") 不需要扫 `_idx_:*` 全库**，只需要：
+
+```
+buntdb.AscendKeys(tx, "_idx_:user_*", cb)
+```
+
+就能精确拿到 user 下的所有 index meta。对应 mem 层 hot doc = ns=`hot` & Mem=true → glob = `_idx_:_m_:hot_*`。
+
+> 这就是「命名约定天然编码归属」的数学基础：只要 11.1 的三条底线不破，上面这个 glob 就是**充要条件**（不多不少，正好是该 ns 下所有 indexes），不需要任何额外 join 或索引字段冗余。
+
+#### 推论 3：Scope 拆分 & StorageNs 解析算法升级（统一共享 helper）
+
+因为 11.1 强制了「**storage key 中 suffix 永远没有 `:`**」，所以 scope 的拆分永远是「**找最后一个 `:` 的位置并在它之前切出 storageNs**」？不 — 更精确地说：由于 **storageNs 本身可能包含多个 `:`（mem 层 storageNs = `_m_:hot` 就有一个 `:`）**，旧的 naive 算法「`strings.IndexByte(key, ':')` → 第一个冒号之前」在 mem 层是**错的**（会把 `_m_:hot:0100` 第一个冒号前当成 `_m_`，实际 storageNs 是 `_m_:hot`）。
+
+所以必须把解析算法升级为「**从右往左，最后一个 `:` 之前 = storageNs；最后一个 `:` 之后 = suffix**」（因为 suffix 永远不含 `:` — 11.1 约定 3）。**这是 scopeGuard 在 mem 层新格式下唯一不会错的算法**：
+
+```
+SplitStorageKey(key string) → (storageNs string, suffix string, ok bool)
+{
+   i = strings.LastIndexByte(key, StorageKeySeparator[0]) // 找最后一个 ":"
+   if i < 0 { return "", key, false }    // 裸 KV，无 namespace（Strict 模式下会白名单处理）
+   storageNs = key[:i]
+   suffix    = key[i+1:]
+   return storageNs, suffix, true
+}
+```
+
+> **为什么 last-colon 一定对？** 数学归纳：
+> - 如果是 disk Doc user → `user:0100` → 最后一个 `:` 位置 4 → storageNs=`user`, suffix=`0100` ✅
+> - 如果是 mem Doc hot → `_m_:hot:0100` → 最后一个 `:` 位置 7 → storageNs=`_m_:hot`, suffix=`0100` ✅（正确识别了两层 storageNs）
+> - 如果是 internal metadata → `_doc_:user` → 最后一个 `:` 位置 5 → storageNs=`_doc_`, suffix=`user` ✅（正确识别 internal storageNs）
+> - 如果是 multi-segment KeyAttrs Doc → `tenantuser:acme_202` → 最后一个 `:` 位置 10 → storageNs=`tenantuser`, suffix=`acme_202` ✅（suffix 内含 `_` 但无 `:`，last-colon 不被混淆）
+
+在此算法基础上再导出 3 个配套 helper（所有实现必须从这 3 个 helper 读，**禁止散落硬编码 `LastIndexByte`**）：
+
+```
+// 1. 白名单判定（Strict Mode §5.3）
+IsInternalStorageNs(storageNs string) bool → storageNs != "" && storageNs[0] == '_'
+
+// 2. 把 storageNs 反解回 user Doc 的 namespace（剥掉 mem 前缀）
+StripMemPrefix(storageNs string) (ns string, isMem bool) →
+   if strings.HasPrefix(storageNs, contract.MemNsPrefix + contract.StorageKeySeparator) = "_m_:"
+        return strings.TrimPrefix(storageNs, "_m_:"), true
+   else return storageNs, false
+
+// 3. KeyAttrs 一致性校验：从 suffix 拆出各段 KeyAttrs value（用 _ 切）
+SplitKeyAttrsSuffix(suffix string, segCount int) ([]string, error) →
+   if segCount <= 1 { return [suffix], nil }   // 单段直接返回
+   segs = strings.SplitN(suffix, contract.KeyAttrsJoin, segCount)
+   if len(segs) != segCount → ERR "KeyAttrs segment count mismatch"
+   return segs, nil
+```
+
+### 11.3 合法 Storage Key 形状速查表（全矩阵）
+
+| 分类 | 示例 | storageNs | suffix | IsInternalNs | 备注 |
+|---|---|---|---|---|---|
+| Disk 用户 Doc（单段 PK） | `user:0100` | `user` | `0100` | NO | 最简单形状 |
+| Disk 用户 Doc（多段 PK，KeyAttrs=[tenant,id]） | `tenantuser:acme_202` | `tenantuser` | `acme_202` | NO | pk-suffix 内部用 `_` 连 |
+| Mem 用户 Doc（单段 PK） | `_m_:hot:0100` | `_m_:hot` | `0100` | NO | 两层 namespace，两个 `:` |
+| Mem 用户 Doc（多段 PK） | `_m_:hot:acme_202` | `_m_:hot` | `acme_202` | NO | 最后一个 `:` 之前 = storageNs |
+| Internal AUTH | `_auth_:demo-key` | `_auth_` | `demo-key` | YES | 白名单跳过 Strict |
+| Internal DOC meta（disk doc user） | `_doc_:user` | `_doc_` | `user` | YES | Doc spec JSON |
+| Internal DOC meta（mem doc hot） | `_doc_:_m_:hot` | `_doc_` | `_m_:hot` | YES | 这里 suffix 含 `:` 是合法的（meta key 里 suffix 不是 pk，而是 storageNs 本身，允许有冒号）|
+| Internal INDEX meta（disk doc user） | `_idx_:user_age` | `_idx_` | `user_age` | YES | Index spec JSON |
+| Internal INDEX meta（mem doc hot） | `_idx_:_m_:hot_price` | `_idx_` | `_m_:hot_price` | YES | suffix 含 `:` 合法（同上 meta 特例）|
+| 裸 KV（无 namespace） | `just-a-flat-key` | *(none)* | `just-a-flat-key` | *(n/a)* | 白名单运维可见，但 Strict 写入会被拦（除非 storageNs 内部空 + internal 前缀裸 key）|
+
+### 11.4 实现时的「零硬编码」门禁
+
+为了保证 11.1 + 11.2 的一致性，实现时必须通过以下 2 条门禁（M1 DoD 中作为编译/静态检查项）：
+
+1. **No scattered split**：全局 `grep -rn "strings.Index\|strings.LastIndex\|strings.Split\|strings.Contains" --include="*.go" client server x internal` → 凡是与 storage key 解析/拼接相关的字符串操作，**只允许调用 `internal/shared.go` 中 11.2 定义的 5 个共享 helper**（`SplitStorageKey`、`IsInternalStorageNs`、`StripMemPrefix`、`SplitKeyAttrsSuffix`、以及已有 `ScopeKeyRange` + `ValidateKeyPattern` + `ValidateIdxName`）。任何散落的 `:` 或 `_` 相关硬编码都必须被**替换为 helper 调用**或给出非 storage-key 解析的正当理由。
+2. **Constant single source of truth**：全局 `grep -rn '":"\|"_"' --include="*.go"`（literal `":"` 和 `"_"`）→ 除了 test 断言的 raw string literal 与 JSON 路径外，**生产代码中拼接 storage key / index name 必须使用 `contract.StorageKeySeparator` 与 `contract.KeyAttrsJoin` 常量**，不允许写字面量 `:` 或 `_`。
+
+两条门禁过不了 → milestone 不得合并。

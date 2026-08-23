@@ -1,0 +1,1070 @@
+# FR: Admin Shell (Local RESP Client CLI REPL) — Doc + Index 运维入口 (MVP)
+
+- **Status:** Draft
+- **Author:** kcmvp & Trae
+- **Date:** 2026-08-22
+- **Parent FR:** [fr-typed-doc-registry.mdx](file:///Users/kcmvp/sandbox/redisx/fr/fr-typed-doc-registry.mdx)
+- **Target issue(s):** TBD
+- **Critical Architectural Decision v2 (corrected):**
+  1. Admin Shell **IS A REDIS PROTOCOL (RESP) CLIENT** — it NEVER opens buntdb files directly, NEVER bypasses the server layer. All operations (Doc/Index registry CRUD + data CRUD) go over RESP wire protocol against a running `redisx-server` process.
+  2. Server listens by DEFAULT on **127.0.0.1 loopback only** (not 0.0.0.0) for Admin commands. Separate `--admin-port` / `--admin-bind` flags exist (independent from the main business RESP port) so operators can further isolate.
+  3. Future upgrade path for **mTLS on Admin port** explicitly reserved — operators who need cross-machine / secure multi-user admin can enable mTLS and get strong client cert auth without touching the business port.
+  4. MVP permission model (simplified): same AUTH key works but Admin-only schema commands (REGISTER / DROP / regdoc) can be restricted later by connection origin / mTLS SAN. MVP no-verify for rapid development; Gate structure in place to add later.
+
+---
+
+## 1. Background & Motivation (Corrected v2)
+
+### 1.1 为什么需要 Admin Shell (RESP Client)
+
+Parent FR（fr-typed-doc-registry.mdx）把 `redisx` 重新定位为「**typed JSON document store with RESP wire compatibility**」，并确立了两条铁律：
+
+1. **Doc = Table。No Table = No Operation（Strict 唯一模式）**
+2. **Index 一等关系，可运行时动态 CREATE/DROP，不写进 `x.Document` 接口**
+
+Parent FR 提供了两条注册通道：
+- **Channel 1 — Eager**：`server.Start(..., server.Doc[UserDoc](), server.IndexOn[UserDoc]("age","age"))`
+- **Channel 2 — Dynamic Go API**：`db.RegisterDoc[D]()` / `db.RegisterIndex[D](name,path)`
+
+但这两条通道都是「Go 开发者视角」的，缺了运维 & 非 Go 用户的第三条入口：
+- **没有 Shell = 没法不编译 Go 就建表/加索引**。运维想加个 Doc 或者临时改个 Index，必须改 Go 代码 + 重编译 + 重启 Server，体验约等于 0。
+- **没有 Shell = 没法对 Strict Gate 做端到端验收**。Strict Gate（No Table = No Op）是 Parent FR 的核心，必须通过 RESP wire 从真实 client 路径测一遍，而不是单看内部函数调用 — 否则就可能出现「Server 内部 API 严、RESP 层漏校验」的旁路漏洞。
+
+### 1.2 为什么是「RESP Client + 默认 127.0.0.1」而不是直开 db 文件？
+
+**这是本 FR 被纠正的核心架构决策（v2 corrected）**，写死不再讨论：
+
+| 维度 | ✅ **RESP Client CLI (v2, correct)** | ❌ 直开 db 文件 (v1, rejected) |
+|---|---|---|
+| **Strict Gate SSoT 纯度** | 🔒 **100%**. Admin Shell 和所有业务 Go/Python/Node clients **走完全相同的 RESP wire → handleCommand dispatcher → *server.DB 公共 API**。No Table=No Op 只在 server 层写一次，Admin 和业务两边天然零旁路。 | ❌ **FAIL**. Shell 直开 db 文件意味着两条写路径：Server 的 handleCommand + Shell 内嵌 db.* 调用。Strict Gate 校验必须在两处都写，极容易漏一处（比如 Shell 里 SetDocs 忘了走 Doc 注册检查）—— 这就打破了 Strict Mode 的 SSoT，Schema 约束成了「走 RESP 才生效」的摆设。 |
+| **抽象层级正确** | ✅ Admin 运维是「一个特殊的 RESP 客户端」。和业务 client 同属一层，共享 connection pool、auth、timeout、retry。未来做 Cluster、Proxy、Read Replica 时，Admin CLI 不用改 — 直接连 Coordinator node 的 admin-port 就行。 | ❌ **FAIL**. 直开 db 文件把 Admin Shell 和 buntdb 文件格式硬绑定。一旦以后 storage engine 从 buntdb 换成 pebble / tikv / object storage（或加 Raft 日志），Admin Shell 就得重写整个 storage 层；但 RESP 协议永远不变，client 代码零成本。 |
+| **未来安全扩展 (mTLS)** | ✅ 预留扩展点 100% 清晰：现在 `-h 127.0.0.1 -p <admin-port>` + AUTH；将来加 `--tls-cert/--tls-key/--ca-cert` + Server 侧 `--admin-tls-*` flags → mTLS。这是业界标准（etcd / CockroachDB / Vault 都这么做）。 | ❌ **FAIL**. 直开文件的安全面只有本地 Unix UID。以后想支持「远程 SRE 在自己笔记本上通过安全通道 Admin DB」（非常常见的运维需求），整个架构要推翻重来，因为没有 wire protocol 就没有 TLS 的插入点。 |
+| **线上热 Schema 变更** | ✅ 原生支持。Server 不停机，Shell 连上去直接 REGISTER INDEX — buntdb 有原生并发安全，内部 registry 有 RWMutex，业务流量不中断（大表 backfill 可以慢慢做或做异步）。 | ❌ **FAIL**. 直开 db 文件必须停 Server 抢文件锁才能操作，运维每次改 Schema 都要停机 — 这对任何有 uptime SLA 的生产系统都是不可接受的。 |
+| **业务端口隔离（双端口）** | ✅ 可以。Server 监听两个端口：<br>`--bind 0.0.0.0:6380`（业务 RESP，面向应用）<br>`--admin-bind 127.0.0.1:6381`（Admin，仅回环 + 未来 mTLS）<br>防火墙或安全组直接 drop 掉 6381 的非回环流量。 | ❌ N/A（没有端口） |
+| **攻击面 & 默认安全** | ✅ 默认安全：Admin bind=127.0.0.1（不对外），AUTH key 强随机，业务和 Admin 端口分离。想暴露外网必须明确改 flag。MVP 权限模型留了 Gate（见 §3.2），将来加 origin 校验或 mTLS 不需要改 CLI 交互层。 | ⚠️ 看似小（只有文件权限），但你一旦忘了 SSH Forwarding / sudo 共享 db 文件路径，等同于把 Schema 改权限给了所有有 shell 的人。 |
+| **代码复用（已有 RESP client）** | ✅ 项目 go.mod 已经带了 `github.com/redis/go-redis/v9`（见 [go.mod](file:///Users/kcmvp/sandbox/redisx/go.mod) L7）。Admin Shell 直接用 `redis.NewClient(...)`，零新增依赖，共享已有的 RESP 序列化/反序列化。 | ❌ 不能复用 go-redis，反而要 import `server` 包 — 这意味着 CLI binary 会把所有 server 层代码（redcon/handler/goroutine pool）都链进来，binary 臃肿 + 启动慢。 |
+
+**§1.2 结论（写死不讨论）：Admin Shell 永远是 RESP client，默认连 127.0.0.1，可独立 admin-port，mTLS 扩展路径预留。db 文件直开是反模式，禁止出现在实现路径上。**
+
+### 1.3 缺口总结（当前缺失的 5 条能力）
+
+| # | 缺口 | 为什么 MVP 必须先做 |
+|---|---|---|
+| G1 | **Doc 可视化 & 交互式创建**：没有「!LISTDOCS → !CREATEDOC 问答 → REGISTERTABLE spec JSON → 落盘 _doc_:<ns>」的 RESP 客户端链路 | 否则 Strict Gate 的 Q2/Q3 命令（SET/GET 糖）只能在 Go 代码里走通，运维视角的「No Table = No Op」端到端无验证。 |
+| G2 | **Index 可视化 & 交互式创建**：没有「先选 Doc ns → logical name → JSON path → 预览 → REGISTER INDEX」的引导 | Parent FR §4.4 UX 4 步顺序不可换，Shell 是人类入口；REGISTRY INDEX 命令如果让运维直接手敲 RESP，参数顺序错率 50%+。 |
+| G3 | **数据 CRUD Sugar 语法**：storage key 拼法 §11 双分隔符人工记不住，Shell 提供 !SETDOC / !GETDOC 糖 | 否则运维发 `SET user:tenant_0100 '{...}'` 很容易把 KeyAttrs 分隔符 `_` 写成 `:` 导致 silent bug（Strict Gate 还会查不到 ns，报的错还没提示）。 |
+| G4 | **Admin 专用 RESP 命令族（regdoc/lsdoc/desdoc 3 Doc 族 + lsidx/regidx/delidx 3 Index 族）**：Server 侧缺 6 条 Doc/Index Registry 查询/注册命令 | Parent FR 原本只在 Go API 层有 Registry 方法，但 RESP client（Admin Shell）要调 Registry 必须走 wire protocol — 这 6 条命令是 Shell 的前置依赖。 |
+| G5 | **Shell 体验基建 + Server Admin 端口 flag**：TAB 补全（命令字 / Doc ns / Index logical）、命令历史、HELP；Server 启动时新增 `--admin-bind` / `--admin-port`（默认 127.0.0.1:6381，独立于业务 port）| 没有基建 = Shell 只是个「手动发 regdoc JSON 的 redis-cli 套壳」，生产力约等于 0。 |
+
+### 1.4 Parent FR §11 SSoT 前置依赖（v2 仍 100% 生效）
+
+Admin Shell 虽是 RESP client，但**所有命名解析、storage key 派生、错误文案里的 namespace 判定都直接消费 `internal/shared.go` 导出的 5 个 helper**（`SplitStorageKey`、`IsInternalStorageNs`、`StripMemPrefix`、`ExtractPKSuffixes`、`ParseIndexFullName`）—— 在 CLI 端用这些 helper 做 **输入预校验**（例如 !GETDOC pk 里发现 `:` → CLI 本地就拦截报错，不需要发到 server 浪费 RTT）。
+
+**严格禁令：Shell 内部绝不允许散落任何 `:` / `_` 相关的 strings.Split / strings.Join 硬编码。违者直接打回重做。**
+
+---
+
+## 2. Design Goals & Non-Goals (MVP)
+
+### 2.1 MVP 硬目标（5 + S1 安全目标）
+
+| ID | 目标 | 验证方式 |
+|---|---|---|
+| G1 | **Doc 管理闭环**：!CREATEDOC 问答 → !LISTDOCS 看得到 → !DESCRIBEDOC 完整 Schema JSON → !SETDOC 写 → !GETDOC 读 | 启动空 Server → CLI 默认连 127.0.0.1:adminPort → 5 条命令走完「建表 → 写 3 条 → 读 1 条 → 读全表」全流程 |
+| G2 | **Index 管理闭环**：!CREATEINDEX 强制先选 Doc → name/path → 预览 → REGISTER INDEX 落盘 _idx_ → buntdb 同步回填 → !LISTINDEXES 看到 → !SEARCHINDEX 立刻查 | !SETDOC 先写 10 条 → !CREATEINDEX user.age → 等回填 → 查 age≥18 返回正确 |
+| G3 | **SSoT 零泄露**：除了 !DESCRIBEDOC debug 输出，所有用户输入输出都不暴露 §11 内部拼法（`:` / `_` / `_m_:` / `_doc_:` / `_idx_:`）| 走一遍 G1，全局 grep 输出流里除 `!DESCRIBEDOC` 外不出现 `_doc_` / `_idx_` / `<ns>:<pk>` |
+| G4 | **Shell 基建可用**：TAB 3 级补全、历史持久化、HELP、启动参数（-h/-p/-a）、Server 未启动有明确报错、QUIT 正常 close 连接 | 手动验证 6 条基建；单测覆盖命令 parser / RESP request builder（不含 readline） |
+| G5 | **Server Admin-port 双端口隔离**：`--admin-bind 127.0.0.1:6381`（默认）+ 业务 RESP 主 port 独立；Admin 命令（REGISTER/DROP/X*）走哪个 port 都行（MVP 先共享实现），但未来可以在 admin-port 上启用 mTLS 时单独限制 | U11：Server 启动两个 port；T1 连业务 port 发 regdoc（MVP 先允许，后续 patch 加 Gate 禁掉，验证 Gate 结构在） |
+| **S1** | **RESP SSoT & 默认本地安全**：Shell 100% 走 go-redis Do()，请求/响应全是 RESP bytes；Server 默认 `--admin-bind 127.0.0.1:6381` 不暴露外网；所有 Schema 变更命令（!CREATEDOC / !CREATEINDEX / !DROPINDEX）到达 server 后走**与业务 client 完全相同的 handleCommand → Strict Gate**，零旁路。 | U12：直接 `redis-cli -h 127.0.0.1 -p <adminPort>` 发 `lsdoc` 能拿到 JSON 数组；U13：业务 port 上故意发 `SET user:pk1 {}` 没注册 → 返回 `ERR table does not exist`（共享 Strict Gate，两边一致） |
+
+### 2.2 Non-Goals（MVP fail-closed：功能不做 = 连参数/入口都不编译）
+
+| # | 不做 | 原因 / 时机 |
+|---|---|---|
+| N1 | **本地直开 db 文件（`-d/--dbpath`）** | 架构错误，永远不做，不进代码。 |
+| N2 | **跨机器远程 Admin（`-h <public IP>`）+ TLS** | 默认 127.0.0.1，想远程用 SSH Tunnel 先 workaround；mTLS 完整实现下一个 patch 版本（加 `--tls-*` 系列 flags + `crypto/tls` wrap）。 |
+| N3 | **Admin vs Business 权限强校验（连接来源 / 双 AUTH key）** | MVP 结构预留 Gate 位置，但实际放行所有 admin 命令（只要 AUTH 对）。权限模型（单 AUTH + 来源判定 / 双 key / 命令前缀 ACL）独立 FR 讨论后落地。 |
+| N4 | **`!DROPDOC <ns>` 删全表** | 高风险，后续双确认 + 自动 JSON 备份后再删。MVP 先占位 handler，收到即报错：use !GETDOC > backup + KEYS+DEL manually。 |
+| N5 | **Auth Key 管理命令（REGISTERAUTH / CHANGEAUTH）** | Auth 子系统与 Doc/Index Registry 正交，独立 FR。 |
+| N6 | **PubSub / Stream 管理命令** | 纯内存分发，与 Registry 主线无关。 |
+| N7 | **Hook 注册** | Hooks Eager 注册（Go 代码），MVP 不在 RESP 层暴露。 |
+| N8 | **彩色 UI / 进度条 / 美化** | 后续 patch；MVP ASCII-only。 |
+| N9 | **脚本批处理模式 `-f script.txt`** | 后续 CI/CD 场景做；MVP 仅 REPL。 |
+| N10 | **Web Admin UI** | 独立子 FR（fr-admin-web.mdx），HTTP API 最终也必须走同一套 RESP / handleCommand 分发（不绕过），否则 SSoT 破。 |
+
+---
+
+## 3. Core Model: Admin Shell ↔ Server (RESP Wire over Loopback)
+
+### 3.1 Architecture Diagram — RESP Client + Independent Admin Port
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│  Admin Shell binary: redisx-admin (RESP CLIENT, no server code imported!)      │
+│  cmd/redisx-admin/main.go + internal/shell/*.go                                │
+│  ┌──────────────────────────────┐   ┌────────────────────────────────────────┐  │
+│  │ REPL Loop (readline)         │──▶│ Command Dispatcher (shellState + TAB) │  │
+│  │  - !CREATEDOC, !LISTDOCS ... │   │  ↓ Builds RESP command string array   │  │
+│  │  - TAB completion            │   │  ↓ Pre-validates with §11 SSoT helpers│  │
+│  │  - history, HELP, QUIT       │   │                                        │  │
+│  └──────────────┬───────────────┘   └───────────────────┬────────────────────┘  │
+│                 │ Shared *redis.Client (go-redis v9,   │ RESP Array [][]byte    │
+│                 │ zero new dependency — already in     │ go-redis Do(req...)    │
+│                 │ go.mod L7!)                          ▼                        │
+│  ┌──────────────▼───────────────────────────────────────────────────────────┐  │
+│  │ redis.NewClient(&redis.Options{Addr: adminHostPort, Password: authKey})  │  │
+│  │ PoolSize 5; DialTimeout 3s; ReadTimeout 0 (REPL); TLSConfig nil by MVP  │  │
+│  │ + Future: TLSConfig filled when --tls-cert flags present (mTLS upgrade) │  │
+│  └──────────────┬───────────────────────────────────────────────────────────┘  │
+└─────────────────┼───────────────────────────────────────────────────────────────┘
+                  │
+         ┌────────▼────────────────────────────────────────────────────────────┐
+         │  Kernel Loopback TCP (127.0.0.1, no external NIC involved by default)│
+         │  OR Unix Domain Socket (/var/run/redisx-admin.sock, optional future) │
+         │  OR mTLS wrap (next patch, cert auth, maybe cross-machine via LB)    │
+         └────────┬────────────────────────────────────────────────────────────┘
+                  │
+┌─────────────────▼──────────────────────────────────────────────────────────────┐
+│  redisx-server process (running)                                                │
+│  server/srv.go  server/cmd.go  server/db.go                                     │
+│  ┌─────────────────────────────────────────────────┐  ┌───────────────────────┐ │
+│  │ redcon listener 1: Business RESP port            │  │ redcon listener 2:    │ │
+│  │   Flags: --bind 0.0.0.0:6380 (default 0.0.0.0?   │  │ Admin RESP port       │ │
+│  │          actually *default to 127.0.0.1 too*)    │  │ Flags:                │ │
+│  │   * TBD by Parent FR, business 端口是否对外暴露   │  │ --admin-bind           │ │
+│  │   For safety, MVP set both default to 127.0.0.1  │  │   127.0.0.1:6381       │ │
+│  │   unless explicitly --bind 0.0.0.0 given by user)│  │ --admin-port (alias)   │ │
+│  │                                                  │  │   Future: TLSConfig    │ │
+│  │   handleConn() → AUTH →                         │  │   loaded via --admin-  │ │
+│  │ Strict Gate pre-check (§4.3.2 in Parent FR)     │  │   tls-cert/key/ca      │ │
+│  │ Shared dispatcher: handleCommand(conn, cmd)     │◀─│ Same dispatcher + Gate│ │
+│  │ (NOTE: MVP both listeners use EXACT same func)  │  │ (SSoT shared)         │ │
+│  └──────────────────┬──────────────────────────────┘  └───────────────────────┘ │
+│                     │ SSoT dispatch                                                │
+│  ┌──────────────────▼────────────────────────────────────────────────────────┐  │
+│  │ handleCommand() Case switch → 12 command categories (Parent FR §4.3)     │  │
+│  │  ├─ Admin-only Doc 族（*doc 后缀 Shell-only, not for business）:         │  │
+│  │  │    regdoc <spec_json>     → db.RegisterDocFromSpec(spec)              │  │
+│  │  │    lsdoc  [pattern]       → db.RegisteredDocs() → []byte JSON         │  │
+│  │  │    desdoc <ns>            → db.DescribeDoc(ns) → JSON                 │  │
+│  │  ├─ Admin-only Index 族（*idx 后缀 Shell + advanced operators）:         │  │
+│  │  │    REGISTER INDEX ON ns (name,path)  →  RESP Wire = regidx            │  │
+│  │  │    DROP INDEX ns.name                 →  RESP Wire = delidx           │  │
+│  │  │    lsidx [ns]              → db.RegisteredIndexes(ns) → JSON          │  │
+│  │  └─ Core Strict Gate cmds (business + Shell shared):                     │  │
+│  │       SET/SETEX/SETNX  (Q2 sugar)  →  No Table?→ERR                     │  │
+│  │       GET / DEL           (Q2 sugar)  →  No Table?→ERR                     │  │
+│  │       KEYS                (Q3)        →  single storageNs, glob banned     │  │
+│  │       SEARCHKEY           (Q1)        →  2 params (storageNs, range)       │  │
+│  │       SEARCHINDEX         (C2 sugar)  →  2 params (fullIdxName, filter)    │  │
+│  │       UPDATE              (C4)        →  KeyAttrs consistency re-match     │  │
+│  └──────────────────┬────────────────────────────────────────────────────────┘  │
+│                     │ Direct internal call, NO RESP RE-SERIALIZE                 │
+│  ┌──────────────────▼────────────────────────────────────────────────────────┐  │
+│  │ *server.DB public methods (same SSoT, client type doesn't matter)        │  │
+│  │   registerIndexes, loadSchemaRegistryFromDB, SetDocs, GetOneDoc, etc.    │  │
+│  │   + Doc/Index memory registry (sync.RWMutex) + meta rows _doc_ / _idx_   │  │
+│  │   + buntdb disk + :memory: layer                                        │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**架构注解（关键正确性检查点）：**
+
+1. **Shared Dispatcher SSoT**：业务 listener 和 Admin listener 的 `handleCommand()` 必须是**同一个函数指针**（不允许复制粘贴两份实现）。`conn.GetContext()` 里塞个 `isAdminConn bool` 将来给权限 Gate 用（§3.2），但命令本身解析和 Strict Gate 只写一遍。
+2. **Admin Shell 二进制禁止 import `server` 包**（构建期用 `go vet` 或 lint 规则卡住，例如禁止 `import "github.com/kcmvp/redisx/server"`）。Shell 是纯 RESP client，只能 `import client/cli.go` + `go-redis` + internal SSoT helpers。
+3. **双端口 + 双 AUTH key（D2 决策，用户拍板）**：
+   - Admin Listener（admin-port）：用独立的 `--admin-auth <key>` 验证 AUTH（和业务 key 完全不同的随机字符串）。AUTH key 不对 → `NOAUTH/WRONGPASS`，连 PING 都过不去。
+   - App Listener（业务 port）：用 `--auth <biz-key>` 验证 AUTH。即使泄露了 biz-key，也只能发业务命令（见下一条 portRoleCheck），动不了 Schema。
+   - 两个 key 默认强制不同 —— 若启动时 `--auth` 和 `--admin-auth` 配置了相同字符串 → **FATAL 启动失败**（Fail-Closed，防运维图省事配成一样，破掉分层权限）。
+4. **App Port 命令字级白名单（D1 推荐决策）**：App Listener 上所有命令必须先过 `portRoleCheck()`。只有 `appPortAllowlist` 里列出的命令字才能进入 dispatcher。Admin-only 命令（regdoc、lsdoc、REGISTER、DROP 等）**连命令字都不 parse**，直接返回 `ERR unknown command 'regdoc' (admin-only commands are not available on the app port). Use admin-port.`
+5. **§11 SSoT helper 双端复用**：Shell 端（预校验 pk 里的 `:`）和 Server 端（Strict Gate 里的 ns 解析）用的是同一个 `internal/shared.go` 的函数——这是 Go monorepo 的优势，零重复代码。
+
+### 3.2 权限模型总览（MVP 4 层 Gate，顺序不可换，Fail-Closed 严格执行）
+
+```
+每个进入 redisx-server 的命令在 *任意端口* 都按以下顺序过 4 道 Gate。
+任何一道 Gate return false → 立刻 WriteError + return，后续步骤永不执行。
+（这 4 道 Gate 只在 handleCommand 里写一次，admin listener 和 app listener 调用完全相同的函数指针 —— SSoT）
+
+      conn arrive (admin-port or app-port)
+             │
+    ┌────────▼─────────────────────────────────────┐
+    │ Gate 0: AUTH Key Gate                        │ ← MVP 必须！双 AUTH key（用户决策 D2）
+    │                                               │
+    │ admin-port → AUTH 必须 == flag --admin-auth  │
+    │ app-port   → AUTH 必须 == flag --auth        │
+    │                                               │
+    │ 特例: PING/AUTH/QUIT 未 auth 也允许 (握手)   │
+    └────────┬─────────────────────────────────────┘
+             │ pass
+    ┌────────▼─────────────────────────────────────┐
+    │ Gate 1: Port-Role Command Word Allowlist     │ ← MVP 必须！命令字级硬隔离（决策 D1）
+    │                                               │
+    │ admin-port: return true ALWAYS (超级用户)     │
+    │ app-port:   cmdWord ∈ appPortAllowlist ONLY  │
+    │             → regdoc/lsdoc/         │
+    │               REGISTER/DROP 不在 allowlist    │
+    │               → ERR unknown command           │
+    └────────┬─────────────────────────────────────┘
+             │ pass
+    ┌────────▼─────────────────────────────────────┐
+    │ Gate 2: Admin Command Enrichment Gate        │ ← MVP 结构预留, return true ALWAYS; 下 patch 打开
+    │                                               │
+    │ admin-only commands (X*/REGISTER/DROP)        │
+    │   must pass: (mTLS) & (Cert OU=admins) &      │
+    │              (realRemote ∈ allow-subnets)     │
+    │ MVP: skip, future Caddy+mTLS patch 强校验     │
+    └────────┬─────────────────────────────────────┘
+             │ pass
+    ┌────────▼─────────────────────────────────────┐
+    │ Gate 3: Strict Mode (No Table = No Op)       │ ← Parent FR §4.3.2
+    │                                               │
+    │ For SET/GET/DEL/KEYS/SEARCH*/UPDATE:         │
+    │   Is the target Doc (storageNs) registered?   │
+    │   No → ERR table '<ns>' does not exist.       │
+    └────────┬─────────────────────────────────────┘
+             │ pass
+    ┌────────▼─────────────────────────────────────┐
+    │ dispatch case switch → actual command fn:     │
+    │   setCommand / getCommand / xRegisterDoc...  │
+    └──────────────────────────────────────────────┘
+```
+
+**Gate 0 (双 AUTH Key Gate) MVP 代码结构：**
+```go
+type connCtx struct {
+    isAdminPort   bool // true = arrived via --admin-bind listener
+    authed        bool
+    authMatches   bool
+    // future: realRemoteAddr (PROXY v2), realCertSubject etc.
+}
+
+func authGate(conn redcon.Conn, cmdCtx *connCtx, cmdWord string, rawAuth string) bool {
+    if cmdWord == "AUTH" || cmdWord == "PING" || cmdWord == "QUIT" ||
+       cmdWord == "HELLO" || cmdWord == "COMMAND" || cmdWord == "SELECT" ||
+       cmdWord == "RESET" {
+        return true // handshake cmds always pass
+    }
+    if !cmdCtx.authed {
+        conn.WriteError("NOAUTH Authentication required.")
+        return false
+    }
+    if !cmdCtx.authMatches {
+        conn.WriteError("WRONGPASS invalid username-password pair or user is disabled.")
+        return false
+    }
+    return true
+}
+// AUTH handler 内部（admin-port vs app-port 用不同 key 比对）：
+func authCommand(conn redcon.Conn, cc *connCtx, db *DB, userKey string) {
+    var correctKey string
+    if cc.isAdminPort {
+        correctKey = db.adminAuthKey
+    } else {
+        correctKey = db.appAuthKey
+    }
+    cc.authed = true
+    cc.authMatches = (userKey == correctKey)
+    if cc.authMatches {
+        conn.WriteString("OK")
+    } else {
+        conn.WriteError("WRONGPASS invalid password")
+    }
+}
+// 启动时校验：if db.appAuthKey == db.adminAuthKey { panic("--auth and --admin-auth MUST be different strings for permission isolation.") }
+```
+
+**Gate 1 (Port-Role Allowlist) MVP 代码结构：**
+```go
+var appPortAllowlist = map[string]bool{
+    // —— handshake base (both sides OK)
+    "PING":true,"AUTH":true,"QUIT":true,"SELECT":true,"COMMAND":true,
+    "HELLO":true,"RESET":true,
+    // —— shared doc/data commands (both sides OK, then Gate 3 Strict判)
+    "SET":true,"GET":true,"DEL":true,"EXISTS":true,"EXPIRE":true,"TTL":true,
+    "SETEX":true,"SETNX":true, // Q2 sugar variants
+    "KEYS":true,"SEARCHKEY":true,"SEARCHINDEX":true,"UPDATE":true,
+    // —— pub/sub if business uses (按需加, 不在 Admin-only)
+    "SUBSCRIBE":true,"UNSUBSCRIBE":true,"PSUBSCRIBE":true,"PUNSUBSCRIBE":true,
+    "PUBLISH":true,
+}
+// adminPortAllowlist: 不用 map —— admin-port = 100% 命令字放行，连新增的命令都自动 superuser。
+// 等价于: admin port 在 Gate 1 直接 return true。
+
+func portRoleGate(conn redcon.Conn, cc *connCtx, cmdWord string) bool {
+    if cc.isAdminPort {
+        return true // superuser port
+    }
+    if !appPortAllowlist[cmdWord] {
+        conn.WriteError("ERR unknown command '" + cmdWord +
+            "' (admin-only commands are not available on the app port). " +
+            "Use redisx-admin CLI or connect via admin-port with the --admin-auth key.")
+        slog.Warn("admin-only command blocked on app-port",
+            "cmd", cmdWord, "remote", conn.RemoteAddr(), "bind_role", "app")
+        return false
+    }
+    return true
+}
+```
+
+**为什么 MVP 就必须同时做 Gate 0+Gate 1（而不是等下一个 patch）？**
+- 因为你的端口定义：「App port 只能响应应用命令」—— 这句话对应的实现，就是 Gate 0（双 key 判连接身份）+ Gate 1（命令字 allowlist 判命令是否属于应用命令）。如果 MVP 只做了双 AUTH key 但没做 Gate 1，那拿到 biz-key 的应用就能直连 admin-port 发 REGISTER/DROP，等于白做分层。
+
+### 3.3 Shell State（REPL 内状态，不持久化到 server）
+
+```go
+type shellState struct {
+    rdb     *redis.Client       // 共享 RESP 连接（go-redis 内部连接池）
+    addr    string              // 当前连的 admin host:port，Banner 显示
+    lastDocNs  string           // 上一次操作 Doc ns，!LISTINDEXES 缺省参数
+    cachedDocNs  []string       // TAB 补全缓存：每次 lsdoc 成功后刷新
+    cachedIdxLogical map[string][]string  // ns → [age,email...] ，每次 lsidx 刷新
+}
+```
+
+> **TAB 缓存一致性**：`!CREATEDOC` / `!CREATEINDEX` / `!DROPINDEX` 成功返回 → **立刻清缓存**；下次 TAB 前静默发一条 lsdoc / lsidx <ns> 从 server 拉最新。任何时候 server Registry 变化 > Shell 离线缓存 → 重新拉；缓存绝不 stale。
+
+---
+
+## 4. Doc 命令族（G1）
+
+> **实现路径（所有 handler 通用）**：Shell handler → 组装 RESP 多字节数组（命令字 + 参数）→ 调 `rdb.Do(ctx, args...).Result()` → 拿到 RESP bulk string（JSON）或 int → 格式化展示。
+>
+> **§11 预校验（Shell 本地先拦一轮，减少 RTT）**：任何用户输入的 ns / pk / <ns>.<logical> 引用，先在 CLI 端用 SSoT helpers 检查字符、格式，非法直接报；server 端再跑一遍 Strict Gate（SSoT 不依赖 client 校验）。
+
+### 4.1 !CREATEDOC / !NEWDOC — 交互式创建 Doc Schema
+
+**触发**：`!CREATEDOC` 或 `!NEWDOC`
+
+**流程（严格按序，Ctrl-C 中止，零副作用直到最后一步）**：
+
+```
+Step 1: Namespace
+─────────────────────────────────────────────────────────
+? Doc Namespace (alphanumeric ONLY. Forbidden: ':' and '_' — those are redisx INTERNAL storage separators. §11.)
+> user
+  → 客户端预校验（§11 SSoT helper: 正则 + IsInternalStorageNs 反查）：
+     ✗ 包含 `:` → 报错 "包含内部保留分隔符 :。Choose simple alphanumeric name."
+     ✗ 已存在 → 预校验阶段不查（lsdoc 拉一遍也行，但预校验可以轻量，让 server 拒绝更权威）；server 最终裁决
+     纯字母数字 → 通过。
+
+Step 2: Memory Layer
+─────────────────────────────────────────────────────────
+? Memory-only layer (volatile, LOST on restart; storage_ns prefix = _m_:<ns>) ? [y/N]: N
+
+Step 3: KeyAttrs (PRIMARY KEY composition, multi-segment OK)
+─────────────────────────────────────────────────────────
+? KeyAttrs (comma-separated TOP-LEVEL JSON field names. e.g. "tenant,id" for composite pk) [id]: tenant,id
+  → 客户端预处理 strings.Split(s,",") → 去空格 → 每段非空校验。
+     （不直接在这里拼 pk；那是 server 的 Q2 SET 糖的事情 — SSoT 单源）
+
+Step 4: Default TTL
+─────────────────────────────────────────────────────────
+? Default TTL per row. Suffix: s/ms/m/h/d. [ENTER = never expire]: 7d
+  → 客户端解析 TTL 成 int64 nanoseconds（和 Go 里 time.ParseDuration 相同规则，对齐 server 端实现）
+
+Step 5: Preview PersistentDocSpec JSON + Uppercase YES Gate
+─────────────────────────────────────────────────────────
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PREVIEW (WILL send regdoc to server at 127.0.0.1:6381)                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ {                                                                            │
+│   "ns": "user",                                                              │
+│   "storage_ns": "user",       ← will be "_m_:user" if step2=y              │
+│   "mem": false,                                                              │
+│   "keyattrs": ["tenant","id"],                                               │
+│   "ttl_ns": 604800000000000,                                                 │
+│   "type_name": "",               ← empty since not registered from Go code   │
+│   "created_at": "<server will set>"                                          │
+│ }                                                                            │
+│                                                                              │
+│ Sending RESP: regdoc <this JSON as single RESP bulk string>           │
+│ Server-side path: regdoc handler → db.RegisterDocFromSpec(spec)       │
+│                → Schema immutability check vs existing _doc_:user meta row  │
+│                → write meta row + refresh memory registry (RWMutex.Lock)     │
+└──────────────────────────────────────────────────────────────────────────────┘
+  → ? Type uppercase 'YES' to confirm regdoc submission: YES
+     其他任何输入 → 中止："Aborted. regdoc NOT sent. 0 server-side changes."
+
+  → 成功（server 返回 +OK）：
+    OK. Doc 'user' registered via RESP regdoc. Server created_at: 2026-08-22T15:30:00Z
+    Meta row persisted at server: _doc_:user
+    Shell TAB cache for ns list invalidated. Next !LISTDOCS / TAB will show.
+
+  → 失败（server 错误，典型 Schema 全等对比失败 §4.2.1 Parent FR）：
+    Server ERR:
+      document namespace "user" already registered with DIFFERENT schema:
+        registered.keyattrs = ["id"]
+        requested.keyattrs  = ["tenant","id"]
+    Aborted. 0 changes. (HINT: schemas are immutable in MVP; migration flow = dump + drop + recreate)
+```
+
+### 4.2 !LISTDOCS / !DOCS — 列出所有 Doc
+
+**触发**：`!LISTDOCS` 或 `!DOCS`
+
+**RESP 请求 → lsdoc**（无参数）
+
+**RESP 响应**：Server 返回一个 RESP BULK STRING = JSON 数组 `[ {PersistentDocSpec}, {...}, ... ]`（用 JSON 而不是 RESP Array-of-Arrays，因为字段多且将来可能加字段，JSON 向后兼容更强）
+
+**Shell 端展示**：ASCII 表格（列规则 §1.3 v1 已对齐，这里沿用）：
+
+```
+Server: 127.0.0.1:6381 via RESP  |  3 registered Doc(s) found
+┌──────────┬────────────────┬──────────────┬──────────────┬────────────────────────┬─────────────────────┐
+│ Namespace│ Mem?           │ KeyAttrs     │ Default TTL  │ Type Name (if Go code) │ Created At          │
+├──────────┼────────────────┼──────────────┼──────────────┼────────────────────────┼─────────────────────┤
+│ user     │ no (persistent)│ tenant, id   │ 7d           │ main.UserDoc           │ 2026-08-22 12:00:00 │
+│ order    │ no             │ order_id     │ (never)      │ shop.OrderDoc          │ 2026-08-22 12:10:00 │
+│ hotitem  │ yes (volatile) │ sku          │ 1h           │ cache.HotItemDoc       │ 2026-08-22 13:05:22 │
+└──────────┴────────────────┴──────────────┴──────────────┴────────────────────────┴─────────────────────┘
+Hint: TAB cache for Doc namespaces now refreshed (3 entries).
+```
+
+**TAB 联动**：此命令执行成功后，Shell 端 `cachedDocNs = ["user","order","hotitem"]`。任何后续需要 ns 参数的命令 → TAB 可补全候选。
+
+### 4.3 !DESCRIBEDOC `<ns>` — Doc 完整快照
+
+**触发**：`!DESCRIBEDOC user`（TAB 补 ns）
+
+**RESP 请求 → desdoc `<ns>`**（单参数）
+
+**RESP 响应**：JSON bulk string = `x.DescribeDocResult`（spec + indexes[] + row_count）
+
+**Shell 端展示**：`json.MarshalIndent` 原样输出。**（SSoT 零泄露唯一豁免点：storage_ns / full / key_pattern 会出现 `_m_` / `_` 内部拼法，但命令是 debug 级，日常路径不进。）**
+
+### 4.4 !SETDOC `<ns>` — 写数据（Q2 糖命令交互包装）
+
+**触发**：`!SETDOC user`
+
+**对齐 Parent FR §4.3.2 Q2 SET 糖：** `SET <storageNs> <JSON> [EX s|PX ms] [NX]`
+
+**流程：**
+
+```
+Step 1（客户端预校验）：
+─────────────────────────────────────────────────────────
+用户输入 `!SETDOC unknownns` → Shell 本地 cachedDocNs 里找不到（或为了避免 stale，直接发 lsdoc 再查一次？MVP 信任缓存，让 server 最终拒绝即可） →
+  Server ERR will be: ERR table 'unknownns' does not exist (Strict Gate Q2 pre-check).
+  Actually — we don't block client-side here to keep logic lean; always let server Strict Gate SSoT be authoritative.
+
+Step 2（可选参数）：
+─────────────────────────────────────────────────────────
+? Override per-doc TTL? [ENTER = use doc default]:
+? Write only if pk does NOT already exist (UPSERT NX, no overwrite silently) [y/N]: N
+
+Step 3（大文本 JSON 输入）：
+─────────────────────────────────────────────────────────
+End your JSON input with a line that contains ONLY "." :
+  (Accepts: SINGLE object {}   OR   BATCH array [{},{},...] — BATCH recommended)
+─────────────────────────────────────────────────────────
+> {"tenant":"acme","id":"0100","name":"Alice","age":30,"contact":{"email":"a@b.co"}}
+> {"tenant":"acme","id":"0101","name":"Bob","age":25,"contact":{"email":"b@c.co"}}
+> .
+─────────────────────────────────────────────────────────
+
+Step 4（构建并发送 RESP Q2 SET 糖命令）：
+─────────────────────────────────────────────────────────
+Client 发送 SET 命令的参数顺序（Parent FR §4.3.2 定义，不能改）：
+  [
+    "SET", "user",
+    "<整个 JSON 原文，单对象或数组作为 ONE bulk string>",
+    "EX", "1800",       ← 如果 override TTL 是 30m，则附加 EX 或 PX；否则不附加
+    "NX"                ← 如果 Step2=y，则附加 NX；否则省略 (UPSERT)
+  ]
+→ rdb.Do(ctx, "SET", args...)
+
+Server-side path：Strict Gate Q2 SET pre-check (table exists) →
+                 KeyAttrs extraction (for each doc in array if batch) →
+                 pk derivation (§11, "_" join) → storageNs + ":" + pk →
+                 buntdb.Set (batch atomic for array case, §4.3.2 Q2) →
+                 返回 integer = written rows
+
+─────────────────────────────────────────────────────────
+成功: OK. Server wrote 2 row(s) via RESP atomic batch SET.
+      Storage keys (INTERNAL, don't rely): user:acme_0100, user:acme_0101
+      (Note: these keys are displayed ONLY for debugging — normal operation NEVER needs them!)
+
+失败（典型 batch atomic abort）：
+Server ERR: SET batch atomic abort at array index #1 (0-based):
+  missing required KeyAttr top-level field "tenant".
+All 0 rows written (strict all-or-nothing guarantee; no half-writes). Hint: fix JSON & retry.
+```
+
+### 4.5 !GETDOC `<ns> [pk-suffix]` — 读数据（Q2 糖 GET 两分支）
+
+**对齐 Parent FR §4.3.2 Q2 GET 糖**：`GET <storageNs>` 或 `GET <storageNs> <pk-suffix>`
+
+```
+分支 1（单条）: !GETDOC user acme_0100
+─────────────────────────────────────────────────────────
+→ 客户端预校验（SSoT helper，拦截 pk 里的 ':'）：
+   ✗ pk="acme:0100" → 本地报错：pk-suffix 包含保留分隔符 ':' 。Multi-segment KeyAttrs composite pk MUST join with '_' （e.g. tenant=acme,id=0100 → 'acme_0100'）
+   ✓ pk="acme_0100" → ok
+→ RESP 请求 = ["GET", "user", "acme_0100"]（Q2 三参数 GET 糖单条分支）
+→ RESP 响应：JSON bulk string of single doc OR NullBulk if not found
+→ 展示：Pretty JSON + 「OK, pk matches」 / 「No row found. Strict mode: 'table not found' vs 'row not found' return DIFFERENT errors」
+
+分支 2（集合糖）: !GETDOC user
+─────────────────────────────────────────────────────────
+→ RESP 请求 = ["GET", "user"] （Q2 两参数 GET 糖全表分支, internal hard LIMIT 10000）
+→ 展示：JSON array, count 前缀。如果 server 返回 ≥10001:
+  Server ERR: !GETDOC 'user' collection hard limit 10000 exceeded. Use !SEARCHKEY user '{range}' for pagination. Hint: SEARCHKEY = Q1 2-param scan with explicit min/max pk range.
+```
+
+---
+
+## 5. Index 命令族（G2）
+
+### 5.1 !CREATEINDEX / !NEWINDEX — 交互式建索引（4 步顺序不可换，Parent FR §4.4）
+
+**触发**：`!CREATEINDEX`
+
+**流程（严格对齐 §4.4 4 步，顺序不可在 Shell handler 里改）：**
+
+```
+Step 1 (MANDATORY FIRST: SELECT OWNER DOC)
+─────────────────────────────────────────────────────────
+Server Registered Docs (fetched via lsdoc LIVE, not cache — to avoid stale):
+┌───┬──────────┬──────────────┬──────────────────┬──────────────┐
+│ # │ Namespace│ KeyAttrs     │ Default TTL      │ Storage Layer│
+├───┼──────────┼──────────────┼──────────────────┼──────────────┤
+│ 1 │ user     │ tenant,id    │ 7d               │ disk         │
+│ 2 │ order    │ order_id     │ (never)          │ disk         │
+│ 3 │ hotitem  │ sku          │ 1h               │ mem          │
+└───┴──────────┴──────────────┴──────────────────┴──────────────┘
+? Select owner Doc by # or name (TAB to complete): 1
+
+Step 2 (Logical index name + uniqueness pre-check)
+─────────────────────────────────────────────────────────
+? Logical name (alphanumeric only; UNIQUE per doc. INTERNAL forbid '_' ':'): age
+  → 客户端预校验：正则字母数字；预查 lsidx user 是否重名（Shell 静默发 lsidx <ns> 去重）
+  → 重名报错：logical 'age' already under doc 'user' (full=user_age path=age). Use different name or !DROPINDEX user.age first.
+  → 通过后，Shell 用 SSoT helper ParseIndexFullName 反向拼 full = "<storageNs>_<logical_lowercase>" （预览用）
+
+Step 3 (JSON path + preview)
+─────────────────────────────────────────────────────────
+? JSON dotted path (e.g. "age" OR "contact.email"): contact.email
+  → 预览框（和 §5.1 v1 已对齐）
+    Full = user_age / dotted_path → contact_email (dots→_ §11 norm) / KeyPattern = user:* / storage = disk (继承 doc)
+  → KeyPattern 窄化（可选，回车默认 *）
+
+Step 4 (Uppercase CREATE Gate + send regidx Wire Command（UI 糖显示 REGISTER INDEX，RESP Wire = regidx）
+─────────────────────────────────────────────────────────
+? READY. Server will:
+    (1) Execute:  REGISTER INDEX ON user (age, contact.email)  ← UI 糖，实际 RESP args = ["regidx","user","(age,contact.email)","TYPE","default"]
+    (2) buntdb CreateIndex() synchronously backfills all existing user:* rows (O(n log n))
+    (3) Persist meta row _idx_:user_age & refresh memory registry
+  This is a HOT schema change on running server — ensure your change window!
+  Type uppercase 'CREATE' to send regidx index register command to 127.0.0.1:6381 (anything else cancels): CREATE
+
+→ 成功：OK. Index 'user_age' registered via RESP wire regidx. Server backfilled N rows live.
+→ 失败（索引冲突，full name 存在但 path 不同）：Server ERR 原样透传。
+```
+
+### 5.2 !LISTINDEXES `<ns>` — 列 Index
+
+RESP 请求 → `lsidx <ns>` → JSON bulk string = `[]x.IndexSpec` array。ASCII 表格展示 logical / full / path / created_at。TAB 缓存刷新 `cachedIdxLogical[ns]`。
+
+### 5.3 !DROPINDEX `<ns>.<logical>` — 删索引（双确认）
+
+- 预校验：格式必须 `<alpha>.<alpha>`（点分隔，禁 `_` 直接当引用，因为 full 里 `_` 是 SSoT 连接符）。
+- 双确认：WARNING 框 → 要求**输入 exact full name**（不是 y/N，防手滑）。
+- RESP 请求 → `delidx <ns> <logical>`（3 args，UI 糖显示 DROP INDEX ns.name，RESP wire 统一 ADM 前缀；Server Gate1 allowlist 拒 app-port REGISTER/DROP 命令字仅需检查 prefix=`ADM` 一个规则即可，不用为 REGISTER INDEX 子句单独写）。
+
+### 5.4 !SEARCHINDEX `<ns>.<logical>` [filter_json] [ASC|DESC] [LIMIT N] — 索引查询
+
+对齐 Parent FR §4.3.2 C2 糖：RESP 请求 = `SEARCHINDEX <fullIdxName> <filter_json>`（两参数），方向和 limit 是 Shell 端附加的 sugar？或者 Server C2 已支持 2+ args？按 Parent FR C2 定义是 2 param only（`fullIdxName` + `filter`）；ASC DESC LIMIT 做 Server 端可选或 Shell 端后续改造，MVP 先做 2 param 再考虑扩展。
+
+---
+
+## 6. Shell 体验基建（G4）+ Server Admin-port Flags
+
+### 6.1 Shell 启动参数（RESP Client 版）
+
+Binary：**redisx-admin**（待定 O2）。启动：
+
+```
+redisx-admin [OPTIONS]
+
+OPTIONS:
+  -h, --host string       Admin RESP server host (default "127.0.0.1")
+  -p, --port int          Admin RESP server port (default 6381)
+                          NOTE: this is INDEPENDENT from the main business RESP port.
+                          Server must be started with matching --admin-port (see §6.2)
+
+  -a, --auth string       AUTH key. (default: prompt interactively if server requires AUTH)
+                          DO NOT hardcode in scripts! Use env var or ~/.redisx-admin-auth
+                          file in the future (not implemented MVP — flag only)
+
+      --tls-cert string   (FUTURE mTLS placeholder, MVP unused + error if set)
+      --tls-key  string   (FUTURE)
+      --ca-cert   string  (FUTURE)
+      --insecure-skip-verify (FUTURE, dangerous)
+                          → If any --tls-* flag is provided in MVP, shell prints:
+                            "mTLS admin connection NOT implemented in MVP.
+                            For remote admin use SSH tunnel: ssh -L 6381:127.0.0.1:6381 user@remote-host
+                            then connect locally with default flags."
+                          exit(1)  ← fail-closed, 不实现就不允许半吊子 tls flag
+
+  -f, --file string       (MVP CARD, script mode not implemented) exit(1) with message
+
+      --help              help + exit(0)
+      --version           version + exit(0)
+```
+
+**启动流程（fail-closed）：**
+
+```
+Step 1: Parse flags. If tls flags present → ERR + SSH tunnel hint → exit(1).
+Step 2: Build redis.Options{Addr: host+port, Password: auth}.
+Step 3: rdb.Ping(ctx) — roundtrip 1x to verify server reachable + AUTH ok.
+        - Fail (connection refused, i/o timeout):
+          ERR connecting to admin RESP server at 127.0.0.1:6381: dial tcp 127.0.0.1:6381: connect: connection refused
+          HINT: Is redisx-server running locally? Did you start it with --admin-port=6381 (or matching port)?
+                To start server with default admin port:
+                  redisx-server --dbpath /var/db/x.db --admin-bind 127.0.0.1:6381 --bind 127.0.0.1:6380 -a <authKey>
+        - Fail (WRONG AUTH invalid password):
+          Server ERR: NOAUTH Authentication required / WRONGPASS invalid password.
+Step 4: Banner → Enter REPL.
+
+成功 Banner 示例：
+╔══════════════════════════════════════════════════════════════════╗
+║ redisx-admin v1.0.0-dev — ADMIN RESP CLIENT REPL SHELL         ║
+║ Connected: 127.0.0.1:6381 (admin-port, loopback default)       ║
+║ Auth:     OK (key provided via -a)                             ║
+║ Server:   PING → PONG (latency 0.2ms)                          ║
+║                                                                  ║
+║ NOTE: Admin shell is a STANDARD REDIS PROTOCOL CLIENT — all    ║
+║ operations go through server's handleCommand() & Strict Gate.  ║
+║ NO local db file manipulation EVER performed by this binary.   ║
+║                                                                  ║
+║ Type HELP or ? for commands; TAB for completions.              ║
+╚══════════════════════════════════════════════════════════════════╝
+redisx-admin[127.0.0.1:6381]> █
+```
+
+### 6.2 Server 侧新增 Admin-port Flags
+
+同步更新 Parent FR 的 Server 启动参数（`server.Start()` 参数 / cmd/redisx-server main flags）。
+**已拍板决策：**
+1. **D2 双 AUTH key 分离**：App port 用 `--auth`，Admin port 用 `--admin-auth`，必须不同（相同启动 FATAL）。
+2. **D3 + O3（用户最新决策）默认绑定策略：**
+   - **Admin-port**（`--admin-bind` / `--admin-port`）：**默认永远 `127.0.0.1:6381`（严格回环，不枚举网卡，不监听非回环，不提供「自动选私网」功能）**。要跨机 Admin → 必须走 Caddy+mTLS 代理到 127.0.0.1（§9.4）。
+   - **App-port**（`--bind` / `--port`）：**默认选「rank 最高的私网网卡 IP」（不是 0.0.0.0，也不是 127.0.0.1）**—— 启动时执行：
+     ```
+     Step 1: net.Interfaces() 枚举所有非 down/非 loopback 网卡
+     Step 2: 取每张网卡的 IPv4 地址，匹配 RFC1918 私网段：
+               10.0.0.0/8
+               172.16.0.0/12  (172.16-31.*.*)
+               192.168.0.0/16
+             排除 169.254 link-local / 127.* loopback
+     Step 3: 对所有匹配的 <网卡, ip> 对计算 rank（只选一张）：
+               rank 1 (最高): 网卡名 == "eth0" OR "en0" (常见默认 VPC 网卡)
+               rank 2:         此网卡存在 default route (0.0.0.0/0) → 生产实例
+               rank 3:         所有其他匹配私网 IP 的网卡
+               (同 rank 下按 IP 字典序稳定选第一个)
+     Step 4: 最终 App port bind = "<top_ranked_private_ip>:6380"
+             FAIL-OPEN 兜底: 如果一张私网网卡都没匹配（如本地笔记本开发环境，无 VPC 弹性网卡）→
+               → 打印大段 WARNING
+               → 绑定 127.0.0.1:6380 (退化为完全本地，仅能本机访问)
+               → 提醒用户: "No RFC1918 private IP found on any up NIC. App port bound to 127.0.0.1 only. Cross-machine app access will fail. Use --bind <ip>:<port> explicitly to override, e.g. --bind 0.0.0.0:6380 with firewall/security-group rules."
+     ```
+   - **为什么 Admin 不享受「自动选私网 IP」？** —— Admin port 是 Schema 改权限入口，安全层级必须比 App 更高；默认不对外（即使是私网 VPC）。要连其他机器，**强制经过 Caddy+mTLS**（mTLS 的 Client Cert OU+CN 校验比「VPC 私网可达」这个层级强得多，VPC 配置错误也能被 mTLS 补一层兜底）。
+
+| Flag | Default (未指定时) | 含义 | Fail-Closed 校验 |
+|---|---|---|---|
+| `--bind` | `auto:<top_ranked_private_ip>:6380` (见上面 Step 1-4) | **业务 RESP 端口**（客户端应用连这个）。云上 VPC 默认绑定 VPC 弹性网卡的私网 IP（同 VPC 其他 VM / K8s Pod 可达；公网 0.0.0.0 绝对不可达，因为根本没监听公网）；用户想绑定公网 / 具体 IP / 多 IP → 显式指定 `--bind 0.0.0.0:6380` 或 `--bind <specific_ip>:6380`。 | 显式写为 `0.0.0.0:*` 或 `[::]:*` 打印 WARNING：App port 对外暴露，必须配 Security Group / 防火墙 + 强 AUTH key + 后续考虑 mTLS（App port 也能 front Caddy TLS）。 |
+| `--port` | (alias: 只改端口，IP 选择策略不变，还是 auto 私网 IP 或 127.0.0.1) | 业务 port 简写，等价于 `--bind auto:<ip>:<port>` 中 <port> 的 override。 | 同上。 |
+| `--private-cidrs` | `"10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"` | （新增 flag）自定义「私网 IP 判定」的 CIDR 白名单，支持追加云厂商特殊网段（如阿里云 shared VPC: 100.64.0.0/10，AWS ECS ENI 附加私有段等）。默认 RFC1918 三段，可自定义 append / 全量 override？MVP = append 语义，不会覆盖默认三段。 | CIDR 语法 parse 错误 → FATAL。 |
+| `--auth` | *(必填 flag 或 env REDISX_AUTH)* | **业务 AUTH key**（App port 专用）。App port 上只有 AUTH 成功才能发业务命令。 | 空字符串不允许（启动 FATAL：please set --auth）。**严禁和 --admin-auth 相同（强制校验）**。 |
+| `--admin-bind` | **严格固定 `127.0.0.1:6381`** | **Admin 管理端口**（Shell 连这个）。永远只绑回环；「没有指定就是 private ip」的逻辑只对 App port 生效，Admin port **不享受**这个自动选择策略。跨机 Admin → 强制 Caddy+mTLS front（§9.4）。 | **强约束**：用户若覆盖 admin-bind → 若不是 127.0.0.1 或 ::1 → 除非同时满足下面两个条件之一，否则 **FATAL 启动失败**：<br>(a) `--admin-trust-proxy=true`（位于 §9.4 Caddy 代理场景，PROXY v2 信任机制会再加一层校验）<br>(b) 显式加 `--admin-danger-bind-any=true`（危险 override，生产禁用） |
+| `--admin-port` | (alias，只改 admin port 的 <port> 部分，IP 永远是 127.0.0.1) | Admin port 简写。 | 同上。 |
+| `--admin-auth` | *(必填 flag 或 env REDISX_ADMIN_AUTH)* | **Admin 独立 AUTH key**（Admin port 专用）。Admin port 上必须用这个 key 通过 AUTH（业务 key 在 Admin-port AUTH 直接 WRONGPASS）。 | 空字符串 FATAL。**严禁和 --auth 相同**（`appAuthKey == adminAuthKey` → 启动 FATAL）。 |
+| `--admin-danger-bind-any` | `false` (默认 false) | **危险 flag**，手动 override Admin-bind 非回环的限制。**仅用于内网隔离 VLAN + 有额外 ACL/mTLS 保证的场景。生产严禁。** | 启用时 Server 启动 Banner 有大段红色 WARNING（日志级别 ERROR），并启动 goroutine 持续每 5 分钟 slog.Error 打告警，审计日志 tag `danger_bind_any=true`。 |
+
+### 6.3 TAB 补全 / 历史 / HELP
+
+已在 §3.3、§4.2、§6.4 v1 描述过，这里 RESP 版内容不变（TAB 三级、history ~/.redisx_admin_history 权限 0600、HELP 分类列命令 + Strict 提醒）。
+
+唯一不同是「缓存刷新」机制：Shell 清空缓存后，不是内嵌调 db.RegisteredDocs()，而是发 RESP `lsdoc` / `lsidx <ns>` 请求。
+
+---
+
+## 7. Shell Sugar ↔ RESP Wire Protocol Mapping (SSoT, 12 条命令完整清单)
+
+> **本节是实现正确性核心**。Shell 每个 handler 最终组装的 RESP args 数组必须和下表严格 byte-level 对齐；Server cmd handler 的参数解析必须能反向匹配。
+>
+> **Admin-only 命令（业务 client 不用，Shell 专用）**：`regdoc / lsdoc / desdoc / lsidx` — ADM 前缀表明 redisx Admin-only 扩展，不和原生 Redis 命令命名空间冲突。
+>
+> **Registry Index 官方命令 UI 糖**：Shell 层面显示 `REGISTER INDEX ON <ns>(field,path)` / `DROP INDEX <ns>.<logical>`（便于人类交互，遵循 Parent FR §4.3.2 Cat4 官方词汇）；**但 RESP wire 实际发送给 server 的命令字统一是 ADM 前缀 regidx / delidx**（避免和未来业务层 CREATE/DROP 语义冲突 + App-port Gate1 统一用「ADM 前缀 = Admin-only」判断，无需判断 REGISTER INDEX 子句）。Shell 层 UI 糖和 RESP wire 命令的映射表固定、不允许绕过。
+>
+> **Strict Gate 核心共享命令**：SET / GET / DEL / KEYS / SEARCHKEY / SEARCHINDEX / UPDATE — Parent FR §4.3.2 类别 2/1/3/C2/C4 已定义。Shell 包装这些，不新增 wire 格式。
+
+| Admin Sugar 命令 | Shell Handler 最终发送的 RESP args (string array, go-redis Do order) | Server 侧 handler 归属 & Parent FR 位置 | 关键备注（Shell 预校验 / Server Gate） |
+|---|---|---|---|
+| **!CREATEDOC** Step 5 | `["regdoc", <spec_json_one_bulk_string>]` | `cmd.go` 新增 `xRegisterDoc(conn, specJSON)` → `db.RegisterDocFromSpec(spec)`（Parent FR §4.2.1 非泛型） | Shell 必须把 Step 1-4 组装成完整 PersistentDocSpec JSON；server 端再次做 Schema 全等检查、落盘 _doc_:<ns>。**SSoT：两边都走 SSoT 校验。** |
+| **!LISTDOCS** | `["lsdoc"]` | `cmd.go` 新增 `xListDocs()` → `json.Marshal(db.RegisteredDocs())` bulk 返回 | 返回 JSON array bulk；Shell ASCII 表格化。 |
+| **!DESCRIBEDOC `<ns>`** | `["desdoc", ns]` | `cmd.go` 新增 `xDescribeDoc(ns)` → `db.DescribeDoc(ns)` → JSON | 预校验：ns 字母数字。 |
+| **!LISTINDEXES `<ns>`** | `["lsidx", ns]` | `cmd.go` 新增 `xListIndexes(ns)` → `json.Marshal(db.RegisteredIndexes(ns))` | 返回 JSON array bulk。 |
+| **!SETDOC `<ns>`** Step 4 | `["SET", storageNs, <paste_json_one_bulk>, ("EX", ttlSecs)*, ("NX")*]` (* = optional per user choice) | `cmd.go` 改造 `setCommand()` 实现 Q2 SET 糖 Strict 逻辑 (Parent FR §4.3.2 Q2) | Shell：KeyAttrs 不提前拼，完全交给 server。StorageNs 是 Shell 端逻辑 ns → StripMemPrefix 应用判断 / IsInternalStorageNs? 不，直接传用户输入的逻辑 ns；SERVER 端内部用 spec.mem 拼 storage_ns。Shell 发送的第二个参数是「logic ns」还是「storageNs」？**必须传 storageNs（按 Parent FR Q2 定义 SET 首参 = storageNs）**。因此 Shell 端在 !SETDOC 之前必须查 lsdoc 拿到 spec.storage_ns，然后用那个做首参发送！SSoT 不能让 Shell 自己拼 storageNs — 必须 server 返回的 spec 里拿！ |
+| **!GETDOC `<ns>`** (分支 2, 集合) | `["GET", storageNs]` | `cmd.go` 改造 `getCommand()` Q2 两参数糖 → `db.GetAllDocs(storageNs, LIMIT 10000)` | 同上，Shell 必须从 lsdoc 缓存里拿 storageNs 传，不自己拼！ |
+| **!GETDOC `<ns> <pk>`** (分支 1) | `["GET", storageNs, pkSuffix]` | `cmd.go` getCommand() Q2 三参数单条分支 | 客户端预校验 pkSuffix 不包含 `:`（用 SSoT helper ExtractPKSuffixes 反向校验） |
+| **!CREATEINDEX** Step 4 | `["REGISTER", "INDEX", "ON", storageNs, "(", logicalName, ",", dottedPathNorm, ")"]` | `cmd.go` 新增 `registerIndexCommand()` (Parent FR §4.3.2 类别 4) → `db.RegisterIndexFromSpec(spec)` | 圆括号和逗号是 RESP 分开的 token，Server 端 parse 时要去掉括号和逗号（与 Parent FR 一致）。Shell 组装时把它们作为独立 args。 |
+| **!DROPINDEX `<ns>.<logical>`** | `["DROP", "INDEX", storageNsDotLogical]`  *其中 storageNsDotLogical = `<storageNs>.<logical>` e.g. `user.age`* | `cmd.go` 新增 `dropIndexCommand()` → `db.DropIndexByFull(ns, logical)` | MVP 传 `<storageNs>.<logical>`（dot 分隔，非下划线 full name），与 Parent FR §4.3.2 类别 4 定义一致。双确认输入的是 full（下划线）但 RESP 发的是 dotted 形式；注意两种引用不混淆。 |
+| **!SEARCHINDEX `<ns>.<logical> [filter] [options]`** | `["SEARCHINDEX", fullIdxName, filterJson]` | `cmd.go` 改造 `searchIndexCommand()` C2 糖 → `db.SearchIndexByRef(ns, logical, filter, asc, limit)` | Shell 端解析 ASC/DESC/LIMIT 附加 sugar；MVP 先不附加扩展参数，Server C2 默认 ASC LIMIT=100；LIMIT 太大通过 Server 侧上限拦截。 |
+| (未来 DEL 糖) !DELDOC `<ns> <pk1> [pkN]` | `["DEL", storageNs, pk1, pk2...]` | `cmd.go` 改造 `delCommand()` Q2 糖 (Parent FR §4.3.2 Q2) | MVP 不提供 !DELDOC 糖 handler，但 RESP 命令已 Strict Gate，裸 redis-cli 也能调。 |
+| (未来 KEYS 糖) !KEYS `<ns>` | `["KEYS", storageNs]` | `cmd.go` 改造 `keysCommand()` Q3 (单参数 storageNs, glob forbidden) | MVP 不提供 !KEYS 糖命令 handler，但 RESP 命令实现必须同期到位（Strict Gate）。 |
+| (共享 PING/AUTH/QUIT) | `PING`, `AUTH <key>`, `QUIT` | redcon 内置 + 标准命令 | Shell 内置命令直接透传。 |
+
+**§7 总结 + 实现 checklist：**
+- 4 条 X 扩展命令必须在 Server cmd.go 新增；Shell 不能通过「走 Go 内部 API」绕过 — 必须走 wire。
+- REGISTER INDEX / DROP INDEX（类别 4）在 Server cmd.go 新增；Shell 只负责参数顺序组装。
+- Parent FR §4.3.2 的类别 2/1/3/C2/C4 严格命令改造要与 Admin Shell 同期实现，不然 Shell 发过去的 SET `<storageNs>` 还在走旧的 raw key 语义 = 功能不一致。
+
+---
+
+## 8. MVP DoD (Definition of Done)
+
+### 8.1 代码交付物
+
+| # | 交付物 | 路径建议 | 说明 |
+|---|---|---|---|
+| **D1** | Admin Shell binary main (RESP client) + dispatcher + handlers | `cmd/redisx-admin/main.go` + `internal/shell/{doc.go,index.go,builtins.go,completer.go}` | **构建限制（lint 卡住）：禁止 import `server` 包；必须 import `client/cli.go` + go-redis。**独立编译：`go build -o redisx-admin ./cmd/redisx-admin`。Shell 连接默认 `-h 127.0.0.1 -p 6381 -a <adminAuthKey>`（注意必须用 Admin key，不是业务 key）。|
+| **D2** | Server 侧权限模型 MVP 4 层 Gate + RESP Admin 命令族（共 8+ 条 handler） | `server/cmd.go`（修改 + 新增） | 具体包括：<br>· **Gate 0 双 AUTH key**：AUTH 命令按 connCtx.isAdminPort 比对不同 key（--auth vs --admin-auth）；appAuth==adminAuth 启动 FATAL<br>· **Gate 1 命令字 Allowlist**：portRoleGate() + appPortAllowlist map，X*/REGISTER/DROP 不在 allowlist 的 app-port 直接 ERR unknown command<br>· Gate 2 Admin 权限 Enrichment（结构预留 return true，MVP 放行，结构在）<br>· Gate 3 Strict Mode：set/get/del/keys/searchKey/searchIndex/update 共 7 条命令的 Q1/Q2/Q3/C2/C4 严格语义改造（Parent FR §4.3.2）<br>· X 前缀 handler：regdoc、lsdoc、desdoc、lsidx（4 条）<br>· Registry handler：REGISTER INDEX ON、DROP INDEX（2 条，Parent FR 类别 4） |
+| **D3** | Server 启动双端口（admin-bind + bind）+ 双 AUTH flag 注入 | `server/srv.go`（Start() 函数新增双 redcon Serve）+ `cmd/redisx-server/main.go`（新增 --admin-bind / --admin-port / --admin-auth / --admin-danger-bind-any flags） | 两个 redcon listener 的 handler **必须是同一个函数指针** `func(conn redcon.Conn, cmd redcon.Command)`（SSoT，§3.1）— 不允许复制粘贴两份 handleCommand。connCtx.isAdminPort 挂在每个 listener 的 accept 回调里，不同 listener 设不同 true/false。默认 admin-bind=127.0.0.1:6381；非回环无 proxy-trust / danger 双 flag → FATAL。|
+| **D4** | §11 SSoT helpers（Phase 0） | `internal/shared.go` + `x/contract/constant.go`（已在 session 早期加了 DocMetaNsPrefix / IdxMetaNsPrefix / KeyAttrsJoin = "_"） | SplitStorageKey、IsInternalStorageNs、StripMemPrefix、ExtractPKSuffixes、ParseIndexFullName 五个实现 + 单元测试。Shell 端 client 预校验和 Server 端 Strict Gate 都复用。 |
+| **D5** | Doc/Index Spec structs + Non-generic public APIs on *server.DB | `x/x.go`（新增 PersistentDocSpec / IndexSpec / DescribeDocResult JSON tags）+ `server/db.go` / `server/doc_api.go`（新增 RegisterDocFromSpec / RegisteredDocs / DescribeDoc / SetDocs / GetAllDocs / GetOneDoc / RegisterIndexFromSpec / RegisteredIndexes / DropIndex / SearchIndexByRef 10 条非泛型公共方法 + 单测） | Shell 侧不 import server，但 Server 侧 cmd.go handlers 最终调这些 db.* 方法；这些也是 Parent FR 的 contract。 |
+| **D6** | Parent FR §4.3 / §4.2 更新同步 | `fr/fr-typed-doc-registry.mdx` | D2/D3/D5 里新增的 RESP 命令、参数格式、Admin-port、Open()/Start() 语义变更，必须回写 Parent FR，保持两份文档一致。 |
+
+### 8.2 验收用例（MUST PASS，U11/U12 安全目标）
+
+**前置：** 构建 `redisx-server` / `redisx-admin` 两二进制；空 DB + 启动 Server 带 admin-port。
+
+```bash
+# 启动 Server（终端 A）—— 注意：--auth（业务）和 --admin-auth（管理）必须不同
+redisx-server --dbpath /tmp/redisx-test.db \
+              --bind 127.0.0.1:6380 \
+              --auth 'BizKey_AppOnly_2026!' \
+              --admin-bind 127.0.0.1:6381 \
+              --admin-auth 'AdminKey_SRE_Only_2026!'
+# 若 --auth == --admin-auth，启动会 FATAL 报错（Fail-Closed 保护）：
+#   FATAL --auth and --admin-auth MUST be different strings for permission isolation.
+```
+
+```
+U1（建表 — Admin-port RESP regdoc + Admin key Gate 0 通过）:
+    终端 B: redisx-admin -h 127.0.0.1 -p 6381 -a 'AdminKey_SRE_Only_2026!'
+    → Banner 显示 Admin-port connected, AUTH OK (admin key), PING OK
+    → 错误验证：redisx-admin 带 -a 'BizKey_AppOnly_2026!'（业务 key 连 admin-port）
+      → AUTH WRONGPASS，连不上 (Gate 0：admin-port 不认业务 key)
+    → 回到 Admin key 成功后：!CREATEDOC → user / N / tenant,id / 7d → YES
+    → Server 返回 OK；Banner 确认 !LISTDOCS 现在能看到 user 行
+
+U2（看表 — Admin-port lsdoc）
+    → !LISTDOCS → 表格 user 行, keyattrs=tenant,id, TTL=7d, TypeName=- (via regdoc, non-Go path)
+
+U3（详情）
+    → !DESCRIBEDOC user → spec.storage_ns="user"; indexes=[]; row_count=0
+
+U4（写数 — Admin-port SET Q2 糖）
+    → !SETDOC user → TTL 回车 → NX=N → 粘贴 3 条 JSON array（tenant=acme id=0100/0101, tenant=globex id=9001）→ "." 结束
+    → OK 3 rows
+    → 故意贴 1 条缺 tenant 的：batch atomic abort 0 rows
+
+U5（建索引 — Admin-port REGISTER INDEX）
+    → !CREATEINDEX → 1 → age → age → CREATE → backfilled 3 rows
+
+U6（查索引 — Admin-port / App-port 都能 SEARCHINDEX）
+    → !SEARCHINDEX user.age '{"$gte":25}' → 返回 2（假设有 2 条 ≥25）条 JSON array
+    → App-port 终端业务 redis-cli 发同样 SEARCHINDEX（前提 table 已注册）→ 同样返回 2 条（共享 Gate 3 Strict，相同结果 SSoT）
+
+U7（读数双分支 — GET Q2 糖 + App-port 读取一致）
+    → !GETDOC user acme_0100 → 单条；输入 acme:0100 → 客户端（本地！）拦截报 : 分隔符错误（没有发 RTT server 就拒绝了 — 证明 SSoT helpers 在客户端使用）
+    → !GETDOC user → 3 rows 数组；造 10001 条时 server 报错 10000 limit
+    → App-port 业务 redis-cli GET user acme_0100 → 同一条 JSON（数据一致性，业务 key 读 OK）
+
+U8（删索引双确认）
+    → !DROPINDEX user.age → 输错 user_Age → abort（!LISTINDEXES 仍存在）→ 重输 user_age → OK dropped
+    → 验证！SEARCHINDEX 报索引不存在：Strict Gate 共享
+
+U9（TAB 三级补全）
+    → 空行 !GET[TAB] → 补 !GETDOC；!SETDOC us[TAB] → user；!SEARCHINDEX user.[TAB] → user.age（如还有索引）；!CREATEINDEX 完成后缓存 invalidation 正确
+
+U10（帮助）
+    → HELP → 严格模式 banner；!CREATEDOC ? → 单命令 2 条示例
+    → HISTORY 命令显示最近 50 条；~/.redisx_admin_history ls -l → 权限 -rw------- (0600)
+
+U11（🔒 Gate 0：App port 拒绝 Admin key？不 — 业务 key 才能过 App port AUTH；Admin key 在 App port 也 WRONGPASS + Admin 命令在 App port 连命令字级都不进 dispatcher）
+    → 终端 C: redis-cli -h 127.0.0.1 -p 6380 -a 'AdminKey_SRE_Only_2026!'
+      连 App port 给 Admin key → AUTH WRONGPASS（Gate 0：app-port 只认 --auth 配置的业务 key）
+    → 换 -a 'BizKey_AppOnly_2026!'（业务 key）→ AUTH OK
+    → 在 App port 上发 regdoc / REGISTER INDEX 等 Admin 命令：
+      App port 6380> regdoc '{"ns":"evil"}'
+      → ERR unknown command 'regdoc' (admin-only commands are not available on the app port). Use redisx-admin CLI or connect via admin-port with the --admin-auth key.
+      （Gate 1 命令字 Allowlist 拦截，连 parse 都没 parse）
+    → 同时 slog 日志有 WARN 行：port_role=app cmd=regdoc remote=... blocked
+
+U12（🔒 S1 RESP SSoT 共享 & Strict Gate 零旁路 + U11：App-port 业务 key 未注册表 STRICT ERR）  ← 最关键！
+    → 用普通业务 redis-cli 连 APP PORT (6380) 用 Biz Key：
+        redis-cli -h 127.0.0.1 -p 6380 -a 'BizKey_AppOnly_2026!'
+        127.0.0.1:6380> SET not_registered_ns '{"id":123}'
+        → 必须返回 ERR: table 'not_registered_ns' does not exist. (Strict Gate 3)
+    → 验证 Admin Shell 和业务 client 的 Strict Gate 错误文本完全相同（U4 里 Shell 的 !SETDOC unknownns 报错文本 ≡ redis-cli SET unknownns ... 报错文本；byte-level 相同 = SSoT 共享的直接证明）
+    → 对比：Admin-port 6381> regdoc '{"ns":"newdoc",...}' → OK（因为 superuser port，Gate 1 return true）
+
+U13（Server 不启动时 CLI 报错友好 + Admin port 绑定非回环时的 Fail-Closed）
+    → Kill server；重新 Shell 连接 → Step 3 Ping 失败；错误提示包含 SSH tunnel 建议 + --admin-port 匹配检查 + 怎么启动 redisx-server 默认 admin-port 的 copy-paste 命令参考（§6.1）。
+    → 故意启动 Server 时 admin-bind=0.0.0.0:6381 不带 --admin-trust-proxy + 不带 --admin-danger-bind-any → FATAL：
+      FATAL --admin-bind '0.0.0.0:6381' is not loopback. Admin port must bind to loopback by default.
+      Fix: (a) Use default --admin-bind 127.0.0.1:6381 + front with Caddy mTLS proxy
+           (b) Use --admin-trust-proxy=true if behind a trusted layer4 proxy (Caddy/HAProxy with PROXY v2)
+           (c) Production dangerous override: add --admin-danger-bind-any=true (NOT RECOMMENDED; audited alert every 5 min)
+    → 再试加 --admin-danger-bind-any → 启动成功（大 WARNING banner + slog ERROR log 每 5 分钟告警）
+```
+
+### 8.3 Go-side Regression
+
+```
+go test ./... -count=1
+```
+
+- 所有旧测试 100% 通过；
+- D4 (helpers) 单测、D5 (db.* 非泛型 API) 单测、D2 (cmd regdoc 等 handler 对错误 spec 的拒绝) 单测、D3 admin-port 双 listener 行为单测（listener not 0.0.0.0 默认）全部通过。
+- 被废弃旧行为的测试（如 raw `SET user:foo value` 语义）不能硬删，必须打 Deprecated 注释 + 新增 Strict 等价测试替代。
+
+---
+
+## 9. Security Design (Corrected v2 — RESP + Loopback Default + mTLS Future)
+
+### 9.1 Trust Boundary (vs v1 文件锁模型完全重构)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ TRUST MODEL (MVP, default deployment — single machine, no external exposure) │
+│                                                                              │
+│  ┌────────────────────────────────────────────┐                                │
+│  │  ADMIN OPERATOR (human, SSH in to box)     │                                │
+│  │   trust = OS user identity (UID=1000 ops)  │                                │
+│  └──────────────┬─────────────────────────────┘                                │
+│                 │ 本地 TTY → 启动 redisx-admin CLI                            │
+│                 ▼                                                             │
+│  ┌────────────────────────────────────────────┐                                │
+│  │  redisx-admin process (UID=1000)            │  ONLY 127.0.0.1 loopback       │
+│  │  AUTH key provided via -a or prompt         │  TCP connection                │
+│  └──────────────┬─────────────────────────────┘  (no external NIC packets)     │
+│                 │ RTT ~0.1ms, no real crypto yet│(MVP plaintext AUTH, local only)│
+│                 ▼                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │  redisx-server running: (UID=redisx, locked-down user)                   │ │
+│  │                                                                          │ │
+│  │  ┌─── Admin Listener (MVP default → 127.0.0.1:6381) ────────────────┐    │ │
+│  │  │  Trust = whoever can reach loopback (local users, root)           │    │ │
+│  │  │  Future: replace plain TCP with mTLS (--admin-tls-cert/key/ca)    │    │ │
+│  │  │    → trust = client certificate X.509 (OrganizationalUnit check)   │    │ │
+│  │  │    → This enables remote SRE (laptop with client cert + VPN)       │    │ │
+│  │  └──────────────────────────────┬─────────────────────────────────────┘    │ │
+│  │                                 │ shared handleCommand() + Strict Gate     │ │
+│  │  ┌─── Business Listener (MVP carefully default → 127.0.0.1:6380) ─────┐   │ │
+│  │  │  Production user will override: --bind 0.0.0.0:6380                 │   │ │
+│  │  │  Trust = AUTH key + IP of deployed apps                            │   │ │
+│  │  │  §3.2 AdminCmdGate (MVP open; future blocks regdoc/REGISTER/   │   │ │
+│  │  │   DROP IF NOT from admin port / loopback OR no mTLS admin cert)     │   │ │
+│  │  └──────────────────────────────┬─────────────────────────────────────┘    │ │
+│  │                                 │                                           │
+│  │                                 ▼                                           │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐  │ │
+│  │  │  SSoT single-point implementation:                                   │  │ │
+│  │  │   (1) Strict Gate pre-check (No Table = No Op) — Parent FR §4.3.2     │  │ │
+│  │  │   (2) Dispatch → db.* methods → buntdb                                │  │ │
+│  │  │   NO BYPASS — Admin port & Business port CANNOT call db directly      │  │ │
+│  │  └──────────────────────────────────────────────────────────────────────┘  │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+KEY PROPERTY: BOTH Admin and Business clients pass through EXACT same (1)+(2) pipeline.
+→ Admin Shell can NEVER do something "secretly higher privilege" than business client except through official RESP command channel (regdoc etc.) — because it's the same code.
+→ Adding new Admin functionality means adding a new RESP command (preferably ADM-, open design review), not a new hidden RPC.
+```
+
+### 9.2 安全原则对照（对比 v1 文件锁模型 + 说明为什么 RESP 模型也能满足）
+
+| 安全原则 | v2 RESP + 默认回环 如何满足 | v1 文件锁 对比说明 |
+|---|---|---|
+| **最小权限** | Admin Shell 二进制：无 setuid；无 `CAP_*`；仅需要本地 TCP 出站到 loopback（kernel 默认允许所有用户）。不需要读 db 文件本身！Shell 是纯 RESP client — 即使运维有 CLI 执行权限，但没 AUTH key 也进不去。 | v1 需要 db 文件读写权限（等于给了 SRE 绕过 server 改文件的能力，即使 server 没启动也能 `cp` 走整个 DB 明文内容 — 泄露面更大）。RESP 模型 Shell 根本没权限直接读磁盘 db 文件，只能通过 server 的业务/Admin 命令访问数据，粒度更细。 |
+| **最小攻击面** | 默认 Admin bind = 127.0.0.1:6381（外部网卡 0 包到达）。即使 host 被入侵，攻击 Admin port 必须先能在本地执行任意代码（= 已经完全接管，没什么好保护的了）。**外部攻击者（远程脚本小子、蠕虫）碰不到 Admin port**。 | 两者都强，只是 v2 对跨机扩展更友好。 |
+| **Fail-Closed** | 1. Admin CLI 启动时 tls flag 被提供？Fail → 告诉你用 SSH tunnel（§6.1）。<br>2. !CREATEDOC 输入非大写 YES → 零发请求。<br>3. Server §3.2 Admin 命令白名单 map。未来开启强权限时，未通过 gate 的连接发 admin 命令直接 ERR。 | v1 Fail-Closed 在文件锁。v2 Fail-Closed 在「命令未在白名单 + 未通过权限判定」。两种模型都强，但 v2 的 Gate 能随时间进化（不重新编译 CLI binary，改 server ACL 就行）。 |
+| **职责分离** | 业务 client AUTH key 泄露 = 攻击者能读能写 DOC（需要强 network ACL + 强 random key）；但**不能改 Schema（未来 §3.2 Gate 限制只能从 admin-port）**。两个权限面（业务 data 读写 / Admin Schema 改）解耦 = 一次泄露不等于全完蛋。 | v1 模型里「改 Schema（有 db 文件写权限）」==「能读整个 DB 所有内容 + 能改 Schema」= 一个面泄露就全没了。**RESP 模型职责分离更强。** |
+| **审计可追溯** | Shell 历史（~/.redisx_admin_history, 0600）。更重要的是 Server redcon 日志每条命令 `cmd+args+remote_addr+timestamp`；Admin Listener 和 Business Listener 日志 tag 不同（`conn_tag=admin:127.0.0.1:2345` vs `conn_tag=biz:10.0.0.5:56789`），配合日志系统（ELK / Loki）能精确区分 Admin 操作 vs 业务流量。即使团队多人共享 AUTH key，来源 IP 区分 Admin 端口来源还是业务端口 + loopback 能帮助定位（多人共用跳板机场景时再加 mTLS client cert DN 做强审计）。 | v1 历史只能看本地 UID 的 history，跨人协同 / 远程变更无法审计。 |
+| **拒绝降级攻击** | 默认 127.0.0.1 是写死在 `flag` default 里的。运维如果乱改成 `--admin-bind 0.0.0.0:6381` 且没上 mTLS，那是故意降级 — 但启动时 Server 可以加 WARNING banner：`⚠ ADMIN BIND ADDRESS 0.0.0.0:6381 IS NOT LOOPBACK! This exposes Schema management to network. Strongly recommend SSH tunnel or enable --admin-tls-*. Continue at your own risk.`（§9.3 新增一条）。 | v1 降级 = 用 root 删 lock 并发两个写者。两边都要靠 WARNING + 文档 fail-closed 防护故意降级（自动防护只能到一定程度）。 |
+
+### 9.3 剩余风险 & 缓解（Residual Risks & Mitigations, v2）
+
+| 风险 | 概率 | 影响 | MVP 缓解 | 后续版本加强 |
+|---|---|---|---|---|
+| **R1: Admin-port 被运维误绑定 0.0.0.0 + AUTH key 弱/泄露** | 中 | 极高（Schema 全改全删，甚至能写特殊 key 提权？Strict Gate 下应该不能，但业务 data 也能读写了） | 1. `flag` default 永远 127.0.0.1；<br>2. 启动时 server 打印 WARNING（见 9.2 拒绝降级节）；<br>3. 文档顶部大字号：不要把 admin-port 直接暴露公网；<br>4. MVP 权限模型没上，先靠文档 + 警告。 | 下一个 patch 强制 admin-port ≠ 127.0.0.1 时必须同时提供 --admin-tls-cert/key（fail-closed，没 tls flag 就不启动），外加 §3.2 AdminCmdGate 限制非 loopback 来源的 admin 命令。 |
+| **R2: AUTH key 共享（多人共用一个 -a key）+ 跳板机 IP 混在一起无法追责** | 高（团队常见配置） | 中（审计不了是谁改了 Schema） | MVP：历史文件 per-user 本地；Server redcon 日志记录 remote_addr（跳板机 IP 多人共享时粒度不够，但至少有时间戳 + 命令文本）。 | mTLS 强制后，每个 SRE 独立用户 client cert（CN=sre-name@corp.com DN）；Server 日志记录 cert.Subject.CommonName，100% 可追责。 |
+| **R3: RESP 反序列化 / go-redis client 漏洞（长包 / 畸形 bulk string 导致 Admin Shell OOM）** | 低（go-redis 社区成熟，生产用的多） | 高（CLI 崩溃 = 运维无法 admin） | 1. Admin Shell `redis.Options.ReadTimeout = 0`（REPL 无限时）但 `MaxRetries = 3`；`PoolSize = 5` 连接数限制。<br>2. Server 端 redcon 有 max string size 限制（默认 512MB 或 flag 配置），超长包主动断连接 — 防止畸形大 JSON 直接打爆。 | 后续 Admin Shell 端对响应包体做 sanity check：lsdoc 响应超过 N MB（如 64MB）就 warning：result too large，分页 / 缩小范围，不直接把整个包塞进内存做 JSON Parse（流式解析）。 |
+| **R4: Shell 缓存（cachedDocNs / cachedIdxLogical）和 Server Registry 不一致（stale）导致 TAB 提供错误候选 & 用户操作失败** | 中 | 低（仅 UX 困扰，数据安全无影响，操作时 Server 端最终拦截校验） | §3.3 规定变更命令成功后**必清缓存**。另外，用户执行 !LISTDOCS / !LISTINDEXES 后无条件 Refresh 缓存。最后，严格校验「用户输入的 ns 不在缓存里，但 server 说存在」这种冲突时，Refresh 缓存再试一次；最多 retry 1 次避免死循环。 | 下一版做 Server Push Notify（PubSub 系统已有 `_auth_:*` 之类 meta；再加 `_sys_registry_changed` channel，Server 端每次 Doc/Index 更新 publish；Shell 订阅后自动 Refresh 缓存 —— 更实时。） |
+| **R5: Strict Gate 仅在 RESP Dispatcher 实现，但有人偷偷给 server 加了新 HTTP API 直接调用 db.SetDocs() 绕过** | 中（开发者最常见的 SSoT 破坏形式：为了「快」加旁路 HTTP 路由） | 极高（HTTP API 没走 Strict Gate → No Table=No Op 被洞穿，Schema 约束成摆设） | **团队工程规则 + CI 检查**：<br>· 所有对 `db.SetDocs / db.RegisterDoc` 等 Doc/Index 写方法的调用，**只能出现在 `server/cmd.go` 的 RESP command handler 函数体内部**。<br>· 用 Go AST linter（或 go vet + custom analyzer）写一条 50 行的检查：`db.SetDocs` 的 CallExpr 的 lexical 父函数必须在 `cmd.go` 里。任何新文件（如 `server/http_admin_api.go`）里调用直接 CI fail。 | 未来 Web Admin UI 的 HTTP API **必须内部构建 RESP args byte array 然后 redcon 内存 loopback（或 in-process dispatch 到 handleCommand()）** — 绝不允许直接 call db.*。lint 保证 + code review checklist。 |
+
+### 9.4 Reference Deployment: Redisx + Caddy mTLS + ACL (用户 vision 落地 —— Redisx Server 本身只绑回环，mTLS/IP白名单全下沉给 Caddy)
+
+**为什么推荐这个模式（vs Redisx 自己实现 listen+TLS+ACL）？** 把「密码学正确的 TLS 实现 / Client Cert 链验证 / 复杂 ACL（OU+CN+Serial+IP）/ 日志审计 / 未来扩多节点 LB」全部下沉给 Caddy，Redisx 代码里只保留两条职责：① 永不监听外网接口（L1 物理 fail-closed）；② 从信任的代理（Caddy）发来的 PROXY Protocol v2 里还原**真实源 IP + 真实 Client Cert DN**，用于 L4 二次防御 + 审计日志。**代码量最小，安全面最小，出密码学 bug 是 Caddy 社区的锅，不是你自研存储的锅。**
+
+#### 9.4.1 架构图（必须走 Caddy，Redisx Admin Port 永远不暴露公网/VPN 非回环）
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│ SRE / 运维笔记本                                                                  │
+│   Client Cert CN = kcmvp@corp.com OU=redisx-admins                                │
+│   redisx-admin CLI: --tls-cert --tls-key --cacert (mTLS) + --host admin.corp.com  │
+│                    --sni admin.corp.com --port 6381                                │
+└───────────────────┬───────────────────────────────────────────────────────────────┘
+                    │  WAN / private network :6381/tcp   mTLS handshake
+                    ▼
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│ Caddy v2.9 + layer4 plugin  (bind 0.0.0.0:6381, 唯一对外暴露的端点)                │
+│  L2 = tls client_auth require_and_verify + ca-cert pool. Cert 链不合法 → RST      │
+│  L2.5 = tls cert Subject OU != "redisx-admins" / CN not in whitelist → RST        │
+│  L3 = Caddy remote_ip matcher: real src IP not in 10.0.0.0/8 192.168.10.0/24 → RST│
+│  全通过 → 包装 PROXY Protocol v2 (含 source src addr + TLV AUTHORITY=Cert Subject) │
+│         → 转发到下游 127.0.0.1:6381 (Redisx Admin Listener 仅回环!)                │
+└───────────────────┬───────────────────────────────────────────────────────────────┘
+                    ▼
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│ Redisx Server (本机 UID=redisx 非 root)                                            │
+│  flags: --admin-bind 127.0.0.1:6381                                               │
+│         --admin-trust-proxy=true                                                  │
+│         --admin-proxy-trusted-ips=127.0.0.1/32,::1/128  (ONLY trust Caddy 本机)   │
+│         --admin-proxy-allow-subnets=10.0.0.0/8,192.168.10.0/24  (L4 fail-closed) │
+│         --admin-require-cert-ou=redisx-admins                                     │
+│         --admin-require-cert-cn=kcmvp@corp.com,sre1@corp.com,sre2@corp.com        │
+│                                                                                   │
+│  connCtx (per-admin-connection):                                                  │
+│   realRemoteAddr = PROXY v2 src (10.3.5.27:54321)  NOT 127.0.0.1:Caddy           │
+│   realCertSubject = CN=kcmvp@corp.com OU=redisx-admins                            │
+│   realCertFingerprint = sha256:XXXXXXX                                            │
+│                                                                                   │
+│  §3.2 adminCmdGate() — Future Patch 开启强校验（MVP return true，结构预留）         │
+│  允许 regdoc / REGISTER / DROP 的充要条件:                                   │
+│    (1) admin-trust-proxy=true && conn source IP ∈ trusted-ips (即 Caddy)          │
+│    (2) realRemoteAddr 解析成功（不是 0.0.0.0）                                     │
+│    (3) realRemoteAddr ∈ --admin-proxy-allow-subnets                               │
+│    (4) realCertOU == --admin-require-cert-ou                                      │
+│    (5) realCertCN ∈ --admin-require-cert-cn (若非空切片)                           │
+│    5 条全满足才放行 Admin 命令。任意一条失败 → ERR + 日志 + 立即 close(conn)       │
+│                                                                                   │
+│  slog audit log (每条 admin cmd 一行 JSON, 100% 可追责):                           │
+│    ts=..., level=INFO, module=admin_conn, conn_id=abc, cmd=regdoc,          │
+│    args=<masked>, real_remote=10.3.5.27:54321,                                    │
+│    real_cert_cn=kcmvp@corp.com, real_cert_ou=redisx-admins                        │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.4.2 新增 Server 启动参数（后续 patch，不在 MVP，但**结构在**，fail-closed 默认关）
+
+| Flag | 默认值 | 用途 + Fail-Closed 行为 |
+|---|---|---|
+| `--admin-bind` | `127.0.0.1:6381` | **强约束**：只能是 `127.0.0.1:port` / `[::1]:port` / `unix:/path.sock`。若配置为 `0.0.0.0:port` 且 `--admin-trust-proxy=false` → `FATAL` 启动失败（或至少大段 WARNING 加 `--admin-danger-bind-any` flag 才能启动）。 |
+| `--admin-trust-proxy` | `false` | 是否解析 PROXY Protocol v2 头。默认 `false` 表示不信任任何注入（本地 CLI 直连 127.0.0.1 的默认 plain 场景）。非 `true` 直接忽略所有 PROXY v2 字节。 |
+| `--admin-proxy-trusted-ips` | `["127.0.0.1/32", "::1/128"]` | **只有源 IP 在这些子网的连接，才允许 PROXY v2**。防止同机非 root 低权限进程伪造 PROXY v2 头冒充源 IP + Cert Subject（Critical RCE 面）。用户部署 Caddy 本机单实例 → 默认就够用；Caddy 在另一台机器（sidecar 跨机）→ 需手动加 sidecar IP。 |
+| `--admin-proxy-allow-subnets` | `[]` (空切片) | L4 二次校验：**真实源 IP（PROXY v2 注入后的）必须在这些子网里才能通过 Admin 命令 Gate**。空切片 = fail-closed，没人能当 Admin（和 `--admin-require-cert-ou` 空串同理，两个参数至少一个非空，或都填 AND 匹配）。 |
+| `--admin-require-cert-ou` | `""` | Client Cert 的 Subject OrganizationalUnit 必须精确等于此值（AND 校验，非 OR）。默认空 = 不校验，但部署 Caddy+mTLS 时**必填**。 |
+| `--admin-require-cert-cn` | `[]` | 空切片 = 不校验 CN；非空 = Cert CN 必须在白名单（适合只有 3~5 个 SRE 的小团队，比 OU 粒度更硬）。 |
+| `--admin-proxy-tlv-policy` | `"ignore"` (MVP) / `"prefer"` / `"require"` (future) | 控制从 PROXY v2 TLV(AUTHORITY) 拿 Cert Subject 的策略 —— require 模式下 TLV 缺失 = 直接 close。 |
+
+#### 9.4.3 新增 Admin Shell CLI 启动参数（mTLS 客户端侧）
+
+对齐：**只要 CLI 实现 mTLS client cert 加载就行，TLS termination + ACL 是 Caddy 的事**。CLI 只做 RESP over TLS：
+
+```
+redisx-admin ... (原有 -h -p -a 保留, 本地 plain 用)
+      ADDED for Caddy mTLS:
+      --tls-cert /path/to/client.pem       (mTLS required)
+      --tls-key  /path/to/client-key.pem   (mTLS required)
+      --ca-cert   /path/to/ca-bundle.pem   (mTLS required, verify Caddy server cert)
+      --sni admin.corp.com                 (SNI for Caddy virtual host match)
+      --insecure-skip-verify               (DANGEROUS, 仅内网 test stub —— 生产强制 --ca-cert)
+```
+
+#### 9.4.4 参考 Caddyfile （Redisx Admin 入口，TCP RESP over TLS）
+
+```caddyfile
+# Caddy v2.9+ (layer4 TCP plugin needed — RESP is not HTTP)
+{
+    admin off
+    log {
+        output stdout
+        format json
+    }
+    servers {
+        listener_wrappers {
+            proxy_protocol {
+                version 2
+                allow 127.0.0.1/32 ::1/128
+            }
+        }
+    }
+}
+
+layer4 {
+    # 对外暴露的唯一 Admin 端点. Redisx 自己监听 127.0.0.1:6381 不对外.
+    :6381 {
+        tls {
+            certificate_file /etc/caddy/admin.crt
+            key_file         /etc/caddy/admin.key
+            client_auth {
+                mode require_and_verify
+                trusted_ca_cert_file /etc/caddy/redisx-ca.pem
+            }
+        }
+
+        # L2.5 + L3 统一 ACL. 不匹配 → 直接 deny (RST/close)
+        acl {
+            allow {
+                remote_ip 10.0.0.0/8 192.168.10.0/24
+                tls_client_certificate_subject_ou "redisx-admins"
+                tls_client_certificate_subject_cn kcmvp@corp.com sre1@corp.com sre2@corp.com
+            }
+            deny
+        }
+
+        # 过了 L2/L3, 才转发给本机 Redisx.
+        proxy 127.0.0.1:6381 {
+            proxy_protocol v2  # 在发往 Redisx 的连接首部加上 PROXY v2 (source addr + AUTHORITY TLV)
+            # 同时 server side also declares accept v2 per --admin-trust-proxy
+        }
+    }
+}
+```
+
+#### 9.4.5 关键正确性检查点（漏掉 = 安全被绕，必须全满足）
+
+| # | 检查点 | 为什么关键 |
+|---|---|---|
+| 1 | **Redisx admin-bind 永远是回环**。用户配置 `0.0.0.0` + 没开 `--admin-trust-proxy` → **启动直接 FATAL**（至少 WARNING + `--admin-danger-bind-any` 强制显式同意）。 | 否则「下沉给 Caddy 做 TLS/ACL」等于空谈：运维漏启动 Caddy 直接暴露 Redisx plaintext admin-port，SLA 0%。 |
+| 2 | **PROXY v2 trusted-ips 匹配「当前连接的真实 remote_addr」**（没解析 PROXY 前的那个，通常是 Caddy 127.0.0.1）。不匹配 → 不解析 PROXY v2，甚至直接关闭。 | 防止同机低权限进程伪造 PROXY v2 头冒充源 IP=10.0.0.1、Cert OU=redisx-admins，然后绕 L4 拿到 Admin 权限。 |
+| 3 | **`allow-subnets` + `require-cert-ou` 至少填一个**，且两个参数都是 AND 校验（同时满足才通过 gate）。 | 防止部署时所有 flag 留空，adminCmdGate return true = 等于没开 Gate。Fail-closed 默认 0 个用户能 Admin，配置了才放行。 |
+| 4 | **日志里的 Admin 源 IP 和 Cert Subject 用 PROXY v2 还原出来的 real_remote / real_cert，不是 conn.RemoteAddr()。** | 否则审计日志里所有人都是 127.0.0.1:Caddy，跳板机多人共用完全无法追责。 |
+| 5 | **CLI 的 mTLS 逻辑 + Caddy 的 TLS 逻辑 + Redisx 的 PROXY v2 逻辑，三方全走标准库 / 成熟库**：CLI `crypto/tls.Config{Certificates, RootCAs, ServerName}`，Caddy 官方 layer4，Redisx `go.guoyk.dev/proxyprotocol`（社区成熟实现，别自己手搓 PROXY v2）。 | 自研 TCP TLS 或 PROXY 协议解析极易出现 parser 漏洞（长度字段/对齐/TLV），给 RCE 面。 |
+
+---
+
+## 10. Open Items (Reviewer Sign-off) — Updated 2026-08-22 16:00
+
+### ✅ 已拍板决策（不再讨论）
+
+| Decision | 选项 | 用户拍板 | 对应位置 |
+|---|---|---|---|
+| **D2: 双 AUTH key 分离（你说的「2，不同」）** | Admin port 独立 `--admin-auth`，和业务 `--auth` 必须不同；相同启动 FATAL | ✅ 已确认：不同 | §3.2 Gate 0 + §6.2 Flags + §8.2 U11 验证 |
+| **端口角色模型**（你的 1/2/3 条） | 1. Admin-port IP+Port 可配（default 严格回环 127.0.0.1:6381）<br>2. Admin-port 能监听所有命令（Admin-only + Shared 业务）<br>3. App-port 只能响应 Shared 业务命令（Gate 1 allowlist 实现） | ✅ 已确认，已写入 FR §3.1 架构图 + §3.2 4 层 Gate | §3.1 注解 3/4 + §3.2 portRoleGate() + §8.2 U11 |
+| **D3 + O3: 默认绑定策略（最新决策）** | **App-port 没指定 = 选 top-ranked 私网网卡 IP**（RFC1918，单网卡 rank 选一张，找不到 fallback 127.0.0.1 WARNING）<br>**Admin-port 没指定 = 永远 127.0.0.1（只本机）**，不享受「自动选私网」；跨机 Admin 必须走 Caddy+mTLS | ✅ 已确认（用户今日消息） | §6.2 顶部 Step 1-4 + Flag 表默认值栏 + 下方 Why Admin 不自动选私网一节 |
+| **App-port 私网选择实现细节**（辅助决策） | 枚举全部私网匹配对 → **只选 rank 最高的一张网卡**（非多网卡同时监听），rank = eth0/en0 > 有 default route > 其他 | ✅ 已确认（辅助问卷结果） | §6.2 Step 3 rank 规则 + 新增 --private-cidrs flag |
+| **O1: readline 库选型** | ergochat/readline（chzyer 社区维护 fork，零 CGO，社区活跃） | ✅ 已确认（与 O2 同时确认） | §6.3 TAB 补全实现；D1 阶段 go.mod 新增仅一个外部依赖 `github.com/ergochat/readline` |
+| **O2: Binary 名** | **`rdxm`（4 字符短缩写，团队约定 = redisx Admin 运维入口）**<br>Server 主 binary 仍叫 `redisx-server`，两者同目录 `ls /usr/local/bin` 时 `redisx-server` 和 `rdxm` 分属 server/client admin 两端。命名独特性强（不和业界知名 CLI 撞名）。 | ✅ 已确认（用户提案：「rdxm 如何？」→ OK，采纳） | §6.1 启动参数 `rdxm [OPTIONS]`；§8.2 U1~U13 所有 Shell 启动示例替换为 `rdxm`；实现目录 `cmd/rdxm/main.go`；构建命令 `go build -o rdxm ./cmd/rdxm` |
+
+### ⚪ Open Items 全部关闭 ✅（无待决策项）
+
+所有设计决策已锁定。**下一节开始按依赖顺序进入代码实现阶段（D4 → D5 → D2 → D3 → D1 → U1-U13 E2E + Regress）。**

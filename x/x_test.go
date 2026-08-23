@@ -2,12 +2,9 @@ package x
 
 import (
 	"encoding/json"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,22 +23,6 @@ func (sameUserDoc) Mem() bool          { return false }
 func (sameUserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u sameUserDoc) RawJSON() string  { return string(u) }
 func (sameUserDoc) TTL() time.Duration { return time.Hour }
-
-type conflictUserDoc string
-
-func (conflictUserDoc) Namespace() string  { return "user" }
-func (conflictUserDoc) Mem() bool          { return false }
-func (conflictUserDoc) KeyAttrs() []string { return []string{"tenant", "id"} }
-func (u conflictUserDoc) RawJSON() string  { return string(u) }
-func (conflictUserDoc) TTL() time.Duration { return time.Hour }
-
-type conflictTTLUserDoc string
-
-func (conflictTTLUserDoc) Namespace() string  { return "user" }
-func (conflictTTLUserDoc) Mem() bool          { return false }
-func (conflictTTLUserDoc) KeyAttrs() []string { return []string{"id"} }
-func (u conflictTTLUserDoc) RawJSON() string  { return string(u) }
-func (conflictTTLUserDoc) TTL() time.Duration { return 2 * time.Hour }
 
 type memUserDoc string
 
@@ -93,7 +74,7 @@ func (invalidPrefixDoc) TTL() time.Duration { return time.Hour }
 
 type bareMemPrefixDoc string
 
-func (bareMemPrefixDoc) Namespace() string  { return contract.MemKeyPrefix }
+func (bareMemPrefixDoc) Namespace() string  { return MemNsPrefix }
 func (bareMemPrefixDoc) Mem() bool          { return false }
 func (bareMemPrefixDoc) KeyAttrs() []string { return []string{"id"} }
 func (u bareMemPrefixDoc) RawJSON() string  { return string(u) }
@@ -130,11 +111,6 @@ func (boolKeyDoc) Mem() bool          { return false }
 func (boolKeyDoc) KeyAttrs() []string { return []string{"enabled"} }
 func (u boolKeyDoc) RawJSON() string  { return string(u) }
 func (boolKeyDoc) TTL() time.Duration { return time.Hour }
-
-func resetDocumentRegistry() {
-	documentRegistry = sync.Map{}
-	documentTypeRegistry = sync.Map{}
-}
 
 func TestComparators(t *testing.T) {
 	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "roles": ["admin", "user"], "score": 95.5}`
@@ -281,24 +257,6 @@ func TestStorageKeyValue(t *testing.T) {
 			},
 		},
 		{
-			name: "rejects conflicting document schema",
-			run: func(t *testing.T) {
-				require.Equal(t, "user:201", StorageKeyValue[userDoc]("201"))
-				require.Panics(t, func() {
-					StorageKeyValue[conflictUserDoc]("202")
-				})
-			},
-		},
-		{
-			name: "rejects conflicting ttl",
-			run: func(t *testing.T) {
-				require.Equal(t, "user:201", StorageKeyValue[userDoc]("201"))
-				require.Panics(t, func() {
-					StorageKeyValue[conflictTTLUserDoc]("202")
-				})
-			},
-		},
-		{
 			name: "allows mem prefix",
 			run: func(t *testing.T) {
 				require.Equal(t, "_m_user:201", StorageKeyValue[memUserDoc]("201"))
@@ -364,7 +322,6 @@ func TestStorageKeyValue(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resetDocumentRegistry()
 			tt.run(t)
 		})
 	}
@@ -385,45 +342,6 @@ func TestMemKey(t *testing.T) {
 			require.Equal(t, tt.want, MemKey(tt.key))
 		})
 	}
-}
-
-type countedDoc string
-
-var countedDocCalls atomic.Int32
-
-func (countedDoc) Namespace() string {
-	countedDocCalls.Add(1)
-	return "counted"
-}
-
-func (countedDoc) Mem() bool {
-	countedDocCalls.Add(1)
-	return false
-}
-
-func (countedDoc) KeyAttrs() []string {
-	countedDocCalls.Add(1)
-	return []string{"id"}
-}
-
-func (countedDoc) RawJSON() string {
-	return `{"id":"1"}`
-}
-
-func (countedDoc) TTL() time.Duration {
-	countedDocCalls.Add(1)
-	return time.Hour
-}
-
-func TestDocumentTypeMetadataCache(t *testing.T) {
-	resetDocumentRegistry()
-	countedDocCalls.Store(0)
-
-	require.Equal(t, "counted:1", StorageKeyValue[countedDoc]("1"))
-	require.Equal(t, int32(5), countedDocCalls.Load())
-
-	require.Equal(t, "counted:2", StorageKeyValue[countedDoc]("2"))
-	require.Equal(t, int32(5), countedDocCalls.Load())
 }
 
 func TestStorageKey(t *testing.T) {
@@ -486,7 +404,6 @@ func TestStorageKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resetDocumentRegistry()
 			got, err := tt.run()
 			if tt.wantErr != "" {
 				require.EqualError(t, err, tt.wantErr)
@@ -545,20 +462,10 @@ func TestIdx(t *testing.T) {
 				})
 			},
 		},
-		{
-			name: "rejects conflicting document schema during registration",
-			run: func(t *testing.T) {
-				_ = Idx[userDoc]("by_age", "*", "age")
-				require.Panics(t, func() {
-					Idx[conflictUserDoc]("by_age", "*", "age")
-				})
-			},
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			resetDocumentRegistry()
 			tt.run(t)
 		})
 	}

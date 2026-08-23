@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
@@ -37,6 +37,31 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		return
 	}
 
+	appAuth, adminAuth, configured := getAuthConfig()
+	if configured && providedKey != internalAuthKey {
+		role := connPortRole(conn)
+		switch role {
+		case portRoleApp:
+			if adminAuth != "" && providedKey == adminAuth {
+				msg := "WRONGPASS invalid password for app port. AUTH with the --auth key, not the --admin-auth key, then retry."
+				conn.WriteError(msg)
+				slog.Warn("auth rejected: app-port used admin-auth key",
+					"remote", conn.RemoteAddr())
+				_ = conn.Close()
+				return
+			}
+		case portRoleAdmin:
+			if appAuth != "" && providedKey == appAuth {
+				msg := "WRONGPASS invalid password for admin port. AUTH with the --admin-auth key, not the --auth key, then retry."
+				conn.WriteError(msg)
+				slog.Warn("auth rejected: admin-port used app-auth key",
+					"remote", conn.RemoteAddr())
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+
 	if err := acquireAuthConn(db, providedKey); err == nil {
 		conn.SetContext(providedKey)
 		conn.WriteString("OK")
@@ -60,15 +85,97 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 }
 
 func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	conn.WriteAny(map[string]any{
-		"server":  "redisx",
-		"version": "1.0.0",
-		"proto":   2,
-		"id":      1,
-		"mode":    "standalone",
-		"role":    "master",
-		"modules": []any{},
-	})
+	const serverVersion = "1.0.0"
+	role := connPortRole(conn)
+	adminRole := role == portRoleAdmin || role == portRoleUnknown
+	storageMode := "hybrid"
+	statsNamespaces := 0
+	statsIndexes := 0
+	if db != nil {
+		db.docRegMu.Lock()
+		statsNamespaces = len(db.docRegSpec)
+		db.docRegMu.Unlock()
+		db.idxRegMu.Lock()
+		statsIndexes = len(db.idxRegSpec)
+		db.idxRegMu.Unlock()
+	}
+	basicGroup := []any{
+		map[string]any{"name": "ping", "usage": "PING — round-trip latency check"},
+		map[string]any{"name": "raw", "usage": "raw <cmd> [args...]  — forward raw RESP and print the reply"},
+		map[string]any{"name": "!banner", "aliases": []any{"banner"}, "usage": "banner — print redisx banner"},
+		map[string]any{"name": "!version", "aliases": []any{"version"}, "usage": "version — print redisx server version"},
+		map[string]any{"name": "!clear", "aliases": []any{"clear", "cls"}, "usage": "clear — clear terminal screen"},
+		map[string]any{"name": "!help", "aliases": []any{"help", "commands", "?"}, "usage": "commands [cmd]  — list all commands (optionally one command detail)"},
+		map[string]any{"name": "quit", "aliases": []any{"exit"}, "usage": "quit — exit shell (Ctrl-C also works)"},
+	}
+	sharedKv := []any{
+		map[string]any{"name": "set", "usage": usageOrProto("SET", "SET key val [EX s|PX ms] [NX]")},
+		map[string]any{"name": "setex", "usage": usageOrProto("SETEX", "SETEX key ttl val")},
+		map[string]any{"name": "setnx", "usage": usageOrProto("SETNX", "SETNX key val")},
+		map[string]any{"name": "get", "usage": usageOrProto("GET", "GET key")},
+		map[string]any{"name": "del", "usage": usageOrProto("DEL", "DEL key [key...]")},
+		map[string]any{"name": "exists", "usage": usageOrProto("EXISTS", "EXISTS key")},
+		map[string]any{"name": "keys", "usage": usageOrProto("KEYS", "KEYS pattern")},
+	}
+	extended := []any{
+		map[string]any{"name": "update", "usage": usageOrProto("UPDATE", "UPDATE key <json_patch>  — merge-UPDATE a JSON value (typed doc enabled: writes validated)")},
+		map[string]any{"name": "searchkey", "usage": usageOrProto("SEARCHKEY", "SEARCHKEY <predicate_json>  — typed doc+index search: filter → pick key")},
+		map[string]any{"name": "searchindex", "usage": usageOrProto("SEARCHINDEX", "SEARCHINDEX <ns> <idx_name> <query>  — query a named typed index")},
+	}
+	meta := make([]any, 0, len(proto.Registry))
+	{
+		order := []string{
+			proto.CmdRegisterDoc, proto.CmdListDocs, proto.CmdDescribeDoc,
+			proto.CmdRegisterIndex, proto.CmdListIndexes, proto.CmdDropIndex,
+		}
+		for _, name := range order {
+			spec, ok := proto.Registry[strings.ToLower(name)]
+			if ok {
+				meta = append(meta, map[string]any{
+					"name":     strings.ToLower(spec.CmdWord),
+					"role":     "admin_only",
+					"min_args": spec.Argc.MinArgs,
+					"max_args": spec.Argc.MaxArgs,
+					"usage":    spec.Usage,
+				})
+			}
+		}
+	}
+	out := map[string]any{
+		"server":     "redisx",
+		"version":    serverVersion,
+		"proto":      2,
+		"id":         1,
+		"mode":       "standalone",
+		"role":       "master",
+		"admin_role": adminRole,
+		"dual_port":  true,
+		"features": map[string]any{
+			"typed_docs":    true,
+			"typed_indexes": true,
+			"live_rebuild":  false,
+			"write_hooks":   false,
+			"search_index":  true,
+			"pubsub":        true,
+		},
+		"stats": map[string]any{
+			"namespaces": statsNamespaces,
+			"indexes":    statsIndexes,
+		},
+		"storage": map[string]any{
+			"mode": storageMode,
+		},
+		"commands": map[string]any{
+			"group_order": []any{"Basic", "Extended", "Meta Management"},
+			"groups": map[string]any{
+				"Basic":           append(basicGroup, sharedKv...),
+				"Extended":        extended,
+				"Meta Management": meta,
+			},
+			"meta_admin_only": true,
+		},
+	}
+	conn.WriteAny(out)
 }
 
 func clientCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
@@ -82,6 +189,14 @@ func pingCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 func quitCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	conn.WriteString("OK")
 	_ = conn.Close()
+}
+
+func usageOrProto(cmdWord, fallback string) string {
+	spec, ok := proto.Registry[strings.ToLower(cmdWord)]
+	if ok && spec.Usage != "" {
+		return spec.Usage
+	}
+	return fallback
 }
 
 func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
@@ -215,7 +330,7 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemKeyPrefix) {
+	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, x.MemNsPrefix) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
@@ -645,4 +760,30 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 			conn.WriteBulkString(val)
 		}
 	}
+}
+
+const adminSkeletonFmt = "ERR %s is not implemented yet — schema registry (D5) and admin command wiring still pending"
+
+func regDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regdoc"))
+}
+
+func lsDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsdoc"))
+}
+
+func desDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "desdoc"))
+}
+
+func lsIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "lsidx"))
+}
+
+func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "regidx"))
+}
+
+func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteError(fmt.Sprintf(adminSkeletonFmt, "delidx"))
 }

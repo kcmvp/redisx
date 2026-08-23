@@ -31,4 +31,7 @@ go.work.sum
 *.txt
 *.db
 fr/*.md
+redisx
+.trae
+demo
 

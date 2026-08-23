@@ -3,13 +3,9 @@ package x
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
-	"slices"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/kcmvp/redisx/x/contract"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 )
@@ -237,29 +233,21 @@ func Set[T ScalarType](path string, value T) Mutation {
 
 // SECTION: Document And Index
 
-// Document declares the metadata contract for one JSON document type.
+// Schema declares the runtime-passable metadata contract for one JSON document
+// type. A zero-value of your string-alias type (e.g. UserDoc("")) fully
+// implements Schema — the receiver is never read, only used for interface
+// dispatch.
 //
-// It defines:
-//   - the storage key prefix
-//   - the storage layer
-//   - which JSON attributes form the key suffix
-//   - the raw JSON used to derive one concrete key
-//   - the default TTL used by typed writes
+// Schema is intentionally free of type elements (no ~string) so it can be used
+// as a value type: variadic params, slices, fields all work.
 //
 // Example:
 //
-//	type UserDoc string
-//
-//	func (UserDoc) Namespace() string  { return "user" }
-//	func (UserDoc) Mem() bool          { return false }
-//	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
-//	func (u UserDoc) RawJSON() string  { return string(u) }
-//	func (UserDoc) TTL() time.Duration { return time.Hour }
-//
-// Documents are JSON string aliases. The `~string` constraint guarantees typed
-// helpers can cast loaded raw JSON payloads back to the concrete document type.
-type Document interface {
-	~string
+//	server.Start("redisx.yaml",
+//	    UserDoc(""),
+//	    OrderDoc(""),
+//	)
+type Schema interface {
 	// Namespace returns the key prefix of this document type, such as "user".
 	//
 	// Final keys are stored as:
@@ -271,101 +259,46 @@ type Document interface {
 	// Mem reports whether this document type lives in the memory-only layer.
 	//
 	// When true, the final key is automatically prefixed with "_m_" before
-	// [Document.Namespace], so:
+	// [Schema.Namespace], so:
 	//
 	//	user:1   -> _m_user:1
 	Mem() bool
-	// KeyAttrs returns the ordered JSON paths used to derive the key suffix from
-	// [Document.RawJSON], such as []string{"tenant", "id"}.
+	// KeyAttrs returns the ordered JSON paths used to derive the key suffix,
+	// such as []string{"tenant", "id"}.
 	//
 	// Their resolved values are joined with ":" in order.
 	KeyAttrs() []string
-	// RawJSON returns the raw JSON payload of this document value.
-	//
-	// [StorageKey] reads it together with [Document.KeyAttrs] to build one full
-	// storage key for the current document instance.
-	RawJSON() string
 	// TTL returns the default TTL used by typed write helpers.
 	//
 	// It does not participate in key derivation.
 	TTL() time.Duration
 }
 
-type documentMeta struct {
-	typeName         string
-	storageNamespace string
-	keyAttrs         []string
-	ttl              time.Duration
-}
-
-var (
-	documentRegistry     sync.Map
-	documentTypeRegistry sync.Map
-)
-
-func validateDocumentNamespace(namespace string) {
-	if namespace == "" {
-		panic("document namespace is required")
-	}
-	if strings.ContainsAny(namespace, contract.StorageKeySeparator+"*?_") {
-		panic("document namespace must not contain reserved characters")
-	}
-}
-
-func storageNamespace[D Document](d D) string {
-	if d.Mem() {
-		return MemKey(d.Namespace())
-	}
-	return d.Namespace()
-}
-
-func documentMetaFor[D Document]() documentMeta {
-	typeKey := reflect.TypeFor[D]()
-	if cached, ok := documentTypeRegistry.Load(typeKey); ok {
-		return cached.(documentMeta)
-	}
-
-	var d D
-
-	meta := documentMeta{
-		typeName:         typeKey.String(),
-		storageNamespace: storageNamespace(d),
-		keyAttrs:         append([]string(nil), d.KeyAttrs()...),
-		ttl:              d.TTL(),
-	}
-
-	validateDocumentNamespace(d.Namespace())
-	for _, path := range meta.keyAttrs {
-		if path == "" {
-			panic("document key attr path is empty")
-		}
-	}
-
-	cached, _ := documentTypeRegistry.LoadOrStore(typeKey, meta)
-	return cached.(documentMeta)
-}
-
-func requireRegistered[D Document]() documentMeta {
-	meta := documentMetaFor[D]()
-
-	existing, loaded := documentRegistry.LoadOrStore(meta.storageNamespace, meta)
-	if !loaded {
-		return meta
-	}
-
-	registered := existing.(documentMeta)
-	if registered.storageNamespace == meta.storageNamespace &&
-		slices.Equal(registered.keyAttrs, meta.keyAttrs) &&
-		registered.ttl == meta.ttl {
-		return meta
-	}
-
-	panic(fmt.Sprintf(
-		"document namespace %q already registered by %s, incompatible with %s",
-		meta.storageNamespace,
-		registered.typeName,
-		meta.typeName,
-	))
+// Document declares the full generic-constraint contract for one JSON document
+// type. It extends Schema with ~string (so typed helpers can cast loaded raw
+// JSON payloads back to the concrete alias type) and RawJSON (needed to build
+// storage keys from a populated payload instance).
+//
+// A string-alias type that implements Document automatically satisfies Schema
+// as well — there is zero extra code to write when defining a new document.
+//
+// Example:
+//
+//	type UserDoc string
+//
+//	func (UserDoc) Namespace() string  { return "user" }
+//	func (UserDoc) Mem() bool          { return false }
+//	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
+//	func (u UserDoc) RawJSON() string  { return string(u) }
+//	func (UserDoc) TTL() time.Duration { return time.Hour }
+type Document interface {
+	~string
+	Schema
+	// RawJSON returns the raw JSON payload of this document value.
+	//
+	// [StorageKey] reads it together with [Schema.KeyAttrs] to build one full
+	// storage key for the current document instance.
+	RawJSON() string
 }
 
 // StorageKey resolves one full storage key directly from the document.
@@ -394,7 +327,7 @@ func StorageKey[D Document](d D) (string, error) {
 		parts = append(parts, keyAttrValue(result))
 	}
 
-	return StorageKeyValue[D](strings.Join(parts, contract.StorageKeySeparator)), nil
+	return StorageKeyValue[D](strings.Join(parts, StorageKeySeparator)), nil
 }
 
 // keyAttrValue normalizes one extracted key attr into its storage-key form.
@@ -411,14 +344,34 @@ func keyAttrValue(result gjson.Result) string {
 	return result.String()
 }
 
+func validateStorageNs[D Document]() string {
+	var d D
+	ns := d.Namespace()
+	if ns == "" {
+		panic("document namespace is required")
+	}
+	if strings.ContainsAny(ns, StorageKeySeparator+"*?_") {
+		panic("document namespace must not contain reserved characters")
+	}
+	for _, p := range d.KeyAttrs() {
+		if p == "" {
+			panic("document key attr path is empty")
+		}
+	}
+	if d.Mem() {
+		return MemNsPrefix + ns
+	}
+	return ns
+}
+
 // StorageKeyValue joins a resolved key value with the document namespace
 // derived from the document metadata type.
 func StorageKeyValue[D Document](v string) string {
-	meta := requireRegistered[D]()
+	storageNs := validateStorageNs[D]()
 	if v == "" {
-		return meta.storageNamespace
+		return storageNs
 	}
-	return meta.storageNamespace + contract.StorageKeySeparator + v
+	return storageNs + StorageKeySeparator + v
 }
 
 // MemKey returns a key routed to the memory-only storage layer.
@@ -426,10 +379,10 @@ func StorageKeyValue[D Document](v string) string {
 // The returned key uses the reserved "_m_" prefix. If key already uses that
 // prefix, it is returned unchanged.
 func MemKey(key string) string {
-	if strings.HasPrefix(key, contract.MemKeyPrefix) {
+	if strings.HasPrefix(key, MemNsPrefix) {
 		return key
 	}
-	return contract.MemKeyPrefix + key
+	return MemNsPrefix + key
 }
 
 // Index describes one registered JSON index definition.
@@ -497,9 +450,9 @@ func IdxFullName[D Document](idxName string) string {
 		panic("index name is required")
 	}
 	fullName := strings.ToLower(idxName)
-	meta := requireRegistered[D]()
-	if meta.storageNamespace != "" {
-		fullName = strings.ToLower(meta.storageNamespace) + "_" + fullName
+	storageNs := validateStorageNs[D]()
+	if storageNs != "" {
+		fullName = strings.ToLower(storageNs) + "_" + fullName
 	}
 	return fullName
 }
@@ -516,7 +469,7 @@ func Idx[D Document](idxName string, keyPattern string, jsonPath string) Index {
 	if keyPattern == "" {
 		panic("index key pattern is required")
 	}
-	if strings.HasPrefix(keyPattern, contract.StorageKeySeparator) {
+	if strings.HasPrefix(keyPattern, StorageKeySeparator) {
 		panic("index key pattern must not start with separator")
 	}
 	if jsonPath == "" {

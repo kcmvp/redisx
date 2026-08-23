@@ -3,6 +3,7 @@ package doc
 import (
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestDocSuite(t *testing.T) {
 	suite.Run(t, new(DocTestSuite))
 }
 
-const docTestServerAddr = "127.0.0.1:36382"
+var docServerSeedOnce sync.Once
 
 type UserDoc string
 
@@ -50,21 +51,28 @@ func (s *DocTestSuite) SetupSuite() {
 	idxProbeBucket := x.RawIndex(probeStripped+"_bucket", probeKP, "bucket")
 	idxProbeSparse := x.RawIndex(probeStripped+"_sparse_amt", probeKP, "sparse_amt")
 
-	db := server.Start(
-		docTestServerAddr,
-		dbPath,
-		x.Idx[UserDoc]("age", "*", "age"),
-		idxProbeScore,
-		idxProbeBucket,
-		idxProbeSparse,
-	)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
+	cfg := &server.Config{
+		DataPath: dbPath,
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+	}
+	adminAddr := cfg.Admin.Addr()
+	db := server.StartWithConfig(cfg)
 	s.Require().NotNil(db)
 
-	for _, kv := range testutil.LoadXFor(s.T(), searchKRDocNamespace, testutil.KeyRangeFixtureMem()) {
-		s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-doc fixture failed for %s", kv.K)
-	}
+	docServerSeedOnce.Do(func() {
+		s.Require().NoError(db.CreateIndex(x.Idx[UserDoc]("age", "*", "age")))
+		s.Require().NoError(db.CreateIndex(idxProbeScore))
+		s.Require().NoError(db.CreateIndex(idxProbeBucket))
+		s.Require().NoError(db.CreateIndex(idxProbeSparse))
 
-	err := client.ConnectEmbed(docTestServerAddr)
+		for _, kv := range testutil.LoadXFor(s.T(), searchKRDocNamespace, testutil.KeyRangeFixtureMem()) {
+			s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-doc fixture failed for %s", kv.K)
+		}
+	})
+
+	err := client.ConnectEmbed(adminAddr)
 	s.Require().NoError(err)
 
 	for range 30 {
