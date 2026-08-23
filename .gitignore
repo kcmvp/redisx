@@ -37,6 +37,12 @@ go.work.sum
 .env
 .idea/
 .trae/
+*.html
+*.patch
+*.txt
+*.db
+fr/*.md
+.trae
 
 # Local SQLite / storage artifacts (never commit the embedded DB)
 *.db
@@ -47,4 +53,3 @@ go.work.sum
 # Local-only docs / patches (project-specific broad patterns go below)
 *.patch
 *.html
-fr/*.md
