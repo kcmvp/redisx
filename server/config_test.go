@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-const sampleRelative = "../cmd/rdxm/internal/demo/redisx.yaml"
+const sampleRelative = "../cmd/redisx/internal/demo/redisx.yaml"
 
 func TestLoadSampleYaml(t *testing.T) {
 	homeDir := t.TempDir()
