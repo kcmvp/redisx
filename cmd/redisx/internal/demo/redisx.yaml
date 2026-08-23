@@ -1,0 +1,15 @@
+# redisx sample / demo configuration
+# This file is intentionally minimal: all fields shown represent their defaults.
+# Omitting data_path causes the server to use ~/.redisx/redisx.db.
+
+app:
+  port: 7379
+  # bind defaults to the first private IP detected (or 127.0.0.1 as fallback)
+  # auth is intentionally empty for the demo
+
+admin:
+  bind: "127.0.0.1"
+  port: 7381
+  # auth is intentionally empty for the demo
+
+# data_path intentionally omitted → falls back to $HOME/.redisx/redisx.db
