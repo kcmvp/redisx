@@ -112,7 +112,7 @@ func genericHello() []byte {
 	return []byte(sb.String())
 }
 
-func writeArrH(sb *strings.Builder, n int) { sb.WriteString(fmt.Sprintf("*%d\r\n", n)) }
+func writeArrH(sb *strings.Builder, n int) { _, _ = fmt.Fprintf(sb, "*%d\r\n", n) }
 
 func redisxHelloResp2() []byte {
 	var sb strings.Builder

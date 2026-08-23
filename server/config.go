@@ -182,17 +182,17 @@ func (c *Config) validate() error {
 		isLoopback := parsed != nil && parsed.IsLoopback()
 		if !isLoopback && !c.Admin.TrustProxy && !c.Admin.DangerBindAny {
 			return fmt.Errorf(
-				"STARTUP FATAL: admin.bind=%q (resolved) is not loopback. Refusing. "+
-					"Either bind admin to 127.0.0.1 (recommended; expose via Caddy+mTLS reverse-proxy), "+
+				"STARTUP FATAL: admin.bind=%q (resolved) is not loopback; refusing. "+
+					"Bind admin to 127.0.0.1 (recommended; expose via Caddy+mTLS reverse-proxy), "+
 					"or set admin.trust_proxy (running behind trusted L7 PROXY v2 + mTLS verifier), "+
-					"or set admin.danger_bind_any (ACKNOWLEDGED unsafe; isolated air-gapped nets only).",
+					"or set admin.danger_bind_any (ACKNOWLEDGED unsafe, for isolated air-gapped nets only)",
 				adminBind,
 			)
 		}
 	}
 	if c.App.Auth != "" && c.Admin.Auth != "" && c.App.Auth == c.Admin.Auth {
 		return errors.New(
-			"STARTUP FATAL: AppAuth equals AdminAuth; dual-port model requires distinct passwords. Refusing.",
+			"STARTUP FATAL: AppAuth equals AdminAuth; dual-port model requires distinct passwords; refusing",
 		)
 	}
 

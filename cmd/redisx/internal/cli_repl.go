@@ -168,10 +168,7 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 	}
 	role := "generic-redis"
 	mode := "generic-redis mode (raw RESP only)"
-	h, p := "127.0.0.1", "7381"
-	if data != nil {
-		h, p = data.HostPort()
-	}
+	h, p := data.HostPort()
 	if isRedisx {
 		if caps.AdminRole {
 			role = "admin"
