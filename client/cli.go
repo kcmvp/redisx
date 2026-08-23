@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
@@ -1044,6 +1046,21 @@ func healthCheck(ctx context.Context, client *redis.Client) error {
 	return client.Ping(ctxPing).Err()
 }
 
+func hostPortFromAddr(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid resp address %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid resp port %q: %w", portStr, err)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return host, port, nil
+}
+
 // connect attempts to create and verify a single Resp client connection.
 // Returns the connected client on success, or nil + error on failure.
 // Caller must handle cleanup (Close) if an error is returned.
@@ -1051,26 +1068,30 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	if authKey == "" {
 		return nil, errors.New("auth key is empty")
 	}
-
-	options := &redis.Options{
-		Addr:        respAddr,
-		DialTimeout: dialTimeout,
-		ReadTimeout: 0,
-		Protocol:    2,
-		OnConnect: func(ctx context.Context, cn *redis.Conn) error {
-			return cn.Do(ctx, "AUTH", authKey).Err()
-		},
+	host, port, err := hostPortFromAddr(respAddr)
+	if err != nil {
+		return nil, err
 	}
-
-	client := redis.NewClient(options)
-	if err := healthCheck(context.Background(), client); err != nil {
-		if closeErr := client.Close(); closeErr != nil {
-			slog.Warn("redisx close client after failed health check failed", "error", closeErr)
+	res, err := internalDialForRespconnInternal(respconn.Options{
+		Host:         host,
+		Port:         port,
+		Auth:         authKey,
+		TimeoutMs:    int(dialTimeout.Milliseconds()),
+		AuthOptional: false,
+		ReadTimeout:  0,
+	})
+	if err != nil {
+		if res != nil && res.Client != nil {
+			if closeErr := res.Client.Close(); closeErr != nil {
+				slog.Warn("redisx close client after failed dial handshake failed", "error", closeErr)
+			}
 		}
 		return nil, err
 	}
-	return client, nil
+	return res.Client, nil
 }
+
+var internalDialForRespconnInternal = respconn.DialAndHandshake
 
 // produce publishes messages from pubChan using the provided client until ctx is done.
 func produce(ctx context.Context, client *redis.Client) error {

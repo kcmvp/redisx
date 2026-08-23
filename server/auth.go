@@ -149,7 +149,7 @@ func gate1CommandWordByPortRole(conn redcon.Conn, cmdName string) (reject bool) 
 	if !appPortCmdAllowlist[cmdName] {
 		slog.Warn("app-port attempted admin-only command (Gate1 reject)",
 			"remote", conn.RemoteAddr(), "cmd", cmdName)
-		conn.WriteError("ERR unknown command '" + cmdName + "' (admin-only commands are not available on the app port). Connect via admin-port and use admin-auth key.")
+		conn.WriteError("ERR No Privilege: '" + cmdName + "' is a Meta Management command, only allowed on the admin port. Connect via the admin port and use --admin-auth, or run equivalent data operations on this app port.")
 		return true
 	}
 	return false

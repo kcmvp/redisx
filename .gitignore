@@ -32,4 +32,6 @@ go.work.sum
 *.db
 fr/*.md
 redisx
+.trae
+demo
 

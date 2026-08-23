@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -18,10 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/gjson"
 )
@@ -2076,6 +2079,276 @@ func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
 		_ = Set(fmt.Sprintf("hook-safe-%d", i), "v")
 	}
 	<-done
+}
+
+func TestHostPortFromAddr(t *testing.T) {
+	tests := []struct {
+		name      string
+		addr      string
+		wantHost  string
+		wantPort  int
+		expectErr bool
+		errSub    string
+	}{
+		{"IPv4 loopback default port", "127.0.0.1:7381", "127.0.0.1", 7381, false, ""},
+		{"Zero port", "0.0.0.0:0", "0.0.0.0", 0, false, ""},
+		{"Max port 65535", "redis.example.com:65535", "redis.example.com", 65535, false, ""},
+		{"Hostname only no port", "redis.local", "", 0, true, "invalid resp address"},
+		{"Colon only no port", "host:", "", 0, true, "invalid resp port"},
+		{"Non-numeric port", "host:abc", "", 0, true, "invalid resp port"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, p, err := hostPortFromAddr(tc.addr)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.errSub)
+				}
+				if tc.errSub != "" && !strings.Contains(err.Error(), tc.errSub) {
+					t.Fatalf("expected error to contain %q, got: %v", tc.errSub, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if h != tc.wantHost || p != tc.wantPort {
+				t.Fatalf("want (%s,%d), got (%s,%d)", tc.wantHost, tc.wantPort, h, p)
+			}
+		})
+	}
+}
+
+func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
+	appPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	adminPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	adminAuth := "np-admin-auth"
+	appAuth := "np-app-auth"
+	cfg := &server.Config{
+		DataPath: testutil.DBPath(t),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+	}
+	db := server.StartWithConfig(cfg)
+	require.NotNil(t, db)
+	defer func() {
+		_ = server.Stop()
+	}()
+
+	appAddr := cfg.App.Addr()
+	probe, err := connect(appAddr, appAuth)
+	require.NoError(t, err, "connect app-port failed")
+	defer func() { _ = probe.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	type tc struct {
+		name string
+		args []any
+	}
+	cases := []tc{
+		{"regdoc", []any{"REGDOC", `{"namespace":"user","mem":false,"key_attrs":["id"]}`}},
+		{"lsdoc", []any{"LSDOC"}},
+		{"desdoc", []any{"DESDOC", "user"}},
+		{"regidx", []any{"REGIDX", "user", "age", "age"}},
+		{"lsidx", []any{"LSIDX"}},
+		{"delidx", []any{"DELIDX", "user", "age"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := probe.Do(ctx, c.args...).Err()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "ERR No Privilege:",
+				"expected No Privilege for %s on app-port, got: %v", c.name, err)
+			cmdWord, _ := c.args[0].(string)
+			require.Contains(t, err.Error(), "'"+strings.ToLower(cmdWord)+"'",
+				"expected cmd name %q in error, got: %v", cmdWord, err)
+			require.Contains(t, err.Error(), "Meta Management")
+		})
+	}
+}
+
+func TestConnectAuthMismatchEmitsWrapAdminErr(t *testing.T) {
+	appPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	adminPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	adminAuth := "mismatch-admin-key"
+	appAuth := "mismatch-app-key"
+	cfg := &server.Config{
+		DataPath: testutil.DBPath(t),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+	}
+	db := server.StartWithConfig(cfg)
+	require.NotNil(t, db)
+	defer func() {
+		_ = server.Stop()
+	}()
+
+	t.Run("app port with admin auth key → connect() itself returns WrapAdminErr WRONGPASS", func(t *testing.T) {
+		_, dialErr := connect(cfg.App.Addr(), adminAuth)
+		require.Error(t, dialErr)
+		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH key rejected (WRONGPASS)")
+		require.Contains(t, dialErr.Error(), "WRONGPASS invalid password for app port")
+		require.Contains(t, dialErr.Error(), "invalid password for app port")
+	})
+	t.Run("admin port with app auth key → connect() itself returns WrapAdminErr WRONGPASS", func(t *testing.T) {
+		_, dialErr := connect(cfg.Admin.Addr(), appAuth)
+		require.Error(t, dialErr)
+		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH key rejected (WRONGPASS)")
+		require.Contains(t, dialErr.Error(), "WRONGPASS invalid password for admin port")
+		require.Contains(t, dialErr.Error(), "invalid password for admin port")
+	})
+	t.Run("admin port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
+		err := Connect(cfg.Admin.Addr(), "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "auth key is empty")
+	})
+	t.Run("admin port with invalid non-empty auth key → connect() returns WrapAdminErr ERR authentication failed", func(t *testing.T) {
+		_, dialErr := connect(cfg.Admin.Addr(), "wrong-wrong-wrong")
+		require.Error(t, dialErr)
+		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH failed (server ERR authentication failed)")
+		require.Contains(t, dialErr.Error(), "ERR authentication failed")
+	})
+}
+
+func TestConnectProbePlainRedisNoCapsNoError(t *testing.T) {
+	called := make(chan struct{}, 1)
+	capsCh := make(chan respconn.Capabilities, 1)
+	origDial := internalDialForRespconnInternal
+	internalDialForRespconnInternal = func(o respconn.Options) (*respconn.DialResult, error) {
+		res, err := origDial(o)
+		if res != nil {
+			select {
+			case capsCh <- res.Capabilities:
+			default:
+			}
+		}
+		return res, err
+	}
+	defer func() { internalDialForRespconnInternal = origDial }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		_ = conn.SetReadDeadline(deadline)
+		_ = conn.SetWriteDeadline(deadline)
+		br := bufio.NewReader(conn)
+		for i := 0; i < 256; i++ {
+			cmdLine, rerr := readOneRESPCommand(br)
+			if rerr != nil {
+				return
+			}
+			cmdLine = strings.TrimSpace(cmdLine)
+			if cmdLine == "" {
+				return
+			}
+			words := strings.Fields(cmdLine)
+			verb := strings.ToUpper(words[0])
+			var reply []byte
+			switch verb {
+			case "HELLO":
+				reply = []byte("-ERR unknown command 'HELLO'\r\n")
+			case "PING":
+				reply = []byte("+PONG\r\n")
+			case "AUTH":
+				reply = []byte("+OK\r\n")
+			case "COMMAND":
+				reply = []byte("*0\r\n")
+			case "CLIENT":
+				reply = []byte("-ERR unknown command 'CLIENT'\r\n")
+			default:
+				reply = []byte("-ERR unknown command '" + verb + "'\r\n")
+			}
+			if _, werr := conn.Write(reply); werr != nil {
+				return
+			}
+		}
+	}()
+
+	res, err := connect(ln.Addr().String(), "anything")
+	if err != nil {
+		t.Fatalf("connect to plain-redis stub should not error, got: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	select {
+	case <-called:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mock listener was never called")
+	}
+	var caps respconn.Capabilities
+	select {
+	case caps = <-capsCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("DialAndHandshake interceptor never fired")
+	}
+	if caps.IsRedisx {
+		t.Fatalf("expected IsRedisx=false on plain redis, got true (caps=%+v)", caps)
+	}
+	if caps.ServerVer != "" || caps.AdminRole || caps.TypedDocs || caps.TypedIndexes {
+		t.Fatalf("expected empty feature caps on plain redis, got %+v", caps)
+	}
+}
+
+func readOneRESPCommand(br *bufio.Reader) (string, error) {
+	ch, err := br.Peek(1)
+	if err != nil {
+		return "", err
+	}
+	if ch[0] == '*' {
+		line, lerr := br.ReadString('\n')
+		if lerr != nil && len(line) == 0 {
+			return "", lerr
+		}
+		trimmed := strings.TrimSpace(strings.TrimPrefix(line, "*"))
+		n, perr := strconv.Atoi(trimmed)
+		if perr != nil {
+			return line, nil
+		}
+		cmdWords := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			bulkLenLine, blerr := br.ReadString('\n')
+			if blerr != nil {
+				return strings.Join(cmdWords, " "), nil
+			}
+			if !strings.HasPrefix(bulkLenLine, "$") {
+				continue
+			}
+			blenTrim := strings.TrimSpace(strings.TrimPrefix(bulkLenLine, "$"))
+			blen, bperr := strconv.Atoi(blenTrim)
+			if bperr != nil {
+				continue
+			}
+			buf := make([]byte, blen+2)
+			_, rrerr := io.ReadFull(br, buf)
+			if rrerr != nil {
+				return strings.Join(cmdWords, " "), nil
+			}
+			word := string(buf[:blen])
+			cmdWords = append(cmdWords, word)
+		}
+		return strings.Join(cmdWords, " "), nil
+	}
+	line, lerr := br.ReadString('\n')
+	return strings.TrimSpace(line), lerr
 }
 
 func BenchmarkSetNoHooks(b *testing.B) {
