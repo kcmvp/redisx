@@ -159,7 +159,7 @@ func requireRedisx(sess *session.Session) error {
 	}
 	caps := sess.Capabilities()
 	if !caps.IsRedisx {
-		return fmt.Errorf("connected peer is not a redisx server — Extended Commands / Meta Management are only available on redisx. Try raw RESP forwarding for standard commands.")
+		return fmt.Errorf("connected peer is not a redisx server — Extended Commands / Meta Management are only available on redisx; try raw RESP forwarding for standard commands")
 	}
 	return nil
 }
@@ -352,7 +352,7 @@ With 0 args, redisx is equivalent to "redisx HELP".`,
 				printServerCommandsList(data, groups, caps.Commands.GroupOrder, roleLine)
 				return nil
 			default:
-				return fmt.Errorf("unknown redisx subcommand %q. Try `redisx HELP`.", useArgs[0])
+				return fmt.Errorf("unknown redisx subcommand %q; try `redisx HELP`", useArgs[0])
 			}
 		},
 	}

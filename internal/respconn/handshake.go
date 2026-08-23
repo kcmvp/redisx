@@ -2,7 +2,6 @@ package respconn
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,11 +49,11 @@ func WrapAdminErr(raw error, authProvided bool) error {
 		if authProvided {
 			return fmt.Errorf("admin-port still returned NOAUTH after AUTH attempt: server has rotated / changed admin-auth key? %w", raw)
 		}
-		return errors.New("connect redisx admin-port failed: server admin-port requires AUTH. Pass the admin-auth key via `-a <ADMIN_AUTH_KEY>` (long form: `--admin-auth <ADMIN_AUTH_KEY>`). If the server was started WITHOUT admin-auth (dev-only), no `-a` flag is needed.")
+		return fmt.Errorf("connect redisx admin-port failed: server admin-port requires AUTH. Pass the admin-auth key via `-a <ADMIN_AUTH_KEY>` (long form `--admin-auth <ADMIN_AUTH_KEY>`); if the server was started WITHOUT admin-auth (dev-only), no `-a` flag is needed")
 	case strings.Contains(msg, "WRONGPASS"):
-		return fmt.Errorf("connect redisx admin-port failed: AUTH key rejected (WRONGPASS). The key passed via `-a / --admin-auth` does not match the server's `--admin-auth` key; check for trailing whitespace. %w", raw)
+		return fmt.Errorf("connect redisx admin-port failed: AUTH key rejected (WRONGPASS); the key passed via `-a / --admin-auth` does not match the server's `--admin-auth` key; check for trailing whitespace %w", raw)
 	case strings.Contains(msg, "ERR authentication failed"):
-		return fmt.Errorf("connect redisx admin-port failed: AUTH failed (server ERR authentication failed). Double-check `-a / --admin-auth` matches the server's `--admin-auth` startup value. %w", raw)
+		return fmt.Errorf("connect redisx admin-port failed: AUTH failed (server ERR authentication failed); double-check `-a / --admin-auth` matches the server's `--admin-auth` startup value %w", raw)
 	}
 	return fmt.Errorf("connect redisx admin-port failed: %w", raw)
 }

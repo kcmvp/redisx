@@ -45,7 +45,6 @@ func (a *AppData) HostPort() (string, string) {
 func cBold(s string) string    { return tui.Bold(s) }
 func cCyan(s string) string    { return tui.Cyan(s) }
 func cYellow(s string) string  { return tui.Yellow(s) }
-func cGreen(s string) string   { return tui.Green(s) }
 func cRed(s string) string     { return tui.Red(s) }
 func cMagenta(s string) string { return tui.Magenta(s) }
 func cDim(s string) string     { return tui.Dim(s) }

@@ -36,7 +36,7 @@ func RunREPL(app *tui.CLIApp, data *AppData, initial session.Capabilities) error
 	reader := bufio.NewReader(in)
 	for {
 		prompt := promptFor(data)
-		fmt.Fprint(ioctx.IO.Out, prompt)
+		_, _ = fmt.Fprint(ioctx.IO.Out, prompt)
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -125,6 +125,9 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 	}
 	if serverGroups, serverOrder, serverRole, ok := fetchServerCommandsGroups(data); ok {
 		printServerCommandsList(data, serverGroups, serverOrder, serverRole)
+		return
+	}
+	if data == nil {
 		return
 	}
 	caps := data.FrozenCaps

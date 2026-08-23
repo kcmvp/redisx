@@ -57,10 +57,10 @@ func readOneRESPCommand(br *bufio.Reader) (string, error) {
 }
 
 func writeBulk(sb *strings.Builder, s string) {
-	sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
+	_, _ = fmt.Fprintf(sb, "$%d\r\n%s\r\n", len(s), s)
 }
-func writeIntSB(sb *strings.Builder, i int64) { sb.WriteString(fmt.Sprintf(":%d\r\n", i)) }
-func writeMapH(sb *strings.Builder, n int)    { sb.WriteString(fmt.Sprintf("%%%d\r\n", n)) }
+func writeIntSB(sb *strings.Builder, i int64) { _, _ = fmt.Fprintf(sb, ":%d\r\n", i) }
+func writeMapH(sb *strings.Builder, n int)    { _, _ = fmt.Fprintf(sb, "%%%d\r\n", n) }
 
 func redisxHello() []byte {
 	var sb strings.Builder
@@ -216,10 +216,10 @@ func startMock(t *testing.T, addr string, rules func(verb string, callNo int) []
 			mp.Seen = append(mp.Seen, append([]string(nil), words...))
 			switch verb {
 			case "CLIENT", "COMMAND":
-				conn.Write([]byte("+OK\r\n"))
+				_, _ = conn.Write([]byte("+OK\r\n"))
 				continue
 			case "QUIT":
-				conn.Write([]byte("+OK\r\n"))
+				_, _ = conn.Write([]byte("+OK\r\n"))
 				return
 			}
 			total++

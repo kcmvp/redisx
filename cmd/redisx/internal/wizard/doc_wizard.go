@@ -326,25 +326,25 @@ func FirstNFieldNames(fields []map[string]any, n int) string {
 func PrintAny(out *os.File, v any) {
 	switch t := v.(type) {
 	case nil:
-		fmt.Fprintln(out, "(nil)")
+		_, _ = fmt.Fprintln(out, "(nil)")
 	case string:
-		fmt.Fprintln(out, t)
+		_, _ = fmt.Fprintln(out, t)
 	case []any:
 		for i, e := range t {
-			fmt.Fprintf(out, "[%d] %v\n", i, e)
+			_, _ = fmt.Fprintf(out, "[%d] %v\n", i, e)
 		}
 	case []string:
 		for i, e := range t {
-			fmt.Fprintf(out, "[%d] %s\n", i, e)
+			_, _ = fmt.Fprintf(out, "[%d] %s\n", i, e)
 		}
 	case error:
-		fmt.Fprintln(out, cRed(t.Error()))
+		_, _ = fmt.Fprintln(out, cRed(t.Error()))
 	default:
 		b, err := json.MarshalIndent(v, "", "  ")
 		if err != nil {
-			fmt.Fprintf(out, "%v\n", v)
+			_, _ = fmt.Fprintf(out, "%v\n", v)
 			return
 		}
-		fmt.Fprintln(out, string(b))
+		_, _ = fmt.Fprintln(out, string(b))
 	}
 }

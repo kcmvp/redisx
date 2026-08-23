@@ -234,7 +234,7 @@ to execute a single action and exit.
 			} else if !isRedisx {
 				promptWord = "redis"
 			}
-			sb.WriteString(fmt.Sprintf("REPL-only shortcuts (type these inside the %s> prompt):\n", promptWord))
+			_, _ = fmt.Fprintf(&sb, "REPL-only shortcuts (type these inside the %s> prompt):\n", promptWord)
 			sb.WriteString("  <enter> with empty = no-op; quit / exit / logout / !quit = exit REPL\n")
 			sb.WriteString("  unrecognised non-! words are forwarded verbatim as raw RESP commands (e.g. SET, GET, KEYS)\n")
 			sb.WriteString("  unrecognised !words error out and hint at !help\n\n")

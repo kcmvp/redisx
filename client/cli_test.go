@@ -124,7 +124,7 @@ func (s *ClientTestSuite) SetupSuite() {
 
 func (s *ClientTestSuite) TearDownSuite() {
 	disconnect()
-	server.Stop()
+	_ = server.Stop()
 	cliServerSeedOnce = sync.Once{}
 	clientTestServerAddr = ""
 }

@@ -718,12 +718,13 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 
 	gotAddrs := map[string]struct{}{}
 	timeout := time.After(500 * time.Millisecond)
+loop:
 	for i := 0; i < 2; i++ {
 		select {
 		case addr := <-listenCalledCh:
 			gotAddrs[addr] = struct{}{}
 		case <-timeout:
-			break
+			break loop
 		}
 	}
 	if _, ok := gotAddrs[startAdminAddr]; !ok {
