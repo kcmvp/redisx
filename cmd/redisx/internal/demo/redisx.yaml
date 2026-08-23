@@ -1,0 +1,41 @@
+# redisx.yaml — server startup config.
+#
+# Passwords (app.auth / admin.auth) are ONLY taken from this file.
+# The server binary takes no --auth / --admin-auth flags so secrets
+# never appear in `ps` output.
+#
+# If you remove this file entirely (or leave fields empty) the
+# server falls back to system defaults. Most importantly:
+#   * data_path unset          -> $HOME/.redisx/redisx.db
+#     (cross-cwd-safe; always user-scoped by default)
+#   * app.auth / admin.auth    -> dev-mode no-auth on that port
+#                                 (SET STRONG VALUES IN PRODUCTION)
+#   * app.bind=""              -> auto-detect top-ranked private IP
+#   * admin.bind               -> 127.0.0.1 (loopback only)
+
+# APP PORT — business clients connect here.
+# Admin-only command words are hard-rejected by Gate1 on this port.
+app:
+  bind: ""          # "" = auto private IP (192.168 > 10 > 172.16-31)
+  port: 7379
+  auth: ""
+
+# ADMIN PORT — redisx shell / ops tooling connect here.
+# Default binds loopback only. Cross-machine exposure MUST go through
+# Caddy + mTLS reverse proxy.
+admin:
+  bind: "127.0.0.1" # non-loopback requires danger_bind_any: true
+  port: 7381
+  auth: ""          # MUST differ from app.auth when both non-empty.
+  trust_proxy: false    # set true behind Caddy+PROXY v2+mTLS
+  danger_bind_any: false # explicit ACK when admin.bind != 127.0.0.1
+
+# Buntdb storage path (top-level; no storage wrapper).
+# Omit this field entirely to use the default $HOME/.redisx/redisx.db
+# location (always user-scoped, cross-cwd safe).
+# data_path: /var/lib/redisx/prod.db
+
+# slog configuration.
+logging:
+  level: "info"     # debug | info | warn | error (unknown -> info + warn)
+  format: "text"    # text | json (unknown -> text + warn)

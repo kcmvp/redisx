@@ -249,7 +249,7 @@ func runHookWithSafety(label string, fn func() error) error {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Error("write hook panic", "hook", label, "panic", r, "stack", stackStr())
+					slog.Warn("write hook panic", "hook", label, "panic", r, "stack", stackStr())
 					err = fmt.Errorf("hook %s panic: %v", label, r)
 				}
 			}()
@@ -261,7 +261,7 @@ func runHookWithSafety(label string, fn func() error) error {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("write hook panic", "hook", label, "panic", r, "stack", stackStr())
+				slog.Warn("write hook panic", "hook", label, "panic", r, "stack", stackStr())
 				done <- fmt.Errorf("hook %s panic: %v", label, r)
 			}
 		}()
