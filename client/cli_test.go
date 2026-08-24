@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/server"
@@ -81,12 +82,11 @@ func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
 
-	probePrefix := testutil.XKeyPrefix(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
-	probeKP := probePrefix + "*"
-	probeStripped := probePrefix[:len(probePrefix)-1]
-	idxProbeScore := x.RawIndex(probeStripped+"_score", probeKP, "score")
-	idxProbeBucket := x.RawIndex(probeStripped+"_bucket", probeKP, "bucket")
-	idxProbeSparse := x.RawIndex(probeStripped+"_sparse_amt", probeKP, "sparse_amt")
+	probeKP := testutil.KeyRangeKeyPattern(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
+	probeStorageNs := naming.BuildStorageNs(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
+	idxProbeScore := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "score"), probeKP, "score")
+	idxProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "bucket"), probeKP, "bucket")
+	idxProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "sparseamt"), probeKP, "sparse_amt")
 
 	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
 	cfg := &server.Config{
@@ -104,7 +104,7 @@ func (s *ClientTestSuite) SetupSuite() {
 		s.Require().NoError(db.CreateIndex(idxProbeScore))
 		s.Require().NoError(db.CreateIndex(idxProbeBucket))
 		s.Require().NoError(db.CreateIndex(idxProbeSparse))
-		s.Require().NoError(db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50"))
+		s.Require().NoError(db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50"))
 
 		for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
 			s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
@@ -134,8 +134,8 @@ func TestClientSuite(t *testing.T) {
 }
 
 func (s *ClientTestSuite) TestMemKey() {
-	s.Equal("_m_user:1", x.MemKey("user:1"))
-	s.Equal("_m_user:1", x.MemKey("_m_user:1"))
+	s.Equal("_m_:user:1", x.MemKey("user:1"))
+	s.Equal("_m_:user:1", x.MemKey("_m_:user:1"))
 }
 
 // ensureConnected waits until the shared client is fully connected
@@ -2362,7 +2362,7 @@ func BenchmarkSetNoHooks(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2397,7 +2397,7 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2432,7 +2432,7 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2469,7 +2469,7 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(x.AuthNsPrefix+x.StorageKeySeparator+clientTestExternalAuthKey, "50")
+	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)

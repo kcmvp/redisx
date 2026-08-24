@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/stretchr/testify/require"
 )
 
@@ -14,7 +15,7 @@ func TestCountXIs100(t *testing.T) {
 
 func TestXKeyPrefix(t *testing.T) {
 	t.Run("mem layer adds _m_ prefix", func(t *testing.T) {
-		require.Equal(t, "_m_ns:", XKeyPrefix("ns", true))
+		require.Equal(t, "_m_:ns:", XKeyPrefix("ns", true))
 	})
 	t.Run("disk layer omits _m_ prefix", func(t *testing.T) {
 		require.Equal(t, "ns:", XKeyPrefix("ns", false))
@@ -22,7 +23,7 @@ func TestXKeyPrefix(t *testing.T) {
 }
 
 func TestXIDKey(t *testing.T) {
-	require.Equal(t, "_m_probe:p050", XIDKey("probe", true, "p050"))
+	require.Equal(t, "_m_:probe:p050", XIDKey("probe", true, "p050"))
 	require.Equal(t, "disk:p100", XIDKey("disk", false, "p100"))
 }
 
@@ -128,9 +129,9 @@ func TestXStrictMonotonic(t *testing.T) {
 func TestLoadX(t *testing.T) {
 	kvs := LoadX(t)
 	require.Len(t, kvs, CountX())
-	t.Run("all keys start with _m_probe: prefix", func(t *testing.T) {
+	t.Run("all keys start with _m_:probe: prefix", func(t *testing.T) {
 		for _, kv := range kvs {
-			require.True(t, strings.HasPrefix(kv.K, "_m_probe:"),
+			require.True(t, strings.HasPrefix(kv.K, "_m_:probe:"),
 				"unexpected key prefix: %s", kv.K)
 		}
 	})
@@ -141,7 +142,7 @@ func TestLoadX(t *testing.T) {
 			require.NoError(t, json.Unmarshal([]byte(kv.V), &rec), "bad JSON at key %s", kv.K)
 			id, ok := rec["id"].(string)
 			require.True(t, ok, "id missing or not string at key %s: %v", kv.K, rec)
-			require.Equal(t, kv.K, "_m_probe:"+id)
+			require.Equal(t, kv.K, naming.BuildStorageKey(naming.BuildStorageNs("probe", true), id))
 			require.False(t, seen[id], "duplicate id: %s", id)
 			seen[id] = true
 		}
@@ -153,11 +154,10 @@ func TestLoadXFor_DifferentNamespace(t *testing.T) {
 	b := LoadXFor(t, "beta", false)
 	require.Len(t, a, CountX())
 	require.Len(t, b, CountX())
-	// Key sets are disjoint because namespace prefixes differ
 	aKeys := make(map[string]bool, len(a))
 	for _, kv := range a {
 		aKeys[kv.K] = true
-		require.True(t, strings.HasPrefix(kv.K, "_m_alpha:"))
+		require.True(t, strings.HasPrefix(kv.K, "_m_:alpha:"))
 	}
 	for _, kv := range b {
 		require.True(t, strings.HasPrefix(kv.K, "beta:"))

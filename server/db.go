@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kcmvp/redisx/internal"
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
@@ -39,10 +39,7 @@ type docSpec struct {
 }
 
 func (p docSpec) StorageNs() string {
-	if p.Mem {
-		return x.MemNsPrefix + p.Namespace
-	}
-	return p.Namespace
+	return naming.BuildStorageNs(p.Namespace, p.Mem)
 }
 
 type idxSpec struct {
@@ -157,7 +154,7 @@ func (db *DB) Close() error {
 // SECTION: Storage Routing
 
 func isMemKey(key string) bool {
-	return strings.HasPrefix(key, x.MemNsPrefix)
+	return naming.HasMemPrefix(key)
 }
 
 func hasLeadingWildcard(keyPattern string) bool {
@@ -327,7 +324,7 @@ func (db *DB) applyIndexSpec(spec idxSpec, persist bool) error {
 	db.idxRegSpec[spec.FullName] = spec
 
 	if persist {
-		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		metaKey := naming.IdxMetaKey(spec.FullName)
 		raw, err := json.Marshal(spec)
 		if err != nil {
 			return fmt.Errorf("index %q: marshal idxSpec: %w", spec.FullName, err)
@@ -367,12 +364,11 @@ func (db *DB) registerIndexes(indexes ...x.Index) error {
 		if _, ok := db.idxRegSpec[fullName]; ok {
 			return fmt.Errorf("index already declared: %s", fullName)
 		}
-		ownerNs, logical, err := internal.ParseIndexFullName(fullName)
+		ownerNs, logical, err := naming.ParseIdxFullName(fullName)
 		if err != nil {
 			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
 		}
-		ownerMem := strings.HasPrefix(idx.KeyPattern(), x.MemNsPrefix+x.StorageKeySeparator) ||
-			strings.HasPrefix(ownerNs, x.MemNsPrefix)
+		ownerMem := naming.HasMemPrefix(idx.KeyPattern()) || naming.HasMemPrefix(ownerNs)
 		spec := idxSpec{
 			FullName:   fullName,
 			OwnerNs:    ownerNs,
@@ -401,8 +397,8 @@ func (db *DB) loadIndexes() error {
 		layer storageLayer
 		glob  string
 	}{
-		{layer: storageDisk, glob: x.IdxMetaNsPrefix + x.StorageKeySeparator + "*"},
-		{layer: storageMem, glob: x.IdxMetaNsPrefix + x.StorageKeySeparator + "*"},
+		{layer: storageDisk, glob: naming.IdxMetaGlob()},
+		{layer: storageMem, glob: naming.IdxMetaGlob()},
 	}
 	for _, p := range patterns {
 		var collected []kv
@@ -448,8 +444,8 @@ func (db *DB) loadDocSpecs() error {
 		layer storageLayer
 		glob  string
 	}{
-		{layer: storageDisk, glob: x.DocMetaNsPrefix + x.StorageKeySeparator + "*"},
-		{layer: storageMem, glob: x.DocMetaNsPrefix + x.StorageKeySeparator + "*"},
+		{layer: storageDisk, glob: naming.DocMetaGlob()},
+		{layer: storageMem, glob: naming.DocMetaGlob()},
 	}
 	for _, p := range patterns {
 		var collected []kv
@@ -497,9 +493,8 @@ func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
 	if spec.Namespace == "" {
 		return errors.New("doc schema: namespace is required")
 	}
-	if strings.ContainsAny(spec.Namespace, x.StorageKeySeparator+"*?_") {
-		return fmt.Errorf("doc %q: namespace must not contain reserved characters %q",
-			spec.Namespace, x.StorageKeySeparator+"*?_")
+	if err := naming.ValidateDocLogicalNamespace(spec.Namespace); err != nil {
+		return fmt.Errorf("doc %q: %w", spec.Namespace, err)
 	}
 	for i, p := range spec.KeyAttrs {
 		if p == "" {
@@ -507,7 +502,7 @@ func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
 		}
 	}
 	storageNs := spec.StorageNs()
-	metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + storageNs
+	metaKey := naming.DocMetaKey(storageNs)
 
 	if spec.TypeName == "" && rt != nil {
 		spec.TypeName = rt.String()
@@ -907,12 +902,12 @@ func withLimit(limit int, fn func(key, value string) bool) func(key, value strin
 }
 
 func nsGuard(pivot string, fn func(k, v string) bool) func(k, v string) bool {
-	i := strings.IndexByte(pivot, ':')
-	if i < 0 {
+	storageNs, _, err := naming.SplitStorageKey(pivot)
+	if err != nil || storageNs == "" {
 		return fn
 	}
-	scope := pivot[:i+1]
-	n := i + 1
+	scope := naming.StorageNsScope(storageNs)
+	n := len(scope)
 	return func(k, v string) bool {
 		if len(k) <= n || k[:n] != scope {
 			return true

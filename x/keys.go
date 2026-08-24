@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/tidwall/match"
 )
 
@@ -549,4 +550,85 @@ func LayerRoutingConstrained(kr KeyRange, layerForKey func(string) any) (any /*s
 		return nil, false
 	}
 	return layerForKey(anchor), true
+}
+
+// ScopeKeyRange resolves one document-scoped x.KeyRange into its fully
+// qualified storage key range. It rejects any field value that already starts
+// with the document namespace prefix (mirroring ValidateKeyPattern on the
+// legacy string path). Every string field in the 6 sealed ctors is prefixed
+// with the D namespace + separator, and any LIMIT set on the input scopedKR
+// is carried onto the returned sealed range via .Limit(old).
+func ScopeKeyRange[D Document](scopedKR KeyRange) (KeyRange, error) {
+	fullNamespace := StorageKeyValue[D]("")
+	fullPrefix := naming.StorageNsScope(fullNamespace)
+
+	checkPrefixed := func(fieldName, v string) error {
+		if v == fullNamespace || strings.HasPrefix(v, fullPrefix) {
+			return fmt.Errorf("key range %s must be document-scoped, got prefixed storage value: %s", fieldName, v)
+		}
+		return nil
+	}
+	prefix := func(s string) string {
+		if s == "" {
+			return fullNamespace
+		}
+		return fullPrefix + s
+	}
+
+	wireBytes, err := scopedKR.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("scoped key range marshal: %w", err)
+	}
+	var wire wireKeyRange
+	if err := json.Unmarshal(wireBytes, &wire); err != nil {
+		return nil, fmt.Errorf("scoped key range unmarshal: %w", err)
+	}
+
+	var built KeyRange
+	switch strings.ToLower(wire.Op) {
+	case "bt":
+		if wire.Ge != "" {
+			if perr := checkPrefixed("ge", wire.Ge); perr != nil {
+				return nil, perr
+			}
+		}
+		if wire.Lt != "" {
+			if perr := checkPrefixed("lt", wire.Lt); perr != nil {
+				return nil, perr
+			}
+		}
+		built = KeysBt(prefix(wire.Ge), prefix(wire.Lt))
+	case "gt":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysGt(prefix(wire.Pivot))
+	case "gte":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysGte(prefix(wire.Pivot))
+	case "lt":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysLt(prefix(wire.Pivot))
+	case "lte":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysLte(prefix(wire.Pivot))
+	case "pattern":
+		if perr := checkPrefixed("p", wire.P); perr != nil {
+			return nil, perr
+		}
+		built = KeysPattern(prefix(wire.P))
+	default:
+		return nil, fmt.Errorf("unknown key range op: %s", wire.Op)
+	}
+
+	if carry := scopedKR.GetLimit(); carry != -1 {
+		built = built.Limit(carry)
+	}
+	return built, nil
 }

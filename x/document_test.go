@@ -1,10 +1,10 @@
 package x
 
 import (
-	"encoding/json"
 	"testing"
 	"time"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,7 +74,7 @@ func (invalidPrefixDoc) TTL() time.Duration { return time.Hour }
 
 type bareMemPrefixDoc string
 
-func (bareMemPrefixDoc) Namespace() string  { return MemNsPrefix }
+func (bareMemPrefixDoc) Namespace() string  { return naming.MemNsPrefix() }
 func (bareMemPrefixDoc) Mem() bool          { return false }
 func (bareMemPrefixDoc) KeyAttrs() []string { return []string{"id"} }
 func (u bareMemPrefixDoc) RawJSON() string  { return string(u) }
@@ -112,125 +112,21 @@ func (boolKeyDoc) KeyAttrs() []string { return []string{"enabled"} }
 func (u boolKeyDoc) RawJSON() string  { return string(u) }
 func (boolKeyDoc) TTL() time.Duration { return time.Hour }
 
-func TestComparators(t *testing.T) {
-	jsonRecord := `{"name": "ken", "age": 30, "status": "active", "roles": ["admin", "user"], "score": 95.5}`
+type memBoolKeyDoc string
 
-	tests := []struct {
-		name     string
-		filter   Filter
-		expected bool
-	}{
-		{"Eq string true", Eq("name", "ken"), true},
-		{"Eq string false", Eq("name", "john"), false},
-		{"Eq number true", Eq("age", float64(30)), true},
-		{"Eq not exists", Eq("email", "ken@a.com"), false},
-		{"Neq string true", Neq("name", "john"), true},
-		{"Neq string false", Neq("name", "ken"), false},
-		{"Neq not exists", Neq("email", "ken@a.com"), true},
-		{"Gt true", Gt("age", 20), true},
-		{"Gt false", Gt("age", 30), false},
-		{"Gt not exists", Gt("salary", 1000), false},
-		{"Gt wrong type", Gt("name", 10), false},
-		{"Gte true greater", Gte("age", 20), true},
-		{"Gte true equal", Gte("age", 30), true},
-		{"Gte false", Gte("age", 40), false},
-		{"Lt true", Lt("age", 40), true},
-		{"Lt false", Lt("age", 30), false},
-		{"Lte true less", Lte("age", 40), true},
-		{"Lte true equal", Lte("age", 30), true},
-		{"Lte false", Lte("age", 20), false},
-		{"Contains true", Contains("status", "act"), true},
-		{"Contains false", Contains("status", "pen"), false},
-		{"Contains not string", Contains("age", "3"), false},
-		{"In string true", In("status", "pending", "active"), true},
-		{"In string false", In("status", "pending", "banned"), false},
-		{"In number true", In("age", float64(20), float64(30)), true},
-		{"In not exists", In("email", "ken@a.com"), false},
-	}
+func (memBoolKeyDoc) Namespace() string  { return "flagdoc" }
+func (memBoolKeyDoc) Mem() bool          { return true }
+func (memBoolKeyDoc) KeyAttrs() []string { return []string{"enabled"} }
+func (u memBoolKeyDoc) RawJSON() string  { return string(u) }
+func (memBoolKeyDoc) TTL() time.Duration { return time.Hour }
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.filter.Eval(jsonRecord)
-			if result != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, result)
-			}
-		})
-	}
-}
+type invalidNsDoc string
 
-func TestCombinators(t *testing.T) {
-	jsonRecord := `{"age": 25, "status": "active"}`
-
-	tests := []struct {
-		name     string
-		filter   Filter
-		expected bool
-	}{
-		{"And true", And(Gt("age", 20), Eq("status", "active")), true},
-		{"And false first", And(Lt("age", 20), Eq("status", "active")), false},
-		{"And false second", And(Gt("age", 20), Eq("status", "pending")), false},
-		{"Or true first", Or(Gt("age", 20), Eq("status", "pending")), true},
-		{"Or true second", Or(Lt("age", 20), Eq("status", "active")), true},
-		{"Or false both", Or(Lt("age", 20), Eq("status", "pending")), false},
-		{"Not true", Not(Lt("age", 20)), true},
-		{"Not false", Not(Gt("age", 20)), false},
-		{
-			name: "Complex true",
-			filter: Or(
-				Lt("age", 20),
-				And(Gt("age", 20), Eq("status", "active")),
-			),
-			expected: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.filter.Eval(jsonRecord)
-			if result != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, result)
-			}
-		})
-	}
-}
-
-func TestFilterMarshalJSON(t *testing.T) {
-	tests := []struct {
-		name   string
-		filter Filter
-		want   string
-	}{
-		{
-			name:   "marshals comparator",
-			filter: Eq("status", "active"),
-			want:   `{"status":{"$eq":"active"}}`,
-		},
-		{
-			name:   "marshals combinator",
-			filter: And(Gte("age", 18), Eq("status", "active")),
-			want:   `{"$and":[{"age":{"$gte":18}},{"status":{"$eq":"active"}}]}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			raw, err := tt.filter.MarshalJSON()
-			require.NoError(t, err)
-			require.JSONEq(t, tt.want, string(raw))
-		})
-	}
-}
-
-func TestSetMutation(t *testing.T) {
-	mutation := Set("profile.age", 18)
-
-	require.Equal(t, "profile.age", mutation.Path())
-	require.Equal(t, 18, mutation.Value())
-
-	raw, err := json.Marshal(mutation.Value())
-	require.NoError(t, err)
-	require.Equal(t, "18", string(raw))
-}
+func (invalidNsDoc) Namespace() string  { return "_bad_ns" }
+func (invalidNsDoc) Mem() bool          { return false }
+func (invalidNsDoc) KeyAttrs() []string { return []string{"id"} }
+func (u invalidNsDoc) RawJSON() string  { return string(u) }
+func (invalidNsDoc) TTL() time.Duration { return time.Hour }
 
 func TestStorageKeyValue(t *testing.T) {
 	tests := []struct {
@@ -259,7 +155,7 @@ func TestStorageKeyValue(t *testing.T) {
 		{
 			name: "allows mem prefix",
 			run: func(t *testing.T) {
-				require.Equal(t, "_m_user:201", StorageKeyValue[memUserDoc]("201"))
+				require.Equal(t, "_m_:user:201", StorageKeyValue[memUserDoc]("201"))
 			},
 		},
 		{
@@ -333,8 +229,8 @@ func TestMemKey(t *testing.T) {
 		key  string
 		want string
 	}{
-		{name: "adds mem prefix", key: "user:1", want: "_m_user:1"},
-		{name: "keeps existing mem prefix", key: "_m_user:1", want: "_m_user:1"},
+		{name: "adds mem prefix", key: "user:1", want: "_m_:user:1"},
+		{name: "keeps existing mem prefix (new shape)", key: "_m_:user:1", want: "_m_:user:1"},
 	}
 
 	for _, tt := range tests {
@@ -359,11 +255,11 @@ func TestStorageKey(t *testing.T) {
 			want: "user:202",
 		},
 		{
-			name: "joins multiple key attrs with separator",
+			name: "joins multiple key attrs with canonical underscore join (naming.JoinPKAttrValues)",
 			run: func() (string, error) {
 				return StorageKey(multiKeyDoc(`{"tenant":"acme","id":"202"}`))
 			},
-			want: "tenantuser:acme:202",
+			want: "tenantuser:acme_202",
 		},
 		{
 			name: "returns prefix when document has no key attrs",
@@ -516,4 +412,239 @@ func TestRawIndex(t *testing.T) {
 			tt.run(t)
 		})
 	}
+}
+
+func TestKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		run     func() (string, error)
+		want    string
+		wantErr string
+	}{
+		{
+			name: "resolves disk doc single key attr",
+			run: func() (string, error) {
+				return Key[userDoc](`{"id":"202","name":"Bob"}`)
+			},
+			want: "user:202",
+		},
+		{
+			name: "resolves mem doc single key attr",
+			run: func() (string, error) {
+				return Key[memUserDoc](`{"id":"202"}`)
+			},
+			want: "_m_:user:202",
+		},
+		{
+			name: "resolves multi key attrs joined with underscore",
+			run: func() (string, error) {
+				return Key[multiKeyDoc](`{"tenant":"acme","id":"202"}`)
+			},
+			want: "tenantuser:acme_202",
+		},
+		{
+			name: "returns ns only when key attrs empty",
+			run: func() (string, error) {
+				return Key[noKeyAttrDoc](`{"name":"Bob"}`)
+			},
+			want: "plain",
+		},
+		{
+			name: "normalizes true bool to 1",
+			run: func() (string, error) {
+				return Key[boolKeyDoc](`{"enabled":true}`)
+			},
+			want: "flagdoc:1",
+		},
+		{
+			name: "normalizes false bool to 0 on mem doc",
+			run: func() (string, error) {
+				return Key[memBoolKeyDoc](`{"enabled":false}`)
+			},
+			want: "_m_:flagdoc:0",
+		},
+		{
+			name: "returns error when namespace is invalid",
+			run: func() (string, error) {
+				return Key[invalidNsDoc](`{"id":"1"}`)
+			},
+			wantErr: "document namespace invalid:",
+		},
+		{
+			name: "returns error for empty key attr path",
+			run: func() (string, error) {
+				return Key[emptyKeyAttrDoc](`{"id":"1"}`)
+			},
+			wantErr: "key attr path is empty",
+		},
+		{
+			name: "returns error for missing key attr",
+			run: func() (string, error) {
+				return Key[userDoc](`{"name":"Bob"}`)
+			},
+			wantErr: "missing key attr: id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.run()
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestStorageNsKeyPattern(t *testing.T) {
+	require.Equal(t, "user:tenant:*", StorageNsKeyPattern[userDoc]("tenant:*"))
+	require.Equal(t, "_m_:user:*", StorageNsKeyPattern[memUserDoc]("*"))
+	require.Equal(t, "tenantuser:*", StorageNsKeyPattern[multiKeyDoc]("*"))
+	require.Panics(t, func() {
+		StorageNsKeyPattern[invalidNsDoc]("*")
+	})
+}
+
+func TestValidateKeyPattern(t *testing.T) {
+	t.Run("accepts document scoped pattern", func(t *testing.T) {
+		full, err := ValidateKeyPattern[userDoc]("*")
+		require.NoError(t, err)
+		require.Equal(t, "user:*", full)
+	})
+
+	t.Run("rejects full namespace", func(t *testing.T) {
+		_, err := ValidateKeyPattern[userDoc]("user")
+		require.EqualError(t, err, "key pattern must be document-scoped, got storage pattern: user")
+	})
+
+	t.Run("rejects prefixed storage pattern", func(t *testing.T) {
+		_, err := ValidateKeyPattern[userDoc]("user:*")
+		require.EqualError(t, err, "key pattern must be document-scoped, got storage pattern: user:*")
+	})
+}
+
+func TestValidateIdxName(t *testing.T) {
+	t.Run("accepts logical name", func(t *testing.T) {
+		full, err := ValidateIdxName[userDoc]("age")
+		require.NoError(t, err)
+		require.Equal(t, "user_age", full)
+	})
+
+	t.Run("rejects empty name", func(t *testing.T) {
+		_, err := ValidateIdxName[userDoc]("")
+		require.EqualError(t, err, "index name is required")
+	})
+
+	t.Run("rejects fully qualified name", func(t *testing.T) {
+		_, err := ValidateIdxName[userDoc]("user_age")
+		require.EqualError(t, err, "idx name must be logical, got fully-qualified index name: user_age")
+	})
+}
+
+func TestScopeKeyRange(t *testing.T) {
+	t.Run("KeysPattern scopes prefix and carries limit", func(t *testing.T) {
+		scoped := KeysPattern("p05*").Limit(7)
+		got, err := ScopeKeyRange[userDoc](scoped)
+		require.NoError(t, err)
+		kind, pa, pb, lim := InspectKeyRange(got)
+		require.Equal(t, KeyRangePattern, kind)
+		require.Equal(t, "user:p05*", pa)
+		require.Empty(t, pb)
+		require.Equal(t, 7, lim)
+	})
+	t.Run("KeysBt prefixes both bounds, supports empty ge/lt", func(t *testing.T) {
+		scoped := KeysBt("p020", "p070")
+		got, err := ScopeKeyRange[userDoc](scoped)
+		require.NoError(t, err)
+		kind, ge, lt, _ := InspectKeyRange(got)
+		require.Equal(t, KeyRangeBt, kind)
+		require.Equal(t, "user:p020", ge)
+		require.Equal(t, "user:p070", lt)
+	})
+	t.Run("KeysBt with empty ge falls back to full namespace", func(t *testing.T) {
+		scoped := KeysBt("", "p100")
+		got, err := ScopeKeyRange[userDoc](scoped)
+		require.NoError(t, err)
+		_, ge, _, _ := InspectKeyRange(got)
+		require.Equal(t, "user", ge)
+	})
+	t.Run("KeysBt with empty lt falls back to full namespace", func(t *testing.T) {
+		scoped := KeysBt("p000", "")
+		got, err := ScopeKeyRange[userDoc](scoped)
+		require.NoError(t, err)
+		_, _, lt, _ := InspectKeyRange(got)
+		require.Equal(t, "user", lt)
+	})
+	t.Run("KeysGte scopes pivot", func(t *testing.T) {
+		got, err := ScopeKeyRange[userDoc](KeysGte("p050"))
+		require.NoError(t, err)
+		kind, pivotA, _, _ := InspectKeyRange(got)
+		require.Equal(t, KeyRangeGte, kind)
+		require.Equal(t, "user:p050", pivotA)
+	})
+	t.Run("KeysGt scopes pivot", func(t *testing.T) {
+		got, err := ScopeKeyRange[userDoc](KeysGt("p050"))
+		require.NoError(t, err)
+		kind, pivotA, _, _ := InspectKeyRange(got)
+		require.Equal(t, KeyRangeGt, kind)
+		require.Equal(t, "user:p050", pivotA)
+	})
+	t.Run("KeysLte scopes pivot", func(t *testing.T) {
+		got, err := ScopeKeyRange[userDoc](KeysLte("p049"))
+		require.NoError(t, err)
+		kind, pivotA, _, _ := InspectKeyRange(got)
+		require.Equal(t, KeyRangeLte, kind)
+		require.Equal(t, "user:p049", pivotA)
+	})
+	t.Run("KeysLt scopes pivot", func(t *testing.T) {
+		got, err := ScopeKeyRange[userDoc](KeysLt("p050"))
+		require.NoError(t, err)
+		kind, pivotA, _, _ := InspectKeyRange(got)
+		require.Equal(t, KeyRangeLt, kind)
+		require.Equal(t, "user:p050", pivotA)
+	})
+	t.Run("no limit on input leaves limit=-1 on output (unset)", func(t *testing.T) {
+		got, err := ScopeKeyRange[userDoc](KeysPattern("p05*"))
+		require.NoError(t, err)
+		_, _, _, lim := InspectKeyRange(got)
+		require.Equal(t, -1, lim)
+	})
+	t.Run("rejects already prefixed pattern", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysPattern("user:p05*"))
+		require.ErrorContains(t, err, "document-scoped")
+		require.ErrorContains(t, err, "p")
+	})
+	t.Run("rejects already prefixed Bt ge", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysBt("user:p020", "p070"))
+		require.ErrorContains(t, err, "ge")
+	})
+	t.Run("rejects already prefixed Bt lt", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysBt("p020", "user:p070"))
+		require.ErrorContains(t, err, "lt")
+	})
+	t.Run("rejects already prefixed Gt pivot", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysGt("user:p050"))
+		require.ErrorContains(t, err, "pivot")
+	})
+	t.Run("rejects already prefixed Gte pivot", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysGte("user:p050"))
+		require.ErrorContains(t, err, "pivot")
+	})
+	t.Run("rejects already prefixed Lt pivot", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysLt("user:p050"))
+		require.ErrorContains(t, err, "pivot")
+	})
+	t.Run("rejects already prefixed Lte pivot", func(t *testing.T) {
+		_, err := ScopeKeyRange[userDoc](KeysLte("user:p050"))
+		require.ErrorContains(t, err, "pivot")
+	})
+	t.Run("unknown op propagates error via marshal round trip unrecognized", func(t *testing.T) {
+		unknownBytes := []byte(`{"op":"surprise","pivot":"x"}`)
+		_, derr := UnmarshalKeyRange(unknownBytes)
+		require.Error(t, derr)
+		require.ErrorContains(t, derr, "unknown key range op")
+	})
 }

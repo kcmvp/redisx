@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/client"
-	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/x"
 	"github.com/samber/mo"
 )
@@ -78,7 +77,7 @@ func Delete[D x.Document](d D) (bool, error) {
 
 // Keys returns all keys matching the document type prefix and sub-pattern.
 func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
+	fullKeyPattern, err := x.ValidateKeyPattern[D](keyPattern)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}
@@ -94,7 +93,7 @@ func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 //   - filter limits which JSON documents match within that key range
 //
 // The logical idxName is resolved into the internal full index name from D,
-// while scopedKR is automatically namespace-prefixed via internal.ScopeKeyRange
+// while scopedKR is automatically namespace-prefixed via x.ScopeKeyRange
 // (carrying any .Limit(N) applied on the input over to the fully-qualified
 // sealed range produced for the server). idxName must be one logical index
 // name, not an already-prefixed full index name such as "user_age". scopedKR
@@ -104,12 +103,12 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 	if scopedKR == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
 	}
-	fullIdxName, err := internal.ValidateIdxName[D](idxName)
+	fullIdxName, err := x.ValidateIdxName[D](idxName)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
 
-	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
@@ -133,12 +132,12 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 // LIMIT is carried directly on the sealed x.KeyRange via .Limit(n int) —
 // there is no separate parameter on the function signature. Any value set on
 // the input scopedKR is preserved through the full-scope key range that
-// internal.ScopeKeyRange produces.
+// x.ScopeKeyRange produces.
 func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if scopedKR == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
 	}
-	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]D](err)
 	}
@@ -162,12 +161,12 @@ func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 // LIMIT is carried directly on the sealed x.KeyRange via .Limit(n int) —
 // there is no separate parameter on the function signature. Any value set on
 // the input scopedKR is preserved through the full-scope key range that
-// internal.ScopeKeyRange produces.
+// x.ScopeKeyRange produces.
 func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if scopedKR == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
-	fullKR, err := internal.ScopeKeyRange[D](scopedKR)
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}

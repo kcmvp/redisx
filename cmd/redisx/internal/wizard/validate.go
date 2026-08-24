@@ -4,26 +4,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/kcmvp/redisx/cmd/_shared/tui"
+	"github.com/kcmvp/redisx/internal/naming"
 )
 
 var ErrCancel = tui.ErrUserAborted
-
-var identifierRE = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 func ValidateIdentifier(s string) error {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return errors.New("value is required")
 	}
-	if !identifierRE.MatchString(s) {
-		return errors.New("contains invalid characters (only [-_.A-Za-z0-9] allowed)")
-	}
 	if strings.HasPrefix(s, "!") {
 		return errors.New("cannot start with '!' (reserved for sugar commands)")
+	}
+	if err := naming.ValidateLogicalIndexName(s); err != nil {
+		return fmt.Errorf("invalid identifier: %w", err)
 	}
 	return nil
 }
@@ -33,14 +31,8 @@ func ValidateNS(s string) error {
 	if s == "" {
 		return errors.New("namespace is required")
 	}
-	if strings.ContainsAny(s, " \t;\"'<>|&*?[]{}()\\/`~!@#$%^+=") {
-		return errors.New("namespace contains invalid characters")
-	}
-	if strings.HasPrefix(s, "_") {
-		return errors.New("namespace cannot start with '_' (reserved for system NsPrefix)")
-	}
-	if strings.Count(s, ":") > 2 {
-		return errors.New("too many ':' separators (>2)")
+	if err := naming.ValidateDocLogicalNamespace(s); err != nil {
+		return fmt.Errorf("invalid doc namespace: %w", err)
 	}
 	return nil
 }

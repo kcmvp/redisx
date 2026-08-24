@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/client"
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
@@ -44,12 +45,11 @@ func (s *DocTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	dbPath := filepath.Join(s.T().TempDir(), "docTest.db")
 
-	probePrefix := testutil.XKeyPrefix(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
-	probeKP := probePrefix + "*"
-	probeStripped := probePrefix[:len(probePrefix)-1]
-	idxProbeScore := x.RawIndex(probeStripped+"_score", probeKP, "score")
-	idxProbeBucket := x.RawIndex(probeStripped+"_bucket", probeKP, "bucket")
-	idxProbeSparse := x.RawIndex(probeStripped+"_sparse_amt", probeKP, "sparse_amt")
+	probeKP := testutil.KeyRangeKeyPattern(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	probeStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	idxProbeScore := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "score"), probeKP, "score")
+	idxProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "bucket"), probeKP, "bucket")
+	idxProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "sparseamt"), probeKP, "sparse_amt")
 
 	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
 	cfg := &server.Config{

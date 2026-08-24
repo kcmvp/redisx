@@ -10,6 +10,7 @@ import (
 
 	"sync"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/suite"
@@ -244,11 +245,11 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:     "keys_allow_mem_namespace",
 			auth:     true,
-			commands: [][]string{{cmdSet, x.MemNsPrefix + "k_{id}", "v"}, {cmdKeys, x.MemNsPrefix + "*"}},
+			commands: [][]string{{cmdSet, naming.BuildStorageKey(naming.BuildStorageNs("k", true), "{id}"), "v"}, {cmdKeys, naming.StorageNsKeyPattern(naming.BuildStorageNs("k", true))}},
 			wantStrings: []string{
 				"OK",
 			},
-			wantArrays: [][]string{{x.MemNsPrefix + "k_{id}"}},
+			wantArrays: [][]string{{naming.BuildStorageKey(naming.BuildStorageNs("k", true), "{id}")}},
 		},
 		{
 			name:     "del non-existent",

@@ -10,6 +10,7 @@ import (
 	"github.com/kcmvp/redisx/cmd/_shared/session"
 	"github.com/kcmvp/redisx/cmd/_shared/tui"
 	"github.com/kcmvp/redisx/cmd/_shared/tui/widgets"
+	"github.com/kcmvp/redisx/internal/naming"
 )
 
 var IndexTypeChoices = []string{
@@ -75,10 +76,12 @@ func RunCreateIdxWizard(sess *session.Session, cache *session.Cache) error {
 	wireType := IndexTypeWire[res.TypeIdx]
 
 	fmt.Println(cBold(cCyan("── Review ──")))
+	idxFullReview := naming.BuildIdxFullName(ownerNS, res.Logical)
 	reviewRows := [][]string{
 		{"Owner Doc", ownerNS},
 		{"Logical name", res.Logical},
-		{"Full name", fmt.Sprintf("%s_%s", ownerNS, res.Logical)},
+		{"Full name (SSoT <owner>_<logical>)", idxFullReview},
+		{"Shell display (UX)", ownerNS + "." + res.Logical},
 		{"JSON path", res.Path},
 		{"Type", wireType},
 		{"UNIQUE", map[bool]string{true: "yes", false: "no"}[res.Unique]},

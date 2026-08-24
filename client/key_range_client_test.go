@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	searchKRClientNamespace = "probe-client"
-	updateKRClientNamespace = "000updclient"
+	searchKRClientNamespace = "probeclient"
+	updateKRClientNamespace = "updclient000"
 )
 
 type SearchFixtureDoc string
@@ -76,7 +76,7 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
 	s.False(resWrong.IsError())
 	s.Empty(resWrong.MustGet())
 
-	krServer := x.KeysPattern(testutil.XKeyPrefix("probe-server", true) + "*")
+	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
 	resServer := SearchKey(krServer, nil, false)
 	s.False(resServer.IsError())
 	s.Empty(resServer.MustGet())
@@ -180,7 +180,7 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeBucketTiebreakersLexicographic
 func (s *SearchKeyRangeSuite) TestSearchIndexRangeSparseAmtLimit10() {
 	s.ensureConnectedClientAndAuth()
 	krLimit := x.KeysPattern(krClientID("*")).Limit(10)
-	idxSparse := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "sparse_amt")
+	idxSparse := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "sparseamt")
 	si := SearchIndex(idxSparse, krLimit, nil, false)
 	s.Require().False(si.IsError())
 	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(si.MustGet()))
@@ -277,7 +277,7 @@ func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
 	s.False(resWrong.IsError())
 	s.Empty(resWrong.MustGet(), "cross-contam probe-client prefix should hit zero keys")
 
-	resServer := Update(x.KeysPattern(testutil.XKeyPrefix("probe-server", true)+"*"), nil, x.Set("tag_contam", true))
+	resServer := Update(x.KeysPattern(testutil.XKeyPrefix("probeserver", true)+"*"), nil, x.Set("tag_contam", true))
 	s.False(resServer.IsError())
 	s.Empty(resServer.MustGet(), "cross-contam probe-server prefix should hit zero keys")
 

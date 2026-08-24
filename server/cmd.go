@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
-	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
@@ -328,7 +328,7 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, x.MemNsPrefix) {
+	if naming.HasUnderscorePrefix(keyPattern) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
@@ -647,7 +647,7 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		return
 	}
 
-	pairs, err := xcmd.ParseUpdate(updateJSON)
+	pairs, err := x.ParseUpdate(updateJSON)
 	if err != nil {
 		conn.WriteError("ERR " + err.Error())
 		return

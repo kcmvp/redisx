@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/require"
 	"github.com/tailscale/hujson"
@@ -34,22 +35,19 @@ func KeyRangeDocTTL() time.Duration { return 0 }
 func KeyRangeFixtureMem() bool      { return true }
 
 func XKeyPrefix(namespace string, mem bool) string {
-	if mem {
-		return "_m_" + namespace + ":"
-	}
-	return namespace + ":"
+	return naming.StorageNsScope(naming.BuildStorageNs(namespace, mem))
 }
 
 func XIDKey(namespace string, mem bool, id string) string {
-	return XKeyPrefix(namespace, mem) + id
+	return naming.BuildStorageKey(naming.BuildStorageNs(namespace, mem), id)
 }
 
 func KeyRangeIndexName(namespace string, mem bool, name string) string {
-	return strings.TrimSuffix(XKeyPrefix(namespace, mem), ":") + "_" + name
+	return naming.BuildIdxFullName(naming.BuildStorageNs(namespace, mem), strings.ToLower(name))
 }
 
 func KeyRangeKeyPattern(namespace string, mem bool) string {
-	return XKeyPrefix(namespace, mem) + "*"
+	return naming.StorageNsKeyPattern(naming.BuildStorageNs(namespace, mem))
 }
 
 func KeyRangeRawIndexes(namespace string, mem bool) []x.Index {
@@ -57,7 +55,7 @@ func KeyRangeRawIndexes(namespace string, mem bool) []x.Index {
 	return []x.Index{
 		x.RawIndex(KeyRangeIndexName(namespace, mem, "score"), kp, "score"),
 		x.RawIndex(KeyRangeIndexName(namespace, mem, "bucket"), kp, "bucket"),
-		x.RawIndex(KeyRangeIndexName(namespace, mem, "sparse_amt"), kp, "sparse_amt"),
+		x.RawIndex(KeyRangeIndexName(namespace, mem, "sparseamt"), kp, "sparse_amt"),
 	}
 }
 

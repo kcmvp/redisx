@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/x"
 	"github.com/samber/lo"
@@ -278,19 +279,19 @@ func getListenAndServeFn() func(portRole, string, func(redcon.Conn, redcon.Comma
 }
 
 func authLimitStoreKey(key string) string {
-	return x.AuthNsPrefix + x.StorageKeySeparator + key
+	return naming.AuthStorageKey(key)
 }
 
 func loadAuthKeyLimits(db *DB) error {
 	limits := map[string]int{}
 
-	keysRes := db.Keys(x.AuthNsPrefix + x.StorageKeySeparator + "*")
+	keysRes := db.Keys(naming.AuthStorageGlob())
 	if keysRes.IsError() {
 		return keysRes.Error()
 	}
 
 	for _, storeKey := range keysRes.MustGet() {
-		key := strings.TrimPrefix(storeKey, x.AuthNsPrefix+x.StorageKeySeparator)
+		key, _ := naming.StripAuthPrefixIfAuth(storeKey)
 		valRes := db.Get(storeKey)
 		if valRes.IsError() {
 			if errors.Is(valRes.Error(), buntdb.ErrNotFound) {

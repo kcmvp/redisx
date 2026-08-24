@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/client"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/suite"
@@ -14,8 +15,8 @@ import (
 )
 
 const (
-	searchKRDocNamespace = "probe-doc"
-	updateKRDocNamespace = "000upddoc"
+	searchKRDocNamespace = "probedoc"
+	updateKRDocNamespace = "upddoc000"
 )
 
 type SearchFixtureDoc string
@@ -72,12 +73,12 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeSeedCountIs100() {
 }
 
 func (s *SearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
-	krServer := x.KeysPattern(testutil.XKeyPrefix("probe-server", true) + "*")
+	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
 	resServer := SearchKey[SearchFixtureDoc](krServer, nil, false)
 	s.False(resServer.IsError())
 	s.Empty(resServer.MustGet())
 
-	krClient := x.KeysPattern(testutil.XKeyPrefix("probe-client", true) + "*")
+	krClient := x.KeysPattern(testutil.XKeyPrefix("probeclient", true) + "*")
 	resClient := SearchKey[SearchFixtureDoc](krClient, nil, false)
 	s.False(resClient.IsError())
 	s.Empty(resClient.MustGet())
@@ -182,14 +183,14 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeBucketTiebreakersLexicographic
 
 func (s *SearchKeyRangeSuite) TestSearchIndexRangeSparseAmtLimit10() {
 	krLimit := x.KeysPattern("p*").Limit(10)
-	si := SearchIndex[SearchFixtureDoc]("sparse_amt", krLimit, nil, false)
+	si := SearchIndex[SearchFixtureDoc]("sparseamt", krLimit, nil, false)
 	s.Require().False(si.IsError())
 	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(docRaw(si.MustGet())))
 }
 
 func (s *SearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchNote_docScoped() {
-	memKP := testutil.XKeyPrefix(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
-	memIdxName := memKP[:len(memKP)-1] + "_score"
+	memStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	memIdxName := naming.BuildIdxFullName(memStorageNs, "score")
 	diskKr := x.KeysPattern("user:*")
 	res := client.SearchIndex(memIdxName, diskKr, nil, false)
 	if res.IsError() {
@@ -278,7 +279,7 @@ func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
 }
 
 func clientKRServerStar() string {
-	return testutil.XKeyPrefix("probe-server", true) + "*"
+	return testutil.XKeyPrefix("probeserver", true) + "*"
 }
 
 func (s *UpdateKeyRangeSuite) TestBulkSetAllTagThenVerifyViaSearchKey() {

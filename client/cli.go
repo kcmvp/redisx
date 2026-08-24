@@ -34,7 +34,6 @@ import (
 	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/respconn"
-	"github.com/kcmvp/redisx/internal/xcmd"
 	"github.com/kcmvp/redisx/x"
 	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
@@ -977,7 +976,7 @@ func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]st
 		filterJSON = string(b)
 	}
 
-	updateJSON, err := xcmd.MarshalUpdate(values...)
+	updateJSON, err := x.MarshalUpdate(values...)
 	if err != nil {
 		return mo.Err[[]string](fmt.Errorf("failed to serialize updates: %w", err))
 	}

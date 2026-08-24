@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/require"
@@ -120,12 +121,12 @@ func (suite *DBSuite) TestRawHandlesExposeBothLayers() {
 		return err
 	}))
 	suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
-		_, _, err := tx.Set("_m_mem:key", "mem", nil)
+		_, _, err := tx.Set(naming.BuildStorageKey(naming.BuildStorageNs("mem", true), "key"), "mem", nil)
 		return err
 	}))
 
 	suite.Equal("disk", suite.db.Get("disk:key").MustGet())
-	suite.Equal("mem", suite.db.Get("_m_mem:key").MustGet())
+	suite.Equal("mem", suite.db.Get(naming.BuildStorageKey(naming.BuildStorageNs("mem", true), "key")).MustGet())
 }
 
 func (suite *DBSuite) TestRegisterIndexes() {
@@ -171,7 +172,7 @@ func (suite *DBSuite) TestLoadIndexes() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		metaKey := naming.IdxMetaKey(spec.FullName)
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -192,17 +193,18 @@ func (suite *DBSuite) TestLoadIndexes() {
 	})
 
 	suite.Run("loads mem index meta and builds BTree", func() {
+		memStorageNs := naming.BuildStorageNs("user", true)
 		spec := idxSpec{
-			FullName:   "_m_user_rank",
-			OwnerNs:    "_m_user",
+			FullName:   naming.BuildIdxFullName(memStorageNs, "rank"),
+			OwnerNs:    memStorageNs,
 			Logical:    "rank",
 			OwnerMem:   true,
-			KeyPattern: "_m_user:*",
+			KeyPattern: naming.StorageNsKeyPattern(memStorageNs),
 			Path:       "rank",
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + spec.FullName
+		metaKey := naming.IdxMetaKey(spec.FullName)
 		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -214,16 +216,16 @@ func (suite *DBSuite) TestLoadIndexes() {
 		suite.True(loaded.OwnerMem)
 
 		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set("_m_user:x1", `{"id":"x1","rank":5}`, nil)
+			_, _, e := tx.Set(naming.BuildStorageKey(memStorageNs, "x1"), `{"id":"x1","rank":5}`, nil)
 			return e
 		}))
-		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern("_m_user:*"), nil, false)
+		res := suite.db.SearchIndex(spec.FullName, x.KeysPattern(naming.StorageNsKeyPattern(memStorageNs)), nil, false)
 		suite.True(res.IsOk())
 		suite.Len(res.MustGet(), 1)
 	})
 
 	suite.Run("corrupt meta record returns error", func() {
-		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_broken"
+		metaKey := naming.IdxMetaKey("user_broken")
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, "{not json", nil)
 			return e
@@ -241,7 +243,7 @@ func (suite *DBSuite) TestLoadIndexes() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.IdxMetaNsPrefix + x.StorageKeySeparator + "user_bad"
+		metaKey := naming.IdxMetaKey("user_bad")
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -264,7 +266,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		metaKey := naming.DocMetaKey(spec.StorageNs())
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -289,7 +291,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		metaKey := naming.DocMetaKey(spec.StorageNs())
 		suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -309,7 +311,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		raw, err := json.Marshal(older)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + older.StorageNs()
+		metaKey := naming.DocMetaKey(older.StorageNs())
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -345,7 +347,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		metaKey := naming.DocMetaKey(spec.StorageNs())
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -361,7 +363,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + spec.StorageNs()
+		metaKey := naming.DocMetaKey(spec.StorageNs())
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -378,7 +380,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 	})
 
 	suite.Run("corrupt meta record returns error", func() {
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "broken_ns"
+		metaKey := naming.DocMetaKey("broken_ns")
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, "not a json", nil)
 			return e
@@ -392,7 +394,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		spec := docSpec{KeyAttrs: []string{"id"}, TTL: time.Hour, TypeName: "pkg.X"}
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := x.DocMetaNsPrefix + x.StorageKeySeparator + "bad"
+		metaKey := naming.DocMetaKey("bad")
 		suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
@@ -513,15 +515,18 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 		x.Idx[testMemUserDoc]("age", "*", "age"),
 	))
 
+	memStorageNs := naming.BuildStorageNs("user", true)
+	userMemPrefix := naming.StorageNsScope(memStorageNs)
+
 	suite.NoError(db.Set("user:1", `{"id":"1","age":20,"status":"cold"}`))
-	suite.NoError(db.Set("_m_user:2", `{"id":"2","age":30,"status":"hot"}`))
-	suite.NoError(db.Set("_m_user:3", `{"id":"3","age":25,"status":"hot"}`))
+	suite.NoError(db.Set(userMemPrefix+"2", `{"id":"2","age":30,"status":"hot"}`))
+	suite.NoError(db.Set(userMemPrefix+"3", `{"id":"3","age":25,"status":"hot"}`))
 
 	keys := db.Keys("*user:*")
 	suite.True(keys.IsError())
 	suite.Contains(keys.Error().Error(), "cannot start with wildcard")
 	suite.ElementsMatch([]string{"user:1"}, db.Keys("user:*").MustGet())
-	suite.ElementsMatch([]string{"_m_user:2", "_m_user:3"}, db.Keys("_m_user:*").MustGet())
+	suite.ElementsMatch([]string{userMemPrefix + "2", userMemPrefix + "3"}, db.Keys(userMemPrefix+"*").MustGet())
 
 	res := db.SearchKey(x.KeysPattern("*user:*"), nil, false)
 	suite.True(res.IsError())
@@ -531,17 +536,17 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	suite.True(updated.IsError())
 	suite.Contains(updated.Error().Error(), "cannot start with wildcard")
 	suite.Equal("cold", gjson.Get(db.Get("user:1").MustGet(), "status").String())
-	suite.Equal("hot", gjson.Get(db.Get("_m_user:2").MustGet(), "status").String())
+	suite.Equal("hot", gjson.Get(db.Get(userMemPrefix+"2").MustGet(), "status").String())
 
 	diskRes := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), nil, false)
 	suite.True(diskRes.IsOk())
 	suite.Len(diskRes.MustGet(), 1)
 
-	memRes := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), x.KeysPattern("_m_user:*"), nil, false)
+	memRes := db.SearchIndex(x.Idx[testMemUserDoc]("age", "*", "age").Name(), x.KeysPattern(userMemPrefix+"*"), nil, false)
 	suite.True(memRes.IsOk())
 	suite.Len(memRes.MustGet(), 2)
 
-	mismatchDisk := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("_m_user:*"), nil, false)
+	mismatchDisk := db.SearchIndex(x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern(userMemPrefix+"*"), nil, false)
 	suite.True(mismatchDisk.IsError())
 	suite.Contains(mismatchDisk.Error().Error(), "different storage layer")
 
@@ -560,7 +565,7 @@ func (suite *DBSuite) TestHybridStorageLayers() {
 	defer func() { _ = db.Close() }()
 
 	suite.True(db.Get("user:1").IsOk())
-	suite.True(db.Get("_m_user:2").IsError())
+	suite.True(db.Get(userMemPrefix + "2").IsError())
 }
 
 func TestDBSuite(t *testing.T) {
@@ -813,7 +818,7 @@ func (suite *SearchSuite) SetupTest() {
 		raw := string(emp)
 		department := gjson.Get(raw, "department").String()
 		id := gjson.Get(raw, "id").String()
-		key := "user" + x.StorageKeySeparator + department + x.StorageKeySeparator + id
+		key := naming.BuildStorageKey("user", naming.JoinPKAttrValues([]string{department, id}))
 		suite.NoError(suite.db.Set(key, raw))
 	}
 }
@@ -864,7 +869,7 @@ func (suite *SearchSuite) TestSearchIndex() {
 		{
 			name:      "Query with key pattern filter",
 			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
-			kr:        x.KeysPattern("user:Engineering:*"),
+			kr:        x.KeysPattern("user:Engineering_*"),
 			filter:    nil,
 			desc:      false,
 			wantErr:   false,
@@ -916,7 +921,7 @@ func (suite *SearchSuite) TestSearchKey() {
 	}{
 		{
 			name:      "QueryKey Engineering department ascending",
-			kr:        x.KeysPattern("user:Engineering:*"),
+			kr:        x.KeysPattern("user:Engineering_*"),
 			filter:    nil,
 			desc:      false,
 			wantEmpty: false,
@@ -924,7 +929,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey Engineering department descending",
-			kr:        x.KeysPattern("user:Engineering:*"),
+			kr:        x.KeysPattern("user:Engineering_*"),
 			filter:    nil,
 			desc:      true,
 			wantEmpty: false,
@@ -940,7 +945,7 @@ func (suite *SearchSuite) TestSearchKey() {
 		},
 		{
 			name:      "QueryKey no match",
-			kr:        x.KeysPattern("user:Marketing:*"),
+			kr:        x.KeysPattern("user:Marketing_*"),
 			wantEmpty: true,
 		},
 		{
@@ -1076,8 +1081,8 @@ func TestSearchSuite(t *testing.T) {
 }
 
 const (
-	searchKRFixtureNamespace = "probe-server"
-	updateKRFixtureNamespace = "000updserver"
+	searchKRFixtureNamespace = "probeserver"
+	updateKRFixtureNamespace = "updserver000"
 )
 
 type SearchFixtureDoc string
@@ -1289,7 +1294,7 @@ func (s *UpdateKeyRangeSuite) TestSeedCountMatchesSearchKey() {
 }
 
 func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
-	resWrong := s.db.Update(x.KeysPattern("probe-server:*"), nil, x.Set("tag_contam", true))
+	resWrong := s.db.Update(x.KeysPattern(naming.StorageNsKeyPattern(naming.BuildStorageNs(searchKRFixtureNamespace, testutil.KeyRangeFixtureMem()))), nil, x.Set("tag_contam", true))
 	s.True(resWrong.IsOk())
 	s.Empty(resWrong.MustGet(), "cross-contam probe-server prefix should hit zero keys")
 
