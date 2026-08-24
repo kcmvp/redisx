@@ -352,16 +352,7 @@ func TestValidateLogicalIndexName_Invalid(t *testing.T) {
 // §3 Validators: ValidateStorageNs
 // ============================================================
 func TestValidateStorageNs_Valid(t *testing.T) {
-	good := []string{
-		"user",
-		BuildStorageNs("hot", true),   // "_m_:hot"
-		BuildStorageNs("cache", true), // "_m_:cache"
-		"_doc_", "_idx_", "_auth_",
-		"_doc_" + ":user"[:0] + "_doc_", // force compile; real tests are specific below
-		"_doc_",
-	}
-	// drop dup "doc_"
-	good = append([]string{}, "user", "_m_:hot", "_m_:cache", "_doc_", "_idx_", "_auth_")
+	good := []string{"user", "_m_:hot", "_m_:cache", "_doc_", "_idx_", "_auth_"}
 	for _, g := range good {
 		if err := ValidateStorageNs(g); err != nil {
 			t.Fatalf("storageNs %q should be valid, err: %v", g, err)
