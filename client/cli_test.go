@@ -95,7 +95,11 @@ func (s *ClientTestSuite) SetupSuite() {
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
 	}
 	clientTestServerAddr = cfg.Admin.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWithConfig(cfg,
+		testUserDoc(""),
+		SearchFixtureDoc(""),
+		UpdateFixtureDoc(""),
+	)
 	s.Require().NotNil(db)
 
 	cliServerSeedOnce.Do(func() {
@@ -233,13 +237,13 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 		{
 			"Get not connected",
 			nil,
-			func() (string, error) { return Get("k") },
+			func() (string, error) { return Get("cli:k") },
 			true, "resp client is not connected", "",
 		},
 		{
 			"Set not connected",
 			nil,
-			func() (string, error) { return "", Set("k", "v") },
+			func() (string, error) { return "", Set("cli:k", "v") },
 			true, "resp client is not connected", "",
 		},
 		{
@@ -258,10 +262,10 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 			"Set and Get Success",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
 			func() (string, error) {
-				if err := Set("external-key", "external-value"); err != nil {
+				if err := Set("cli:external-key", "external-value"); err != nil {
 					return "", err
 				}
-				return Get("external-key")
+				return Get("cli:external-key")
 			},
 			false, "", "external-value",
 		},
@@ -269,15 +273,15 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 			"SetWithTTL Success and Expire",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
 			func() (string, error) {
-				if err := SetWithTTL("ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
+				if err := SetWithTTL("cli:ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
 					return "", err
 				}
-				v1, _ := Get("ttl_key")
+				v1, _ := Get("cli:ttl_key")
 				if v1 != "ttl_val" {
 					return v1, nil
 				}
 				time.Sleep(200 * time.Millisecond)
-				v2, err := Get("ttl_key")
+				v2, err := Get("cli:ttl_key")
 				return v2, err
 			},
 			true, "redis: nil", "",
@@ -308,7 +312,7 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 func (s *ClientTestSuite) TestCrudCommands() {
 	s.Run("SetNXWithTTL not connected", func() {
 		s.SetupTest()
-		ok, err := SetNXWithTTL("k", "v", time.Second)
+		ok, err := SetNXWithTTL("cli:k", "v", time.Second)
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(ok)
@@ -331,11 +335,11 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		ok, err := SetNXWithTTL("setnx-fallback", "v1", 0)
+		ok, err := SetNXWithTTL("cli:setnx-fallback", "v1", 0)
 		s.NoError(err)
 		s.True(ok)
 
-		ok, err = SetNXWithTTL("setnx-fallback", "v2", 0)
+		ok, err = SetNXWithTTL("cli:setnx-fallback", "v2", 0)
 		s.NoError(err)
 		s.False(ok)
 	})
@@ -346,24 +350,24 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		ok, err := SetNXWithTTL("setnx-ttl", "ttl-value", 100*time.Millisecond)
+		ok, err := SetNXWithTTL("cli:setnx-ttl", "ttl-value", 100*time.Millisecond)
 		s.NoError(err)
 		s.True(ok)
 
-		val, err := Get("setnx-ttl")
+		val, err := Get("cli:setnx-ttl")
 		s.NoError(err)
 		s.Equal("ttl-value", val)
 
 		time.Sleep(200 * time.Millisecond)
 
-		_, err = Get("setnx-ttl")
+		_, err = Get("cli:setnx-ttl")
 		s.Error(err)
 		s.Contains(err.Error(), "redis: nil")
 	})
 
 	s.Run("SetNX not connected", func() {
 		s.SetupTest()
-		ok, err := SetNX("k", "v")
+		ok, err := SetNX("cli:k", "v")
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(ok)
@@ -371,7 +375,7 @@ func (s *ClientTestSuite) TestCrudCommands() {
 
 	s.Run("Delete not connected", func() {
 		s.SetupTest()
-		deleted, err := Delete("k")
+		deleted, err := Delete("cli:k")
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(deleted)
@@ -379,7 +383,7 @@ func (s *ClientTestSuite) TestCrudCommands() {
 
 	s.Run("Keys not connected", func() {
 		s.SetupTest()
-		keysRes := Keys("k*")
+		keysRes := Keys("cli:k*")
 		s.True(keysRes.IsError())
 		s.Contains(keysRes.Error().Error(), "resp client is not connected")
 	})
@@ -391,34 +395,34 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.ensureConnected()
 
 		// Test SetNX
-		ok, err := SetNX("key_nx", "val1")
+		ok, err := SetNX("cli:key_nx", "val1")
 		s.NoError(err)
 		s.True(ok)
 
-		ok, err = SetNX("key_nx", "val2")
+		ok, err = SetNX("cli:key_nx", "val2")
 		s.NoError(err)
 		s.False(ok)
 
-		v, err := Get("key_nx")
+		v, err := Get("cli:key_nx")
 		s.NoError(err)
 		s.Equal("val1", v)
 
 		// Test Keys
-		_ = Set("key_another", "val")
-		keysRes := Keys("key_*")
+		_ = Set("cli:key_another", "val")
+		keysRes := Keys("cli:key_*")
 		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"key_nx", "key_another"}, keysRes.MustGet())
+		s.ElementsMatch([]string{"cli:key_nx", "cli:key_another"}, keysRes.MustGet())
 
 		// Test Delete
-		deleted, err := Delete("key_nx")
+		deleted, err := Delete("cli:key_nx")
 		s.NoError(err)
 		s.True(deleted)
 
-		keysRes = Keys("key_*")
+		keysRes = Keys("cli:key_*")
 		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"key_another"}, keysRes.MustGet())
+		s.ElementsMatch([]string{"cli:key_another"}, keysRes.MustGet())
 
-		deleted, err = Delete("key_another")
+		deleted, err = Delete("cli:key_another")
 		s.NoError(err)
 		s.True(deleted)
 	})
@@ -1420,13 +1424,13 @@ func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-obs-1", "hello")
+	err = Set("cli:hook-obs-1", "hello")
 	s.NoError(err)
 	s.True(called, "ObserverHook must be called")
-	s.Equal("hook-obs-1", gotKey)
+	s.Equal("cli:hook-obs-1", gotKey)
 	s.Equal([]byte("hello"), gotVal)
 
-	stored, err := Get("hook-obs-1")
+	stored, err := Get("cli:hook-obs-1")
 	s.NoError(err)
 	s.Equal("hello", stored)
 }
@@ -1450,11 +1454,11 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-obs-panic", "val")
+	err = Set("cli:hook-obs-panic", "val")
 	s.NoError(err, "ObserverHook panic must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run after panic in prior observer")
 
-	stored, err := Get("hook-obs-panic")
+	stored, err := Get("cli:hook-obs-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1479,13 +1483,13 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("hook-obs-timeout", "val")
+	err = Set("cli:hook-obs-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverHook timeout must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run")
 	s.Less(elapsed, 500*time.Millisecond, "timeout should bound the hook time")
 
-	stored, err := Get("hook-obs-timeout")
+	stored, err := Get("cli:hook-obs-timeout")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1495,7 +1499,7 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 
 	customErr := errors.New("blocked by policy")
 	AddAbortHook(func(key string, value []byte) error {
-		if key == "forbidden" {
+		if key == "cli:forbidden" {
 			return customErr
 		}
 		return nil
@@ -1505,15 +1509,15 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("forbidden", "secret")
+	err = Set("cli:forbidden", "secret")
 	s.ErrorIs(err, customErr)
 
-	_, err = Get("forbidden")
+	_, err = Get("cli:forbidden")
 	s.Error(err, "key must not exist after abort")
 
-	err = Set("allowed", "public")
+	err = Set("cli:allowed", "public")
 	s.NoError(err)
-	v, err := Get("allowed")
+	v, err := Get("cli:allowed")
 	s.NoError(err)
 	s.Equal("public", v)
 }
@@ -1532,11 +1536,11 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-abort-panic", "val")
+	err = Set("cli:hook-abort-panic", "val")
 	s.Error(err, "AbortHook panic must abort write (fail-closed)")
 	s.Contains(err.Error(), "panic")
 
-	_, err = Get("hook-abort-panic")
+	_, err = Get("cli:hook-abort-panic")
 	s.Error(err, "key must not exist after AbortHook panic")
 }
 
@@ -1556,7 +1560,7 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("hook-abort-timeout", "val")
+	err = Set("cli:hook-abort-timeout", "val")
 	elapsed := time.Since(start)
 	s.Error(err, "AbortHook timeout must abort write (fail-closed)")
 	s.Contains(err.Error(), "timeout")
@@ -1578,10 +1582,10 @@ func (s *ClientTestSuite) TestTransformHookChangesValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-transform-1", "plain")
+	err = Set("cli:hook-transform-1", "plain")
 	s.NoError(err)
 
-	stored, err := Get("hook-transform-1")
+	stored, err := Get("cli:hook-transform-1")
 	s.NoError(err)
 	s.Equal("enc:plain", stored, "TransformHook must change the written value")
 }
@@ -1608,10 +1612,10 @@ func (s *ClientTestSuite) TestTransformHookChain() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-transform-chain", "\x01")
+	err = Set("cli:hook-transform-chain", "\x01")
 	s.NoError(err)
 
-	stored, err := Get("hook-transform-chain")
+	stored, err := Get("cli:hook-transform-chain")
 	s.NoError(err)
 	s.Equal([]byte{("\x01"[0] + 1) * 2}, []byte(stored),
 		"TransformHooks must chain in registration order: (+1) then (*2)")
@@ -1628,11 +1632,11 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnError() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-transform-err", "val")
+	err = Set("cli:hook-transform-err", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "transform failed")
 
-	_, err = Get("hook-transform-err")
+	_, err = Get("cli:hook-transform-err")
 	s.Error(err, "key must not exist after TransformHook error")
 }
 
@@ -1650,11 +1654,11 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-transform-panic", "val")
+	err = Set("cli:hook-transform-panic", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "panic")
 
-	_, err = Get("hook-transform-panic")
+	_, err = Get("cli:hook-transform-panic")
 	s.Error(err)
 }
 
@@ -1673,9 +1677,9 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-after-1", "hello-after")
+	err = Set("cli:hook-after-1", "hello-after")
 	s.NoError(err)
-	s.Equal("hook-after-1", gotKey)
+	s.Equal("cli:hook-after-1", gotKey)
 	s.Equal("hello-after", gotVal)
 	s.NoError(gotWriteErr, "writeErr should be nil on success")
 }
@@ -1701,7 +1705,7 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-after-transformed", "ABC")
+	err = Set("cli:hook-after-transformed", "ABC")
 	s.NoError(err)
 	s.Equal([]byte("BCD"), gotVal, "ObserverAfter must see the transformed value")
 }
@@ -1725,11 +1729,11 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-after-panic", "val")
+	err = Set("cli:hook-after-panic", "val")
 	s.NoError(err, "ObserverAfterHook panic must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
 
-	stored, err := Get("hook-after-panic")
+	stored, err := Get("cli:hook-after-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1754,7 +1758,7 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("hook-after-timeout", "val")
+	err = Set("cli:hook-after-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverAfterHook timeout must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
@@ -1796,7 +1800,7 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-order", "original")
+	err = Set("cli:hook-order", "original")
 	s.NoError(err)
 	steps[3] = seq.Add(1) // Capture "write step" after Set returns
 
@@ -1808,7 +1812,7 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 	s.Equal(int64(4), steps[4]) // ObserverAfter runs BEFORE Set returns (sync)
 	s.Equal(int64(5), steps[3]) // our post-Set capture happens last
 
-	stored, err := Get("hook-order")
+	stored, err := Get("cli:hook-order")
 	s.NoError(err)
 	s.Equal("transformed", stored)
 }
@@ -1837,7 +1841,7 @@ func (s *ClientTestSuite) TestObserverBeforeSeesPostTransformValueButAbortSeesOr
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-see-orig", "raw-value")
+	err = Set("cli:hook-see-orig", "raw-value")
 	s.NoError(err)
 	s.Equal([]byte("raw-value"), abortSaw,
 		"AbortHook must see ORIGINAL value (runs first)")
@@ -1868,7 +1872,7 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("hook-no-after", "val")
+	err = Set("cli:hook-no-after", "val")
 	s.Error(err)
 	s.False(observerBeforeCalled,
 		"ObserverBefore must NOT run when AbortHook aborted earlier (fail-closed propagates out of Abort phase)")
@@ -1888,11 +1892,11 @@ func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() 
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("nil-transform", "should-not-be-overwritten")
+	err = Set("cli:nil-transform", "should-not-be-overwritten")
 	s.Error(err)
 	s.Contains(err.Error(), "returned nil bytes without error")
 
-	existing, gerr := Get("nil-transform")
+	existing, gerr := Get("cli:nil-transform")
 	if gerr == nil {
 		s.Equal("", existing,
 			"key either should not exist OR be empty string; what we must NOT see is 'should-not-be-overwritten' overwritten to ''.")
@@ -1913,9 +1917,9 @@ func (s *ClientTestSuite) TestSetHookZeroTimeoutUsesSyncPathNoGoroutineAllocs() 
 	s.ensureConnected()
 
 	// Quick sanity — no error, writes succeed with T=0.
-	err = Set("sync-path", "v")
+	err = Set("cli:sync-path", "v")
 	s.NoError(err)
-	v, gerr := Get("sync-path")
+	v, gerr := Get("cli:sync-path")
 	s.NoError(gerr)
 	s.Equal("v", v)
 }
@@ -1937,9 +1941,9 @@ func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError()
 	s.ensureConnected()
 
 	// (1) Plain Set success -> committed true, err nil
-	err = Set("after-commit-1", "v1")
+	err = Set("cli:after-commit-1", "v1")
 	s.NoError(err)
-	s.Equal("after-commit-1", gotKey)
+	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
 	s.NoError(gotErr)
 
@@ -1948,11 +1952,11 @@ func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError()
 		return errors.New("blocked in abort hook")
 	})
 	defer RemoveHook(abortID)
-	err = Set("after-commit-2", "v2")
+	err = Set("cli:after-commit-2", "v2")
 	s.Error(err)
 	// gotKey/gotCommitted/gotErr still hold values from the previous successful Set because
 	// runAfterHooks is entirely skipped when runBeforeHooks aborts (fail-closed propagation).
-	s.Equal("after-commit-1", gotKey)
+	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
 }
 
@@ -1986,21 +1990,21 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNX("hook-setnx-1", "original")
+	ok, err := SetNX("cli:hook-setnx-1", "original")
 	s.NoError(err)
 	s.True(ok)
 	s.True(afterCommitted, "first SetNX write actually occurred -> committed=true")
-	s.Equal("hook-setnx-1", obsKey)
+	s.Equal("cli:hook-setnx-1", obsKey)
 	s.Equal("x:original", obsVal,
 		"ObserverBefore runs after Transform, so sees post-transform value (A5 order)")
 	s.Equal("x:original", afterVal)
 	s.NoError(afterErr)
 
-	stored, err := Get("hook-setnx-1")
+	stored, err := Get("cli:hook-setnx-1")
 	s.NoError(err)
 	s.Equal("x:original", stored)
 
-	ok, err = SetNX("hook-setnx-1", "another")
+	ok, err = SetNX("cli:hook-setnx-1", "another")
 	s.NoError(err)
 	s.False(ok, "SetNX should return false on existing key")
 	s.False(afterCommitted,
@@ -2020,15 +2024,15 @@ func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetWithTTL("hook-ttl", "base", 100*time.Millisecond)
+	err = SetWithTTL("cli:hook-ttl", "base", 100*time.Millisecond)
 	s.NoError(err)
 
-	v, err := Get("hook-ttl")
+	v, err := Get("cli:hook-ttl")
 	s.NoError(err)
 	s.Equal("base-ttl", v)
 
 	time.Sleep(200 * time.Millisecond)
-	_, err = Get("hook-ttl")
+	_, err = Get("cli:hook-ttl")
 	s.Error(err)
 }
 
@@ -2043,16 +2047,16 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNXWithTTL("hook-setnx-ttl", "x", 80*time.Millisecond)
+	ok, err := SetNXWithTTL("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
 	s.NoError(err)
 	s.True(ok)
 
-	v, err := Get("hook-setnx-ttl")
+	v, err := Get("cli:hook-setnx-ttl")
 	s.NoError(err)
 	s.Equal("x", v)
 
 	time.Sleep(160 * time.Millisecond)
-	_, err = Get("hook-setnx-ttl")
+	_, err = Get("cli:hook-setnx-ttl")
 	s.Error(err)
 }
 
@@ -2376,7 +2380,7 @@ func BenchmarkSetNoHooks(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("bench-nohook", "payload-value", 0)
+		_ = SetWithTTL("cli:bench-nohook", "payload-value", 0)
 	}
 }
 
@@ -2411,7 +2415,7 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("bench-observer", "payload-value", 0)
+		_ = SetWithTTL("cli:bench-observer", "payload-value", 0)
 	}
 }
 
@@ -2446,7 +2450,7 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("bench-abort", "payload-value", 0)
+		_ = SetWithTTL("cli:bench-abort", "payload-value", 0)
 	}
 }
 
@@ -2483,7 +2487,7 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("bench-transform", "payload-value", 0)
+		_ = SetWithTTL("cli:bench-transform", "payload-value", 0)
 	}
 }
 

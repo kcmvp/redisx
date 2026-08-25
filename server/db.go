@@ -43,12 +43,29 @@ func (p docSpec) StorageNs() string {
 }
 
 type idxSpec struct {
-	FullName   string `json:"full_name"`
-	OwnerNs    string `json:"owner_ns"`
-	Logical    string `json:"logical"`
-	OwnerMem   bool   `json:"owner_mem"`
-	KeyPattern string `json:"key_pattern"`
-	Path       string `json:"path"`
+	OwnerNs    string   `json:"owner_ns"`
+	Logical    string   `json:"logical"`
+	KeyPattern string   `json:"key_pattern"`
+	Paths      []string `json:"paths"`
+}
+
+func (i idxSpec) FullName() string { return naming.BuildIdxFullName(i.OwnerNs, i.Logical) }
+
+func (i *idxSpec) UnmarshalJSON(b []byte) error {
+	type rawIdx idxSpec
+	aux := &struct {
+		Path string `json:"path"`
+		*rawIdx
+	}{
+		rawIdx: (*rawIdx)(i),
+	}
+	if err := json.Unmarshal(b, aux); err != nil {
+		return err
+	}
+	if len(aux.Paths) == 0 && aux.Path != "" {
+		aux.Paths = []string{aux.Path}
+	}
+	return nil
 }
 
 // SECTION: Open
@@ -108,10 +125,10 @@ type DB struct {
 	disk *buntdb.DB
 	mem  *buntdb.DB
 
-	docRegMu   sync.Mutex
+	docRegMu   sync.RWMutex
 	docRegSpec map[string]docSpec
 
-	idxRegMu   sync.Mutex
+	idxRegMu   sync.RWMutex
 	idxRegSpec map[string]idxSpec
 }
 
@@ -178,6 +195,13 @@ func resolvePatternLayer(keyPattern string) (storageLayer, bool, error) {
 		return storageDisk, false, nil
 	}
 	return layerForKey(keyPattern), true, nil
+}
+
+func layerForStorageNs(storageNs string) storageLayer {
+	if naming.HasMemPrefix(storageNs) {
+		return storageMem
+	}
+	return storageDisk
 }
 
 // store returns the underlying storage handle for layer.
@@ -248,6 +272,20 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 				}
 			}
 
+			storageNs, _, splitErr := naming.SplitStorageKey(key)
+			if splitErr == nil && !naming.IsInternalStorageNs(storageNs) {
+				doc, regOK := db.docRegSpec[storageNs]
+				if regOK {
+					oldDK, dkErr := deriveDocKey(doc, storageNs, val)
+					if dkErr == nil {
+						newDK, dkErr2 := deriveDocKey(doc, storageNs, newVal)
+						if dkErr2 == nil && oldDK.FullStorageKey != newDK.FullStorageKey {
+							return fmt.Errorf("UPDATE would change primary key of %q from %q to %q — pk mutations are not allowed", key, oldDK.FullStorageKey, newDK.FullStorageKey)
+						}
+					}
+				}
+			}
+
 			if newVal != val {
 				_, _, err = tx.Set(key, newVal, setOptionsForTTL(ttl))
 				if err != nil {
@@ -279,69 +317,91 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 // no-op (idempotent). Conflicting specs for the same FullName return a
 // descriptive error.
 func (db *DB) applyIndexSpec(spec idxSpec, persist bool) error {
-	if spec.FullName == "" {
-		return errors.New("index spec: full_name is required")
+	if spec.OwnerNs == "" {
+		return errors.New("index spec: owner_ns is required")
 	}
+	if spec.Logical == "" {
+		return errors.New("index spec: logical is required")
+	}
+	fullName := spec.FullName()
 	if spec.KeyPattern == "" {
-		return fmt.Errorf("index %q: key_pattern is required", spec.FullName)
+		return fmt.Errorf("index %q: key_pattern is required", fullName)
 	}
-	if spec.Path == "" {
-		return fmt.Errorf("index %q: path is required", spec.FullName)
+	if len(spec.Paths) == 0 {
+		return fmt.Errorf("index %q: at least one json path is required (single-field or composite multi-field)", fullName)
+	}
+	for i, p := range spec.Paths {
+		if p == "" {
+			return fmt.Errorf("index %q: paths[%d] is empty", fullName, i)
+		}
 	}
 	layer, constrained, err := resolvePatternLayer(spec.KeyPattern)
 	if err != nil {
-		return fmt.Errorf("index %q: %w", spec.FullName, err)
+		return fmt.Errorf("index %q: %w", fullName, err)
 	}
 	if !constrained {
-		return fmt.Errorf("index %q: key_pattern cannot start with wildcard", spec.FullName)
+		return fmt.Errorf("index %q: key_pattern cannot start with wildcard", fullName)
 	}
 
 	db.idxRegMu.Lock()
 	defer db.idxRegMu.Unlock()
 
-	existing, ok := db.idxRegSpec[spec.FullName]
-	if ok {
-		identical := existing.FullName == spec.FullName &&
-			existing.OwnerNs == spec.OwnerNs &&
-			existing.Logical == spec.Logical &&
-			existing.OwnerMem == spec.OwnerMem &&
-			existing.KeyPattern == spec.KeyPattern &&
-			existing.Path == spec.Path
-		if identical {
-			return nil
-		}
-		return fmt.Errorf(
-			"index %q already registered with owner_ns=%q pattern=%q path=%q; "+
-				"conflicting registration requested: owner_ns=%q pattern=%q path=%q",
-			spec.FullName,
-			existing.OwnerNs, existing.KeyPattern, existing.Path,
-			spec.OwnerNs, spec.KeyPattern, spec.Path)
+	if _, exists := db.idxRegSpec[fullName]; exists {
+		slog.Debug("applyIndexSpec: index already in registry, skipping", "name", fullName)
+		return nil
 	}
 
-	if err := db.store(layer).CreateIndex(spec.FullName, spec.KeyPattern, buntdb.IndexJSON(spec.Path)); err != nil {
-		return fmt.Errorf("index %q: create btree: %w", spec.FullName, err)
+	if err := db.store(layer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
+		return fmt.Errorf("index %q: create btree: %w", fullName, err)
 	}
-	db.idxRegSpec[spec.FullName] = spec
+	db.idxRegSpec[fullName] = spec
 
 	if persist {
-		metaKey := naming.IdxMetaKey(spec.FullName)
+		metaKey := naming.IdxMetaKey(fullName)
 		raw, err := json.Marshal(spec)
 		if err != nil {
-			return fmt.Errorf("index %q: marshal idxSpec: %w", spec.FullName, err)
+			return fmt.Errorf("index %q: marshal idxSpec: %w", fullName, err)
 		}
-		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		raw, err = sjson.SetBytes(raw, "created_at", time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return fmt.Errorf("index %q: inject created_at: %w", fullName, err)
+		}
+		metaLayer := layerForStorageNs(spec.OwnerNs)
+		if err := db.store(metaLayer).Update(func(tx *buntdb.Tx) error {
 			_, _, setErr := tx.Set(metaKey, string(raw), nil)
 			return setErr
 		}); err != nil {
-			return fmt.Errorf("index %q: persist %s: %w", spec.FullName, metaKey, err)
+			return fmt.Errorf("index %q: persist %s: %w", fullName, metaKey, err)
 		}
 	}
 
 	slog.Debug("index registered",
-		"name", spec.FullName, "owner_ns", spec.OwnerNs,
-		"logical", spec.Logical, "mem", spec.OwnerMem,
-		"pattern", spec.KeyPattern, "path", spec.Path)
+		"name", fullName, "owner_ns", spec.OwnerNs,
+		"logical", spec.Logical, "mem", naming.HasMemPrefix(spec.OwnerNs),
+		"pattern", spec.KeyPattern, "paths", spec.Paths)
 	return nil
+}
+
+func indexJSONComposite(paths ...string) func(a, b string) bool {
+	if len(paths) == 0 {
+		panic("indexJSONComposite: at least one path is required")
+	}
+	if len(paths) == 1 {
+		return buntdb.IndexJSON(paths[0])
+	}
+	return func(a, b string) bool {
+		for _, p := range paths {
+			ra := gjson.Get(a, p)
+			rb := gjson.Get(b, p)
+			if ra.Less(rb, false) {
+				return true
+			}
+			if rb.Less(ra, false) {
+				return false
+			}
+		}
+		return false
+	}
 }
 
 // CreateIndex converts legacy x.Index declarations into idxSpec
@@ -354,28 +414,29 @@ func (db *DB) CreateIndex(idx x.Index) error {
 
 // registerIndexes converts legacy x.Index declarations into idxSpec
 // and forwards them to applyIndexSpec without persisting "_idx_:*" meta
-// keys. Duplicate specs are rejected (idempotent: only exact duplicates pass).
+// keys. Duplicate specs are rejected: a fixture that attempts to register
+// the same index name twice must drop it first or fix the fixture schema.
 func (db *DB) registerIndexes(indexes ...x.Index) error {
 	for _, idx := range indexes {
 		fullName := idx.Name()
 		if fullName == "" {
 			return fmt.Errorf("index name is required")
 		}
-		if _, ok := db.idxRegSpec[fullName]; ok {
+		db.idxRegMu.RLock()
+		_, already := db.idxRegSpec[fullName]
+		db.idxRegMu.RUnlock()
+		if already {
 			return fmt.Errorf("index already declared: %s", fullName)
 		}
 		ownerNs, logical, err := naming.ParseIdxFullName(fullName)
 		if err != nil {
 			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
 		}
-		ownerMem := naming.HasMemPrefix(idx.KeyPattern()) || naming.HasMemPrefix(ownerNs)
 		spec := idxSpec{
-			FullName:   fullName,
 			OwnerNs:    ownerNs,
 			Logical:    logical,
-			OwnerMem:   ownerMem,
 			KeyPattern: idx.KeyPattern(),
-			Path:       idx.Path(),
+			Paths:      idx.Paths(),
 		}
 		if err := db.applyIndexSpec(spec, false); err != nil {
 			return err
@@ -416,8 +477,8 @@ func (db *DB) loadIndexes() error {
 			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
 				return fmt.Errorf("index %s: unmarshal idxSpec: %w", c.metaKey, err)
 			}
-			if spec.FullName == "" {
-				return fmt.Errorf("index %s: empty name", c.metaKey)
+			if spec.OwnerNs == "" || spec.Logical == "" {
+				return fmt.Errorf("index %s: missing owner_ns/logical", c.metaKey)
 			}
 			if err := db.applyIndexSpec(spec, false); err != nil {
 				return fmt.Errorf("index %s: apply: %w", c.metaKey, err)
@@ -511,49 +572,8 @@ func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
 	db.docRegMu.Lock()
 	defer db.docRegMu.Unlock()
 
-	existing, ok := db.docRegSpec[storageNs]
-	if ok {
-		compatible := existing.Namespace == spec.Namespace &&
-			existing.Mem == spec.Mem &&
-			reflect.DeepEqual(existing.KeyAttrs, spec.KeyAttrs)
-		if !compatible {
-			return fmt.Errorf(
-				"namespace %q already registered by %q (keyattrs=%v ttl=%s); "+
-					"incompatible with %q (keyattrs=%v ttl=%s)",
-				storageNs, existing.TypeName, existing.KeyAttrs, existing.TTL,
-				spec.TypeName, spec.KeyAttrs, spec.TTL)
-		}
-		if spec.TypeName == "" || strings.HasPrefix(spec.TypeName, "unknown<") {
-			spec.TypeName = existing.TypeName
-		}
-		if existing.TTL == spec.TTL && existing.TypeName == spec.TypeName {
-			return nil
-		}
-		raw, err := json.Marshal(spec)
-		if err != nil {
-			return fmt.Errorf("doc %q: marshal updated docSpec: %w", storageNs, err)
-		}
-		layer := storageDisk
-		if spec.Mem {
-			layer = storageMem
-		}
-		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
-			_, _, setErr := tx.Set(metaKey, string(raw), nil)
-			return setErr
-		}); err != nil {
-			return fmt.Errorf("doc %q: persist updated %s: %w", storageNs, metaKey, err)
-		}
-		db.docRegSpec[storageNs] = spec
-		if existing.TTL != spec.TTL {
-			slog.Debug("doc schema TTL updated",
-				"namespace", spec.Namespace, "storage_ns", storageNs,
-				"mem", spec.Mem, "old_ttl", existing.TTL, "new_ttl", spec.TTL)
-		}
-		if existing.TypeName != spec.TypeName {
-			slog.Debug("doc schema type label updated",
-				"namespace", spec.Namespace, "storage_ns", storageNs,
-				"old_type", existing.TypeName, "new_type", spec.TypeName)
-		}
+	if _, exists := db.docRegSpec[storageNs]; exists {
+		slog.Debug("applyDocSpec: namespace already in registry, skipping", "storage_ns", storageNs)
 		return nil
 	}
 
@@ -565,10 +585,11 @@ func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
 	if err != nil {
 		return fmt.Errorf("doc %q: marshal docSpec: %w", storageNs, err)
 	}
-	layer := storageDisk
-	if spec.Mem {
-		layer = storageMem
+	raw, err = sjson.SetBytes(raw, "created_at", time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("doc %q: inject created_at: %w", storageNs, err)
 	}
+	layer := layerForStorageNs(storageNs)
 	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, _, setErr := tx.Set(metaKey, string(raw), nil)
 		return setErr
@@ -587,10 +608,10 @@ func (db *DB) applyDocSpec(spec docSpec, rt reflect.Type) error {
 // registerSchemas eagerly applies a batch of Schema values at server boot
 // by converting each Schema interface into a docSpec and forwarding it to
 // applyDocSpec. Each schema value is normally the zero-value of a ~string
-// Document alias (e.g. UserDoc("")). Conflict detection, namespace
-// validation, ~string guard, and persistence are all delegated to
-// applyDocSpec; this wrapper exists purely to bridge the type-level
-// interface world (x.Schema) into the runtime spec world (docSpec).
+// Document alias (e.g. UserDoc("")). When a namespace is already present
+// in the runtime registry (restored from persisted "_doc_:*" meta), we
+// skip applying the in-process schema copy and emit a warning. Conflicting
+// specs across restarts must be resolved via DESDOC / DROPDOC first.
 func (db *DB) registerSchemas(schemas ...x.Schema) error {
 	for _, sch := range schemas {
 		rt := reflect.TypeOf(sch)
@@ -602,6 +623,18 @@ func (db *DB) registerSchemas(schemas ...x.Schema) error {
 		}
 		if rt != nil {
 			spec.TypeName = rt.String()
+		}
+		storageNs := spec.StorageNs()
+
+		db.docRegMu.RLock()
+		_, already := db.docRegSpec[storageNs]
+		db.docRegMu.RUnlock()
+		if already {
+			slog.Warn("schema namespace already registered; "+
+				"skipping boot-time schema copy (persisted _doc_:* meta wins). "+
+				"Drop the namespace first if you want to re-register with different schema",
+				"namespace", spec.Namespace, "storage_ns", storageNs, "mem", spec.Mem)
+			continue
 		}
 		if err := db.applyDocSpec(spec, rt); err != nil {
 			return err
@@ -625,11 +658,9 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 	}
-	var layer storageLayer
-	if idxSpec.OwnerMem {
+	layer := storageDisk
+	if naming.HasMemPrefix(idxSpec.OwnerNs) {
 		layer = storageMem
-	} else {
-		layer = storageDisk
 	}
 	krLayerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
 		return layerForKey(k)
@@ -760,6 +791,7 @@ func (db *DB) Set(key string, value string) error {
 //	SET <key> <value> EX <seconds>
 //	SETEX <key> <seconds> <value>
 func (db *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
+	ttl = db.autoTTLFromKey(key, ttl)
 	opt := setOptionsForTTL(ttl)
 	if opt == nil {
 		return db.Set(key, value)
@@ -790,6 +822,7 @@ func (db *DB) SetNX(key string, value string) (bool, error) {
 //
 // key must be the full storage key.
 func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, error) {
+	ttl = db.autoTTLFromKey(key, ttl)
 	var set bool
 	opt := setOptionsForTTL(ttl)
 	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
@@ -1102,4 +1135,156 @@ func applyKeyRange(tx *buntdb.Tx, kr x.KeyRange, dir x.RangeDirection, fn func(k
 		return applyPatternRange(tx, pa, limit, dir, fn)
 	}
 	panic("applyKeyRange: unhandled KeyRangeKind " + kind.String())
+}
+
+// ============================================================
+// Internal helpers for atomic batched writes + index drop.
+// Batch atomicity enforces single storage layer (disk XOR mem).
+// ============================================================
+
+func (db *DB) dropIndexByFullName(fullName string) error {
+	if db == nil {
+		return errors.New("dropIndexByFullName: db is nil")
+	}
+	if fullName == "" {
+		return errors.New("dropIndexByFullName: full_name is required")
+	}
+	ownerNs, _, err := naming.ParseIdxFullName(fullName)
+	if err != nil {
+		return fmt.Errorf("dropIndexByFullName: %w", err)
+	}
+	layer := layerForStorageNs(ownerNs)
+	db.idxRegMu.Lock()
+	defer db.idxRegMu.Unlock()
+	spec, ok := db.idxRegSpec[fullName]
+	if !ok {
+		return fmt.Errorf("dropIndexByFullName: index %q not registered", fullName)
+	}
+	if err := db.store(layer).DropIndex(fullName); err != nil && !errors.Is(err, buntdb.ErrNotFound) {
+		return fmt.Errorf("dropIndexByFullName: drop btree: %w", err)
+	}
+	metaKey := naming.IdxMetaKey(fullName)
+	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		_, delErr := tx.Delete(metaKey)
+		if delErr != nil && !errors.Is(delErr, buntdb.ErrNotFound) {
+			return delErr
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("dropIndexByFullName: delete %s: %w", metaKey, err)
+	}
+	delete(db.idxRegSpec, fullName)
+	slog.Debug("index dropped",
+		"name", fullName, "owner_ns", spec.OwnerNs,
+		"logical", spec.Logical, "mem", naming.HasMemPrefix(spec.OwnerNs))
+	return nil
+}
+
+type batchedWrite struct {
+	Key   string
+	Value string
+	TTL   time.Duration
+}
+
+var errNxPreconditionFailed = errors.New("setBatchAtomic: nx precondition failed — one or more keys already exist")
+
+func (db *DB) setBatchAtomic(batch []batchedWrite, nxMode bool) (int, error) {
+	if len(batch) == 0 {
+		return 0, nil
+	}
+	layers := make(map[storageLayer][]batchedWrite, 2)
+	for _, w := range batch {
+		l := layerForKey(w.Key)
+		layers[l] = append(layers[l], w)
+	}
+	if len(layers) != 1 {
+		return 0, errors.New("atomic batch writes cannot span storage layers; pick consistent Mem flag across payloads")
+	}
+	var layer storageLayer
+	var writes []batchedWrite
+	for l, ws := range layers {
+		layer = l
+		writes = ws
+	}
+	applied := 0
+	err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		seen := make(map[string]struct{}, len(writes))
+		for _, w := range writes {
+			if w.Key == "" {
+				return errors.New("batch: empty key")
+			}
+			if _, dup := seen[w.Key]; dup {
+				return fmt.Errorf("batch: duplicate key %q in single SET", w.Key)
+			}
+			seen[w.Key] = struct{}{}
+		}
+		if nxMode {
+			for _, w := range writes {
+				_, err := tx.Get(w.Key)
+				if err == nil {
+					return errNxPreconditionFailed
+				}
+				if err != buntdb.ErrNotFound {
+					return err
+				}
+			}
+		}
+		for _, w := range writes {
+			opt := setOptionsForTTL(w.TTL)
+			_, _, err := tx.Set(w.Key, w.Value, opt)
+			if err != nil {
+				return err
+			}
+			applied++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return applied, nil
+}
+
+func (db *DB) deleteBatchAtomic(keys []string) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	layers := make(map[storageLayer][]string, 2)
+	for _, k := range keys {
+		l := layerForKey(k)
+		layers[l] = append(layers[l], k)
+	}
+	if len(layers) != 1 {
+		return 0, errors.New("atomic batch deletes cannot span storage layers")
+	}
+	var layer storageLayer
+	var ks []string
+	for l, list := range layers {
+		layer = l
+		ks = list
+	}
+	seen := make(map[string]struct{}, len(ks))
+	for _, k := range ks {
+		if _, dup := seen[k]; dup {
+			return 0, fmt.Errorf("batch: duplicate key %q in single DEL", k)
+		}
+		seen[k] = struct{}{}
+	}
+	deleted := 0
+	err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		for _, k := range ks {
+			val, err := tx.Delete(k)
+			if err != nil && err != buntdb.ErrNotFound {
+				return err
+			}
+			if err == nil && len(val) > 0 {
+				deleted++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }

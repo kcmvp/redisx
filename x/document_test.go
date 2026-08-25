@@ -1,12 +1,148 @@
 package x
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/stretchr/testify/require"
 )
+
+// cheatsheetUserDoc / cheatsheetSessionDoc are the EXACT reference types
+// from x/document.go "RESP Wire Cheatsheet §0". Any change to Namespace /
+// Mem / KeyAttrs / TTL in the cheatsheet comment MUST be mirrored here and
+// TestCheatsheetSchemaReference_ExactKeyCoordinates re-run to stay in sync.
+//
+//	UserDoc    (disk) Namespace="user"    Mem=false KeyAttrs=["tenant","id"] TTL=24h
+//	SessionDoc (mem)  Namespace="session" Mem=true  KeyAttrs=["sid"]          TTL=30m
+type cheatsheetUserDoc string
+
+func (cheatsheetUserDoc) Namespace() string  { return "user" }
+func (cheatsheetUserDoc) Mem() bool          { return false }
+func (cheatsheetUserDoc) KeyAttrs() []string { return []string{"tenant", "id"} }
+func (u cheatsheetUserDoc) RawJSON() string  { return string(u) }
+func (cheatsheetUserDoc) TTL() time.Duration { return 24 * time.Hour }
+
+type cheatsheetSessionDoc string
+
+func (cheatsheetSessionDoc) Namespace() string  { return "session" }
+func (cheatsheetSessionDoc) Mem() bool          { return true }
+func (cheatsheetSessionDoc) KeyAttrs() []string { return []string{"sid"} }
+func (u cheatsheetSessionDoc) RawJSON() string  { return string(u) }
+func (cheatsheetSessionDoc) TTL() time.Duration { return 30 * time.Minute }
+
+// TestCheatsheetSchemaReference_ExactKeyCoordinates pins the EXACT 10
+// coordinate values written in x/document.go RESP Wire Cheatsheet §0
+// (L476-L502) against x-package APIs directly — because x is the SSoT
+// contract layer for Document key-derivation logic, not internal/naming.
+//
+// Covered per reference type:
+//   - storageNs          (BuildStorageNs from Namespace()+Mem())
+//   - full key value     (Key[T] / StorageKey, for the exact attrs from the
+//     cheatsheet comment: user={tenant:"acme", id:"7"} /
+//     session={sid:"abc"})
+//   - doc meta key       (_doc_:{storageNs})
+//   - index full name    (Idx[T].Name / ValidateIdxName — logical index
+//     names match cheatsheet: "age" / "last")
+//   - index meta key     (_idx_:{indexFullName})
+func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
+	// ------------------------------------------------------------
+	// UserDoc (disk)
+	// ------------------------------------------------------------
+	userAcme7 := cheatsheetUserDoc(`{"tenant":"acme","id":"7","age":30,"status":"cold"}`)
+	require.Equal(t, "user",
+		naming.BuildStorageNs(cheatsheetUserDoc("").Namespace(), cheatsheetUserDoc("").Mem()),
+		"cheatsheet UserDoc storageNs = Namespace(\"user\") + Mem=false → \"user\"")
+
+	userFullByGenericAPI, err := Key[cheatsheetUserDoc](string(userAcme7))
+	require.NoError(t, err)
+	userFullByMethod, err := StorageKey(userAcme7)
+	require.NoError(t, err)
+	require.Equal(t, "user:acme_7", userFullByGenericAPI,
+		"cheatsheet: user:{tenant}_{id} for {acme,7} → Key[T] = user:acme_7")
+	require.Equal(t, userFullByGenericAPI, userFullByMethod,
+		"Key[T] and StorageKey(d) must agree on the full storage key")
+	require.Equal(t, "acme_7",
+		naming.JoinPKAttrValues([]string{"acme", "7"}),
+		"cheatsheet suffix = {tenant}_{id} for {acme,7} → \"acme_7\"")
+
+	require.Equal(t, "_doc_:user",
+		naming.DocMetaKey(naming.BuildStorageNs("user", false)),
+		"cheatsheet UserDoc doc meta = _doc_:{storageNs} → \"_doc_:user\"")
+
+	userAgeIdxName, err := ValidateIdxName[cheatsheetUserDoc]("age")
+	require.NoError(t, err)
+	require.Equal(t, "user:age", userAgeIdxName,
+		"cheatsheet UserDoc index \"age\" full name = {storageNs}:age → \"user:age\"")
+	require.Equal(t, userAgeIdxName, Idx[cheatsheetUserDoc]("age", "*", "age").Name(),
+		"ValidateIdxName[T] and Idx[T].Name must agree on the full index name")
+	require.Equal(t, "_idx_:user:age", naming.IdxMetaKey(userAgeIdxName),
+		"cheatsheet UserDoc index meta = _idx_:{indexFullName} → \"_idx_:user:age\"")
+
+	// ------------------------------------------------------------
+	// SessionDoc (mem)
+	// ------------------------------------------------------------
+	sessionAbc := cheatsheetSessionDoc(`{"sid":"abc","user_id":1,"last_ts":1000}`)
+	require.Equal(t, "_m_:session",
+		naming.BuildStorageNs(cheatsheetSessionDoc("").Namespace(), cheatsheetSessionDoc("").Mem()),
+		"cheatsheet SessionDoc storageNs = Mem=true → \"_m_:session\"")
+
+	sessFullByGenericAPI, err := Key[cheatsheetSessionDoc](string(sessionAbc))
+	require.NoError(t, err)
+	sessFullByMethod, err := StorageKey(sessionAbc)
+	require.NoError(t, err)
+	require.Equal(t, "_m_:session:abc", sessFullByGenericAPI,
+		"cheatsheet: _m_:session:{sid} for {abc} → Key[T] = _m_:session:abc")
+	require.Equal(t, sessFullByGenericAPI, sessFullByMethod,
+		"Key[T] and StorageKey(d) must agree on mem full storage key")
+
+	require.Equal(t, "_doc_:_m_:session",
+		naming.DocMetaKey(naming.BuildStorageNs("session", true)),
+		"cheatsheet SessionDoc doc meta = _doc_:_m_:session")
+
+	sessLastIdxName, err := ValidateIdxName[cheatsheetSessionDoc]("last")
+	require.NoError(t, err)
+	require.Equal(t, "_m_:session:last", sessLastIdxName,
+		"cheatsheet SessionDoc index \"last\" full name = _m_:session:last")
+	require.Equal(t, sessLastIdxName, Idx[cheatsheetSessionDoc]("last", "*", "last_ts").Name(),
+		"ValidateIdxName[T] and Idx[T].Name must agree on mem index name")
+	require.Equal(t, "_idx_:_m_:session:last", naming.IdxMetaKey(sessLastIdxName),
+		"cheatsheet SessionDoc index meta = _idx_:_m_:session:last")
+}
+
+// TestCheatsheetSchemaReference_KeyAttrValueContainingColonRejects mirrors
+// Schema.KeyAttrs doc "A pk value that itself contains ':' after joining is
+// rejected by Strict Gate (validatePKSuffixNoColon)".
+//
+// Verified at the x SSoT layer by showing the naming helper used by all
+// key builders (BuildStorageKey) panics with illegal ':' when a joined
+// pkSuffix contains ':', which is exactly what Strict Gate enforces at
+// the command entry before ever calling BuildStorageKey.
+func TestCheatsheetSchemaReference_KeyAttrValueContainingColonRejects(t *testing.T) {
+	cases := []struct {
+		name   string
+		values []string
+	}{
+		{"UserDoc tenant has colon", []string{"acme:eu", "7"}},
+		{"UserDoc id has colon", []string{"acme", "7:prod"}},
+		{"SessionDoc sid has colon", []string{"abc:preauth"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			joined := naming.JoinPKAttrValues(c.values)
+			if !strings.Contains(joined, ":") {
+				t.Fatalf("test data broken: JoinPKAttrValues(%v)=%q should contain ':'", c.values, joined)
+			}
+			require.PanicsWithValue(t,
+				"naming.BuildStorageKey: pkSuffix \""+joined+"\" contains illegal ':' "+
+					"(storage-key separator); multi-segment pk must join with '_'",
+				func() { _ = naming.BuildStorageKey("user", joined) },
+				"BuildStorageKey must panic to enforce no ':' inside pk suffix — "+
+					"matches Schema.KeyAttrs doc Strict Gate reject rule")
+		})
+	}
+}
 
 type userDoc string
 
@@ -321,9 +457,17 @@ func TestIdx(t *testing.T) {
 			name: "builds lowercased full name and scoped pattern",
 			run: func(t *testing.T) {
 				idx := Idx[userDoc]("ByAge", "tenant:*", "profile.age")
-				require.Equal(t, "user_byage", idx.Name())
+				require.Equal(t, "user:byage", idx.Name())
 				require.Equal(t, "user:tenant:*", idx.KeyPattern())
-				require.Equal(t, "profile_age", idx.Path())
+				require.Equal(t, []string{"profile_age"}, idx.Paths())
+			},
+		},
+		{
+			name: "composite multi-field index preserves path order",
+			run: func(t *testing.T) {
+				idx := Idx[userDoc]("TenantAge", "*", "tenant", "profile.age")
+				require.Equal(t, "user:tenantage", idx.Name())
+				require.Equal(t, []string{"tenant", "profile_age"}, idx.Paths())
 			},
 		},
 		{
@@ -378,7 +522,7 @@ func TestRawIndex(t *testing.T) {
 				idx := RawIndex("ScoreRank", "tenant:user:*", "metrics.activity.score")
 				require.Equal(t, "scorerank", idx.Name())
 				require.Equal(t, "tenant:user:*", idx.KeyPattern())
-				require.Equal(t, "metrics_activity_score", idx.Path())
+				require.Equal(t, []string{"metrics_activity_score"}, idx.Paths())
 			},
 		},
 		{
@@ -530,7 +674,7 @@ func TestValidateIdxName(t *testing.T) {
 	t.Run("accepts logical name", func(t *testing.T) {
 		full, err := ValidateIdxName[userDoc]("age")
 		require.NoError(t, err)
-		require.Equal(t, "user_age", full)
+		require.Equal(t, "user:age", full)
 	})
 
 	t.Run("rejects empty name", func(t *testing.T) {
@@ -539,8 +683,8 @@ func TestValidateIdxName(t *testing.T) {
 	})
 
 	t.Run("rejects fully qualified name", func(t *testing.T) {
-		_, err := ValidateIdxName[userDoc]("user_age")
-		require.EqualError(t, err, "idx name must be logical, got fully-qualified index name: user_age")
+		_, err := ValidateIdxName[userDoc]("user:age")
+		require.EqualError(t, err, "idx name must be logical, got fully-qualified index name: user:age")
 	})
 }
 

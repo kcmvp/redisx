@@ -58,7 +58,12 @@ func (s *DocTestSuite) SetupSuite() {
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
 	}
 	adminAddr := cfg.Admin.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWithConfig(cfg,
+		UserDoc(""),
+		ExpiringUserDoc(""),
+		SearchFixtureDoc(""),
+		UpdateFixtureDoc(""),
+	)
 	s.Require().NotNil(db)
 
 	docServerSeedOnce.Do(func() {

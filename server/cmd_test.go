@@ -13,6 +13,7 @@ import (
 	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/redcon"
 )
@@ -88,15 +89,20 @@ func (s *CmdTestSuite) TestCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
+	if err := s.db.applyDocSpec(docSpec{
+		Namespace: "user",
+		KeyAttrs:  []string{"id"},
+		Mem:       false,
+	}, nil); err != nil {
+		t.Fatalf("failed to seed user doc spec: %v", err)
+	}
 	if err := s.db.applyIndexSpec(idxSpec{
-		FullName:   "user_age",
 		OwnerNs:    "user",
 		Logical:    "age",
-		OwnerMem:   false,
 		KeyPattern: "user:*",
-		Path:       "age",
+		Paths:      []string{"age"},
 	}, true); err != nil {
-		t.Fatalf("failed to seed user_age index: %v", err)
+		t.Fatalf("failed to seed user:age index: %v", err)
 	}
 
 	tests := []struct {
@@ -116,7 +122,7 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:        "unauthenticated write command",
 			auth:        false,
-			commands:    [][]string{{cmdSet, "k_{id}", "v"}},
+			commands:    [][]string{{cmdSet, "k:{id}", "v"}},
 			wantStrings: []string{"OK"},
 		},
 		{
@@ -194,11 +200,11 @@ func (s *CmdTestSuite) TestCmd() {
 			name: "set get setnx and del lifecycle",
 			auth: true,
 			commands: [][]string{
-				{cmdSet, "name_{id}", "alice"},
-				{cmdGet, "name_{id}"},
-				{cmdSetNX, "name_{id}", "bob"},
-				{cmdDel, "name_{id}"},
-				{cmdGet, "name_{id}"},
+				{cmdSet, "name:{id}", "alice"},
+				{cmdGet, "name:{id}"},
+				{cmdSetNX, "name:{id}", "bob"},
+				{cmdDel, "name:{id}"},
+				{cmdGet, "name:{id}"},
 			},
 			wantStrings: []string{"OK"},
 			wantBulks:   []string{"alice"},
@@ -208,15 +214,15 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:      "get non-existent",
 			auth:      true,
-			commands:  [][]string{{cmdGet, "nonexistent_{id}"}},
+			commands:  [][]string{{cmdGet, "nonexistent:{id}"}},
 			wantNulls: 1,
 		},
 		{
 			name:        cmdKeys,
 			auth:        true,
-			commands:    [][]string{{cmdSet, "{id}_key1", "val1"}, {cmdSet, "{id}_key2", "val2"}, {cmdKeys, "{id}_key*"}},
+			commands:    [][]string{{cmdSet, "{id}:key1", "val1"}, {cmdSet, "{id}:key2", "val2"}, {cmdKeys, "{id}:key*"}},
 			wantStrings: []string{"OK", "OK"},
-			wantArrays:  [][]string{{"{id}_key1", "{id}_key2"}},
+			wantArrays:  [][]string{{"{id}:key1", "{id}:key2"}},
 		},
 		{
 			name:       "keys_not_found",
@@ -254,13 +260,13 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:     "del non-existent",
 			auth:     true,
-			commands: [][]string{{cmdDel, "nonexistent_{id}"}},
+			commands: [][]string{{cmdDel, "nonexistent:{id}"}},
 			wantInts: []int{0},
 		},
 		{
 			name:        "setnx exists",
 			auth:        true,
-			commands:    [][]string{{cmdSet, "k_{id}", "v"}, {cmdSetNX, "k_{id}", "v2"}},
+			commands:    [][]string{{cmdSet, "k:{id}", "v"}, {cmdSetNX, "k:{id}", "v2"}},
 			wantStrings: []string{"OK"},
 			wantInts:    []int{0},
 		},
@@ -273,49 +279,49 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:        "set with EX",
 			auth:        true,
-			commands:    [][]string{{cmdSet, "k2_{id}", "v2", "EX", "1"}},
+			commands:    [][]string{{cmdSet, "k2:{id}", "v2", "EX", "1"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "set with PX",
 			auth:        true,
-			commands:    [][]string{{cmdSet, "k3_{id}", "v3", "PX", "500"}},
+			commands:    [][]string{{cmdSet, "k3:{id}", "v3", "PX", "500"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "setex command",
 			auth:        true,
-			commands:    [][]string{{cmdSetEx, "k4_{id}", "1", "v4"}},
+			commands:    [][]string{{cmdSetEx, "k4:{id}", "1", "v4"}},
 			wantStrings: []string{"OK"},
 		},
 		{
 			name:       "wrong number of args setex",
 			auth:       true,
-			commands:   [][]string{{cmdSetEx, "k_{id}"}},
+			commands:   [][]string{{cmdSetEx, "k:{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'setex' command"},
 		},
 		{
 			name:       "setex invalid ttl",
 			auth:       true,
-			commands:   [][]string{{cmdSetEx, "k_{id}", "abc", "v"}},
+			commands:   [][]string{{cmdSetEx, "k:{id}", "abc", "v"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "set wrong number of args",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}"}},
+			commands:   [][]string{{cmdSet, "k:{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'set' command"},
 		},
 		{
 			name:       "set EX invalid integer",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}", "v", "EX", "abc"}},
+			commands:   [][]string{{cmdSet, "k:{id}", "v", "EX", "abc"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "set PX invalid integer",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}", "v", "PX", "abc"}},
+			commands:   [][]string{{cmdSet, "k:{id}", "v", "PX", "abc"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
@@ -327,7 +333,7 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:       "setnx wrong number of args",
 			auth:       true,
-			commands:   [][]string{{cmdSetNX, "k_{id}"}},
+			commands:   [][]string{{cmdSetNX, "k:{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'setnx' command"},
 		},
 		{
@@ -357,7 +363,7 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:       "wrong number of args set",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}"}},
+			commands:   [][]string{{cmdSet, "k:{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'set' command"},
 		},
 		{
@@ -369,7 +375,7 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:       "wrong number of args setnx",
 			auth:       true,
-			commands:   [][]string{{cmdSetNX, "k_{id}"}},
+			commands:   [][]string{{cmdSetNX, "k:{id}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'setnx' command"},
 		},
 		{
@@ -410,19 +416,19 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:       "set with EX invalid value",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}", "v", "EX", "notanumber"}},
+			commands:   [][]string{{cmdSet, "k:{id}", "v", "EX", "notanumber"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "set with PX invalid value",
 			auth:       true,
-			commands:   [][]string{{cmdSet, "k_{id}", "v", "PX", "notanumber"}},
+			commands:   [][]string{{cmdSet, "k:{id}", "v", "PX", "notanumber"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		},
 		{
 			name:       "setex command invalid time",
 			auth:       true,
-			commands:   [][]string{{cmdSetEx, "k_{id}", "notanumber", "v"}},
+			commands:   [][]string{{cmdSetEx, "k:{id}", "notanumber", "v"}},
 			wantErrors: []string{"ERR value is not an integer or out of range"},
 		}}
 
@@ -709,15 +715,20 @@ func (s *CmdTestSuite) TestXCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
+	if err := s.db.applyDocSpec(docSpec{
+		Namespace: "user",
+		KeyAttrs:  []string{"id"},
+		Mem:       false,
+	}, nil); err != nil {
+		t.Fatalf("failed to seed user doc spec for XCmd: %v", err)
+	}
 	if err := s.db.applyIndexSpec(idxSpec{
-		FullName:   "user_age",
 		OwnerNs:    "user",
 		Logical:    "age",
-		OwnerMem:   false,
 		KeyPattern: "user:*",
-		Path:       "age",
+		Paths:      []string{"age"},
 	}, true); err != nil {
-		t.Fatalf("failed to seed user_age index for XCmd: %v", err)
+		t.Fatalf("failed to seed user:age index for XCmd: %v", err)
 	}
 
 	tests := []struct {
@@ -737,61 +748,61 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchindex_wrong_number_of_args_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age"}},
+			commands:   [][]string{{cmdSearchIndex, "user:age"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
 		},
 		{
 			name:       "searchindex_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age", `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "user:age", `{"op":"pattern","p":"user:*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age", `{"op":"pattern","p":"*"}`, "{invalid"}},
+			commands:   [][]string{{cmdSearchIndex, "user:age", `{"op":"pattern","p":"user:*"}`, "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchkey_wrong_number_of_args_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, "*"}},
+			commands:   [][]string{{cmdSearchKey, "t:*"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
 		},
 		{
 			name:       "searchkey_invalid_order_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchkey_invalid_json_01",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*"}`, "{invalid"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"user:*"}`, "{invalid"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchindex_wrong_number_of_args",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "attr"}},
+			commands:   [][]string{{cmdSearchIndex, "user:attr"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
 		},
 		{
 			name:       "searchindex_invalid_order_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "attr", `{"op":"pattern","p":"*"}`, "{}", "INVALID"}},
+			commands:   [][]string{{cmdSearchIndex, "user:attr", `{"op":"pattern","p":"user:*"}`, "{}", "INVALID"}},
 			wantErrors: []string{"ERR invalid order: INVALID"},
 		},
 		{
 			name:       "searchindex_invalid_json_02",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "attr", `{"op":"pattern","p":"*"}`, "{invalid}", "ASC"}},
+			commands:   [][]string{{cmdSearchIndex, "user:attr", `{"op":"pattern","p":"user:*"}`, "{invalid}", "ASC"}},
 			wantErrors: []string{"ERR invalid query: invalid JSON filter format"},
 		},
 		{
 			name:       "searchindex_zero_legacy_rejects_plain_glob_arg2",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "age", "user:*", "{}"}},
+			commands:   [][]string{{cmdSearchIndex, "user:age", "user:*", "{}"}},
 			wantErrors: []string{"ERR wrong number of arguments for 'searchindex' command"},
 		},
 		{
@@ -866,13 +877,13 @@ func (s *CmdTestSuite) TestXCmd() {
 			name:       "searchkey_forbidden_cross_layer_pattern",
 			auth:       true,
 			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"*user:*"}`, "{}", "ASC"}},
-			wantErrors: []string{"ERR key range cannot start with wildcard"},
+			wantErrors: []string{"ERR SEARCHKEY key-range must be anchored to a namespace (no leading wildcard)"},
 		},
 		{
 			name:       "searchkey_zero_legacy_rejects_plain_glob_arg1",
 			auth:       true,
 			commands:   [][]string{{cmdSearchKey, "*user:*", "{}"}},
-			wantErrors: []string{"ERR wrong number of arguments for 'searchkey' command"},
+			wantErrors: []string{"ERR SEARCHKEY key-range must be anchored to a namespace (no leading wildcard)"},
 		},
 		{
 			name:       "searchkey_limit_count_zero_rejects_wire",
@@ -925,8 +936,8 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchindex unknown index",
 			auth:       true,
-			commands:   [][]string{{cmdSearchIndex, "unknown", `{"op":"pattern","p":"*"}`, "{}", "ASC"}},
-			wantErrors: []string{"ERR index not found: unknown"},
+			commands:   [][]string{{cmdSearchIndex, "user:unknown", `{"op":"pattern","p":"user:*"}`, "{}", "ASC"}},
+			wantErrors: []string{"ERR index not found: user:unknown"},
 		},
 		{
 			name:       "update success",
@@ -987,10 +998,10 @@ func (s *CmdTestSuite) TestXCmd() {
 			wantErrors: []string{"ERR invalid count for LIMIT: not_a_number"},
 		},
 		{
-			name:       "update arg1_plain_glob_not_json_rejects",
+			name:       "update_arg1_plain_glob_sugar_form_runs_normally",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "user:*", "{}", `{"a":1}`}},
-			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
+			commands:   [][]string{{cmdUpdate, "sugar:*", "{}", `{"a":1}`}},
+			wantArrays: [][]string{{}},
 		},
 		{
 			name:       "searchkey success",
@@ -1005,7 +1016,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "searchkey not found",
 			auth:       true,
-			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"unknown_{id}:*"}`, "{}"}},
+			commands:   [][]string{{cmdSearchKey, `{"op":"pattern","p":"unknownns:*"}`, "{}"}},
 			wantArrays: [][]string{{}},
 		},
 	}
@@ -1122,4 +1133,210 @@ func (s *CmdTestSuite) TestXCmd() {
 			}
 		})
 	}
+}
+
+func (s *CmdTestSuite) TestStrictGates() {
+	t := s.T()
+	dbPath := testutil.DBPath(t)
+	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	appAuth := "app-secret-strict"
+	adminAuth := "admin-secret-strict"
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+	}
+	s.db = StartWithConfig(cfg)
+	if s.db == nil {
+		t.Fatalf("StartWithConfig returned nil for strict gates; appPort=%d adminPort=%d", appPort, adminPort)
+	}
+	appAddr := cfg.App.Addr()
+	adminAddr := cfg.Admin.Addr()
+
+	runRESP := func(addr string, auth string, cmds [][]string) (string, bool) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("failed to dial %s: %v", addr, err)
+		}
+		defer func() { _ = conn.Close() }()
+		closed := false
+		var sb strings.Builder
+		if auth != "" {
+			b := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(auth), auth)
+			if _, err := conn.Write([]byte(b)); err == nil {
+				buf := make([]byte, 4096)
+				_ = conn.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+				n, _ := conn.Read(buf)
+				if n > 0 {
+					sb.Write(buf[:n])
+				}
+			}
+		}
+		for _, args := range cmds {
+			if len(args) == 0 {
+				continue
+			}
+			var b strings.Builder
+			fmt.Fprintf(&b, "*%d\r\n", len(args))
+			for _, a := range args {
+				fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
+			}
+			if _, err := conn.Write([]byte(b.String())); err != nil {
+				closed = true
+				break
+			}
+			buf := make([]byte, 16384)
+			_ = conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+			n, rerr := conn.Read(buf)
+			if rerr == nil && n > 0 {
+				sb.Write(buf[:n])
+			}
+		}
+		return sb.String(), closed
+	}
+
+	specStr := `{"namespace":"strictuser","mem":false,"key_attrs":["id","org"],"ttl_ns":3600000000000}`
+	resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regdoc", specStr}})
+	if !strings.Contains(resp, "+OK\r\n") {
+		t.Fatalf("REGDOC failed — expected OK, got: %s", resp)
+	}
+
+	t.Run("KV_no_colon_SET", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "noblekey", "v"}})
+		require.Contains(t, resp, "namespace separator")
+	})
+	t.Run("KV_no_colon_SETEX", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setex", "noblekey", "10", "v"}})
+		require.Contains(t, resp, "namespace separator")
+	})
+	t.Run("KV_no_colon_SETNX", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setnx", "noblekey", "v"}})
+		require.Contains(t, resp, "namespace separator")
+	})
+	t.Run("KV_no_colon_GET", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "noblekey"}})
+		require.Contains(t, resp, "namespace separator")
+	})
+	t.Run("KV_no_colon_DEL", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "noblekey"}})
+		require.Contains(t, resp, "namespace separator")
+	})
+
+	t.Run("Doc_unregistered_ns_SET", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "nonexistentns", `{"id":"1","org":"acme"}`}})
+		require.Contains(t, resp, "not registered")
+	})
+	t.Run("Doc_unregistered_ns_SETEX", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setex", "nonexistentns", "60", `{"id":"1","org":"acme"}`}})
+		require.Contains(t, resp, "not registered")
+	})
+	t.Run("Doc_unregistered_ns_SETNX", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setnx", "nonexistentns", `{"id":"1","org":"acme"}`}})
+		require.Contains(t, resp, "not registered")
+	})
+	t.Run("Doc_unregistered_ns_GET", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "nonexistentns", "1"}})
+		require.Contains(t, resp, "not registered")
+	})
+	t.Run("Doc_unregistered_ns_DEL", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "nonexistentns", "1"}})
+		require.Contains(t, resp, "not registered")
+	})
+	t.Run("Doc_unregistered_ns_UPDATE", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"update", "nonexistentns:*", "{}", `{"$set":{"age":30}}`}})
+		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGDOC gate; UPDATE returns 0 touched keys")
+	})
+
+	t.Run("Doc_GET_ns_alone_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "strictuser"}})
+		require.Contains(t, resp, "alone is not a query")
+	})
+	t.Run("Doc_DEL_ns_alone_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "strictuser"}})
+		require.Contains(t, resp, "alone is not a delete target")
+	})
+
+	t.Run("Doc_REGDOC_reserved_indexes_field_ERR", func(t *testing.T) {
+		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regdoc", bad}})
+		require.Contains(t, resp, "reserved field 'indexes'")
+	})
+
+	t.Run("Doc_SET_object_ok", func(t *testing.T) {
+		doc := `{"id":"u1","org":"acme","age":30}`
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "strictuser", doc},
+			{"get", "strictuser", naming.JoinPKAttrValues([]string{"u1", "acme"})},
+		})
+		require.Contains(t, resp, "+OK\r\n")
+		require.Contains(t, resp, fmt.Sprintf("$%d\r\n%s\r\n", len(doc), doc))
+	})
+
+	t.Run("Doc_SETNX_collision_zero_written", func(t *testing.T) {
+		a := `{"id":"u_coll","org":"acme","n":1}`
+		b := `{"id":"u_coll","org":"acme","n":2}`
+		c := `{"id":"u_second","org":"acme","n":3}`
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "strictuser", a},
+			{"setnx", "strictuser", "[" + b + "," + c + "]"},
+			{"get", "strictuser", naming.JoinPKAttrValues([]string{"u_coll", "acme"})},
+			{"get", "strictuser", naming.JoinPKAttrValues([]string{"u_second", "acme"})},
+		})
+		require.Contains(t, resp, "+OK\r\n")
+		idx := strings.Index(resp, "+OK\r\n")
+		after := resp[idx+len("+OK\r\n"):]
+		require.Contains(t, after, "$-1\r\n", "SETNX collision must roll back — second object must NOT exist (Null)")
+		require.Contains(t, after, `{"id":"u_coll","org":"acme","n":1}`, "original value after SETNX collision must be preserved")
+	})
+
+	t.Run("Doc_UPDATE_pk_mutation_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "strictuser", `{"id":"pk1","org":"acme","age":1}`},
+			{"update", "strictuser:*", `{"id":"pk1"}`, `{"id":"PK_CHANGED"}`},
+		})
+		require.Contains(t, resp, "pk mutations are not allowed")
+	})
+
+	t.Run("Doc_SEARCHKEY_bare_pivot_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchkey", "*", "{}"}})
+		require.Contains(t, resp, "must be anchored to a namespace")
+	})
+
+	t.Run("Doc_SEARCHKEY_unregistered_ns_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchkey", "ghostns:*", "{}"}})
+		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGDOC gate; SEARCHKEY returns 0 matched values")
+	})
+
+	t.Run("Doc_SEARCHINDEX_unregistered_owner_ns_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchindex", "ghostdoc:zzz", `{"op":"pattern","p":"*"}`, "{}"}})
+		require.Contains(t, resp, "not registered")
+	})
+
+	t.Run("KEYS_app_port_Gate1_reject", func(t *testing.T) {
+		resp, _ := runRESP(appAddr, appAuth, [][]string{{"keys", "*"}})
+		require.Contains(t, resp, "No Privilege")
+		require.Contains(t, resp, "admin port")
+	})
+	t.Run("KEYS_admin_port_pass", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "app:strict_1", "v"}, {"keys", "app:strict_*"}})
+		require.NotContains(t, resp, "No Privilege")
+		require.Contains(t, resp, "*1\r\n$12\r\napp:strict_1\r\n")
+	})
+
+	t.Run("LSDOC_DESDOC_createdAt_present", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"lsdoc"},
+			{"desdoc", "strictuser"},
+		})
+		require.Contains(t, resp, `"created_at"`)
+	})
+
+	t.Run("REGIDX_LSIDX_createdAt_present", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"regidx", "strictuser", "age", "age"},
+			{"lsidx", "strictuser"},
+		})
+		require.Contains(t, resp, "+OK\r\n")
+		require.Contains(t, resp, `"created_at"`)
+	})
 }

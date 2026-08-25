@@ -90,8 +90,8 @@ var Registry = map[string]CommandSpec{
 	CmdRegisterIndex: {
 		CmdWord: CmdRegisterIndex,
 		Role:    RoleAdminOnly,
-		Argc:    ArgcConstraint{MinArgs: 4, MaxArgs: 6}, // regidx ns name path [UNIQUE] [TYPE type]
-		Usage:   "regidx <ns> <logicalName> <jsonPath> [UNIQUE] [TYPE <type>]  — 动态创建索引（Shell UI 糖：REGISTER INDEX ON ...）",
+		Argc:    ArgcConstraint{MinArgs: 3, MaxArgs: 7}, // regidx ns logicalName path1[,path2,...] [UNIQUE] [TYPE type]
+		Usage:   "regidx <ns> <logicalName> <jsonPath>[,<jsonPath>...] [UNIQUE] [TYPE <type>]  — 动态创建索引（Shell UI 糖：REGISTER INDEX ON ...），多字段复合索引用逗号分隔：age,contact.email",
 	},
 	CmdDropIndex: {
 		CmdWord: CmdDropIndex,
@@ -109,7 +109,7 @@ var BaseHandshakeCommands = []string{
 
 // SharedBizCommands —— Shared 业务命令（Strict Gate 共享）
 var SharedBizCommands = []string{
-	CmdSet, CmdSetEx, CmdSetNX, CmdGet, CmdDel, CmdExists, CmdKeys, CmdSearchKey, CmdSearchIndex, CmdUpdate,
+	CmdSet, CmdSetEx, CmdSetNX, CmdGet, CmdDel, CmdExists, CmdSearchKey, CmdSearchIndex, CmdUpdate,
 }
 
 // IsAdminOnly 辅助：Shell dispatcher / Server Gate1 Allowlist 构建时都用

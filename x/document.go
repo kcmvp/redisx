@@ -11,113 +11,138 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// Package x provides the building-block types for registering typed Redisx
-// document types and building query / index / update primitives.
+// Package x is the single source of truth for the runtime-facing contracts of
+// redisx: typed document schemas, key derivation helpers, index declarations,
+// filter combinators, and the UPDATE wire codec. It does NOT hold registry
+// metadata (that lives inside the server package as private docSpec/idxSpec).
 //
-// The primary entry points are:
+// Core routing rule — Doc vs KV pattern — decided purely by the shape of arg1
+// at the RESP command layer (never by content inspection, never by registry
+// lookups):
 //
-//   - Define a [Schema] / [Document] (string-alias types with zero-value methods)
-//   - Use [Key] or [StorageKey] to resolve storage keys from a raw JSON payload
-//   - Use [Idx] to declare a registered JSON index for search flows
-//   - Use the filter combinators ([Eq], [Gt], [And], [In], ...) and [Set]
-//     mutations to compose read and write operations.
+//  1. If arg1 does NOT contain ':' → Doc Pattern. arg1 is treated as a
+//     logical document namespace and MUST have been registered via
+//     server.Start(schemas…) or the REGDOC admin command. A bare no-colon
+//     key that is not a registered namespace is rejected outright; the
+//     system never falls back to plain-KV mode for it.
+//  2. If arg1 contains ':' → KV Pattern. arg1 is treated as the literal
+//     full storage key and is passed straight through to the storage layer
+//     with no JSON parsing. KV Pattern enforces one additional strict
+//     gate: the full key MUST contain a ':' i.e. every KV key must be
+//     namespaced (user rule: "key always has a namespace"). A bare
+//     no-colon KV key such as "mykey" is rejected with "ERR missing
+//     namespace".
 //
-// All naming decisions (storage namespace shape, ns:pk separator, multi-segment
-// pk join character, internal meta-key prefixes, and the validators used by
-// Strict Gate) live inside the package-private internal/naming subpackage and
-// are NEVER exported to consumers of package x directly. Consumers build keys
-// through the typed helpers declared in this package only, which keeps the
-// naming contract free-form from accidental ad-hoc string concatenation.
+// All naming decisions (storage ns shape, ns:pk separator, pk join char,
+// internal meta-key prefixes) live inside internal/naming and are exposed
+// through naming-package getter functions ONLY — never via exported
+// constants and never via raw string concatenation from callers.
 
-// Schema declares the runtime-passable metadata contract for one JSON document
-// type. A zero-value of your string-alias type (e.g. UserDoc("")) fully
-// implements Schema — the receiver is never read, only used for interface
-// dispatch.
+// Schema declares the metadata contract for one JSON document type.
+// Implement it on the zero-value of your ~string alias type (e.g.
+// UserDoc("")); the receiver value is never read — it exists purely for
+// interface dispatch.
 //
-// Schema is intentionally free of type elements (no ~string) so it can be used
-// as a value type: variadic params, slices, fields all work.
+// Schema is intentionally free of type parameters so it can be stored in
+// slices, passed variadic to server.Start, etc. For a typed version that
+// includes RawJSON() (needed to build storage keys from a populated
+// payload), see [Document].
 //
-// Example:
+// Example — disk-backed user document (cold data, survives restart):
 //
-//	server.Start("redisx.yaml",
-//	    UserDoc(""),
-//	    OrderDoc(""),
-//	)
+//	type UserDoc string
+//	func (UserDoc) Namespace() string  { return "user" }
+//	func (UserDoc) Mem() bool          { return false }                 // lives on disk layer
+//	func (UserDoc) KeyAttrs() []string { return []string{"tenant","id"} } // composite pk
+//	func (UserDoc) TTL() time.Duration { return 24 * time.Hour }         // default TTL used by auto-TTL
+//
+// Example — in-memory session document (hot data, dropped on restart):
+//
+//	type SessionDoc string
+//	func (SessionDoc) Namespace() string  { return "session" }
+//	func (SessionDoc) Mem() bool          { return true }                  // lives on mem layer (prefix "_m_:")
+//	func (SessionDoc) KeyAttrs() []string { return []string{"sid"} }       // single-segment pk
+//	func (SessionDoc) TTL() time.Duration { return 30 * time.Minute }
+//
+// Usage at boot:
+//
+//	server.Start(cfg, UserDoc(""), SessionDoc(""))
 type Schema interface {
-	// Namespace returns the key prefix of this document type, such as "user".
+	// Namespace returns the canonical logical document namespace, e.g.
+	// "user". It is combined with Mem() to produce the storage namespace
+	// ("user" for disk, "_m_:user" for mem).
 	//
-	// Final keys are stored as:
-	//
-	//	namespace:key_suffix
-	//
-	// Keep it short, because it is repeated in every stored key.
+	// Constraints: lowercase letter followed by 0-62 lowercase letters or
+	// digits; ':' '*' '?' '-' '_' are all reserved and forbidden here.
 	Namespace() string
-	// Mem reports whether this document type lives in the memory-only layer.
-	//
-	// When true, the final key is automatically prefixed with "_m_:" before
-	// [Schema.Namespace] (using the canonical mem-layer marker defined by the
-	// naming single-source-of-truth), resulting in:
-	//
-	//	user:1   -> _m_:user:1
+	// Mem reports whether documents of this type live in the memory-only
+	// layer. When true: storageNs = "_m_:<namespace>", data keys and
+	// _doc_/_idx_ metadata all live on the mem store, and everything is
+	// discarded on process restart. When false: everything stays on the
+	// disk store and is durable across restarts.
 	Mem() bool
-	// KeyAttrs returns the ordered JSON paths used to derive the key suffix,
-	// such as []string{"tenant", "id"}.
+	// KeyAttrs returns the ordered list of JSON paths whose values are
+	// joined with the canonical pk-join character ('_') to form the key
+	// suffix. Format + concrete example:
+	//   KeyAttrs = ["tenant","id"]
+	//     → suffix format:        "{tenant}_{id}"
+	//                            for {"tenant":"acme","id":"7"} → suffix value "acme_7"
+	//     → full key format:      "{storageNs}:{tenant}_{id}"
+	//                            for storageNs="user"            → full key value "user:acme_7"
 	//
-	// Their resolved values are joined with the canonical pk-join character
-	// defined by the naming single-source-of-truth in order.
+	// A pk value that itself contains ':' after joining is rejected by
+	// Strict Gate (validatePKSuffixNoColon) so callers never need to
+	// escape ':' inside attribute values.
 	KeyAttrs() []string
-	// TTL returns the default TTL used by typed write helpers.
-	//
-	// It does not participate in key derivation.
+	// TTL returns the default document TTL. It is applied automatically by
+	// SetWithTtl / SetNXWithTtl whenever the caller passes an explicit
+	// TTL of 0. Pass 0 to mean "no default TTL".
 	TTL() time.Duration
 }
 
-// Document declares the full generic-constraint contract for one JSON document
-// type. It extends Schema with ~string (so typed helpers can cast loaded raw
-// JSON payloads back to the concrete alias type) and RawJSON (needed to build
-// storage keys from a populated payload instance).
+// Document is the fully-typed variant of [Schema]: it adds ~string (so
+// loaded JSON payloads can be cast back to the alias) and RawJSON() (so
+// [StorageKey] can derive full keys from a populated instance).
 //
-// A string-alias type that implements Document automatically satisfies Schema
-// as well — there is zero extra code to write when defining a new document.
-//
-// Example:
-//
-//	type UserDoc string
-//
-//	func (UserDoc) Namespace() string  { return "user" }
-//	func (UserDoc) Mem() bool          { return false }
-//	func (UserDoc) KeyAttrs() []string { return []string{"id"} }
-//	func (u UserDoc) RawJSON() string  { return string(u) }
-//	func (UserDoc) TTL() time.Duration { return time.Hour }
+// Any string-alias that implements Document automatically satisfies
+// Schema; there is no extra work beyond the five methods shown in the
+// Schema examples.
 type Document interface {
 	~string
 	Schema
-	// RawJSON returns the raw JSON payload of this document value.
-	//
-	// [StorageKey] reads it together with [Schema.KeyAttrs] to build one full
-	// storage key for the current document instance.
+	// RawJSON returns the raw JSON payload carried by this document
+	// instance. For a zero-value alias (e.g. UserDoc("")) it returns "".
 	RawJSON() string
 }
 
-// Index describes one registered JSON index definition.
+// Index describes one declared JSON BTree index. Instances are normally
+// produced by [Idx] or [RawIndex] and then passed to
+// server.Start / DB.CreateIndex at boot; the Admin REGIDX command does
+// not use this struct — it writes idxSpec metadata directly via
+// applyIndexSpec.
 //
-// It contains the fully-qualified runtime index name, the full storage-key
-// pattern it applies to, and the normalized JSON path used by the backend
-// index.
+// An Index is always bound to one storage layer (disk XOR mem) via the
+// owner document's Mem() flag; cross-layer index searches are rejected
+// at the Strict Gate.
 type Index struct {
 	name       string
 	keyPattern string
-	path       string
+	paths      []string
 }
 
-// Name returns the fully-qualified runtime index name.
+// Name returns the fully-qualified runtime index name, i.e.
+// "<storageNs>:<logical>" (e.g. "user:age" or "_m_:session:last").
 func (d Index) Name() string { return d.name }
 
-// KeyPattern returns the full storage-key pattern bound to this index.
+// KeyPattern returns the storage-key glob pattern the index is scoped to
+// (e.g. "user:*" or "_m_:session:*").
 func (d Index) KeyPattern() string { return d.keyPattern }
 
-// Path returns the normalized JSON path used by the backend index.
-func (d Index) Path() string { return d.path }
+// Paths returns the normalized JSON paths used by the BTree indexer, with
+// '.' already replaced by '_' per BuntDB's IndexJSON convention. For
+// single-field indexes the returned slice has one element; for composite
+// (multi-field) indexes it has >=2 elements in ORDER-BY priority.
+func (d Index) Paths() []string { return d.paths }
 
 // StorageKey resolves one full storage key directly from the document.
 //
@@ -288,20 +313,27 @@ func MemKey(key string) string {
 // RawIndex is intended for pure-data fixtures that register indexes over a
 // manually-keyed KV space without needing a concrete [Document] type (e.g.
 // shared SEARCHKEY / SEARCHINDEX parity suites).
-func RawIndex(name string, keyPattern string, jsonPath string) Index {
+func RawIndex(name string, keyPattern string, jsonPaths ...string) Index {
 	if name == "" {
 		panic("RawIndex: name is required")
 	}
 	if keyPattern == "" {
 		panic("RawIndex: keyPattern is required")
 	}
-	if jsonPath == "" {
-		panic("RawIndex: jsonPath is required")
+	if len(jsonPaths) == 0 {
+		panic("RawIndex: at least one jsonPath is required")
+	}
+	paths := make([]string, 0, len(jsonPaths))
+	for _, p := range jsonPaths {
+		if p == "" {
+			panic("RawIndex: jsonPaths entry must not be empty")
+		}
+		paths = append(paths, strings.ReplaceAll(p, ".", "_"))
 	}
 	return Index{
 		name:       strings.ToLower(name),
 		keyPattern: keyPattern,
-		path:       strings.ReplaceAll(jsonPath, ".", "_"),
+		paths:      paths,
 	}
 }
 
@@ -322,26 +354,36 @@ func IdxFullName[D Document](idxName string) string {
 //
 // The runtime index name stored inside the system is always normalized as:
 //
-//	namespace_idxname
+//	namespace:idxname
 //
 // where namespace comes from D, idxName is lowercased, and the final result is
 // entirely lowercase.
-func Idx[D Document](idxName string, keyPattern string, jsonPath string) Index {
+//
+// For composite (multi-field) indexes, pass multiple jsonPaths in ORDER-BY
+// priority; buntdb.IndexJSON natively consumes the variadic path list to
+// build a compound BTree key.
+func Idx[D Document](idxName string, keyPattern string, jsonPaths ...string) Index {
 	if keyPattern == "" {
 		panic("index key pattern is required")
 	}
 	if strings.HasPrefix(keyPattern, ":") {
 		panic("index key pattern must not start with separator")
 	}
-	if jsonPath == "" {
-		panic("index json path is required")
+	if len(jsonPaths) == 0 {
+		panic("at least one index json path is required")
 	}
-	jsonPath = strings.ReplaceAll(jsonPath, ".", "_")
+	paths := make([]string, 0, len(jsonPaths))
+	for _, p := range jsonPaths {
+		if p == "" {
+			panic("index jsonPaths entry must not be empty")
+		}
+		paths = append(paths, strings.ReplaceAll(p, ".", "_"))
+	}
 
 	return Index{
 		name:       IdxFullName[D](idxName),
 		keyPattern: StorageNsKeyPattern[D](keyPattern),
-		path:       jsonPath,
+		paths:      paths,
 	}
 }
 
@@ -367,7 +409,9 @@ func ValidateIdxName[D Document](idxName string) (string, error) {
 
 	fullNamespace := strings.ToLower(StorageKeyValue[D](""))
 	lowerName := strings.ToLower(idxName)
-	if strings.HasPrefix(lowerName, fullNamespace+naming.KeyAttrsJoin()) {
+	colonPrefix := fullNamespace + naming.StorageKeySeparator()
+	underscorePrefix := fullNamespace + naming.KeyAttrsJoin()
+	if strings.HasPrefix(lowerName, colonPrefix) || strings.HasPrefix(lowerName, underscorePrefix) {
 		return "", fmt.Errorf("idx name must be logical, got fully-qualified index name: %s", idxName)
 	}
 	return IdxFullName[D](idxName), nil
@@ -447,3 +491,169 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 	}
 	return pairs, nil
 }
+
+// ============================================================
+// RESP Wire Cheatsheet — two concrete document types
+// ============================================================
+//
+// Reference types used below (identical to the Schema examples above):
+//
+//   - UserDoc:    Namespace="user",    Mem=false, KeyAttrs=["tenant","id"], TTL=24h
+//                 → storageNs:                  "user"                      (disk layer, durable across restart)
+//                 → full key format:            "user:{tenant}_{id}"           (multi-segment pk JOINED by '_' only WITHIN the pk suffix)
+//                                                 for {"tenant":"acme","id":"7"}  → value "user:acme_7"
+//                 → doc meta key format:        "_doc_:{storageNs}"
+//                                                 for storageNs="user"          → value "_doc_:user"
+//                 → index "age" full name:      "{storageNs}:age"              (ALL hierarchical levels JOINED by ':')
+//                                                 for storageNs="user"          → value "user:age"
+//                 → composite index "tenantage": "{storageNs}:tenantage"
+//                   (REGIDX user tenantage tenant,age)
+//                                                 for storageNs="user"          → value "user:tenantage"
+//                                                 ordered by (tenant ASC, age ASC) via buntdb.IndexJSON("tenant","age")
+//                 → index meta key format:      "_idx_:{indexFullName}"
+//                                                 for indexFullName="user:age"  → value "_idx_:user:age"
+//
+//   - SessionDoc: Namespace="session", Mem=true,  KeyAttrs=["sid"],          TTL=30m
+//                 → storageNs:                  "_m_:session"               (mem layer, dropped on restart)
+//                 → full key format:            "_m_:session:{sid}"
+//                                                 for {"sid":"abc"}            → value "_m_:session:abc"
+//                 → doc meta key format:        "_doc_:{storageNs}"
+//                                                 for storageNs="_m_:session"  → value "_doc_:_m_:session"
+//                 → index "last" full name:     "{storageNs}:last"           (consistent colon-based hierarchy)
+//                                                 for storageNs="_m_:session"  → value "_m_:session:last"
+//                 → composite index "uidlast":  "{storageNs}:uidlast"
+//                   (REGIDX _m_:session uidlast user_id,last_ts)
+//                                                 for storageNs="_m_:session"  → value "_m_:session:uidlast"
+//                                                 ordered by (user_id ASC, last_ts ASC)
+//                 → index meta key format:      "_idx_:{indexFullName}"
+//                                                 for indexFullName="_m_:session:last"
+//                                                                               → value "_idx_:_m_:session:last"
+//
+// Single mental model, no character mixing ever:
+//   ┌─ ':'  = hierarchical boundary (layer / namespace / index-logical / pk prefix)
+//   └─ '_'  = flat concatenation only:
+//               (a) inside the pk suffix when KeyAttrs has >=2 fields (e.g. "acme_7")
+//               (b) the internal '_m_' / '_doc_' / '_idx_' sentinel tokens
+//                   which are treated as opaque identifiers, never split on '_'
+//
+// ❌ Why the namespace "product_bundle" is rejected by ValidateDocLogicalNamespace
+//    ──────────────────────────────────────────────────────────────────────────
+//    If doc logical namespaces were allowed to contain '_', the reader would
+//    constantly have to disambiguate:
+//      "product_bundle:acme_7"
+//        ├─ is '_' a LAYER separator? (→ product/bundle/acme_7 ?)
+//        └─ or is '_' the pk-JOIN marker inside the suffix? (→ product_bundle/acme_7)
+//    To keep the single-mental-model promise ('_' = flat, ':' = layer), '_'
+//    is RESERVED EXCLUSIVELY for the two flat-concatenation cases above.
+//    Namespace "product_bundle" therefore violates the rule. Use "productbundle"
+//    (flat) or split into layers explicitly and route via SET/KV pattern.
+//
+// ------------------------------------------------------------
+// 1. Doc Pattern (arg1 has NO ':' → treated as logical namespace)
+// ------------------------------------------------------------
+// Rule: arg1 is a namespace name. It MUST already be registered; otherwise
+// the command is rejected outright (no KV-pattern fallback).
+//
+//  (a) SET — single or batched JSON object / array-of-objects.
+//      For each object pk attrs are resolved to derive the full storage
+//      key, then setBatchAtomic writes them all-or-nothing on the layer
+//      dictated by spec.Mem.
+//
+//      SET user {"tenant":"acme","id":"7","age":30,"status":"cold"}
+//        → writes "user:acme_7" on disk layer, TTL=24h (autoTTL from DocSpec)
+//        → returns "+OK"
+//
+//      SET session [{"sid":"abc","user_id":1,"last_ts":1000},{"sid":"xyz","user_id":2,"last_ts":999}]
+//        → writes "_m_:session:abc" + "_m_:session:xyz" on mem layer, TTL=30m
+//        → returns "+OK"
+//        → all-or-nothing atomic; if any key derivation fails NONE is written
+//
+//      SETNX user [{"tenant":"acme","id":"7"}, {"tenant":"acme","id":"8"}]
+//        → NX semantics: if EITHER "user:acme_7" OR "user:acme_8" already
+//          exists, NEITHER row is written and the command returns Null.
+//
+//  (b) GET — requires exactly "<namespace> <pk-suffix>" (two args after the
+//      command). A lone namespace argument is rejected — use SEARCHKEY or
+//      the Admin-only KEYS command to enumerate.
+//
+//      GET user acme_7            → bulk {"tenant":"acme","id":"7",...}
+//      GET session abc           → bulk {"sid":"abc",...}   (reads mem layer)
+//      GET user                  → ERR "ns alone is not a query; use SEARCHKEY"
+//
+//  (c) DEL — zero or more pk-suffix args. No args + namespace alone is
+//      rejected (same reasoning as GET). Multiple suffixes are deleted
+//      atomically on the storage layer dictated by spec.Mem.
+//
+//      DEL user acme_7 acme_8    → deletes "user:acme_7" + "user:acme_8" (atomic)
+//      DEL session abc xyz       → deletes both mem sessions (atomic)
+//      DEL user                  → ERR "DEL ns alone is not supported; use SEARCHKEY"
+//
+//  (d) UPDATE — anchor = "<storageNs>:*" or "<storageNs>:<suffix>".
+//      The anchor is resolved back to a storageNs and thence to the
+//      registered docSpec. If any $set mutation touches a pk attr and
+//      the re-derived full storage key changes, the entire UPDATE is
+//      rolled back and returns "ERR pk mutations are not allowed".
+//
+//      UPDATE user:* "tenant=acme" '{"$set":{"status":"banned"}}'
+//        → OK, all matching user docs get status overwritten, pk attrs untouched
+//
+//      UPDATE user:* "" '{"$set":{"id":"9"}}'
+//        → ERR "pk mutations are not allowed" (id ∈ KeyAttrs, full key would change)
+//
+//  (e) SEARCHKEY / SEARCHINDEX — anchor must NOT start with wildcard and
+//      must resolve to a registered storageNs. A bare "*" pivot is
+//      rejected to force clients to anchor to a namespace (use the
+//      Admin-only KEYS command for a global scan).
+//
+//      SEARCHKEY user:* ""          → matches "user:*" on disk layer
+//      SEARCHKEY * ""               → ERR "SEARCHKEY must be anchored to a namespace; use SEARCHINDEX for cross-ns scans"
+//      SEARCHINDEX user_age user:* "" | filter | desc  → runs on user_age index (disk)
+//      SEARCHINDEX unknown_idx user:* ""  → ERR "index not registered: unknown_idx"
+//
+// ------------------------------------------------------------
+// 2. KV Pattern (arg1 HAS ':' → literal full storage key)
+// ------------------------------------------------------------
+// Rule: arg1 is the raw full storage key. No JSON parsing, no registry
+// lookup, zero introspection. The key is routed to mem or disk purely
+// by the "_m_:" prefix (via layerForKey).
+//
+// ADDITIONAL USER RULE: Every KV full key MUST contain ':' somewhere
+// (enforced by validateKVFullKey at the command gate). A bare no-colon
+// key is NOT KV-Pattern (it would be Doc-Pattern instead, and fail at
+// registry lookup unless that no-colon name is a registered namespace).
+//
+//  (a) SET / SETEX / SETNX — straight through, autoTTL only applies if
+//      the caller passes explicit TTL==0 AND the full key matches a
+//      registered docSpec storageNs prefix; otherwise TTL is as given.
+//
+//      SET app:config:theme "dark"           → writes "app:config:theme" on disk layer  (KV, no JSON parsed)
+//      SET _m_:cache:hot:123 "blurb" EX 60   → writes mem layer, TTL=60s
+//      SET mykey "val"                       → ERR KV "missing namespace (required ':')" — mykey has no colon
+//      SET _doc_:user "payload"              → ERR internal storage ns reserved
+//
+//  (b) GET / DEL — same routing + same "full key must contain ':'" gate.
+//
+//      GET app:config:theme           → bulk "dark"
+//      GET _m_:cache:hot:123          → bulk "blurb" (mem layer)
+//      GET mykey                      → ERR KV "missing namespace"
+//      DEL app:config:theme           → OK, deleted
+//
+// ------------------------------------------------------------
+// 3. Symmetric persistence (Doc/Index meta follow their storage layer)
+// ------------------------------------------------------------
+//   - Restart behavior for UserDoc (disk):
+//       data "user:acme_7"         → still on disk, present
+//       _doc_:user meta           → still on disk → docSpec re-registered automatically
+//       _idx_:user_age meta       → still on disk → BTree rebuilt, backfill works
+//
+//   - Restart behavior for SessionDoc (mem):
+//       data "_m_:session:abc"    → mem store is new buntdb.Open(":memory:") → GONE
+//       _doc_:_m_:session meta    → mem store gone → docSpec NOT auto-registered
+//                                      caller MUST re-declare at Start(..., SessionDoc(""))
+//       _idx_:_m_:session_last  → mem store gone → idxSpec NOT auto-registered
+//                                      caller MUST re-declare at Start or re-run REGIDX
+//
+//   This symmetry is intentional: "if a doc lives on the mem layer and
+//   its data is gone on restart, then its registry metadata is gone
+//   too" so the system never ends up with a dangling empty registry
+//   pointing at an empty mem-layer namespace.

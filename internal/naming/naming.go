@@ -73,7 +73,7 @@ func BuildIdxFullName(storageNs, logical string) string {
 	if err := ValidateLogicalIndexName(logical); err != nil {
 		panic(fmt.Sprintf("naming.BuildIdxFullName: %v", err))
 	}
-	return storageNs + keyAttrsJoin + logical
+	return storageNs + storageKeySeparator + logical
 }
 
 func DocMetaKey(storageNs string) string {
@@ -157,22 +157,17 @@ func ExtractPKSuffixes(pkSuffix string) ([]string, error) {
 }
 
 func ParseIdxFullName(full string) (ownerStorageNs, logical string, err error) {
-	if full == "" {
-		return "", "", fmt.Errorf("empty index full name")
-	}
-	i := strings.LastIndex(full, keyAttrsJoin)
-	if i < 0 {
-		return "", "", fmt.Errorf("index full name %q has no join separator %q (expected shape <storageNs>%s<logical>)", full, keyAttrsJoin, keyAttrsJoin)
-	}
-	ownerNs := full[:i]
-	log := full[i+len(keyAttrsJoin):]
-	if ownerNs == "" {
-		return "", "", fmt.Errorf("index full name %q has empty owner storage namespace", full)
+	ns, log, splitErr := SplitStorageKey(full)
+	if splitErr != nil {
+		return "", "", fmt.Errorf("index full name %q has no join separator %q (expected shape <storageNs>%s<logical>): %w", full, storageKeySeparator, storageKeySeparator, splitErr)
 	}
 	if log == "" {
-		return "", "", fmt.Errorf("index full name %q has empty logical suffix", full)
+		return "", "", fmt.Errorf("index full name %q has no join separator %q (expected shape <storageNs>%s<logical>)", full, storageKeySeparator, storageKeySeparator)
 	}
-	return ownerNs, log, nil
+	if ns == "" {
+		return "", "", fmt.Errorf("index full name %q has empty owner storage namespace", full)
+	}
+	return ns, log, nil
 }
 
 func IsInternalStorageNs(storageNs string) bool {
