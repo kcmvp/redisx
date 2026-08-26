@@ -55,7 +55,7 @@ func printBootstrapAuthBanner(appAuth, ctrlAuth string) {
 	fmt.Fprintf(&sb, "  %s\n", save2)
 	fmt.Fprintf(&sb, "  %s\n", save3)
 	fmt.Fprintf(&sb, "%s\n", bar)
-	fmt.Fprint(os.Stdout, sb.String())
+	_, _ = fmt.Fprint(os.Stdout, sb.String())
 }
 
 var (
