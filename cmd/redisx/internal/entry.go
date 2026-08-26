@@ -17,17 +17,16 @@ const Version = "0.1.0"
 type ConnOpts struct {
 	Host      string
 	Port      int
-	AdminAuth string
+	Auth      string
 	TimeoutMs int
 }
 
 type AppData struct {
-	Opts       ConnOpts
-	Session    **session.Session
-	Cache      *session.Cache
-	Help       bool
-	ShowVer    bool
-	FrozenCaps session.Capabilities
+	Opts    ConnOpts
+	Session **session.Session
+	Cache   *session.Cache
+	Help    bool
+	ShowVer bool
 }
 
 func (a *AppData) HostPort() (string, string) {
@@ -50,54 +49,21 @@ func cMagenta(s string) string { return tui.Magenta(s) }
 func cDim(s string) string     { return tui.Dim(s) }
 func cPurple(s string) string  { return tui.Magenta(s) }
 
-func bannerLinesFor(caps session.Capabilities, host, port string) []string {
-	var headPure string
-	switch {
-	case !caps.IsRedisx:
-		headPure = "Redisx  RESP client — Generic-redis mode"
-	case caps.AdminRole:
-		headPure = "Redisx  Admin Shell  — Typed docs & Indexes available"
-	default:
-		headPure = "Redisx  App Mode     — Meta commands still shown, but server may return No Privilege"
-	}
-	hasTypedDocs := caps.IsRedisx && caps.TypedDocs
-	hasTypedIndexes := caps.IsRedisx && caps.TypedIndexes
-	hasSearch := caps.IsRedisx && caps.SearchIndex
-
+func bannerLinesFor(host, port string) []string {
+	headPure := "Redisx  RESP Shell  — Raw RESP passthrough; support & privilege enforcement handled server-side"
 	basicPure := []string{"ping", "!version / !clear", "!help", "quit / exit (Ctrl-C)"}
-	metaPure := []string{}
-	if hasTypedDocs {
-		metaPure = append(metaPure, "docs:  regsch / dropsch / !createsch")
+	metaPure := []string{
+		"docs:  regsch / dropsch",
+		"idx:   regidx / dropidx",
 	}
-	if hasTypedIndexes {
-		metaPure = append(metaPure, "idx:   regidx / dropidx / !createidx / !dropidx")
-	}
-	extPure := []string{}
-	if hasSearch {
-		extPure = append(extPure, "searchkey(sk)  /  searchindex(si)  /  update(upd)")
-	}
-	if !caps.IsRedisx {
-		metaPure = append(metaPure, "(not a redisx server — only raw RESP forwarding available)")
-	}
+	extPure := []string{"searchkey(sk)  /  searchindex(si)  /  update(upd)"}
 	body := []string{"Basic: " + strings.Join(basicPure, "  ·  ")}
-	if len(extPure) > 0 {
-		body = append(body, "Extended: "+strings.Join(extPure, "    "))
+	body = append(body, "Extended: "+strings.Join(extPure, "    "))
+	body = append(body, "Meta:")
+	for _, m := range metaPure {
+		body = append(body, "  "+m)
 	}
-	if len(metaPure) > 0 {
-		body = append(body, "Meta:")
-		for _, m := range metaPure {
-			body = append(body, "  "+m)
-		}
-	}
-	role := "generic-redis"
-	if caps.IsRedisx {
-		if caps.AdminRole {
-			role = "admin"
-		} else {
-			role = "app"
-		}
-	}
-	body = append(body, "connected: "+role+" "+host+":"+port)
+	body = append(body, "connected: "+host+":"+port+"  (raw RESP passthrough)")
 	bodyMaxW := 0
 	for _, l := range body {
 		if rw := len([]rune(l)); rw > bodyMaxW {
@@ -109,8 +75,8 @@ func bannerLinesFor(caps session.Capabilities, host, port string) []string {
 	if totalW < headW {
 		totalW = headW
 	}
-	if totalW < 70 {
-		totalW = 70
+	if totalW < 80 {
+		totalW = 80
 	}
 	var sepSb strings.Builder
 	pattern := "- - "
@@ -126,17 +92,11 @@ func bannerLinesFor(caps session.Capabilities, host, port string) []string {
 	for i, p := range pure {
 		switch i {
 		case 0:
-			if !caps.IsRedisx {
-				out[i] = cBold(p)
-			} else if caps.AdminRole {
-				out[i] = cBold(cCyan(p))
+			idx := strings.Index(p, "—")
+			if idx > 0 {
+				out[i] = cBold(p[:idx] + "—" + cMagenta(p[idx+len("—"):]))
 			} else {
-				idx := strings.Index(p, "—")
-				if idx > 0 {
-					out[i] = cBold(p[:idx] + "—" + cMagenta(p[idx+len("—"):]))
-				} else {
-					out[i] = cBold(cMagenta(p))
-				}
+				out[i] = cBold(cMagenta(p))
 			}
 		case 1:
 			out[i] = p
@@ -148,8 +108,6 @@ func bannerLinesFor(caps session.Capabilities, host, port string) []string {
 				line = cBold("Extended") + line[len("Extended"):]
 			} else if strings.HasPrefix(line, "Meta:") {
 				line = cBold("Meta") + line[len("Meta"):]
-			} else if strings.HasPrefix(line, "  (not a redisx server") {
-				line = "  " + cYellow(strings.TrimPrefix(line, "  "))
 			}
 			out[i] = line
 		}
@@ -175,8 +133,8 @@ func stripANSIStrict(s string) string {
 	return sb.String()
 }
 
-func BannerFor(caps session.Capabilities, host, port string) string {
-	lines := bannerLinesFor(caps, host, port)
+func BannerFor(host, port string) string {
+	lines := bannerLinesFor(host, port)
 	stripped := make([]string, len(lines))
 	for i, l := range lines {
 		stripped[i] = stripANSIStrict(l)
@@ -188,8 +146,8 @@ func BannerFor(caps session.Capabilities, host, port string) string {
 			contentW = r
 		}
 	}
-	if contentW < 70 {
-		contentW = 70
+	if contentW < 80 {
+		contentW = 80
 	}
 	sidePad := 2
 	borderRunes := contentW + sidePad*2

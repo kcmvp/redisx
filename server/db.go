@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/internal/naming"
+	"github.com/samber/lo"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
@@ -598,10 +599,9 @@ func canonicalDocMD5(spec docSpec) (string, error) {
 // are collapsed to underscores before hashing so buntdb comparator key-paths
 // are always stable regardless of input spelling.
 func canonicalIdxMD5(spec idxSpec) (string, error) {
-	paths := make([]string, len(spec.Paths))
-	for i, p := range spec.Paths {
-		paths[i] = strings.ReplaceAll(p, ".", "_")
-	}
+	paths := lo.Map(spec.Paths, func(p string, _ int) string {
+		return strings.ReplaceAll(p, ".", "_")
+	})
 	if len(paths) == 0 {
 		paths = []string{}
 	}
@@ -747,40 +747,40 @@ func (db *DB) loadIdxSpec(idxFullName string) (spec idxSpec, exists bool, err er
 	return spec, exists, err
 }
 
-// deleteDocSpecMeta deletes the single persisted doc meta key for storageNs
-// inside a running BuntDB tx. Exactly one live key per storageNs is the
-// invariant; if none exist the call is a no-op (the caller then decides
-// whether this is "not registered" via a pre-probe).
+// deleteMetaKeys deletes all persisted meta keys that match a glob inside a
+// running BuntDB tx. The "what" label is used for error messages (callers pass
+// e.g. "deleteDocSpecMeta" / "deleteIdxSpecMeta" so the origin of a delete
+// failure is clear). Missing keys (ErrNotFound) are ignored because the
+// invariant of "exactly one live version" means zero matches just means
+// nothing to delete.
 //
 // Do NOT call Write operations inside AscendKeys callbacks (BuntDB iter-then-
 // write rule); doomed is collected first, then deleted in a second pass.
-func deleteDocSpecMeta(tx *buntdb.Tx, storageNs string) error {
+func deleteMetaKeys(tx *buntdb.Tx, glob string, what string) error {
 	var doomed []string
-	_ = tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, _ string) bool {
+	_ = tx.AscendKeys(glob, func(k, _ string) bool {
 		doomed = append(doomed, k)
 		return true
 	})
 	for _, k := range doomed {
 		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteDocSpecMeta: %s: %w", k, e)
+			return fmt.Errorf("%s: %s: %w", what, k, e)
 		}
 	}
 	return nil
 }
 
+// deleteDocSpecMeta deletes the single persisted doc meta key for storageNs
+// inside a running BuntDB tx. Exactly one live key per storageNs is the
+// invariant; if none exist the call is a no-op (the caller then decides
+// whether this is "not registered" via a pre-probe).
+func deleteDocSpecMeta(tx *buntdb.Tx, storageNs string) error {
+	return deleteMetaKeys(tx, naming.DocMetaGlobFor(storageNs), "deleteDocSpecMeta")
+}
+
 // deleteIdxSpecMeta mirrors deleteDocSpecMeta for an index fullName.
 func deleteIdxSpecMeta(tx *buntdb.Tx, idxFullName string) error {
-	var doomed []string
-	_ = tx.AscendKeys(naming.IdxMetaGlobFor(idxFullName), func(k, _ string) bool {
-		doomed = append(doomed, k)
-		return true
-	})
-	for _, k := range doomed {
-		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteIdxSpecMeta: %s: %w", k, e)
-		}
-	}
-	return nil
+	return deleteMetaKeys(tx, naming.IdxMetaGlobFor(idxFullName), "deleteIdxSpecMeta")
 }
 
 // ——— Core writers: writeDocSpec / writeIndexSpec ———
@@ -1486,19 +1486,14 @@ func (db *DB) dropSchemaByLogicalNs(logicalNs string) error {
 	memStorageNs := naming.BuildStorageNs(logicalNs, true)
 	diskStorageNs := naming.BuildStorageNs(logicalNs, false)
 	db.idxRegMu.RLock()
-	attached := 0
-	var attachedNames []string
-	for full, spec := range db.idxRegSpec {
-		base, _ := naming.StripMemPrefixIfMem(spec.OwnerNs)
-		if base == logicalNs || spec.OwnerNs == memStorageNs || spec.OwnerNs == diskStorageNs {
-			attached++
-			attachedNames = append(attachedNames, full)
-		}
-	}
+	attachedNames := lo.FilterMap(lo.Entries(db.idxRegSpec), func(e lo.Entry[string, idxSpec], _ int) (string, bool) {
+		base, _ := naming.StripMemPrefixIfMem(e.Value.OwnerNs)
+		return e.Key, base == logicalNs || e.Value.OwnerNs == memStorageNs || e.Value.OwnerNs == diskStorageNs
+	})
 	db.idxRegMu.RUnlock()
-	if attached > 0 {
+	if len(attachedNames) > 0 {
 		sort.Strings(attachedNames)
-		return fmt.Errorf("doc %q still has %d attached index(es): %s — drop indexes first via DROPIDX", logicalNs, attached, strings.Join(attachedNames, ","))
+		return fmt.Errorf("doc %q still has %d attached index(es): %s — drop indexes first via DROPIDX", logicalNs, len(attachedNames), strings.Join(attachedNames, ","))
 	}
 	candidates := []struct {
 		storageNs string
@@ -1577,10 +1572,10 @@ func (db *DB) setBatchAtomic(batch []batchedWrite, nxMode bool) (int, error) {
 	applied := 0
 	err := db.store(layer).Update(func(tx *buntdb.Tx) error {
 		seen := make(map[string]struct{}, len(writes))
+		if lo.ContainsBy(writes, func(w batchedWrite) bool { return w.Key == "" }) {
+			return errors.New("batch: empty key")
+		}
 		for _, w := range writes {
-			if w.Key == "" {
-				return errors.New("batch: empty key")
-			}
 			if _, dup := seen[w.Key]; dup {
 				return fmt.Errorf("batch: duplicate key %q in single SET", w.Key)
 			}

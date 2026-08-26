@@ -147,11 +147,11 @@ func ensureServerAndSeed(t *testing.T) {
 
 	if clientTestServerAddr == "" {
 		dbPath := filepath.Join(t.TempDir(), "redisx.db")
-		appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+		appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
 		cfg := &server.Config{
 			DataPath: dbPath,
 			App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
-			Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+			Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort},
 		}
 		clientTestServerAddr = cfg.Admin.Addr()
 		db := server.StartWithConfig(cfg,
@@ -260,11 +260,11 @@ func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
 
-	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(s.T())
 	cfg := &server.Config{
 		DataPath: dbPath,
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	clientTestServerAddr = cfg.Admin.Addr()
 	db := server.StartWithConfig(cfg,
@@ -873,26 +873,26 @@ func runEmbedSignalChild(t *testing.T) {
 
 	dbPath := filepath.Join(t.TempDir(), "redisx.db")
 
-	adminHost, adminPortStr, err := net.SplitHostPort(addr)
+	ctrlHost, ctrlPortStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatalf("invalid REDISX_CHILD_ADDR=%q: %v", addr, err)
 	}
-	if adminHost == "" {
-		adminHost = "127.0.0.1"
+	if ctrlHost == "" {
+		ctrlHost = "127.0.0.1"
 	}
-	adminPort, pErr := strconv.Atoi(adminPortStr)
+	ctrlPort, pErr := strconv.Atoi(ctrlPortStr)
 	if pErr != nil {
-		t.Fatalf("invalid admin port %q: %v", adminPortStr, pErr)
+		t.Fatalf("invalid ctrl port %q: %v", ctrlPortStr, pErr)
 	}
 	var appPort int
-	claimedApp, lErr := net.Listen("tcp", net.JoinHostPort(adminHost, "0"))
+	claimedApp, lErr := net.Listen("tcp", net.JoinHostPort(ctrlHost, "0"))
 	if lErr != nil {
 		t.Fatalf("allocate free app port: %v", lErr)
 	}
 	appPort = claimedApp.Addr().(*net.TCPAddr).Port
-	if appPort == adminPort {
+	if appPort == ctrlPort {
 		_ = claimedApp.Close()
-		claimedApp, lErr = net.Listen("tcp", net.JoinHostPort(adminHost, "0"))
+		claimedApp, lErr = net.Listen("tcp", net.JoinHostPort(ctrlHost, "0"))
 		if lErr != nil {
 			t.Fatalf("re-allocate free app port (collision): %v", lErr)
 		}
@@ -902,12 +902,12 @@ func runEmbedSignalChild(t *testing.T) {
 
 	cfg := &server.Config{
 		DataPath: dbPath,
-		App:      server.AppConfig{Bind: adminHost, Port: appPort},
-		Admin:    server.AdminConfig{Bind: adminHost, Port: adminPort},
+		App:      server.AppConfig{Bind: ctrlHost, Port: appPort},
+		Admin:    server.AdminConfig{Bind: ctrlHost, Port: ctrlPort},
 	}
 	db := server.StartWithConfig(cfg)
 	if db == nil {
-		t.Fatalf("server.StartWithConfig() returned nil; appPort=%d adminPort=%d — likely a bind race, retry", appPort, adminPort)
+		t.Fatalf("server.StartWithConfig() returned nil; appPort=%d ctrlPort=%d — likely a bind race, retry", appPort, ctrlPort)
 	}
 
 	if err := ConnectEmbed(addr); err != nil {
@@ -2261,14 +2261,14 @@ func TestHostPortFromAddr(t *testing.T) {
 func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 	appPort, err := testutil.AllocateFreePort()
 	require.NoError(t, err)
-	adminPort, err := testutil.AllocateFreePort()
+	ctrlPort, err := testutil.AllocateFreePort()
 	require.NoError(t, err)
-	adminAuth := "np-admin-auth"
+	ctrlAuth := "np-ctrl-auth"
 	appAuth := "np-app-auth"
 	cfg := &server.Config{
 		DataPath: testutil.DBPath(t),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
@@ -2308,17 +2308,17 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 	}
 }
 
-func TestConnectAuthMismatchEmitsWrapAdminErr(t *testing.T) {
+func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 	appPort, err := testutil.AllocateFreePort()
 	require.NoError(t, err)
-	adminPort, err := testutil.AllocateFreePort()
+	ctrlPort, err := testutil.AllocateFreePort()
 	require.NoError(t, err)
-	adminAuth := "mismatch-admin-key"
+	ctrlAuth := "mismatch-ctrl-key"
 	appAuth := "mismatch-app-key"
 	cfg := &server.Config{
 		DataPath: testutil.DBPath(t),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
@@ -2326,42 +2326,39 @@ func TestConnectAuthMismatchEmitsWrapAdminErr(t *testing.T) {
 		stopAndResetGlobalState()
 	}()
 
-	t.Run("app port with admin auth key → connect() itself returns WrapAdminErr WRONGPASS", func(t *testing.T) {
-		_, dialErr := connect(cfg.App.Addr(), adminAuth)
+	t.Run("app port with ctrl auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
+		_, dialErr := connect(cfg.App.Addr(), ctrlAuth)
 		require.Error(t, dialErr)
-		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH key rejected (WRONGPASS)")
 		require.Contains(t, dialErr.Error(), "WRONGPASS invalid password for app port")
 		require.Contains(t, dialErr.Error(), "invalid password for app port")
 	})
-	t.Run("admin port with app auth key → connect() itself returns WrapAdminErr WRONGPASS", func(t *testing.T) {
+	t.Run("ctrl port with app auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
 		_, dialErr := connect(cfg.Admin.Addr(), appAuth)
 		require.Error(t, dialErr)
-		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH key rejected (WRONGPASS)")
-		require.Contains(t, dialErr.Error(), "WRONGPASS invalid password for admin port")
-		require.Contains(t, dialErr.Error(), "invalid password for admin port")
+		require.Contains(t, dialErr.Error(), "WRONGPASS")
+		require.Contains(t, dialErr.Error(), "invalid password")
 	})
-	t.Run("admin port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
+	t.Run("ctrl port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
 		err := Connect(cfg.Admin.Addr(), "")
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "auth key is empty")
 	})
-	t.Run("admin port with invalid non-empty auth key → connect() returns WrapAdminErr ERR authentication failed", func(t *testing.T) {
+	t.Run("ctrl port with invalid non-empty auth key → connect() returns raw ERR authentication failed", func(t *testing.T) {
 		_, dialErr := connect(cfg.Admin.Addr(), "wrong-wrong-wrong")
 		require.Error(t, dialErr)
-		require.Contains(t, dialErr.Error(), "connect redisx admin-port failed: AUTH failed (server ERR authentication failed)")
 		require.Contains(t, dialErr.Error(), "ERR authentication failed")
 	})
 }
 
 func TestConnectProbePlainRedisNoCapsNoError(t *testing.T) {
 	called := make(chan struct{}, 1)
-	capsCh := make(chan respconn.Capabilities, 1)
+	dialCh := make(chan *respconn.DialResult, 1)
 	origDial := internalDialForRespconnInternal
 	internalDialForRespconnInternal = func(o respconn.Options) (*respconn.DialResult, error) {
 		res, err := origDial(o)
 		if res != nil {
 			select {
-			case capsCh <- res.Capabilities:
+			case dialCh <- res:
 			default:
 			}
 		}
@@ -2431,17 +2428,17 @@ func TestConnectProbePlainRedisNoCapsNoError(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("mock listener was never called")
 	}
-	var caps respconn.Capabilities
+	var dialRes *respconn.DialResult
 	select {
-	case caps = <-capsCh:
+	case dialRes = <-dialCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("DialAndHandshake interceptor never fired")
 	}
-	if caps.IsRedisx {
-		t.Fatalf("expected IsRedisx=false on plain redis, got true (caps=%+v)", caps)
+	if dialRes == nil {
+		t.Fatal("dial result is nil")
 	}
-	if caps.ServerVer != "" || caps.AdminRole || caps.TypedDocs || caps.TypedIndexes {
-		t.Fatalf("expected empty feature caps on plain redis, got %+v", caps)
+	if dialRes.Client == nil {
+		t.Fatal("dial result has no client")
 	}
 }
 

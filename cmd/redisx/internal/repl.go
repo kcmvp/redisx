@@ -12,19 +12,12 @@ import (
 	"github.com/kcmvp/redisx/cmd/_shared/tui"
 )
 
-func RunREPL(app *tui.CLIApp, data *AppData, initial session.Capabilities) error {
+func RunREPL(app *tui.CLIApp, data *AppData) error {
 	if app == nil {
 		return fmt.Errorf("RunREPL: app is nil")
 	}
 	if data == nil {
 		return fmt.Errorf("RunREPL: no app data")
-	}
-	if !data.FrozenCaps.IsRedisx {
-		if initial.IsRedisx {
-			data.FrozenCaps = initial
-		} else if *data.Session != nil {
-			data.FrozenCaps = (*data.Session).Capabilities()
-		}
 	}
 	hp := app.Hooks()
 	ioctx := tui.RunContext{UserData: data, IO: tui.DefaultIO()}
@@ -69,16 +62,8 @@ func promptFor(data *AppData) string {
 	if data == nil {
 		return "redisx> "
 	}
-	caps := data.FrozenCaps
 	host, port := data.HostPort()
-	switch {
-	case !caps.IsRedisx:
-		return cDim("generic-redis") + " " + host + ":" + port + "> "
-	case caps.AdminRole:
-		return cPurple("admin") + " " + host + ":" + port + "> "
-	default:
-		return cCyan("app") + " " + host + ":" + port + "> "
-	}
+	return cCyan("redisx") + " " + host + ":" + port + "> "
 }
 
 func handleREPLLine(app *tui.CLIApp, data *AppData, line string) (bool, error) {
@@ -117,7 +102,7 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 	if want != "" {
 		c, canonical := app.Resolve(want)
 		if c == nil {
-			fmt.Fprintln(os.Stderr, cRed(fmt.Sprintf("unknown command %q — try commands (no args) for list", want)))
+			fmt.Fprintln(os.Stderr, cRed(fmt.Sprintf("unknown command %q — server-side |supported:| list will be returned for wire commands; for local commands try `help` / `commands`", want)))
 			return
 		}
 		fmt.Println(app.HelpForCmd(c, canonical))
@@ -130,13 +115,6 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 	if data == nil {
 		return
 	}
-	caps := data.FrozenCaps
-	isRedisx := caps.IsRedisx
-	hasDocs := isRedisx && caps.TypedDocs
-	hasIdx := isRedisx && caps.TypedIndexes
-	hasSearch := isRedisx && caps.SearchIndex
-	_ = hasSearch
-
 	groups := map[string][][2]string{}
 	order := []string{"Basic", "Extended", "Meta Management"}
 	for _, g := range order {
@@ -145,14 +123,6 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 	for _, name := range currentCmdOrder {
 		c, ok := currentCmds[name]
 		if !ok || c == nil || c.Hidden {
-			continue
-		}
-		switch {
-		case (name == "regsch" || name == "dropsch" || name == "!createsch") && !hasDocs:
-			continue
-		case (name == "regidx" || name == "dropidx" || name == "!createidx" || name == "!dropidx") && !hasIdx:
-			continue
-		case (name == "searchkey" || name == "searchindex" || name == "update") && !hasSearch:
 			continue
 		}
 		g := groupOfForCommands(name)
@@ -166,19 +136,9 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 		}
 		groups[g] = append(groups[g], [2]string{use, c.Short})
 	}
-	role := "generic-redis"
-	mode := "generic-redis mode (raw RESP only)"
 	h, p := data.HostPort()
-	if isRedisx {
-		if caps.AdminRole {
-			role = "admin"
-			mode = "admin shell — typed docs & indexes available"
-		} else {
-			role = "app"
-			mode = "app mode — meta commands may be rejected by server (No Privilege)"
-		}
-	}
-	fmt.Println(cBold("Connected: ") + cCyan(role+" "+h+":"+p) + "  (" + mode + ")")
+	mode := "raw RESP passthrough — support & privilege enforcement handled server-side"
+	fmt.Println(cBold("Connected: ") + cCyan(h+":"+p) + "  (" + mode + ")")
 	fmt.Println()
 	for _, g := range order {
 		rows := groups[g]
@@ -203,41 +163,19 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 		}
 		fmt.Println()
 	}
-	fmt.Println("Hint: type `commands <name>` for detailed help; `regsch` / `regidx` without args run an interactive wizard.")
+	fmt.Println("Hint: type `commands <name>` for detailed help; type `example` to list paste-ready templates.")
 }
 
 func fetchServerCommandsGroups(data *AppData) (groups map[string][][2]string, order []string, roleLine string, ok bool) {
 	if data == nil || *data.Session == nil {
 		return nil, nil, "", false
 	}
-	caps := data.FrozenCaps
-	if !caps.IsRedisx {
-		sess := *data.Session
-		if _, now, okR := sess.RefreshCapabilities(); okR {
-			data.FrozenCaps = now
-			caps = now
-		}
-	}
-	if !caps.IsRedisx {
-		return nil, nil, "", false
-	}
-	if caps.Commands == nil {
-		return nil, nil, "", false
-	}
+	cmdGroups := defaultCommandGroups()
 	groups = map[string][][2]string{}
-	order = append(order, caps.Commands.GroupOrder...)
+	order = append(order, cmdGroups.GroupOrder...)
 	h, p := data.HostPort()
-	role := "app"
-	mode := "app mode — meta commands may be rejected by server (No Privilege)"
-	if caps.AdminRole {
-		role = "admin"
-		mode = "admin shell — typed docs & indexes available"
-	}
-	roleLine = cBold("Connected: ") + cCyan(role+" "+h+":"+p) + "  (" + mode + ")"
-	if caps.ServerVer != "" {
-		roleLine += "  [" + cDim("server="+caps.ServerVer) + "]"
-	}
-	for g, entries := range caps.Commands.Groups {
+	roleLine = cBold("Connected: ") + cCyan(h+":"+p) + "  (raw RESP passthrough — support & privilege enforcement handled server-side)"
+	for g, entries := range cmdGroups.Groups {
 		rows := make([][2]string, 0, len(entries))
 		for _, e := range entries {
 			if e.Name == "" {
@@ -276,21 +214,13 @@ func printServerCommandsList(data *AppData, groups map[string][][2]string, order
 		}
 		fmt.Println()
 	}
-	if data != nil {
-		caps := data.FrozenCaps
-		if caps.IsRedisx {
-			fmt.Println(cDim("(commands list above comes from the handshake HELLO reply; server upgrade auto-syncs when shell reconnects)"))
-		}
-	}
-	fmt.Println("Hint: type `commands <name>` for detailed help; `regsch` / `regidx` without args run an interactive wizard.")
+	fmt.Println(cDim("(commands list above is the client-builtin SSoT catalogue; server command set upgrades ship with shell binary per the decoupling rule)"))
+	fmt.Println("Hint: type `commands <name>` for detailed help; type `example` to list paste-ready templates.")
 }
 
 func groupOfForCommands(name string) string {
 	switch name {
-	case "searchkey", "searchindex", "update":
-		return "Extended"
-	case "regsch", "dropsch", "!createsch",
-		"regidx", "dropidx", "!createidx", "!dropidx":
+	case "!createsch", "!createidx", "!dropidx":
 		return "Meta Management"
 	}
 	return "Basic"

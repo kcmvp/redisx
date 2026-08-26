@@ -40,7 +40,7 @@ func AllocateFreePort() (int, error) {
 // AllocateTwoFreePorts returns two distinct free TCP ports on 127.0.0.1. The
 // two ports are NEVER equal even if a transient listener release leaves an
 // overlap window for the second allocate.
-func AllocateTwoFreePorts(tb testing.TB) (appPort, adminPort int) {
+func AllocateTwoFreePorts(tb testing.TB) (appPort, ctrlPort int) {
 	tb.Helper()
 	var err error
 	appPort, err = AllocateFreePort()
@@ -48,15 +48,15 @@ func AllocateTwoFreePorts(tb testing.TB) (appPort, adminPort int) {
 		tb.Fatalf("allocate free app port: %v", err)
 	}
 	for tries := 0; tries < 10; tries++ {
-		adminPort, err = AllocateFreePort()
+		ctrlPort, err = AllocateFreePort()
 		if err != nil {
-			tb.Fatalf("allocate free admin port: %v", err)
+			tb.Fatalf("allocate free ctrl port: %v", err)
 		}
-		if adminPort != appPort {
+		if ctrlPort != appPort {
 			return
 		}
 	}
-	tb.Fatalf("AllocateTwoFreePorts: admin port collided with appPort=%d after 10 retries", appPort)
+	tb.Fatalf("AllocateTwoFreePorts: ctrl port collided with appPort=%d after 10 retries", appPort)
 	return 0, 0
 }
 

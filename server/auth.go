@@ -85,7 +85,7 @@ func getAuthConfig() (appAuth, adminAuth string, configured bool) {
 func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
 	cmdLower := strings.ToLower(cmdName)
 	switch cmdLower {
-	case strings.ToLower(proto.CmdAuth), strings.ToLower(proto.CmdHello), strings.ToLower(proto.CmdClient):
+	case proto.LowerCmdAuth, proto.LowerCmdHello, proto.LowerCmdClient:
 		return false
 	}
 	appAuth, adminAuth, configured := getAuthConfig()
@@ -169,13 +169,13 @@ var appPortCmdAllowlist = map[string]bool{}
 func init() {
 	combined := []string{
 		// Handshake & base transport commands
-		proto.CmdAuth, proto.CmdHello, proto.CmdClient, proto.CmdPing, proto.CmdQuit, proto.CmdSelect, proto.CmdCommand, proto.CmdReset,
-		proto.CmdSubscribe, proto.CmdUnsubscribe, proto.CmdPSubscribe, proto.CmdPUnsubscribe, proto.CmdPublish,
+		proto.LowerCmdAuth, proto.LowerCmdHello, proto.LowerCmdClient, proto.LowerCmdPing, proto.LowerCmdQuit, proto.LowerCmdSelect, proto.LowerCmdCommand, proto.LowerCmdReset,
+		proto.LowerCmdSubscribe, proto.LowerCmdUnsubscribe, proto.LowerCmdPSubscribe, proto.LowerCmdPUnsubscribe, proto.LowerCmdPublish,
 		// Shared business commands: KV, KV-extensions
-		proto.CmdSet, proto.CmdSetEx, proto.CmdSetNX, proto.CmdGet, proto.CmdDel, proto.CmdExists,
-		proto.CmdSearchKey, proto.CmdSearchIndex, proto.CmdUpdate,
+		proto.LowerCmdSet, proto.LowerCmdSetEx, proto.LowerCmdSetNX, proto.LowerCmdGet, proto.LowerCmdDel, proto.LowerCmdExists,
+		proto.LowerCmdSearchKey, proto.LowerCmdSearchIndex, proto.LowerCmdUpdate,
 	}
 	for _, c := range combined {
-		appPortCmdAllowlist[strings.ToLower(c)] = true
+		appPortCmdAllowlist[c] = true
 	}
 }

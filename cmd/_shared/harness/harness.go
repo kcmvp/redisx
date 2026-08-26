@@ -37,24 +37,24 @@ func FindFreePortIn7k8k(t *testing.T) int {
 }
 
 type Harness struct {
-	T           *testing.T
-	AppPort     int
-	AdminPort   int
-	DBPath      string
-	DataDir     string
-	AppBindIP   string
-	AdminBindIP string
-	AppAuth     string
-	AdminAuth   string
+	T          *testing.T
+	AppPort    int
+	CtrlPort   int
+	DBPath     string
+	DataDir    string
+	AppBindIP  string
+	CtrlBindIP string
+	AppAuth    string
+	CtrlAuth   string
 }
 
 type HarnessOpts struct {
-	AppAuth            string
-	AdminAuth          string
-	AppBindIP          string
-	AdminBindIP        string
-	AdminTrustProxy    bool
-	AdminDangerBindAny bool
+	AppAuth           string
+	CtrlAuth          string
+	AppBindIP         string
+	CtrlBindIP        string
+	CtrlTrustProxy    bool
+	CtrlDangerBindAny bool
 }
 
 func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
@@ -62,13 +62,13 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 	if opt.AppBindIP == "" {
 		opt.AppBindIP = "127.0.0.1"
 	}
-	if opt.AdminBindIP == "" {
-		opt.AdminBindIP = "127.0.0.1"
+	if opt.CtrlBindIP == "" {
+		opt.CtrlBindIP = "127.0.0.1"
 	}
 	appPort := FindFreePortIn7k8k(t)
-	adminPort := FindFreePortIn7k8k(t)
-	for adminPort == appPort {
-		adminPort = FindFreePortIn7k8k(t)
+	ctrlPort := FindFreePortIn7k8k(t)
+	for ctrlPort == appPort {
+		ctrlPort = FindFreePortIn7k8k(t)
 	}
 
 	dataDir := t.TempDir()
@@ -81,18 +81,18 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 			Auth: opt.AppAuth,
 		},
 		Admin: server.AdminConfig{
-			Bind:          opt.AdminBindIP,
-			Port:          adminPort,
-			Auth:          opt.AdminAuth,
-			TrustProxy:    opt.AdminTrustProxy,
-			DangerBindAny: opt.AdminDangerBindAny,
+			Bind:          opt.CtrlBindIP,
+			Port:          ctrlPort,
+			Auth:          opt.CtrlAuth,
+			TrustProxy:    opt.CtrlTrustProxy,
+			DangerBindAny: opt.CtrlDangerBindAny,
 		},
 		DataPath: dbPath,
 	}
 
-	t.Logf("harness: boot app=%s:%d admin=%s:%d db=%s app_auth=%q admin_auth=%q trust_proxy=%v danger=%v",
-		opt.AppBindIP, appPort, opt.AdminBindIP, adminPort, dbPath,
-		opt.AppAuth, opt.AdminAuth, opt.AdminTrustProxy, opt.AdminDangerBindAny)
+	t.Logf("harness: boot app=%s:%d ctrl=%s:%d db=%s app_auth=%q ctrl_auth=%q trust_proxy=%v danger=%v",
+		opt.AppBindIP, appPort, opt.CtrlBindIP, ctrlPort, dbPath,
+		opt.AppAuth, opt.CtrlAuth, opt.CtrlTrustProxy, opt.CtrlDangerBindAny)
 
 	db := server.StartWithConfig(cfg)
 	if db == nil {
@@ -101,16 +101,16 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 	t.Cleanup(func() { _ = server.Stop() })
 
 	waitListenReady(t, opt.AppBindIP, appPort)
-	waitListenReady(t, opt.AdminBindIP, adminPort)
+	waitListenReady(t, opt.CtrlBindIP, ctrlPort)
 	return &Harness{
-		T: t, AppPort: appPort, AdminPort: adminPort, DBPath: dbPath, DataDir: dataDir,
-		AppBindIP: opt.AppBindIP, AdminBindIP: opt.AdminBindIP,
-		AppAuth: opt.AppAuth, AdminAuth: opt.AdminAuth,
+		T: t, AppPort: appPort, CtrlPort: ctrlPort, DBPath: dbPath, DataDir: dataDir,
+		AppBindIP: opt.AppBindIP, CtrlBindIP: opt.CtrlBindIP,
+		AppAuth: opt.AppAuth, CtrlAuth: opt.CtrlAuth,
 	}
 }
 
-func (h *Harness) AdminBind() string { return h.AdminBindIP }
-func (h *Harness) AppBind() string   { return h.AppBindIP }
+func (h *Harness) CtrlBind() string { return h.CtrlBindIP }
+func (h *Harness) AppBind() string  { return h.AppBindIP }
 
 func waitListenReady(t *testing.T, ip string, port int) {
 	t.Helper()

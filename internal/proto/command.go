@@ -1,5 +1,7 @@
 package proto
 
+import "strings"
+
 const (
 	CmdAuth         = "AUTH"
 	CmdHello        = "HELLO"
@@ -27,7 +29,7 @@ const (
 	CmdSearchIndex = "SEARCHINDEX"
 	CmdSearchKey   = "SEARCHKEY"
 
-	// 4 registry / admin pair commands.
+	// 4 registry pair commands.
 	// They are ordinary commands treated identically to SET/GET at the
 	// dispatcher level; the only semantic differences live inside their
 	// handler functions (e.g. DROPSCH refuses to drop a schema while
@@ -37,6 +39,78 @@ const (
 	CmdDropSchema     = "DROPSCH"
 	CmdDropIndex      = "DROPIDX"
 )
+
+// LowerName returns the canonical lowercase form of a RedisX command word
+// (the exact key used by the server-side command registry and the app-port
+// allowlist). Callers should prefer this inline helper over ad-hoc
+// strings.ToLower(cmd) so the casing rule lives in exactly one place.
+func LowerName(cmd string) string { return strings.ToLower(cmd) }
+
+var (
+	LowerCmdAuth           = LowerName(CmdAuth)
+	LowerCmdHello          = LowerName(CmdHello)
+	LowerCmdClient         = LowerName(CmdClient)
+	LowerCmdPing           = LowerName(CmdPing)
+	LowerCmdQuit           = LowerName(CmdQuit)
+	LowerCmdSelect         = LowerName(CmdSelect)
+	LowerCmdCommand        = LowerName(CmdCommand)
+	LowerCmdReset          = LowerName(CmdReset)
+	LowerCmdSubscribe      = LowerName(CmdSubscribe)
+	LowerCmdUnsubscribe    = LowerName(CmdUnsubscribe)
+	LowerCmdPSubscribe     = LowerName(CmdPSubscribe)
+	LowerCmdPUnsubscribe   = LowerName(CmdPUnsubscribe)
+	LowerCmdPublish        = LowerName(CmdPublish)
+	LowerCmdSet            = LowerName(CmdSet)
+	LowerCmdSetEx          = LowerName(CmdSetEx)
+	LowerCmdSetNX          = LowerName(CmdSetNX)
+	LowerCmdGet            = LowerName(CmdGet)
+	LowerCmdDel            = LowerName(CmdDel)
+	LowerCmdExists         = LowerName(CmdExists)
+	LowerCmdKeys           = LowerName(CmdKeys)
+	LowerCmdUpdate         = LowerName(CmdUpdate)
+	LowerCmdSearchIndex    = LowerName(CmdSearchIndex)
+	LowerCmdSearchKey      = LowerName(CmdSearchKey)
+	LowerCmdRegisterSchema = LowerName(CmdRegisterSchema)
+	LowerCmdRegisterIndex  = LowerName(CmdRegisterIndex)
+	LowerCmdDropSchema     = LowerName(CmdDropSchema)
+	LowerCmdDropIndex      = LowerName(CmdDropIndex)
+)
+
+// AllLowerCmdNames returns the complete lowercase command set, keyed by the
+// original upper-case constant name. It is intended for allowlist/blocklist
+// builders that want to iterate over every known RedisX command word without
+// re-listing them by hand.
+func AllLowerCmdNames() map[string]string {
+	return map[string]string{
+		CmdAuth:           LowerCmdAuth,
+		CmdHello:          LowerCmdHello,
+		CmdClient:         LowerCmdClient,
+		CmdPing:           LowerCmdPing,
+		CmdQuit:           LowerCmdQuit,
+		CmdSelect:         LowerCmdSelect,
+		CmdCommand:        LowerCmdCommand,
+		CmdReset:          LowerCmdReset,
+		CmdSubscribe:      LowerCmdSubscribe,
+		CmdUnsubscribe:    LowerCmdUnsubscribe,
+		CmdPSubscribe:     LowerCmdPSubscribe,
+		CmdPUnsubscribe:   LowerCmdPUnsubscribe,
+		CmdPublish:        LowerCmdPublish,
+		CmdSet:            LowerCmdSet,
+		CmdSetEx:          LowerCmdSetEx,
+		CmdSetNX:          LowerCmdSetNX,
+		CmdGet:            LowerCmdGet,
+		CmdDel:            LowerCmdDel,
+		CmdExists:         LowerCmdExists,
+		CmdKeys:           LowerCmdKeys,
+		CmdUpdate:         LowerCmdUpdate,
+		CmdSearchIndex:    LowerCmdSearchIndex,
+		CmdSearchKey:      LowerCmdSearchKey,
+		CmdRegisterSchema: LowerCmdRegisterSchema,
+		CmdRegisterIndex:  LowerCmdRegisterIndex,
+		CmdDropSchema:     LowerCmdDropSchema,
+		CmdDropIndex:      LowerCmdDropIndex,
+	}
+}
 
 // Usage strings shown by the Shell's handshake meta group and the server's
 // built-in "wrong number of arguments" errors.

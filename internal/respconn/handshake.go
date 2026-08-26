@@ -21,9 +21,8 @@ type Options struct {
 }
 
 type DialResult struct {
-	Client       *redis.Client
-	Timeout      time.Duration
-	Capabilities Capabilities
+	Client  *redis.Client
+	Timeout time.Duration
 }
 
 func Defaults(o Options) Options {
@@ -39,25 +38,6 @@ func Defaults(o Options) Options {
 	return o
 }
 
-func WrapAdminErr(raw error, authProvided bool) error {
-	if raw == nil {
-		return nil
-	}
-	msg := raw.Error()
-	switch {
-	case strings.Contains(msg, "NOAUTH"):
-		if authProvided {
-			return fmt.Errorf("admin-port still returned NOAUTH after AUTH attempt: server has rotated / changed admin-auth key? %w", raw)
-		}
-		return fmt.Errorf("connect redisx admin-port failed: server admin-port requires AUTH. Pass the admin-auth key via `-a <ADMIN_AUTH_KEY>` (long form `--admin-auth <ADMIN_AUTH_KEY>`); if the server was started WITHOUT admin-auth (dev-only), no `-a` flag is needed")
-	case strings.Contains(msg, "WRONGPASS"):
-		return fmt.Errorf("connect redisx admin-port failed: AUTH key rejected (WRONGPASS); the key passed via `-a / --admin-auth` does not match the server's `--admin-auth` key; check for trailing whitespace %w", raw)
-	case strings.Contains(msg, "ERR authentication failed"):
-		return fmt.Errorf("connect redisx admin-port failed: AUTH failed (server ERR authentication failed); double-check `-a / --admin-auth` matches the server's `--admin-auth` startup value %w", raw)
-	}
-	return fmt.Errorf("connect redisx admin-port failed: %w", raw)
-}
-
 func DialAndHandshake(o Options) (*DialResult, error) {
 	o = Defaults(o)
 	to := time.Duration(o.TimeoutMs) * time.Millisecond
@@ -65,9 +45,8 @@ func DialAndHandshake(o Options) (*DialResult, error) {
 	if readTimeout == 0 {
 		readTimeout = to
 	}
-	authProvided := o.Auth != ""
 	onConnect := o.OnConnect
-	if authProvided {
+	if o.Auth != "" {
 		inner := onConnect
 		onConnect = func(ctx context.Context, cn *redis.Conn) error {
 			if err := cn.Do(ctx, "AUTH", o.Auth).Err(); err != nil {
@@ -91,39 +70,22 @@ func DialAndHandshake(o Options) (*DialResult, error) {
 	probeCtx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
 	raw := client.Do(probeCtx, "HELLO", 3)
-	var firstCaps Capabilities
-	if raw.Err() == nil {
-		if v, err := raw.Result(); err == nil {
-			firstCaps = ParseHelloCapabilities(v)
-		}
-	} else {
+	if raw.Err() != nil {
 		helloErr := raw.Err()
 		if !strings.Contains(helloErr.Error(), "NOAUTH") {
 			pingCtx, cancelPing := context.WithTimeout(context.Background(), to)
 			defer cancelPing()
 			if pingErr := client.Ping(pingCtx).Err(); pingErr != nil {
 				_ = client.Close()
-				return nil, WrapAdminErr(pingErr, authProvided)
+				return nil, pingErr
 			}
 		} else {
 			_ = client.Close()
-			return nil, WrapAdminErr(helloErr, authProvided)
+			return nil, helloErr
 		}
 	}
-	caps := ProbeCapabilities(context.Background(), client, to)
-	if caps.IsRedisx {
-		return &DialResult{
-			Client:       client,
-			Timeout:      to,
-			Capabilities: caps,
-		}, nil
-	}
-	if !firstCaps.IsRedisx && firstCaps.ServerVer != "" {
-		caps = firstCaps
-	}
 	return &DialResult{
-		Client:       client,
-		Timeout:      to,
-		Capabilities: caps,
+		Client:  client,
+		Timeout: to,
 	}, nil
 }

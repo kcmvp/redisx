@@ -23,7 +23,7 @@ func main() {
 	slog.Info("demo booting redisx via yaml config",
 		"config", defaultConfigName, "db", cfg.DataPath,
 		"app", cfg.App.Addr(),
-		"admin", cfg.Admin.Addr(),
+		"ctrl", cfg.Admin.Addr(),
 	)
 	db := server.StartWithConfig(cfg)
 	if db == nil {

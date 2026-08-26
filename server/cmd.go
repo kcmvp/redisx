@@ -17,6 +17,228 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+// ——— ——— 工具函数 / Pure helpers ——— ———
+
+// appearsDocIntentJSON reports whether a raw SET/SETEX/SETNX value string
+// "looks like" typed-document JSON — i.e. parses as a JSON object or
+// JSON array. When namespace is missing and the value matches, we emit
+// a "schema not registered" error instead of a generic "need separator"
+// error, which is a much better diagnostic for callers migrating from
+// raw KV to typed docs.
+func appearsDocIntentJSON(v string) bool {
+	if !gjson.Valid(v) {
+		return false
+	}
+	r := gjson.Parse(v)
+	return r.IsObject() || r.IsArray()
+}
+
+// normalizeKRJSONArg normalises the first positional argument of
+// UPDATE / SEARCHKEY to a valid x.KeyRange JSON payload.
+//
+// Accepts two forms:
+//   - already-JSON `{ "op": "pattern", "p": "<ns>:*" }` — returned as-is
+//   - legacy shorthand string `<ns>:*` (or any string without a leading
+//     '{') — wrapped into `{"op":"pattern","p":"<raw>"}` via json.Marshal
+//
+// If json.Marshal fails for a non-JSON raw, the input string is returned
+// unchanged so downstream UnmarshalKeyRange can surface the exact parse
+// error instead of a misleading wrapper failure.
+func normalizeKRJSONArg(raw string) []byte {
+	if len(raw) > 0 && raw[0] == '{' {
+		return []byte(raw)
+	}
+	b, err := json.Marshal(map[string]string{"op": "pattern", "p": raw})
+	if err != nil {
+		return []byte(raw)
+	}
+	return b
+}
+
+// parseFilter recursively parses a MongoDB-style JSON filter string into
+// an x.Filter tree. Empty / "{}" passes everything.
+//
+// Supported operators:
+//   - Top-level keys combine with implicit $and
+//   - `$and` / `$or` — array of sub-filters
+//   - `$eq`, `$neq` — scalar equality
+//   - `$gt`, `$gte`, `$lt`, `$lte` — numeric comparisons (parsed as float64)
+//   - `$contains` — string substring match
+//   - `$in` — array value, any match passes
+//   - `"field": <scalar>` — shorthand implicit `$eq`
+func parseFilter(jsonStr string) (x.Filter, error) {
+	if jsonStr == "" || jsonStr == "{}" {
+		return nil, nil // empty filter passes everything
+	}
+
+	if !gjson.Valid(jsonStr) {
+		return nil, errors.New("invalid JSON filter format")
+	}
+
+	root := gjson.Parse(jsonStr)
+	return parseNode(root)
+}
+
+// parseNode recursively parses one gjson JSON object node into an
+// x.Filter. See parseFilter for the supported operator grammar.
+//
+// Field-comparison sub-objects (e.g. `{"age":{"$gt":18}}`) are parsed in
+// the `default` branch; an unrecognised operator bubbles up as a parse
+// error via the closure-local `parseErr` variable.
+func parseNode(node gjson.Result) (x.Filter, error) {
+	if node.Type != gjson.JSON {
+		return nil, errors.New("expected JSON object")
+	}
+
+	var filters []x.Filter
+	var parseErr error
+
+	node.ForEach(func(key, value gjson.Result) bool {
+		k := key.String()
+
+		switch k {
+		case "$and":
+			if !value.IsArray() {
+				parseErr = errors.New("$and must be an array")
+				return false
+			}
+			var subFilters []x.Filter
+			value.ForEach(func(_, subNode gjson.Result) bool {
+				f, err := parseNode(subNode)
+				if err != nil {
+					parseErr = err
+					return false
+				}
+				subFilters = append(subFilters, f)
+				return true
+			})
+			if parseErr != nil {
+				return false
+			}
+			filters = append(filters, x.And(subFilters...))
+		case "$or":
+			if !value.IsArray() {
+				parseErr = errors.New("$or must be an array")
+				return false
+			}
+			var subFilters []x.Filter
+			value.ForEach(func(_, subNode gjson.Result) bool {
+				f, err := parseNode(subNode)
+				if err != nil {
+					parseErr = err
+					return false
+				}
+				subFilters = append(subFilters, f)
+				return true
+			})
+			if parseErr != nil {
+				return false
+			}
+			filters = append(filters, x.Or(subFilters...))
+		default:
+			// Field comparison. E.g. "age": {"$gt": 18} or "status": "active"
+			if value.Type == gjson.JSON {
+				// Object with operators
+				value.ForEach(func(opKey, opVal gjson.Result) bool {
+					op := opKey.String()
+					switch op {
+					case "$eq":
+						filters = append(filters, x.Eq(k, opVal.Value()))
+					case "$neq":
+						filters = append(filters, x.Neq(k, opVal.Value()))
+					case "$gt":
+						filters = append(filters, x.Gt(k, opVal.Float()))
+					case "$gte":
+						filters = append(filters, x.Gte(k, opVal.Float()))
+					case "$lt":
+						filters = append(filters, x.Lt(k, opVal.Float()))
+					case "$lte":
+						filters = append(filters, x.Lte(k, opVal.Float()))
+					case "$contains":
+						filters = append(filters, x.Contains(k, opVal.String()))
+					case "$in":
+						if !opVal.IsArray() {
+							parseErr = fmt.Errorf("$in operator requires an array for field %s", k)
+							return false
+						}
+						var inValues []any
+						opVal.ForEach(func(_, v gjson.Result) bool {
+							inValues = append(inValues, v.Value())
+							return true
+						})
+						filters = append(filters, x.In(k, inValues...))
+					default:
+						parseErr = fmt.Errorf("unsupported operator: %s", op)
+						return false
+					}
+					return true
+				})
+			} else {
+				// Implicit $eq. E.g. "status": "active"
+				filters = append(filters, x.Eq(k, value.Value()))
+			}
+		}
+
+		return parseErr == nil
+	})
+
+	if parseErr != nil {
+		return nil, parseErr
+	}
+
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	if len(filters) == 1 {
+		return filters[0], nil
+	}
+	// Implicit AND for multiple keys in the same object
+	return x.And(filters...), nil
+}
+
+// normalizeIndexPathFields extracts index paths from a REGIDX raw JSON
+// payload, accepting either the single-field "path": "foo.bar" legacy
+// form or the multi-field "paths": ["a","b.c"] form.
+//
+// The extracted strings are NOT canonicalised here — downstream
+// writeIndexSpec / indexJSONComposite rely on dot→underscore
+// replacement, which still happens inside regIdxCommand and
+// canonicalIdxMD5 as their respective SSoT sites.
+func normalizeIndexPathFields(rawMap map[string]any) ([]string, error) {
+	if rawArr, ok := rawMap["paths"].([]any); ok && len(rawArr) > 0 {
+		out := make([]string, 0, len(rawArr))
+		for i, v := range rawArr {
+			s, _ := v.(string)
+			if s == "" {
+				return nil, fmt.Errorf("paths[%d] is empty or not a string", i)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	}
+	if single, ok := rawMap["path"].(string); ok && single != "" {
+		return []string{single}, nil
+	}
+	return nil, fmt.Errorf("either \"path\" (string, single-field) or \"paths\" ([string], multi-field) is required")
+}
+
+// ——— ——— 握手 / 元命令 / Auth & Hello & Client & Ping & Quit ——— ———
+
+// authCommand implements the AUTH wire command for RedisX's dual-port
+// (app + admin) model.
+//
+// Flow:
+//  1. If the connection is already authenticated and the caller repeats
+//     the same key we answer OK; if they send a DIFFERENT key we close
+//     the connection (security: no silent re-auth downgrade).
+//  2. If --admin-auth is configured on the admin port we REFUSE the
+//     app-auth key (and vice versa on the app port) to prevent leaking
+//     the wrong role.
+//  3. acquireAuthConn() checks the global per-key connection limit and
+//     validates existence of the key via `_auth_:<key>` storage lookup
+//     (or the bootstrap internalAuthKey literal). Internal-NS Write
+//     Guard forbids wire clients from mutating `_auth_:` keys directly
+//     through SET / DEL; AUTH key rotation is an admin-only operation.
 func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR authentication failed")
@@ -85,152 +307,69 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 	}
 }
 
+// helloCommand implements HELLO handshake for client/server identity probing.
+//
+// SSoT: Minimal identity response — intentionally returns ONLY the server
+// string "redisx". This follows the "backend command upgrade, frontend App
+// no update needed" decoupling principle: the client owns its command
+// catalogue, feature flags, and admin/app UI distinctions. The server's
+// only job during HELLO is to prove it's a RedisX peer so the client
+// SDK can enable typed-doc / colon-mode routing internally.
+//
+// All further metadata is accessed via dedicated wire commands (KEYS,
+// SEARCHKEY, etc.) — never via HELLO field inflation.
 func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	const serverVersion = "1.0.0"
-	role := connPortRole(conn)
-	adminRole := role == portRoleAdmin || role == portRoleUnknown
-	storageMode := "hybrid"
-	statsNamespaces := 0
-	statsIndexes := 0
-	if db != nil {
-		db.docRegMu.Lock()
-		statsNamespaces = len(db.docRegSpec)
-		db.docRegMu.Unlock()
-		db.idxRegMu.Lock()
-		statsIndexes = len(db.idxRegSpec)
-		db.idxRegMu.Unlock()
-	}
-	basicGroup := []any{
-		map[string]any{"name": "ping", "usage": "PING — round-trip latency check"},
-		map[string]any{"name": "!version", "aliases": []any{"version"}, "usage": "version — print redisx server version"},
-		map[string]any{"name": "!clear", "aliases": []any{"clear", "cls"}, "usage": "clear — clear terminal screen"},
-		map[string]any{"name": "!help", "aliases": []any{"help", "commands", "?"}, "usage": "commands [cmd]  — list all commands (optionally one command detail)"},
-		map[string]any{"name": "quit", "aliases": []any{"exit"}, "usage": "quit — exit shell (Ctrl-C also works)"},
-	}
-	sharedKv := []any{
-		map[string]any{"name": "set", "usage": usageOrProto("SET", "SET key val [EX s|PX ms] [NX]")},
-		map[string]any{"name": "setex", "usage": usageOrProto("SETEX", "SETEX key ttl val")},
-		map[string]any{"name": "setnx", "usage": usageOrProto("SETNX", "SETNX key val")},
-		map[string]any{"name": "get", "usage": usageOrProto("GET", "GET key")},
-		map[string]any{"name": "del", "usage": usageOrProto("DEL", "DEL key [key...]")},
-		map[string]any{"name": "exists", "usage": usageOrProto("EXISTS", "EXISTS key")},
-		map[string]any{"name": "keys", "usage": usageOrProto("KEYS", "KEYS pattern")},
-	}
-	extended := []any{
-		map[string]any{"name": "update", "usage": usageOrProto("UPDATE", "UPDATE key <json_patch>  — merge-UPDATE a JSON value (typed doc enabled: writes validated)")},
-		map[string]any{"name": "searchkey", "usage": usageOrProto("SEARCHKEY", "SEARCHKEY <predicate_json>  — typed doc+index search: filter → pick key")},
-		map[string]any{"name": "searchindex", "usage": usageOrProto("SEARCHINDEX", "SEARCHINDEX <ns> <idx_name> <query>  — query a named typed index")},
-	}
-	meta := make([]any, 0, 4)
-	{
-		// 4 registry pair commands. They are ordinary commands at the
-		// dispatcher level; all semantic checks live inside the handlers.
-		meta = append(meta, map[string]any{
-			"name":     "regsch",
-			"role":     "shared_biz",
-			"min_args": 1,
-			"max_args": 1,
-			"usage":    proto.UsageRegisterSchema,
-		})
-		meta = append(meta, map[string]any{
-			"name":     "dropsch",
-			"role":     "shared_biz",
-			"min_args": 1,
-			"max_args": 1,
-			"usage":    proto.UsageDropSchema,
-		})
-		meta = append(meta, map[string]any{
-			"name":     "regidx",
-			"role":     "shared_biz",
-			"min_args": 1,
-			"max_args": 1,
-			"usage":    proto.UsageRegisterIndex,
-		})
-		meta = append(meta, map[string]any{
-			"name":     "dropidx",
-			"role":     "shared_biz",
-			"min_args": 1,
-			"max_args": 2,
-			"usage":    proto.UsageDropIndex,
-		})
-	}
-	out := map[string]any{
-		"server":     "redisx",
-		"version":    serverVersion,
-		"proto":      2,
-		"id":         1,
-		"mode":       "standalone",
-		"role":       "master",
-		"admin_role": adminRole,
-		"dual_port":  true,
-		"features": map[string]any{
-			"typed_docs":    true,
-			"typed_indexes": true,
-			"live_rebuild":  false,
-			"write_hooks":   false,
-			"search_index":  true,
-			"pubsub":        true,
-		},
-		"stats": map[string]any{
-			"namespaces": statsNamespaces,
-			"indexes":    statsIndexes,
-		},
-		"storage": map[string]any{
-			"mode": storageMode,
-		},
-		"commands": map[string]any{
-			"group_order": []any{"Basic", "Extended", "Meta Management"},
-			"groups": map[string]any{
-				"Basic":           append(basicGroup, sharedKv...),
-				"Extended":        extended,
-				"Meta Management": meta,
-			},
-			"meta_admin_only": true,
-		},
-	}
-	conn.WriteAny(out)
+	conn.WriteAny(map[string]any{"server": "redisx"})
 }
 
+// clientCommand answers CLIENT * subcommands. RedisX intentionally
+// implements the minimum viable subset to keep generic Redis clients
+// happy (redis-py, ioredis, Jedis all issue CLIENT SETINFO lib-name/…
+// after HELLO). Currently a no-op that always answers OK.
 func clientCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	conn.WriteString("OK")
 }
 
+// pingCommand answers PING with PONG. No argc stricter than len(cmd.Args)
+// ≥ 1 needed because dispatcher already validates argv≥1; redis-cli
+// customarily supports `PING <msg>` to round-trip arbitrary payloads
+// but we use the strict zero-arg form to avoid leaking echoes.
 func pingCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	conn.WriteString("PONG")
 }
 
+// quitCommand closes the redcon connection and writes OK so redis-cli's
+// "exit / Ctrl-D" path stays indistinguishable from Redis native
+// behaviour. Calling conn.Close() while writing is idempotent in our
+// redcon fork; the slog-level event lives at the listener layer.
 func quitCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	conn.WriteString("OK")
 	_ = conn.Close()
 }
 
-func usageOrProto(_ string, fallback string) string {
-	// Registry commands are ordinary commands; usage strings live inline at
-	// each handler and in the proto.Usage* constants that feed the handshake
-	// meta group. This helper stays as a pass-through so legacy basic KV
-	// command argc-error call sites keep working unchanged.
-	return fallback
-}
+// ——— ——— 业务命令处理器 / KV + Typed Doc + Index + Registry ——— ———
 
-func appearsDocIntentJSON(v string) bool {
-	if !gjson.Valid(v) {
-		return false
-	}
-	r := gjson.Parse(v)
-	return r.IsObject() || r.IsArray()
-}
-
-func normalizeKRJSONArg(raw string) []byte {
-	if len(raw) > 0 && raw[0] == '{' {
-		return []byte(raw)
-	}
-	b, err := json.Marshal(map[string]string{"op": "pattern", "p": raw})
-	if err != nil {
-		return []byte(raw)
-	}
-	return b
-}
-
+// setCommand implements SET.
+//
+// Trust-User Colon rule (SSoT, via classifyArg1):
+//   - arg1 contains ":" → KV native path (write-through to storage as-is,
+//     NO schema, NO typed-doc registration checks, NX/EX/PX work exactly
+//     like Redis). Internal-NS Write Guard enforced by
+//     validateKVMutationKey(arg1) which rejects `_doc_:` / `_idx_:` /
+//     `_auth_:` head segments (wire callers cannot mutate meta keys).
+//   - arg1 does NOT contain ":" → typed-doc path: argv[1] is a namespace
+//     (logical OR storageNs), value must be a JSON object or array of
+//     objects. Each object is (a) checked against the registered
+//     docSpec, (b) has its storage key derived via deriveDocKey
+//     (SSoT: Schema → StorageKey), (c) written atomically via
+//     db.setBatchAtomic. Schema TTL overrides caller TTL when caller
+//     TTL is 0.
+//
+// Optional trailing flags: EX <seconds>, PX <milliseconds>, NX. Flags
+// are order-independent, matching Redis. Note NX on doc-pattern is
+// evaluated per-object, NOT across the whole batch: each pk either
+// exists already (skipped, counts as N=0) or not (inserted, counts in
+// the OK path).
 func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -365,6 +504,12 @@ func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 	}
 }
 
+// setExCommand implements SETEX (TTL in seconds, mandatory, no NX).
+//
+// Semantics mirror setCommand's KV/doc paths with the single
+// simplification that TTL is always present and argc is strictly 4.
+// Internal-NS Write Guard is enforced identically via
+// validateKVMutationKey on the KV branch.
 func setExCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 4 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -446,6 +591,14 @@ func setExCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 	}
 }
 
+// setNxCommand implements SETNX (write if not-exists; integer return:
+// 1 = written, 0 = precondition failed).
+//
+// Doc-path semantics differ slightly from KV-path semantics on
+// duplicate PK in a single batch: setBatchAtomic reports
+// errNxPreconditionFailed on ANY duplicate in the batch so callers get
+// deterministic "nothing written" rather than partial writes. KV-path
+// uses BuntDB native SetNX (single-key, no batch ambiguity).
 func setNxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -533,6 +686,19 @@ func setNxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 	}
 }
 
+// getCommand implements GET.
+//
+// Trust-User Colon rule:
+//   - arg1 contains ":" → KV native path (single full key; NOT an array
+//     form — multi-key reads are intentionally not exposed on raw KV to
+//     match the DEL constraint).
+//   - arg1 does NOT contain ":" → typed-doc path: argc MUST be 3
+//     (GET <ns> <pk-suffix>), storageNs derived via
+//     lookupDocByLogicalOrStorageNs, final key constructed via
+//     naming.BuildStorageKey(storageNs, suffix).
+//
+// Buntdb.ErrNotFound maps to RESP WriteNull (nil bulk), matching Redis
+// native GET semantics on miss.
 func getCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command — usage: GET <kv-full-key>  or  GET <doc-ns> <pk-suffix>")
@@ -595,6 +761,26 @@ func getCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 	}
 }
 
+// delCommand implements DEL.
+//
+// Two allowed forms (KV-path DEL Single-Key Guard):
+//
+//  1. argc == 2: single-key delete. classifyArg1(arg1) routes into KV
+//     (argShapeKV: one raw full key, validateKVMutationKey enforces
+//     Internal-NS Write Guard) OR doc namespace alone (an ERROR —
+//     caller should pass at least one pk-suffix to del).
+//  2. argc > 2: MULTI delete on typed docs ONLY. If arg1 still looks
+//     like raw KV (classifyArg1 == argShapeKV) we refuse outright and
+//     tell the caller to issue separate DELs per key or switch to
+//     doc-path form. Otherwise arg1 is a registered ns, remaining
+//     argv are pk-suffixes, we BuildStorageKey each one, then
+//     everything is deleted in one BuntDB transaction via
+//     db.deleteBatchAtomic.
+//
+// Note on "native Redis DEL M N" semantics: Redis allows DEL k1 k2 … kn
+// of unrelated keys. RedisX KV native path intentionally disallows
+// this. Callers that really need a multi-raw-key delete on arbitrary
+// non-doc keys can call `PIPELINE; DEL a; DEL b; EXEC`.
 func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -658,6 +844,36 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 	conn.WriteInt(n)
 }
 
+// keysCommand implements KEYS.
+//
+// Guardrails (applied BEFORE touching storage):
+//   - no leading glob wildcard (would force full DB scan + defeat
+//     BuntDB ordered index usefulness)
+//   - no leading underscore (forbids enumerating `_doc_:` / `_idx_:` /
+//     `_auth_:` meta keys — wire-level enumeration of registry data is
+//     an admin-only exposure and goes via REGSCH/REGIDX introspection,
+//     not raw KEYS).
+//
+// Routing via SSoTs:
+//   - resolveLayer(keyPattern) — storage-layer decision is delegated to
+//     the exact same SSoT that SET/GET/DELETE use; hand-written
+//     HasMemPrefix/IsInternalStorageNs branches were removed here to
+//     keep layer semantics in one place (db.go resolveLayer).
+//   - classifyArg1(keyPattern) == argShapeKV → raw KV pattern, pass
+//     straight through to db.Keys (which itself calls applyKeyRange and
+//     isLeadingWildcard guarded again).
+//   - otherwise (doc-path shape):
+//   - if pattern contains ANY glob: forbidden (admin must pass bare
+//     namespace only). Enumeration within a doc-ns with filters goes
+//     via SEARCHKEY, not KEYS.
+//   - otherwise the pattern is a bare storageNs: look it up via
+//     lookupDocByStorageNs to ensure REGSCH has run, then rewrite
+//     to `<ns>:*` via naming.BuildStorageKey(ns, "*").
+//
+// Output is a RESP array of bulk strings exactly matching Redis native
+// KEYS output shape; lengths >0 on a single mem/disk layer combined so
+// callers see `_m_:app:u1` and `app:u1` both in the same listing when
+// both exist (Metadata Symmetric Storage SSoT).
 func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -674,19 +890,33 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		return
 	}
 
-	if !naming.HasMemPrefix(keyPattern) && !naming.IsInternalStorageNs(keyPattern) {
-		if strings.Contains(keyPattern, naming.StorageKeySeparator()) {
-		} else if strings.ContainsAny(keyPattern, "*?[") {
-			conn.WriteError("ERR KEYS for doc-path requires bare <storageNs> without wildcards or colons. Glob patterns like 'abc*' on a naked namespace fragment are forbidden; patterns containing ':' (like 'app:prefix*') are treated as raw KV-path and allowed freely. Use SEARCHKEY <ns> <keyrange_json> for typed-document scoped queries.")
-			return
-		} else {
-			if !naming.IsInternalStorageNs(keyPattern) {
+	layer, constrained, rlErr := resolveLayer(keyPattern)
+	if rlErr != nil {
+		conn.WriteError("ERR KEYS " + rlErr.Error())
+		return
+	}
+	// mem-layer or internal-ns or leading-wildcard unconstrained: pass
+	// pattern through as-is. These are the only code paths that let
+	// `_m_:app:*` or a pre-formulated `app:*` KV pattern reach storage.
+	if constrained {
+		switch layer {
+		case storageMem:
+			// falls through → no doc-path path transformation needed
+		default:
+			switch classifyArg1(keyPattern) {
+			case argShapeKV:
+				// raw KV pattern: pass through unchanged
+			default:
+				if strings.ContainsAny(keyPattern, "*?[") {
+					conn.WriteError("ERR KEYS for doc-path requires bare <storageNs> without wildcards or colons. Glob patterns like 'abc*' on a naked namespace fragment are forbidden; patterns containing ':' (like 'app:prefix*') are treated as raw KV-path and allowed freely. Use SEARCHKEY <ns> <keyrange_json> for typed-document scoped queries.")
+					return
+				}
 				if _, ok := db.lookupDocByStorageNs(keyPattern); !ok {
 					conn.WriteError(fmt.Sprintf("ERR KEYS namespace %q is not registered — doc-path KEYS requires REGSCH first. For raw KV enumeration, pass a pattern containing ':' (e.g. '%s:*' or '%s:prefix*').", keyPattern, keyPattern, keyPattern))
 					return
 				}
+				keyPattern = naming.BuildStorageKey(keyPattern, "*")
 			}
-			keyPattern = naming.BuildStorageKey(keyPattern, "*")
 		}
 	}
 
@@ -702,6 +932,9 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 	}
 }
 
+// publishCommand implements PUBLISH. Delegates to the redcon.PubSub
+// handle attached to both listeners; RedisX does not namespace pub/sub
+// into storage layers — channels are global like vanilla Redis.
 func publishCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -710,6 +943,10 @@ func publishCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.Pub
 	conn.WriteInt(ps.Publish(string(cmd.Args[1]), string(cmd.Args[2])))
 }
 
+// subscribeCommand implements SUBSCRIBE. 1..n channel names; subscribes
+// each in order and does NOT WriteOK per channel manually — redcon's
+// PubSub machinery already emits the `subscribe` streaming push to the
+// connection on Subscribe().
 func subscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -720,6 +957,10 @@ func subscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 	}
 }
 
+// pSubscribeCommand implements PSUBSCRIBE (glob-pattern subscribe).
+// Semantics mirror subscribeCommand; pattern matching is handled by
+// redcon's implementation. RedisX doesn't split channels by storage
+// layer, so channel names don't route through resolveLayer.
 func pSubscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
@@ -730,133 +971,27 @@ func pSubscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.
 	}
 }
 
-// X Commands
-
-// parseFilter recursively parses a MongoDB-style JSON string into an x.Filter.
-func parseFilter(jsonStr string) (x.Filter, error) {
-	if jsonStr == "" || jsonStr == "{}" {
-		return nil, nil // empty filter passes everything
-	}
-
-	if !gjson.Valid(jsonStr) {
-		return nil, errors.New("invalid JSON filter format")
-	}
-
-	root := gjson.Parse(jsonStr)
-	return parseNode(root)
-}
-
-func parseNode(node gjson.Result) (x.Filter, error) {
-	if node.Type != gjson.JSON {
-		return nil, errors.New("expected JSON object")
-	}
-
-	var filters []x.Filter
-	var parseErr error
-
-	node.ForEach(func(key, value gjson.Result) bool {
-		k := key.String()
-
-		switch k {
-		case "$and":
-			if !value.IsArray() {
-				parseErr = errors.New("$and must be an array")
-				return false
-			}
-			var subFilters []x.Filter
-			value.ForEach(func(_, subNode gjson.Result) bool {
-				f, err := parseNode(subNode)
-				if err != nil {
-					parseErr = err
-					return false
-				}
-				subFilters = append(subFilters, f)
-				return true
-			})
-			if parseErr != nil {
-				return false
-			}
-			filters = append(filters, x.And(subFilters...))
-		case "$or":
-			if !value.IsArray() {
-				parseErr = errors.New("$or must be an array")
-				return false
-			}
-			var subFilters []x.Filter
-			value.ForEach(func(_, subNode gjson.Result) bool {
-				f, err := parseNode(subNode)
-				if err != nil {
-					parseErr = err
-					return false
-				}
-				subFilters = append(subFilters, f)
-				return true
-			})
-			if parseErr != nil {
-				return false
-			}
-			filters = append(filters, x.Or(subFilters...))
-		default:
-			// Field comparison. E.g. "age": {"$gt": 18} or "status": "active"
-			if value.Type == gjson.JSON {
-				// Object with operators
-				value.ForEach(func(opKey, opVal gjson.Result) bool {
-					op := opKey.String()
-					switch op {
-					case "$eq":
-						filters = append(filters, x.Eq(k, opVal.Value()))
-					case "$neq":
-						filters = append(filters, x.Neq(k, opVal.Value()))
-					case "$gt":
-						filters = append(filters, x.Gt(k, opVal.Float()))
-					case "$gte":
-						filters = append(filters, x.Gte(k, opVal.Float()))
-					case "$lt":
-						filters = append(filters, x.Lt(k, opVal.Float()))
-					case "$lte":
-						filters = append(filters, x.Lte(k, opVal.Float()))
-					case "$contains":
-						filters = append(filters, x.Contains(k, opVal.String()))
-					case "$in":
-						if !opVal.IsArray() {
-							parseErr = fmt.Errorf("$in operator requires an array for field %s", k)
-							return false
-						}
-						var inValues []any
-						opVal.ForEach(func(_, v gjson.Result) bool {
-							inValues = append(inValues, v.Value())
-							return true
-						})
-						filters = append(filters, x.In(k, inValues...))
-					default:
-						parseErr = fmt.Errorf("unsupported operator: %s", op)
-						return false
-					}
-					return true
-				})
-			} else {
-				// Implicit $eq. E.g. "status": "active"
-				filters = append(filters, x.Eq(k, value.Value()))
-			}
-		}
-
-		return parseErr == nil
-	})
-
-	if parseErr != nil {
-		return nil, parseErr
-	}
-
-	if len(filters) == 0 {
-		return nil, nil
-	}
-	if len(filters) == 1 {
-		return filters[0], nil
-	}
-	// Implicit AND for multiple keys in the same object
-	return x.And(filters...), nil
-}
-
+// searchIndexCommand implements SEARCHINDEX.
+//
+// Wire form (argv after cmd-name, so nArgs = len(cmd.Args)-1):
+//
+//	SEARCHINDEX <fullIndexName> <keyRangeJSON> <filterJSON> \
+//	            [ASC|DESC] [LIMIT N]
+//
+// Index name format (SSoT: naming.ParseIdxFullName): `<ownerNs>!_!<logical>`.
+// The ownerNs portion must either be an internal storage ns (rare:
+// indexes over `_auth_:` etc.) or match a registered doc
+// (lookupDocByStorageNs). Index objects on non-registered owner
+// namespaces cannot be searched because applyKeyRange needs a
+// documented layer to route to.
+//
+// Optional tail args parsed by positional switch on nArgs (3..6):
+//   - nArgs==4 → ASC/DESC only
+//   - nArgs==5 → LIMIT only
+//   - nArgs==6 → ASC/DESC + LIMIT
+//
+// Buntdb.ErrNotFound maps to empty RESP array (same as empty index on
+// matching filter). All other errors surface via `ERR` wire message.
 func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	nArgs := len(cmd.Args) - 1
 	if nArgs < 3 || nArgs > 6 {
@@ -954,6 +1089,29 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 	}
 }
 
+// updateCommand implements UPDATE (JSON-patch style).
+//
+// Key design: UPDATE works on typed documents ONLY, NEVER on raw KV
+// (SSoT: doc-pattern UPDATE-only; raw-KV mutators go through SET /
+// DEL). This is enforced via storageNsFromKRAnchor + registered-schema
+// check. Callers wanting raw SET should use SET with a colon-key.
+//
+// Wire form:
+//
+//	UPDATE <keyRangeJSON|shorthand_pattern> <filterJSON> <updateJSON> \
+//	       [LIMIT N]
+//
+// keyRangeJSON is first forwarded through normalizeKRJSONArg() to
+// accept both `{…}` object form and the `<ns>:*` shorthand string form.
+//
+// updateJSON semantics forwarded directly to x.ParseUpdate (SSoT for
+// JSON patch = `x.ParseUpdate`): list of {op, path, value} ops e.g.
+// `[{"op":"replace","path":"/age","value":21}]`.
+//
+// The layer routing decision (disk vs mem) is handled SSoT-style by
+// db.Update via resolveLayer + x.LayerRoutingConstrained callback;
+// cmd.go only validates that the anchor is a registered storageNs (to
+// produce a good error instead of an opaque 0-updates result).
 func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	nArgs := len(cmd.Args) - 1
 	if nArgs != 3 && nArgs != 5 {
@@ -1023,6 +1181,25 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	}
 }
 
+// searchKeyCommand implements SEARCHKEY (filter → pick keys, without
+// loading a named index). Often called instead of KEYS when a caller
+// wants server-side filtering or ordered iteration over a doc
+// namespace, since KEYS on doc-path only returns the raw storage keys
+// in BuntDB AscendKeys order with no filter.
+//
+// Wire form (nArgs = argv after command):
+//
+//	SEARCHKEY <keyRangeJSON|shorthand> <filterJSON> [ASC|DESC] \
+//	          [LIMIT N]
+//
+// Key-range routing: SEARCHKEY is more permissive than UPDATE — it can
+// scan raw KV-paths too. This is why the storageNs validation block
+// (L1046) only fires when anchor is colon-free AND looks like a doc
+// storageNs (so missing REGSCH → actionable error). Anchors with a
+// colon (raw KV form) skip that validation branch entirely and let
+// applyKeyRange sort out layer/disallow paths.
+//
+// Tail argc parsed the same 3/4/5 switch as SEARCHINDEX.
 func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	nArgs := len(cmd.Args) - 1
 	if nArgs < 2 || nArgs > 5 {
@@ -1118,6 +1295,23 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 	}
 }
 
+// regSchemaCommand implements REGSCH (register typed-document schema).
+//
+// JSON payload must match the public x.Schema fields; unknown fields
+// are rejected (via json.Decoder.DisallowUnknownFields) to avoid silent
+// typos like "indexes" on the payload (the review guard below
+// explicitly catches `"indexes"` first so users are told to use REGIDX
+// rather than generic "unknown field").
+//
+// Semantic validation (field types, TTL positive, pk+attribute paths
+// unique, ValidateDocLogicalNamespace compliance) lives inside
+// db.writeDocSpec and is the SSoT for schema checks; cmd.go only does
+// JSON-shape + unknown-field guard.
+//
+// Internal-NS Write Guard doesn't apply here because REGSCH itself IS
+// the designated admin write path for `_doc_:` meta keys — wire
+// clients cannot SET _doc_:abc directly, they must go through this
+// command.
 func regSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for 'regsch' command: usage: REGSCH <json-spec>")
@@ -1151,6 +1345,19 @@ func regSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 	conn.WriteString("OK")
 }
 
+// dropSchemaCommand implements DROPSCH.
+//
+// Usage (argv strict): DROPSCH <logicalNs>
+//
+// Semantic constraints enforced in db.dropSchemaByLogicalNs (SSoT):
+//   - DROPSCH refuses to drop if any attached indexes remain, listing
+//     the index names so callers know which DROPIDX calls to issue
+//     first. (Registry coarse-grained write lock held for the whole
+//     op; caller must not mix parallel REGSCH/DROPSCH.)
+//   - Both mem and disk layer meta-keys + storage ns scopes are
+//     symmetrically cleaned up regardless of whether the schema was
+//     declared Mem=true or disk-only (Metadata Symmetric Storage
+//     SSoT).
 func dropSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	argc := len(cmd.Args)
 	if argc < 2 || argc > 2 {
@@ -1169,6 +1376,33 @@ func dropSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.
 	conn.WriteString("OK")
 }
 
+// regIdxCommand implements REGIDX (register a typed index on a
+// registered typed-document owner namespace).
+//
+// Accepts three JSON forms, tried in precedence order:
+//
+//  1. { "full_name": "<ownerNs>!_!<logical>" } — fully-qualified form
+//     from ParseIdxFullName; takes precedence when present.
+//  2. { "owner_ns": "<storageNs>", "logical": "age_idx" } + optional
+//     "owner_doc_logical_ns" + "owner_mem" — when "owner_ns" is a raw
+//     storageNs, but the caller wants to override owner_mem from a
+//     `_m_:` prefix embedded inside "owner_ns" we used to write a
+//     hand-rolled naming.HasMemPrefix check; it now goes through the
+//     resolveLayer SSoT (append a trailing colon to turn the string
+//     into a storage-key shape so classifyArg1 → resolveLayer
+//     semantics apply identically to runtime data keys).
+//  3. { "owner_doc_logical_ns": "user", "logical": "age_idx",
+//     "owner_mem": true } — pure logical-ns shortcut without a
+//     storageNs override on owner_ns.
+//
+// Path fields come from normalizeIndexPathFields() (accepts "path" or
+// "paths"). Dot → underscore normalisation happens HERE in
+// regIdxCommand (before write) rather than in writeIndexSpec, so that
+// indexes registered with identical semantic paths (via either JSON
+// form) compare equal through canonicalIdxMD5 and avoid duplicate
+// meta writes (SSoT for MD5 content = canonicalIdxMD5, which also
+// runs the same dot→underscore substitution independently for
+// idempotency).
 func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	argc := len(cmd.Args)
 	if argc != 2 {
@@ -1198,7 +1432,16 @@ func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		lg, _ := rawMap["logical"].(string)
 		if lg == "" {
 			if v := gjson.Get(rawJSON, "owner_doc_logical_ns").String(); v != "" {
-				ownerMem := naming.HasMemPrefix(on)
+				ownerMem := false
+				// SSoT routing check: prefer resolveLayer over
+				// hand-rolled naming.HasMemPrefix(on). Append ':'
+				// to turn `on` into a key-shape argument the same
+				// way runtime SET/GET would see it.
+				if on != "" {
+					if l, _, err := resolveLayer(on + ":"); err == nil {
+						ownerMem = l == storageMem
+					}
+				}
 				if !ownerMem {
 					ownerMem = gjson.Get(rawJSON, "owner_mem").Bool()
 				}
@@ -1273,6 +1516,27 @@ func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	conn.WriteString("OK")
 }
 
+// dropIndexCommand implements DROPIDX.
+//
+// Two call forms:
+//
+//  1. DROPIDX <fullName>    — argv==2. ParseIdxFullName compatible,
+//     forwards straight to db.dropIndexByFullName. Layer choice is
+//     implicit: the fullName already embeds storageNs (which includes
+//     the `_m_:` prefix when Mem=true), so a single drop call is
+//     enough — the coarse-grained registry write lock inside
+//     dropIndexByFullName guarantees idempotency across concurrent
+//     REGIDX/DROPIDX.
+//  2. DROPIDX <logicalNs> <logicalIdxName>   — argv==3. Convenience
+//     form for operators who don't know the fullName format. We try
+//     BOTH the mem variant (`_m_:<ns>!_!<idx>`) AND the disk variant
+//     (`<ns>!_!<idx>`) sequentially; we only surface an error if
+//     NEITHER deletion succeeded beyond "not registered" (i.e. it's
+//     fine for a schema that only ever lived on one layer — its
+//     sister-layer index will simply say "not registered", which we
+//     suppress). The combined `errMem != nil && errDisk != nil`
+//     branch prefers identical errors via errors.Is, or falls back to
+//     joining "mem: X; disk: Y" when the two differ materially.
 func dropIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
 		conn.WriteError("ERR wrong number of arguments for 'dropidx' command: usage: DROPIDX <fullName>  or  DROPIDX <logicalNs> <logicalIdxName>")
@@ -1315,30 +1579,4 @@ func dropIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 		return
 	}
 	conn.WriteString("OK")
-}
-
-func mustMarshal(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "[]"
-	}
-	return string(b)
-}
-
-func normalizeIndexPathFields(rawMap map[string]any) ([]string, error) {
-	if rawArr, ok := rawMap["paths"].([]any); ok && len(rawArr) > 0 {
-		out := make([]string, 0, len(rawArr))
-		for i, v := range rawArr {
-			s, _ := v.(string)
-			if s == "" {
-				return nil, fmt.Errorf("paths[%d] is empty or not a string", i)
-			}
-			out = append(out, s)
-		}
-		return out, nil
-	}
-	if single, ok := rawMap["path"].(string); ok && single != "" {
-		return []string{single}, nil
-	}
-	return nil, fmt.Errorf("either \"path\" (string, single-field) or \"paths\" ([string], multi-field) is required")
 }

@@ -14,7 +14,7 @@ import (
 type dialRole int
 
 const (
-	dialAdmin dialRole = iota
+	dialCtrl dialRole = iota
 	dialApp
 )
 
@@ -30,11 +30,11 @@ type integCase struct {
 func runIntegCase(t *testing.T, c integCase) {
 	t.Helper()
 	hrn := h.NewHarness(t, c.Harness)
-	opts := session.Options{TimeoutMs: 2500, AdminAuth: c.DialAuth}
+	opts := session.Options{TimeoutMs: 2500, Auth: c.DialAuth}
 	switch c.DialRole {
-	case dialAdmin:
-		opts.Host = hrn.AdminBind()
-		opts.Port = hrn.AdminPort
+	case dialCtrl:
+		opts.Host = hrn.CtrlBind()
+		opts.Port = hrn.CtrlPort
 	case dialApp:
 		opts.Host = hrn.AppBind()
 		opts.Port = hrn.AppPort
@@ -72,7 +72,7 @@ var sharedAfterPingOK = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	}
 }
 
-var sharedAfterAdminSkeletonCmd = func(t *testing.T, sh *session.Session, _ *h.Harness) {
+var sharedAfterCtrlSkeletonCmd = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	t.Helper()
 	r := sh.RawDo([]any{"REGSCH", `{"namespace":"skeletontest","mem":false,"key_attrs":["id"],"ttl_ns":0}`})
 	_, err := r.Result()
@@ -113,7 +113,7 @@ var sharedAfterSetGetOK = func(t *testing.T, sh *session.Session, _ *h.Harness) 
 	}
 }
 
-var sharedAfterAdminCmdOnAppPortBlocked = func(t *testing.T, sh *session.Session, _ *h.Harness) {
+var sharedAfterCtrlCmdOnAppPortBlocked = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	t.Helper()
 	r := sh.RawDo([]any{"REGSCH", `{"namespace":"test","mem":false,"key_attrs":["id"]}`})
 	_, err := r.Result()
@@ -122,7 +122,7 @@ var sharedAfterAdminCmdOnAppPortBlocked = func(t *testing.T, sh *session.Session
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "app port") &&
-		!strings.Contains(msg, "admin-only commands are not available") &&
+		!strings.Contains(msg, "Meta Management") &&
 		!strings.Contains(msg, "No Privilege") {
 		t.Fatalf("app-port REGSCH missing Gate1 hint in: %v", err)
 	}
@@ -134,74 +134,74 @@ var sharedAfterAdminCmdOnAppPortBlocked = func(t *testing.T, sh *session.Session
 	}
 }
 
-var sharedAfterAdminWrongAuthWrongPass = func(t *testing.T, sh *session.Session, _ *h.Harness) {
+var sharedAfterCtrlWrongAuthWrongPass = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	t.Helper()
 	r := sh.RawDo([]any{"PING"})
 	_, err := r.Result()
 	if err == nil {
-		t.Fatalf("PING with admin-port wrong AUTH should Gate0 WRONGPASS, got nil")
+		t.Fatalf("PING with ctrl-port wrong AUTH should Gate0 WRONGPASS, got nil")
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "WRONGPASS") {
-		t.Fatalf("wrong-auth-on-admin PING err %q; want substring WRONGPASS (Gate0)", msg)
+		t.Fatalf("wrong-auth-on-ctrl PING err %q; want substring WRONGPASS (Gate0)", msg)
 	}
 }
 
 func TestRdxmE2E(t *testing.T) {
 	cases := []integCase{
 		{
-			Name:      "no_auth_admin_connect_ping",
+			Name:      "no_auth_ctrl_connect_ping",
 			Harness:   h.HarnessOpts{},
-			DialRole:  dialAdmin,
+			DialRole:  dialCtrl,
 			AfterDial: sharedAfterPingOK,
 		},
 		{
-			Name:            "admin_auth_set_user_omits_a_receives_noauth_hint",
-			Harness:         h.HarnessOpts{AdminAuth: "secreta"},
-			DialRole:        dialAdmin,
+			Name:            "ctrl_auth_set_user_omits_a_receives_noauth",
+			Harness:         h.HarnessOpts{CtrlAuth: "secreta"},
+			DialRole:        dialCtrl,
 			DialAuth:        "",
-			WantNewShellSub: "server admin-port requires AUTH. Pass the admin-auth key via",
+			WantNewShellSub: "NOAUTH",
 		},
 		{
-			Name:      "admin_auth_set_user_passes_correct_key_connects_runs_registry_skeleton",
-			Harness:   h.HarnessOpts{AdminAuth: "abc123"},
-			DialRole:  dialAdmin,
+			Name:      "ctrl_auth_set_user_passes_correct_key_connects_runs_registry_skeleton",
+			Harness:   h.HarnessOpts{CtrlAuth: "abc123"},
+			DialRole:  dialCtrl,
 			DialAuth:  "abc123",
-			AfterDial: sharedAfterAdminSkeletonCmd,
+			AfterDial: sharedAfterCtrlSkeletonCmd,
 		},
 		{
-			Name:            "admin_auth_set_user_passes_wrong_key_receives_err_auth_failed",
-			Harness:         h.HarnessOpts{AdminAuth: "rightkey"},
-			DialRole:        dialAdmin,
+			Name:            "ctrl_auth_set_user_passes_wrong_key_receives_err_auth_failed",
+			Harness:         h.HarnessOpts{CtrlAuth: "rightkey"},
+			DialRole:        dialCtrl,
 			DialAuth:        "wrongkey",
 			WantNewShellSub: "ERR authentication failed",
 			AfterDial:       nil,
 		},
 		{
-			Name:      "app_port_admin_only_cmd_gate1_blocked_while_setget_still_works",
-			Harness:   h.HarnessOpts{AppAuth: "onlyapp", AdminAuth: "onlyadmin"},
+			Name:      "app_port_ctrl_only_cmd_gate1_blocked_while_setget_still_works",
+			Harness:   h.HarnessOpts{AppAuth: "onlyapp", CtrlAuth: "onlyctrl"},
 			DialRole:  dialApp,
 			DialAuth:  "onlyapp",
-			AfterDial: sharedAfterAdminCmdOnAppPortBlocked,
+			AfterDial: sharedAfterCtrlCmdOnAppPortBlocked,
 		},
 		{
 			Name:      "app_port_correct_auth_runs_setget_ping",
-			Harness:   h.HarnessOpts{AppAuth: "apk", AdminAuth: "adk"},
+			Harness:   h.HarnessOpts{AppAuth: "apk", CtrlAuth: "adk"},
 			DialRole:  dialApp,
 			DialAuth:  "apk",
 			AfterDial: sharedAfterSetGetOK,
 		},
 		{
-			Name:            "app_port_user_passes_admin_auth_gets_gate0_wrongpass",
-			Harness:         h.HarnessOpts{AppAuth: "a1", AdminAuth: "a2"},
+			Name:            "app_port_user_passes_ctrl_auth_gets_gate0_wrongpass",
+			Harness:         h.HarnessOpts{AppAuth: "a1", CtrlAuth: "a2"},
 			DialRole:        dialApp,
 			DialAuth:        "a2",
 			WantNewShellSub: "WRONGPASS",
 		},
 		{
-			Name:            "admin_port_user_passes_app_auth_gets_gate0_wrongpass",
-			Harness:         h.HarnessOpts{AppAuth: "a1", AdminAuth: "a2"},
-			DialRole:        dialAdmin,
+			Name:            "ctrl_port_user_passes_app_auth_gets_gate0_wrongpass",
+			Harness:         h.HarnessOpts{AppAuth: "a1", CtrlAuth: "a2"},
+			DialRole:        dialCtrl,
 			DialAuth:        "a1",
 			WantNewShellSub: "WRONGPASS",
 		},

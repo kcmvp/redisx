@@ -78,20 +78,30 @@ func validatePKSuffixNoColon(suffix string) error {
 	return nil
 }
 
+func extractStorageNsHead(full string) (string, error) {
+	sep := naming.StorageKeySeparator()[0]
+	first := strings.IndexByte(full, sep)
+	if first < 0 {
+		return "", fmt.Errorf("missing namespace separator %q in %q", naming.StorageKeySeparator(), full)
+	}
+	if full[:first] != naming.MemNsPrefix() {
+		return full[:first], nil
+	}
+	second := strings.IndexByte(full[first+1:], sep)
+	if second < 0 {
+		return "", fmt.Errorf("key %q starts with %q but missing second namespace separator", full, naming.MemNsPrefix())
+	}
+	return full[:first+1+second], nil
+}
+
 func validateKVFullKey(fullKey string) error {
 	if !strings.Contains(fullKey, naming.StorageKeySeparator()) {
 		return fmt.Errorf("kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator())
 	}
 	if naming.HasUnderscorePrefix(fullKey) {
-		head := fullKey
-		if p := strings.IndexByte(head, naming.StorageKeySeparator()[0]); p >= 0 {
-			head = head[:p]
-		}
-		if head == naming.MemNsPrefix() {
-			suffix := fullKey[len(head)+1:]
-			if p2 := strings.IndexByte(suffix, naming.StorageKeySeparator()[0]); p2 >= 0 {
-				head = head + naming.StorageKeySeparator() + suffix[:p2]
-			}
+		head, err := extractStorageNsHead(fullKey)
+		if err != nil {
+			return err
 		}
 		if !naming.IsInternalStorageNs(head) {
 			return fmt.Errorf("kv-pattern key must not start with reserved internal prefix %q", head)
@@ -104,15 +114,9 @@ func validateKVMutationKey(fullKey string) error {
 	if err := validateKVFullKey(fullKey); err != nil {
 		return err
 	}
-	head := fullKey
-	if p := strings.IndexByte(head, naming.StorageKeySeparator()[0]); p >= 0 {
-		head = head[:p]
-	}
-	if head == naming.MemNsPrefix() {
-		suffix := fullKey[len(head)+1:]
-		if p2 := strings.IndexByte(suffix, naming.StorageKeySeparator()[0]); p2 >= 0 {
-			head = head + naming.StorageKeySeparator() + suffix[:p2]
-		}
+	head, err := extractStorageNsHead(fullKey)
+	if err != nil {
+		return err
 	}
 	if naming.IsInternalStorageNs(head) {
 		return fmt.Errorf("internal storage namespace %q is managed exclusively via dedicated registry commands (REGSCH/DROPSCH/REGIDX/DROPIDX/AUTH); direct KV mutation via SET/SETEX/SETNX/DEL is forbidden", head)
@@ -131,19 +135,9 @@ func storageNsFromKRAnchor(anchor string) (string, error) {
 	if p := strings.IndexByte(anchor, '|'); p >= 0 {
 		head = anchor[:p]
 	}
-	first := strings.IndexByte(head, ':')
-	if first < 0 {
-		return "", fmt.Errorf("key range anchor %q has no namespace separator — cannot resolve storage namespace", anchor)
-	}
-	var ns string
-	if head[:first] == naming.MemNsPrefix() {
-		second := strings.IndexByte(head[first+1:], ':')
-		if second < 0 {
-			return "", fmt.Errorf("key range anchor %q starts with _m_: but missing second separator — cannot resolve storage namespace", anchor)
-		}
-		ns = head[:first+1+second]
-	} else {
-		ns = head[:first]
+	ns, err := extractStorageNsHead(head)
+	if err != nil {
+		return "", fmt.Errorf("key range anchor %q — %w", anchor, err)
 	}
 	if naming.IsInternalStorageNs(ns) {
 		return "", nil
@@ -162,21 +156,19 @@ func keyAttrString(r gjson.Result) string {
 }
 
 func (db *DB) lookupDocByLogicalOrStorageNs(keyOrNs string) (lookedUpDoc, bool) {
+	db.docRegMu.Lock()
+	defer db.docRegMu.Unlock()
 	if strings.Contains(keyOrNs, naming.StorageKeySeparator()) {
 		ns, _, err := naming.SplitStorageKey(keyOrNs)
 		if err != nil {
 			ns = keyOrNs
 		}
-		db.docRegMu.Lock()
-		defer db.docRegMu.Unlock()
 		spec, ok := db.docRegSpec[ns]
 		if !ok {
 			return lookedUpDoc{}, false
 		}
 		return lookedUpDoc{Spec: spec, StorageNs: ns}, true
 	}
-	db.docRegMu.Lock()
-	defer db.docRegMu.Unlock()
 	for storageNs, spec := range db.docRegSpec {
 		if spec.Namespace == keyOrNs {
 			return lookedUpDoc{Spec: spec, StorageNs: storageNs}, true

@@ -22,7 +22,7 @@ import (
 //
 //  1. If arg1 does NOT contain ':' → Doc Pattern. arg1 is treated as a
 //     logical document namespace and MUST have been registered via
-//     server.Start(schemas…) or the REGSCH admin command. A bare no-colon
+//     server.Start(schemas…) or the REGSCH registry command. A bare no-colon
 //     key that is not a registered namespace is rejected outright; the
 //     system never falls back to plain-KV mode for it.
 //  2. If arg1 contains ':' → KV Pattern. arg1 is treated as the literal
@@ -117,7 +117,7 @@ type Document interface {
 
 // Index describes one declared JSON BTree index. Instances are normally
 // produced by [Idx] or [RawIndex] and then passed to
-// server.Start / DB.CreateIndex at boot; the Admin REGIDX command does
+// server.Start / DB.CreateIndex at boot; the REGIDX registry command does
 // not use this struct — it writes idxSpec metadata directly via
 // applyIndexSpec.
 //
@@ -574,7 +574,7 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 //
 //  (b) GET — requires exactly "<namespace> <pk-suffix>" (two args after the
 //      command). A lone namespace argument is rejected — use SEARCHKEY or
-//      the Admin-only KEYS command to enumerate.
+//      the control-plane-only KEYS command to enumerate.
 //
 //      GET user acme_7            → bulk {"tenant":"acme","id":"7",...}
 //      GET session abc           → bulk {"sid":"abc",...}   (reads mem layer)
@@ -603,7 +603,7 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 //  (e) SEARCHKEY / SEARCHINDEX — anchor must NOT start with wildcard and
 //      must resolve to a registered storageNs. A bare "*" pivot is
 //      rejected to force clients to anchor to a namespace (use the
-//      Admin-only KEYS command for a global scan).
+//      control-plane-only KEYS command for a global scan).
 //
 //      SEARCHKEY user:* ""          → matches "user:*" on disk layer
 //      SEARCHKEY * ""               → ERR "SEARCHKEY must be anchored to a namespace; use SEARCHINDEX for cross-ns scans"

@@ -2,7 +2,6 @@ package internal
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -82,13 +81,12 @@ func TestHistoryFileNotEmptyWhenHomePresent(t *testing.T) {
 }
 
 func TestBannerStartsWithBox(t *testing.T) {
-	adminCaps := session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true}
-	b := BannerFor(adminCaps, "127.0.0.1", "7381")
-	if !strings.Contains(b, "Admin Shell") {
-		t.Fatalf("Banner should include admin-shell head when admin role: %q", b)
+	b := BannerFor("127.0.0.1", "7381")
+	if !strings.Contains(b, "Redisx  RESP Shell") {
+		t.Fatalf("Banner should include Redisx RESP Shell head: %q", b)
 	}
-	if !strings.Contains(b, "connected: admin 127.0.0.1:7381") {
-		t.Fatalf("Banner should include connected admin host:port line: %q", b)
+	if !strings.Contains(b, "connected: 127.0.0.1:7381") {
+		t.Fatalf("Banner should include connected host:port line: %q", b)
 	}
 	lines := strings.Split(strings.TrimRight(b, "\n"), "\n")
 	if len(lines) < 3 {
@@ -123,19 +121,17 @@ func TestBannerStartsWithBox(t *testing.T) {
 func TestBannerBoxWidthConsistentAllStates(t *testing.T) {
 	cases := []struct {
 		name string
-		caps session.Capabilities
 		host string
 		port string
 	}{
-		{"PlainShort", session.Capabilities{}, "h", "1"},
-		{"PlainLong", session.Capabilities{}, "very.long.host.name.with.many.subdomain.parts", "65535"},
-		{"AdminFull", session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true}, "127.0.0.1", "7381"},
-		{"AppMode", session.Capabilities{IsRedisx: true, AdminRole: false, TypedDocs: true, TypedIndexes: true, SearchIndex: true}, "127.0.0.1", "7379"},
-		{"PartialDocs", session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: false, SearchIndex: false}, "127.0.0.1", "7381"},
+		{"PlainShort", "h", "1"},
+		{"PlainLong", "very.long.host.name.with.many.subdomain.parts", "65535"},
+		{"LocalDefault", "127.0.0.1", "7381"},
+		{"AltPort", "127.0.0.1", "7379"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			b := BannerFor(c.caps, c.host, c.port)
+			b := BannerFor(c.host, c.port)
 			lines := strings.Split(strings.TrimRight(b, "\n"), "\n")
 			if len(lines) < 3 {
 				t.Fatalf("too few lines")
@@ -187,12 +183,12 @@ func TestPrintTabWriterWithHeaders(t *testing.T) {
 }
 
 func TestNewShellFailsOnBadPort(t *testing.T) {
-	_, err := session.New(session.Options{Host: "127.0.0.1", Port: 9, AdminAuth: "x", TimeoutMs: 1})
+	_, err := session.New(session.Options{Host: "127.0.0.1", Port: 9, Auth: "x", TimeoutMs: 1})
 	if err == nil {
 		t.Fatalf("expected error connecting to invalid port")
 	}
-	if !strings.Contains(err.Error(), "admin-port") {
-		t.Fatalf("error should mention admin-port: %v", err)
+	if err.Error() == "" {
+		t.Fatalf("error should not be empty string on dial failure")
 	}
 }
 
@@ -211,7 +207,7 @@ func TestIsKnownCommandMatchesNameAndAlias(t *testing.T) {
 		t.Fatalf("PING case insensitive")
 	}
 	if app.IsKnownCommand("banner") {
-		t.Fatalf("banner alias must NOT be known after removal in Task3; found known")
+		t.Fatalf("banner alias must NOT be known after removal; found known")
 	}
 	if app.IsKnownCommand("!banner") {
 		t.Fatalf("!banner canonical must NOT be known after removal; found known")
@@ -247,40 +243,6 @@ func TestForwardUnknownAsRawBangErrorsBang(t *testing.T) {
 	}
 }
 
-func TestWrapAdminErrBranches(t *testing.T) {
-	cases := []struct {
-		name         string
-		err          error
-		authProvided bool
-		wantSub      string
-		wantNil      bool
-	}{
-		{"nil", nil, false, "", true},
-		{"noauth_no_a", errors.New("NOAUTH authentication required"), false, "Pass the admin-auth key via", false},
-		{"noauth_gave_a_stale_server", errors.New("NOAUTH authentication required"), true, "admin-port still returned NOAUTH after AUTH attempt", false},
-		{"wrongpass", errors.New("WRONGPASS invalid username-password pair"), true, "AUTH key rejected (WRONGPASS)", false},
-		{"err_auth_failed", errors.New("ERR authentication failed"), true, "ERR authentication failed", false},
-		{"random_passthrough", errors.New("i/o timeout"), false, "connect redisx admin-port failed: i/o timeout", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got := session.WrapAdminErr(c.err, c.authProvided)
-			if c.wantNil {
-				if got != nil {
-					t.Fatalf("want nil got %v", got)
-				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("want error, got nil")
-			}
-			if !strings.Contains(got.Error(), c.wantSub) {
-				t.Fatalf("substring %q not in %q", c.wantSub, got.Error())
-			}
-		})
-	}
-}
-
 func TestOptionsDefaultsAppliedInNewShellBadPort(t *testing.T) {
 	sh, err := session.New(session.Options{Port: 9, TimeoutMs: 1})
 	if err == nil {
@@ -290,9 +252,8 @@ func TestOptionsDefaultsAppliedInNewShellBadPort(t *testing.T) {
 		_ = sh.Close()
 		t.Fatalf("sh should be nil on err")
 	}
-	emsg := err.Error()
-	if !strings.Contains(emsg, "admin-port") {
-		t.Fatalf("error should mention admin-port: %v", emsg)
+	if err.Error() == "" {
+		t.Fatalf("error should not be empty string on dial failure")
 	}
 }
 
@@ -325,28 +286,20 @@ func TestRootCmdHasExpectedFlags(t *testing.T) {
 	if ud2.Opts.Port != 9999 {
 		t.Fatalf("-p shorthand write want 9999 got %d", ud2.Opts.Port)
 	}
-	if ud2.Opts.AdminAuth != "sekret" {
-		t.Fatalf("-a shorthand write want sekret got %q", ud2.Opts.AdminAuth)
+	if ud2.Opts.Auth != "sekret" {
+		t.Fatalf("-a shorthand write want sekret got %q", ud2.Opts.Auth)
 	}
 	if ud.Help != false {
 		t.Fatalf("default help want false got %v", ud.Help)
 	}
 }
 
-func stubSessionWithCaps(t *testing.T, caps session.Capabilities) *session.Session {
-	t.Helper()
-	s := &session.Session{}
-	s.SetCapabilitiesForTest(caps)
-	return s
-}
-
-func runGlobalHelpFor(t *testing.T, caps session.Capabilities) string {
+func runGlobalHelpFor(t *testing.T) string {
 	t.Helper()
 	app, sessPtr := buildStubRoot(t)
-	*sessPtr = stubSessionWithCaps(t, caps)
+	*sessPtr = &session.Session{}
 	ud, _ := app.UserData().(*AppData)
 	*ud.Session = *sessPtr
-	ud.FrozenCaps = caps
 	hooks := app.Hooks()
 	if hooks.GlobalHelp == nil {
 		t.Fatalf("no GlobalHelp hook")
@@ -355,114 +308,44 @@ func runGlobalHelpFor(t *testing.T, caps session.Capabilities) string {
 	return hooks.GlobalHelp(ctx, map[string][]tui.GroupEntry{}, app.FlagHelpText())
 }
 
-func TestGlobalHelpPlainRedisShowsOnlyBasic(t *testing.T) {
-	out := runGlobalHelpFor(t, session.Capabilities{})
-	if strings.Contains(out, cBold("Extended Commands")+":") {
-		t.Fatalf("plain-redis should not show Extended Commands group: %q", out)
+func TestGlobalHelpShowsAllGroupsStatic(t *testing.T) {
+	out := runGlobalHelpFor(t)
+	if !strings.Contains(out, cBold("Extended Commands")+":") {
+		t.Fatalf("global help should always advertise Extended Commands group (SSoT passthrough, server-side privilege gating): %q", out)
 	}
-	if strings.Contains(out, cBold("Meta Management")+":") {
-		t.Fatalf("plain-redis should not show Meta Management group: %q", out)
+	if !strings.Contains(out, cBold("Meta Management")+":") {
+		t.Fatalf("global help should always advertise Meta Management group (SSoT passthrough, server-side privilege gating): %q", out)
 	}
 	if !strings.Contains(out, cBold("Basic Commands")+":") {
-		t.Fatalf("plain-redis must still show Basic Commands group: %q", out)
+		t.Fatalf("global help must still show Basic Commands group: %q", out)
 	}
-	if !strings.Contains(out, "connected peer is not a redisx server") {
-		t.Fatalf("plain-redis should show peer-not-redisx notice: %q", out)
+	if !strings.Contains(out, "example regsch") || !strings.Contains(out, "example regidx") || !strings.Contains(out, "example dropsch") || !strings.Contains(out, "example dropidx") {
+		t.Fatalf("Meta Management zero-length list should hint ALL 4 example templates (docs+indexes; server enforces privilege): %q", out)
 	}
-	if strings.Contains(out, "  regsch ") || strings.Contains(out, "  searchkey ") || strings.Contains(out, "  update ") || strings.Contains(out, "  regidx ") {
-		t.Fatalf("plain-redis help must not list redisx-only command rows (regsch/searchkey/update/regidx): %q", out)
+	if !strings.Contains(out, "example searchkey") || !strings.Contains(out, "example searchindex") || !strings.Contains(out, "example update") {
+		t.Fatalf("Extended Commands zero-length list should hint ALL 3 search/update example templates: %q", out)
 	}
-}
-
-func TestGlobalHelpSearchIndexOffHidesExtended(t *testing.T) {
-	caps := session.Capabilities{
-		IsRedisx:     true,
-		AdminRole:    true,
-		TypedDocs:    true,
-		TypedIndexes: true,
-		SearchIndex:  false,
+	if strings.Contains(out, "!createsch") || strings.Contains(out, "!createidx") || strings.Contains(out, "!dropidx") {
+		t.Fatalf("wizard shortcuts (!createsch/!createidx/!dropidx) were removed — must NOT appear in help any more: %q", out)
 	}
-	out := runGlobalHelpFor(t, caps)
-	if strings.Contains(out, cBold("Extended Commands")+":") {
-		t.Fatalf("SearchIndex=false should hide Extended Commands group: %q", out)
+	if !strings.Contains(out, "raw RESP passthrough") {
+		t.Fatalf("help should explain command entries are raw RESP passthrough, not locally-wizard routes: %q", out)
 	}
-	if strings.Contains(out, "  searchkey ") || strings.Contains(out, "  searchindex ") || strings.Contains(out, "  update ") {
-		t.Fatalf("SearchIndex=false must not list search/update entry rows: %q", out)
+	if strings.Contains(out, "connected peer is not a redisx server") {
+		t.Fatalf("global help should NOT gate Extended/Meta on IsRedisx — they are always shown, server decides: %q", out)
 	}
-	if !strings.Contains(out, cBold("Meta Management")+":") {
-		t.Fatalf("with TypedDocs+TypedIndexes true, Meta Management must still appear: %q", out)
-	}
-}
-
-func TestGlobalHelpTypedDocsAndIndexesDrilldown(t *testing.T) {
-	docsOnly := session.Capabilities{
-		IsRedisx:     true,
-		AdminRole:    true,
-		TypedDocs:    true,
-		TypedIndexes: false,
-		SearchIndex:  true,
-	}
-	out := runGlobalHelpFor(t, docsOnly)
-	if !strings.Contains(out, "  regsch ") || !strings.Contains(out, "  dropsch ") {
-		t.Fatalf("docs=true must list Doc management entry rows (regsch/dropsch): %q", out)
-	}
-	if strings.Contains(out, "  regidx ") || strings.Contains(out, "  dropidx ") || strings.Contains(out, "  !createidx ") {
-		t.Fatalf("indexes=false must NOT list Index management entry rows: %q", out)
-	}
-	if !strings.Contains(out, cBold("Extended Commands")+":") {
-		t.Fatalf("SearchIndex=true must show Extended Commands group: %q", out)
-	}
-	if !strings.Contains(out, cBold("Meta Management")+":") {
-		t.Fatalf("Docs alone should still show Meta Management group: %q", out)
-	}
-
-	idxOnly := session.Capabilities{
-		IsRedisx:     true,
-		AdminRole:    true,
-		TypedDocs:    false,
-		TypedIndexes: true,
-		SearchIndex:  true,
-	}
-	out = runGlobalHelpFor(t, idxOnly)
-	if strings.Contains(out, "  regsch ") || strings.Contains(out, "  dropsch ") || strings.Contains(out, "  !createsch ") {
-		t.Fatalf("docs=false must NOT list Doc management entry rows: %q", out)
-	}
-	if !strings.Contains(out, "  regidx ") || !strings.Contains(out, "  dropidx ") {
-		t.Fatalf("indexes=true must list Index management entry rows (regidx/dropidx): %q", out)
-	}
-}
-
-func TestGlobalHelpAppRoleShowsMetaCommands(t *testing.T) {
-	caps := session.Capabilities{
-		IsRedisx:     true,
-		AdminRole:    false,
-		TypedDocs:    true,
-		TypedIndexes: true,
-		SearchIndex:  true,
-	}
-	out := runGlobalHelpFor(t, caps)
-	if !strings.Contains(out, cBold("Meta Management")+":") {
-		t.Fatalf("AdminRole=false should still show Meta Management in help (No Privilege handled server-side): %q", out)
-	}
-	if !strings.Contains(out, "  regsch ") || !strings.Contains(out, "  regidx ") {
-		t.Fatalf("AdminRole=false help entries for Meta should still list command rows: %q", out)
-	}
-	if !strings.Contains(out, cBold("Extended Commands")+":") {
-		t.Fatalf("AdminRole=false should still show Extended Commands: %q", out)
+	if !strings.Contains(out, "Support, availability and privilege enforcement are entirely server-side") {
+		t.Fatalf("global help should mention zero-client-assumption / all decisions server-side: %q", out)
 	}
 }
 
 func TestBeforeRunEmptyNameTriggersBuildSession(t *testing.T) {
 	wantHost, wantPort, wantAuth, wantTimeoutMs := "10.0.0.1", 9999, "k", 2000
 	prev := session.SetNewForTest(func(opts session.Options) (*session.Session, error) {
-		if opts.Host != wantHost || opts.Port != wantPort || opts.AdminAuth != wantAuth || opts.TimeoutMs != wantTimeoutMs {
+		if opts.Host != wantHost || opts.Port != wantPort || opts.Auth != wantAuth || opts.TimeoutMs != wantTimeoutMs {
 			t.Fatalf("session.New opts mismatch got=%+v want host=%s port=%d auth=%s ms=%d", opts, wantHost, wantPort, wantAuth, wantTimeoutMs)
 		}
-		s := &session.Session{}
-		s.SetCapabilitiesForTest(session.Capabilities{
-			IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-		})
-		return s, nil
+		return &session.Session{}, nil
 	})
 	defer func() { session.SetNewForTest(prev) }()
 
@@ -470,7 +353,7 @@ func TestBeforeRunEmptyNameTriggersBuildSession(t *testing.T) {
 	ud, _ := app.UserData().(*AppData)
 	ud.Opts.Host = wantHost
 	ud.Opts.Port = wantPort
-	ud.Opts.AdminAuth = wantAuth
+	ud.Opts.Auth = wantAuth
 	ud.Opts.TimeoutMs = wantTimeoutMs
 	ctx := tui.RunContext{UserData: app.UserData()}
 	hooks := app.Hooks()
@@ -486,98 +369,40 @@ func TestBeforeRunEmptyNameTriggersBuildSession(t *testing.T) {
 	if *sessPtr == nil {
 		t.Fatal("BeforeRun(empty REPL name) must build session; it's nil — the 'noShellCmds(\"\")==true' regression is back")
 	}
-	caps := (*sessPtr).Capabilities()
-	if !caps.IsRedisx || !caps.AdminRole {
-		t.Fatalf("mock caps should flow through: %+v", caps)
-	}
 }
 
-func TestBannerForThreeStates(t *testing.T) {
-	t.Run("PlainRedis", func(t *testing.T) {
-		out := BannerFor(session.Capabilities{}, "1.2.3.4", "6379")
-		if strings.Contains(out, "Admin Shell") || strings.Contains(out, "App Mode") {
-			t.Fatalf("plain-redis banner should not mention admin/app mode: %q", out)
+func TestBannerStaticContent(t *testing.T) {
+	t.Run("AllHosts", func(t *testing.T) {
+		out := BannerFor("1.2.3.4", "6379")
+		// Banner must be single-mode per client zero-assumption (no role branching).
+		// Static content is enforced by the positive assertion below.
+		if !strings.Contains(out, "Redisx  RESP Shell") {
+			t.Fatalf("banner must say 'Redisx  RESP Shell': %q", out)
 		}
-		if !strings.Contains(out, "Generic-redis mode") {
-			t.Fatalf("plain-redis banner must mark Generic-redis mode: %q", out)
+		if !strings.Contains(out, "connected: 1.2.3.4:6379") {
+			t.Fatalf("banner should include host:port connected line: %q", out)
 		}
-		if !strings.Contains(out, "connected: generic-redis 1.2.3.4:6379") {
-			t.Fatalf("plain-redis banner should include host:port / generic-redis role label: %q", out)
+		if !strings.Contains(out, "docs:  regsch / dropsch") {
+			t.Fatalf("Meta docs list missing: %q", out)
 		}
-		if !strings.Contains(out, "not a redisx server — only raw RESP forwarding available") {
-			t.Fatalf("plain-redis banner should show yellow 'not a redisx server' notice: %q", out)
-		}
-		if strings.Contains(out, "regsch") || strings.Contains(out, "searchkey") {
-			t.Fatalf("plain-redis banner should NOT list any redisx-only command names (regsch/searchkey/...): %q", out)
-		}
-	})
-	t.Run("RedisxAdminFullFeatures", func(t *testing.T) {
-		caps := session.Capabilities{
-			IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-		}
-		out := BannerFor(caps, "127.0.0.1", "7381")
-		if !strings.Contains(out, "Admin Shell") {
-			t.Fatalf("admin role banner must say 'Admin Shell': %q", out)
-		}
-		if !strings.Contains(out, "connected: admin 127.0.0.1:7381") {
-			t.Fatalf("admin banner role label + host:port missing: %q", out)
-		}
-		if !strings.Contains(out, "docs:  regsch / dropsch / !createsch") {
-			t.Fatalf("with TypedDocs=true docs list missing: %q", out)
-		}
-		if !strings.Contains(out, "idx:   regidx / dropidx / !createidx / !dropidx") {
-			t.Fatalf("with TypedIndexes=true idx list missing: %q", out)
+		if !strings.Contains(out, "idx:   regidx / dropidx") {
+			t.Fatalf("Meta idx list missing: %q", out)
 		}
 		if !strings.Contains(out, "searchkey(sk)  /  searchindex(si)  /  update(upd)") {
-			t.Fatalf("with SearchIndex=true extended list missing: %q", out)
+			t.Fatalf("Extended search/update list missing: %q", out)
 		}
 		if strings.Contains(out, "generic-redis") || strings.Contains(out, "not a redisx server") {
-			t.Fatalf("admin-role banner should NOT mention generic-redis / not-redisx: %q", out)
+			t.Fatalf("banner should NOT mention generic-redis / not-redisx fallback (client zero assumptions): %q", out)
 		}
-	})
-	t.Run("RedisxAppRole", func(t *testing.T) {
-		caps := session.Capabilities{
-			IsRedisx: true, AdminRole: false, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-		}
-		out := BannerFor(caps, "127.0.0.1", "7379")
-		if !strings.Contains(out, "App Mode") {
-			t.Fatalf("app-role banner must say 'App Mode': %q", out)
-		}
-		if !strings.Contains(out, "No Privilege") {
-			t.Fatalf("app-role banner should warn about No Privilege: %q", out)
-		}
-		if !strings.Contains(out, "connected: app 127.0.0.1:7379") {
-			t.Fatalf("app-role banner should have 'app' role label and host:port: %q", out)
-		}
-		if strings.Contains(out, "generic-redis") {
-			t.Fatalf("app-role banner should NOT say generic-redis (it IS redisx, just app port): %q", out)
-		}
-	})
-	t.Run("PartialFeaturesDocsOnlySearchOff", func(t *testing.T) {
-		caps := session.Capabilities{
-			IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: false, SearchIndex: false,
-		}
-		out := BannerFor(caps, "127.0.0.1", "7381")
-		if !strings.Contains(out, "docs:  regsch / dropsch / !createsch") {
-			t.Fatalf("with TypedDocs=true docs list must be present: %q", out)
-		}
-		if strings.Contains(out, "idx:") {
-			t.Fatalf("with TypedIndexes=false idx list must not appear: %q", out)
-		}
-		if strings.Contains(out, "searchkey(sk)") || strings.Contains(out, "searchindex(si)") || strings.Contains(out, "update(upd)") {
-			t.Fatalf("with SearchIndex=false extended section must not list searchkey/searchindex/update: %q", out)
+		if strings.Contains(out, "!createsch") || strings.Contains(out, "!createidx") || strings.Contains(out, "!dropidx") {
+			t.Fatalf("wizard shortcuts removed — must not remain in banner: %q", out)
 		}
 	})
 }
 
-func TestEnterREPLBannerHitsCapabilities(t *testing.T) {
-	wantCtxCaps := session.Capabilities{
-		IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-	}
+func TestEnterREPLBannerUsesHostPortFromAppData(t *testing.T) {
 	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
-		s := &session.Session{}
-		s.SetCapabilitiesForTest(wantCtxCaps)
-		return s, nil
+		return &session.Session{}, nil
 	})
 	defer func() { session.SetNewForTest(prev) }()
 
@@ -586,7 +411,7 @@ func TestEnterREPLBannerHitsCapabilities(t *testing.T) {
 	ud, _ := app.UserData().(*AppData)
 	ud.Opts.Host = "9.9.9.9"
 	ud.Opts.Port = 7381
-	ud.Opts.AdminAuth = "X"
+	ud.Opts.Auth = "X"
 	ud.Opts.TimeoutMs = 100
 	ctx := tui.RunContext{UserData: app.UserData()}
 	ctx.IO = tui.IO{In: os.Stdin, Out: &buf, Err: os.Stderr, FSOut: os.Stderr}
@@ -604,14 +429,14 @@ func TestEnterREPLBannerHitsCapabilities(t *testing.T) {
 		t.Fatal("Banner hook not installed")
 	}
 	txt := h.Banner(ctx)
-	if !strings.Contains(txt, "connected: admin 9.9.9.9:7381") {
+	if !strings.Contains(txt, "connected: 9.9.9.9:7381") {
 		t.Fatalf("Banner(ctx) should pick host/port from AppData after BuildApp; got: %q", txt)
 	}
 	if strings.Contains(txt, "generic-redis") || strings.Contains(txt, "not a redisx server") {
-		t.Fatalf("Banner(ctx) with session built via seam should NOT fall back to generic-redis — regression of 'BeforeRun empty-name no-op' bug: %q", txt)
+		t.Fatalf("Banner(ctx) should NOT fall back to generic-redis — client zero assumptions: %q", txt)
 	}
-	if !strings.Contains(txt, "Admin Shell") {
-		t.Fatalf("Banner(ctx) should read IsRedisx+AdminRole=true and print 'Admin Shell' head: %q", txt)
+	if !strings.Contains(txt, "Redisx  RESP Shell") {
+		t.Fatalf("Banner(ctx) should print 'Redisx  RESP Shell' head: %q", txt)
 	}
 	if ok, diag := bannerIsPerfectRect(txt); !ok {
 		t.Fatalf("Banner(ctx) box is NOT a perfect rect (user-visible right-side zigzag): %s\nraw=%q", diag, txt)
@@ -621,20 +446,18 @@ func TestEnterREPLBannerHitsCapabilities(t *testing.T) {
 func TestBannerForBoxPerfectRect(t *testing.T) {
 	cases := []struct {
 		name string
-		caps session.Capabilities
 		host string
 		port string
 	}{
-		{"PlainMin", session.Capabilities{}, "h", "1"},
-		{"PlainLong", session.Capabilities{}, "very-long.hostname.with-many.subdomains.example.internal", "65535"},
-		{"AdminFullShort", session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true}, "127.0.0.1", "7381"},
-		{"AdminFullLong", session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true}, "a.very.long.subdomain.chain.for.admin.port.redisx.internal", "7381"},
-		{"AppMode", session.Capabilities{IsRedisx: true, AdminRole: false, TypedDocs: true, TypedIndexes: true, SearchIndex: true}, "10.0.0.22", "7379"},
-		{"PartialDocsOnly", session.Capabilities{IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: false, SearchIndex: false}, "::1", "7381"},
+		{"Min", "h", "1"},
+		{"Long", "very-long.hostname.with-many.subdomains.example.internal", "65535"},
+		{"LocalShort", "127.0.0.1", "7381"},
+		{"LongSubdomain", "a.very.long.subdomain.chain.for.redisx.port.internal", "7381"},
+		{"AltPort", "10.0.0.22", "7379"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			txt := BannerFor(c.caps, c.host, c.port)
+			txt := BannerFor(c.host, c.port)
 			ok, diag := bannerIsPerfectRect(txt)
 			if !ok {
 				t.Fatalf("Banner box NOT perfect rect: %s\nraw=%q", diag, txt)
@@ -652,14 +475,9 @@ func TestBannerForBoxPerfectRect(t *testing.T) {
 	}
 }
 
-func TestCommandsListMatchesAdminShellCaps(t *testing.T) {
-	caps := session.Capabilities{
-		IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-	}
+func TestCommandsListStaticAllGroups(t *testing.T) {
 	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
-		s := &session.Session{}
-		s.SetCapabilitiesForTest(caps)
-		return s, nil
+		return &session.Session{}, nil
 	})
 	defer func() { session.SetNewForTest(prev) }()
 	app, sessPtr := buildStubRoot(t)
@@ -690,36 +508,35 @@ func TestCommandsListMatchesAdminShellCaps(t *testing.T) {
 	out := buf.String()
 	outPlain := stripANSIStrict(out)
 	mustContain := []string{
-		"Basic:", "Extended:", "Meta Management:",
+		"Extended:", "Meta Management:",
 		"regsch", "regidx", "searchkey",
-		"admin 127.0.0.1:7381",
+		"127.0.0.1:7381",
 	}
 	for _, m := range mustContain {
 		if !strings.Contains(outPlain, m) {
 			t.Fatalf("commands output missing %q — plain output:\n%s", m, outPlain)
 		}
 	}
+	if strings.Contains(outPlain, "Basic:") {
+		t.Fatalf("commands output should NO LONGER include 'Basic:' group (generic Redis commands are universally known) — plain output:\n%s", outPlain)
+	}
 	if strings.Contains(outPlain, "generic-redis") || strings.Contains(outPlain, "not a redisx server") {
-		t.Fatalf("commands header should be admin shell but saw generic-redis fallback:\n%s", outPlain)
+		t.Fatalf("commands header should never use generic-redis fallback / client zero assumptions:\n%s", outPlain)
 	}
 }
 
-func TestBannerVsCommandsHeaderForkRegression(t *testing.T) {
+func TestBannerVsCommandsConsistentHeader(t *testing.T) {
 	var realSess *session.Session
 	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
 		realSess = &session.Session{}
-		realSess.SetCapabilitiesForTest(session.Capabilities{})
 		return realSess, nil
 	})
 	defer func() { session.SetNewForTest(prev) }()
-	adminCaps := session.Capabilities{
-		IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: true, SearchIndex: true,
-	}
 	app, _ := buildStubRoot(t)
 	ud, _ := app.UserData().(*AppData)
 	ud.Opts.Host = "127.0.0.1"
 	ud.Opts.Port = 7381
-	ud.Opts.AdminAuth = "X"
+	ud.Opts.Auth = "X"
 	ctx := tui.RunContext{UserData: app.UserData()}
 	if err := app.Hooks().BeforeRun(ctx, "", nil); err != nil {
 		t.Fatalf("BeforeRun err: %v", err)
@@ -731,7 +548,6 @@ func TestBannerVsCommandsHeaderForkRegression(t *testing.T) {
 	if app.Hooks().Banner != nil {
 		combo.WriteString(app.Hooks().Banner(ctx))
 	}
-	realSess.SetCapabilitiesForTest(adminCaps)
 	var cmdBuf bytes.Buffer
 	oldOut := os.Stdout
 	rp, wp, _ := os.Pipe()
@@ -750,12 +566,15 @@ func TestBannerVsCommandsHeaderForkRegression(t *testing.T) {
 			break
 		}
 	}
-	bodyAdmin := strings.Contains(bodyConnLine, "(Admin Shell") || strings.Contains(bodyConnLine, "Connected: admin ")
-	if headGeneric && bodyAdmin {
+	bodyRedisx := strings.Contains(bodyConnLine, "127.0.0.1:7381")
+	if headGeneric && bodyRedisx {
 		t.Fatalf(
-			"BUG REPRODUCED — Banner head says Generic-redis mode, but commands Connected: header says Admin Shell\n\n%s",
+			"BUG — Banner head said Generic-redis mode fallback, commands Connected header includes expected host:port\n\n%s",
 			plain,
 		)
+	}
+	if !bodyRedisx {
+		t.Fatalf("Expected body Connected line to contain '127.0.0.1:7381', got %q", bodyConnLine)
 	}
 }
 

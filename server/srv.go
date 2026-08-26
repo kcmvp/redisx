@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,27 +28,27 @@ const (
 )
 
 var (
-	cmdAuth        = strings.ToLower(proto.CmdAuth)
-	cmdHello       = strings.ToLower(proto.CmdHello)
-	cmdPing        = strings.ToLower(proto.CmdPing)
-	cmdQuit        = strings.ToLower(proto.CmdQuit)
-	cmdSet         = strings.ToLower(proto.CmdSet)
-	cmdSetEx       = strings.ToLower(proto.CmdSetEx)
-	cmdGet         = strings.ToLower(proto.CmdGet)
-	cmdSetNX       = strings.ToLower(proto.CmdSetNX)
-	cmdDel         = strings.ToLower(proto.CmdDel)
-	cmdKeys        = strings.ToLower(proto.CmdKeys)
-	cmdPublish     = strings.ToLower(proto.CmdPublish)
-	cmdSubscribe   = strings.ToLower(proto.CmdSubscribe)
-	cmdPSubscribe  = strings.ToLower(proto.CmdPSubscribe)
-	cmdClient      = strings.ToLower(proto.CmdClient)
-	cmdUpdate      = strings.ToLower(proto.CmdUpdate)
-	cmdSearchIndex = strings.ToLower(proto.CmdSearchIndex)
-	cmdSearchKey   = strings.ToLower(proto.CmdSearchKey)
-	cmdRegSch      = strings.ToLower(proto.CmdRegisterSchema)
-	cmdDropSch     = strings.ToLower(proto.CmdDropSchema)
-	cmdRegIdx      = strings.ToLower(proto.CmdRegisterIndex)
-	cmdDropIdx     = strings.ToLower(proto.CmdDropIndex)
+	cmdAuth        = proto.LowerCmdAuth
+	cmdHello       = proto.LowerCmdHello
+	cmdPing        = proto.LowerCmdPing
+	cmdQuit        = proto.LowerCmdQuit
+	cmdSet         = proto.LowerCmdSet
+	cmdSetEx       = proto.LowerCmdSetEx
+	cmdGet         = proto.LowerCmdGet
+	cmdSetNX       = proto.LowerCmdSetNX
+	cmdDel         = proto.LowerCmdDel
+	cmdKeys        = proto.LowerCmdKeys
+	cmdPublish     = proto.LowerCmdPublish
+	cmdSubscribe   = proto.LowerCmdSubscribe
+	cmdPSubscribe  = proto.LowerCmdPSubscribe
+	cmdClient      = proto.LowerCmdClient
+	cmdUpdate      = proto.LowerCmdUpdate
+	cmdSearchIndex = proto.LowerCmdSearchIndex
+	cmdSearchKey   = proto.LowerCmdSearchKey
+	cmdRegSch      = proto.LowerCmdRegisterSchema
+	cmdDropSch     = proto.LowerCmdDropSchema
+	cmdRegIdx      = proto.LowerCmdRegisterIndex
+	cmdDropIdx     = proto.LowerCmdDropIndex
 )
 
 type commandHandler func(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
@@ -75,6 +76,12 @@ var commandRegistry = map[string]commandHandler{
 	cmdRegIdx:      regIdxCommand,
 	cmdDropIdx:     dropIndexCommand,
 }
+
+var supportedCommandList = func() string {
+	keys := lo.Keys(commandRegistry)
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}()
 
 var (
 	internalAuthKey = internal.AuthKey()
@@ -530,7 +537,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	if handler, ok := commandRegistry[cmdName]; ok {
 		handler(conn, cmd, db, ps)
 	} else {
-		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "'")
+		conn.WriteError("ERR unknown command '" + string(cmd.Args[0]) + "' | supported: " + supportedCommandList)
 	}
 }
 

@@ -2,27 +2,23 @@ package session
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/redis/go-redis/v9"
 )
 
-type Capabilities = respconn.Capabilities
-
 type Options struct {
 	Host      string
 	Port      int
-	AdminAuth string
+	Auth      string
 	TimeoutMs int
 }
 
 type Session struct {
-	client       *redis.Client
-	ctx          context.Context
-	timeout      time.Duration
-	capabilities Capabilities
+	client  *redis.Client
+	ctx     context.Context
+	timeout time.Duration
 }
 
 type Cache struct {
@@ -41,17 +37,11 @@ func (c *Cache) Invalidate() {
 	c.FetchedAt = time.Time{}
 }
 
-var ErrAdminAuthRequired = errors.New("server admin-port requires AUTH (admin-auth key is set on the server side)")
-
-func WrapAdminErr(raw error, authProvided bool) error {
-	return respconn.WrapAdminErr(raw, authProvided)
-}
-
 var newInternal = func(opts Options) (*Session, error) {
 	res, err := respconn.DialAndHandshake(respconn.Options{
 		Host:         opts.Host,
 		Port:         opts.Port,
-		Auth:         opts.AdminAuth,
+		Auth:         opts.Auth,
 		TimeoutMs:    opts.TimeoutMs,
 		AuthOptional: true,
 	})
@@ -59,10 +49,9 @@ var newInternal = func(opts Options) (*Session, error) {
 		return nil, err
 	}
 	return &Session{
-		client:       res.Client,
-		ctx:          context.Background(),
-		timeout:      res.Timeout,
-		capabilities: res.Capabilities,
+		client:  res.Client,
+		ctx:     context.Background(),
+		timeout: res.Timeout,
 	}, nil
 }
 
@@ -80,16 +69,6 @@ func (s *Session) Close() error {
 func (s *Session) Client() *redis.Client  { return s.client }
 func (s *Session) Timeout() time.Duration { return s.timeout }
 func (s *Session) Ctx() context.Context   { return s.ctx }
-func (s *Session) Capabilities() Capabilities {
-	if s == nil {
-		return Capabilities{}
-	}
-	return s.capabilities
-}
-
-func (s *Session) SetCapabilitiesForTest(c Capabilities) {
-	s.capabilities = c
-}
 
 func SetNewForTest(fn func(Options) (*Session, error)) func(Options) (*Session, error) {
 	prev := newInternal
@@ -116,17 +95,4 @@ func (s *Session) RawDo(args []any) *redis.Cmd {
 		return &redis.Cmd{}
 	}
 	return s.client.Do(ctx, args...)
-}
-
-func (s *Session) RefreshCapabilities() (previous Capabilities, now Capabilities, ok bool) {
-	if s == nil || s.client == nil {
-		return Capabilities{}, Capabilities{}, false
-	}
-	previous = s.capabilities
-	c := respconn.ProbeCapabilitiesWithRetry(s.ctx, s.client, s.timeout)
-	if !c.IsRedisx {
-		return previous, previous, false
-	}
-	s.capabilities = c
-	return previous, c, true
 }
