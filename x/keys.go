@@ -63,7 +63,7 @@ func isLiteral(s string) bool { return IsLiteral(s) }
 // hasLeadingWildcard reports whether the first byte of the candidate
 // "anchor" returned by Pattern() / Bounds() is a glob metacharacter. A
 // leading wildcard means the candidate does NOT anchor the keyspace. This
-// mirrors resolvePatternLayer semantics in server/db.go exactly — first
+// mirrors resolveLayer semantics in server/db.go exactly — first
 // byte check only, metachar set limited to '*' and '?' (matches legacy).
 func hasLeadingWildcard(s string) bool {
 	return s != "" && (s[0] == '*' || s[0] == '?')
@@ -519,7 +519,7 @@ func MatchesStorageKey(kr KeyRange, storageKey string) bool {
 //
 //  1. If Pattern() reports (glob, true) → use glob as the anchor (so
 //     leading wildcards are preserved for routing exactly as
-//     resolvePatternLayer(keyPattern) would have computed them in the
+//     resolveLayer(keyPattern) would have computed them in the
 //     legacy string-only days).
 //  2. Otherwise use the concatenated lo:hi Bounds string; a literal-only
 //     range will have real non-wildcard bytes on both sides.
@@ -536,7 +536,7 @@ func LayerRoutingAnchor(kr KeyRange) string {
 
 // LayerRoutingConstrained reports whether a given KeyRange is sufficiently
 // constrained to pin down a single storage layer without scanning both the
-// disk and memory stores. It mirrors the behaviour of resolvePatternLayer:
+// disk and memory stores. It mirrors the behaviour of resolveLayer:
 // false means the caller should reject (SearchKey) or double-sweep
 // (future cross-layer scans if ever desired). True, layer reports the
 // pinned layer.

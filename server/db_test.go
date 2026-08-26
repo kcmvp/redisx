@@ -1026,7 +1026,10 @@ func requireTTLPositive(t *testing.T, db *DB, key string) {
 	t.Helper()
 
 	var ttl time.Duration
-	err := db.store(layerForKey(key)).View(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	require.NoError(t, err)
+	require.True(t, constrained, "requireTTLPositive: key %q is not a concrete key", key)
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
 		var ttlErr error
 		ttl, ttlErr = tx.TTL(key)
 		return ttlErr

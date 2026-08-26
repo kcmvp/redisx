@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,61 +39,84 @@ const clientTestAuthLimit = 50
 
 var cliServerSeedOnce sync.Once
 
-type rawSchema struct {
-	ns       string
-	mem      bool
-	keyAttrs []string
-	ttl      time.Duration
+type wireSchemaJSON struct {
+	Namespace string        `json:"namespace"`
+	Mem       bool          `json:"mem"`
+	KeyAttrs  []string      `json:"key_attrs"`
+	TTL       time.Duration `json:"ttl_ns"`
 }
 
-func (r rawSchema) Namespace() string       { return r.ns }
-func (r rawSchema) Mem() bool              { return r.mem }
-func (r rawSchema) KeyAttrs() []string     { return r.keyAttrs }
-func (r rawSchema) TTL() time.Duration     { return r.ttl }
+type wireIndexJSON struct {
+	FullName   string   `json:"full_name"`
+	KeyPattern string   `json:"key_pattern"`
+	Paths      []string `json:"paths"`
+}
 
-func sharedSeedBody(t *testing.T, db interface {
-	CreateIndex(idx x.Index) error
-	Set(k string, v string) error
-	UpsertDoc(s x.Schema) error
-}) {
+func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 	t.Helper()
 	require := require.New(t)
 
-	require.NoError(db.UpsertDoc(rawSchema{ns: "probenegcli", mem: false, keyAttrs: []string{"id"}, ttl: 0}))
-	require.NoError(db.UpsertDoc(rawSchema{ns: "probeserver", mem: true, keyAttrs: []string{"id"}, ttl: 0}))
-	require.NoError(db.UpsertDoc(rawSchema{ns: "probenegdoc", mem: false, keyAttrs: []string{"id"}, ttl: 0}))
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	defer func() { _ = rdb.Close() }()
 
-	require.NoError(db.CreateIndex(x.Idx[testUserDoc]("age", "*", "age")))
-	require.NoError(db.CreateIndex(x.Idx[testUserDoc]("email", "*", "email")))
+	wireREGSCH := func(ns string, mem bool, keyAttrs []string, ttl time.Duration) {
+		t.Helper()
+		b, err := json.Marshal(wireSchemaJSON{Namespace: ns, Mem: mem, KeyAttrs: keyAttrs, TTL: ttl})
+		require.NoError(err, "marshal REGSCH for %s (mem=%v)", ns, mem)
+		status := rdb.Do(ctx, "REGSCH", string(b))
+		require.NoError(status.Err(), "REGSCH %s (mem=%v)", ns, mem)
+		require.Equal("OK", status.Val(), "REGSCH %s (mem=%v) want OK got %v", ns, mem, status.Val())
+	}
+	wireREGIDX := func(idx x.Index) {
+		t.Helper()
+		paths := idx.Paths()
+		if paths == nil {
+			paths = []string{}
+		}
+		b, err := json.Marshal(wireIndexJSON{FullName: idx.Name(), KeyPattern: idx.KeyPattern(), Paths: paths})
+		require.NoError(err, "marshal REGIDX for %s", idx.Name())
+		status := rdb.Do(ctx, "REGIDX", string(b))
+		require.NoError(status.Err(), "REGIDX %s", idx.Name())
+		require.Equal("OK", status.Val(), "REGIDX %s want OK got %v", idx.Name(), status.Val())
+	}
+
+	wireREGSCH("probenegcli", false, []string{"id"}, 0)
+	wireREGSCH("probeserver", true, []string{"id"}, 0)
+	wireREGSCH("probenegdoc", false, []string{"id"}, 0)
+
+	wireREGIDX(x.Idx[testUserDoc]("age", "*", "age"))
+	wireREGIDX(x.Idx[testUserDoc]("email", "*", "email"))
 
 	probeClientKP := testutil.KeyRangeKeyPattern(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
 	probeClientStorageNs := naming.BuildStorageNs(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
 	idxClientProbeScore := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "score"), probeClientKP, "score")
 	idxClientProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "bucket"), probeClientKP, "bucket")
 	idxClientProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "sparseamt"), probeClientKP, "sparse_amt")
-	require.NoError(db.CreateIndex(idxClientProbeScore))
-	require.NoError(db.CreateIndex(idxClientProbeBucket))
-	require.NoError(db.CreateIndex(idxClientProbeSparse))
+	wireREGIDX(idxClientProbeScore)
+	wireREGIDX(idxClientProbeBucket)
+	wireREGIDX(idxClientProbeSparse)
 
 	probeDocKP := testutil.KeyRangeKeyPattern(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
 	probeDocStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
 	idxDocProbeScore := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "score"), probeDocKP, "score")
 	idxDocProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "bucket"), probeDocKP, "bucket")
 	idxDocProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "sparseamt"), probeDocKP, "sparse_amt")
-	require.NoError(db.CreateIndex(idxDocProbeScore))
-	require.NoError(db.CreateIndex(idxDocProbeBucket))
-	require.NoError(db.CreateIndex(idxDocProbeSparse))
+	wireREGIDX(idxDocProbeScore)
+	wireREGIDX(idxDocProbeBucket)
+	wireREGIDX(idxDocProbeSparse)
 
-	require.NoError(db.CreateIndex(x.Idx[UserDoc]("age", "*", "age")))
+	wireREGIDX(x.Idx[UserDoc]("age", "*", "age"))
 
-	require.NoError(db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50"))
+	require.NotNil(internalSet, "internalSet callback for AUTH-key seed must be provided (writes bypass RESP wire internal-write-guard)")
+	require.NoError(internalSet(naming.AuthStorageKey(clientTestExternalAuthKey), "50"), "seed AUTH key (internal storage write, bypasses wire internal-write-guard)")
 
 	for _, kv := range testutil.LoadXFor(t, searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
-		require.NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
+		require.NoError(rdb.Set(ctx, kv.K, kv.V, 0).Err(), "seed probe-client fixture failed for %s", kv.K)
 	}
 
 	for _, kv := range testutil.LoadXFor(t, searchKRDocNamespace, testutil.KeyRangeFixtureMem()) {
-		require.NoError(db.Set(kv.K, kv.V), "seed probe-doc fixture failed for %s", kv.K)
+		require.NoError(rdb.Set(ctx, kv.K, kv.V, 0).Err(), "seed probe-doc fixture failed for %s", kv.K)
 	}
 }
 
@@ -140,7 +164,7 @@ func ensureServerAndSeed(t *testing.T) {
 			DocUpdateFixture(""),
 		)
 		require.NotNil(db)
-		sharedSeedBody(t, db)
+		sharedSeedBody(t, func(k, v string) error { return db.Set(k, v) })
 	}
 
 	for i := 0; i < 30; i++ {
@@ -254,7 +278,7 @@ func (s *ClientTestSuite) SetupSuite() {
 	)
 	s.Require().NotNil(db)
 
-	sharedSeedBody(s.T(), db)
+	sharedSeedBody(s.T(), func(k, v string) error { return db.Set(k, v) })
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -2471,11 +2495,16 @@ func BenchmarkSetNoHooks(b *testing.B) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
 	}
+	clientTestServerAddr = cfg.Admin.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
+	rdbAuth := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	defer func() { _ = rdbAuth.Close() }()
+	if err := rdbAuth.Set(context.Background(), naming.AuthStorageKey(clientTestExternalAuthKey), "50", 0).Err(); err != nil {
+		b.Fatalf("seed AUTH key via wire: %v", err)
+	}
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2506,11 +2535,16 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
 	}
+	clientTestServerAddr = cfg.Admin.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
+	rdbAuth := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	defer func() { _ = rdbAuth.Close() }()
+	if err := rdbAuth.Set(context.Background(), naming.AuthStorageKey(clientTestExternalAuthKey), "50", 0).Err(); err != nil {
+		b.Fatalf("seed AUTH key via wire: %v", err)
+	}
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2541,11 +2575,16 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
 	}
+	clientTestServerAddr = cfg.Admin.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
+	rdbAuth := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	defer func() { _ = rdbAuth.Close() }()
+	if err := rdbAuth.Set(context.Background(), naming.AuthStorageKey(clientTestExternalAuthKey), "50", 0).Err(); err != nil {
+		b.Fatalf("seed AUTH key via wire: %v", err)
+	}
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)
@@ -2578,11 +2617,16 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
 		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
 	}
+	clientTestServerAddr = cfg.Admin.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
-	_ = db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50")
+	rdbAuth := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
+	defer func() { _ = rdbAuth.Close() }()
+	if err := rdbAuth.Set(context.Background(), naming.AuthStorageKey(clientTestExternalAuthKey), "50", 0).Err(); err != nil {
+		b.Fatalf("seed AUTH key via wire: %v", err)
+	}
 	time.Sleep(200 * time.Millisecond)
 	mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	_ = setSharedClient(mockClient)

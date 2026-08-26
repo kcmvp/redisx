@@ -24,6 +24,8 @@ import (
 	"github.com/kcmvp/redisx/x"
 )
 
+// ——— Type / Struct definitions ———
+
 type storageLayer uint8
 
 const (
@@ -31,6 +33,11 @@ const (
 	storageMem
 )
 
+// docSpec stores a single registered typed-document schema (the server-
+// internal enriched version of x.Schema). It always contains exactly one live
+// copy per storageNs (the "no multi-version" invariant). The three internal
+// fields Version/CreatedAt/UpdatedAt are excluded from the canonical MD5
+// fingerprint, so metadata-only drifts do not invalidate version identity.
 type docSpec struct {
 	Namespace string        `json:"namespace"`
 	Mem       bool          `json:"mem"`
@@ -42,10 +49,15 @@ type docSpec struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
-func (p docSpec) StorageNs() string {
-	return naming.BuildStorageNs(p.Namespace, p.Mem)
-}
-
+// idxSpec stores a single registered secondary index (server-internal version
+// of x.Index). Same "exactly one live copy per fullName" invariant as docSpec.
+// Composite indexes are buntdb-native JSON-path comparators (see
+// indexJSONComposite) that are re-created whenever the canonical fingerprint
+// changes.
+//
+// UnmarshalJSON accepts both "path" (single) and "paths" (array) keys for
+// backwards-compatibility with legacy JSON payloads; "path" is rewritten into
+// a single-element "paths" array.
 type idxSpec struct {
 	OwnerNs    string   `json:"owner_ns"`
 	Logical    string   `json:"logical"`
@@ -57,6 +69,43 @@ type idxSpec struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
+// DB is a lightweight two-layer BuntDB wrapper (disk + memory). Memory layer
+// keys are routed via the "_m_:" storageNs prefix. All typed-doc registry
+// logic (docRegSpec / idxRegSpec maps) live in-process alongside storage so
+// registry lookups are zero I/O.
+type DB struct {
+	disk *buntdb.DB
+	mem  *buntdb.DB
+
+	docRegMu   sync.RWMutex
+	docRegSpec map[string]docSpec
+
+	idxRegMu   sync.RWMutex
+	idxRegSpec map[string]idxSpec
+}
+
+// batchedWrite is the per-item tuple used by setBatchAtomic (the underlying
+// implementation for SET/SETEX/SETNX when multiple JSON payloads are sent via
+// doc-path colon-routing form). TTL=0 means persist forever.
+type batchedWrite struct {
+	Key   string
+	Value string
+	TTL   time.Duration
+}
+
+var errNxPreconditionFailed = errors.New("setBatchAtomic: nx precondition failed — one or more keys already exist")
+
+// ——— Public (exported) struct methods ———
+
+// StorageNs returns the actual storage-layer namespace used for meta + data
+// keys: it is either "<ns>" (disk) or "_m_:<ns>" (memory). See Rule1 in
+// checker.go / naming package for the full Spec-vs-MetaKey-vs-x.Schema map.
+func (p docSpec) StorageNs() string {
+	return naming.BuildStorageNs(p.Namespace, p.Mem)
+}
+
+// FullName returns the canonical composite key used for idx meta-keys and the
+// buntdb native index handle: "<ownerNs>!_!<logical>".
 func (i idxSpec) FullName() string { return naming.BuildIdxFullName(i.OwnerNs, i.Logical) }
 
 func (i *idxSpec) UnmarshalJSON(b []byte) error {
@@ -76,440 +125,22 @@ func (i *idxSpec) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// ==========================================================================
-// VERSIONED META HELPERS (Step 2 — canonical MD5 + latest load + stale cleanup)
-// ==========================================================================
+// ——— Public (exported) DB methods ———
 
-// md5VersionHex computes a 12-character truncated MD5 hex fingerprint over
-// the canonical JSON encoding of v. The encoding sorts map keys alphabetically
-// and omits non-semantic fields (Version, CreatedAt, UpdatedAt) so that
-// fingerprints are deterministic across callers and time.
-func md5VersionHex(v any) (string, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return "", fmt.Errorf("md5VersionHex: marshal: %w", err)
-	}
-	sum := md5.Sum(raw)
-	return hex.EncodeToString(sum[:])[:12], nil
-}
+// ——— DB raw access + lifecycle ———
 
-type canonicalDoc struct {
-	Namespace string        `json:"namespace"`
-	Mem       bool          `json:"mem"`
-	KeyAttrs  []string      `json:"key_attrs"`
-	TTL       time.Duration `json:"ttl_ns"`
-}
-
-func canonicalDocMD5(spec docSpec) (string, error) {
-	if len(spec.KeyAttrs) == 0 {
-		spec.KeyAttrs = []string{}
-	}
-	return md5VersionHex(canonicalDoc{
-		Namespace: spec.Namespace,
-		Mem:       spec.Mem,
-		KeyAttrs:  append([]string(nil), spec.KeyAttrs...),
-		TTL:       spec.TTL,
-	})
-}
-
-type canonicalIdx struct {
-	OwnerNs    string   `json:"owner_ns"`
-	Logical    string   `json:"logical"`
-	KeyPattern string   `json:"key_pattern"`
-	Paths      []string `json:"paths"`
-}
-
-func canonicalIdxMD5(spec idxSpec) (string, error) {
-	paths := make([]string, len(spec.Paths))
-	for i, p := range spec.Paths {
-		paths[i] = strings.ReplaceAll(p, ".", "_")
-	}
-	if len(paths) == 0 {
-		paths = []string{}
-	}
-	return md5VersionHex(canonicalIdx{
-		OwnerNs:    spec.OwnerNs,
-		Logical:    spec.Logical,
-		KeyPattern: spec.KeyPattern,
-		Paths:      paths,
-	})
-}
-
-// loadDocSpec reads the single persisted doc meta key for storageNs.
-// Uses the per-ns glob invariant (at most one v_* key exists after any
-// write path; multiple stale ones are cleaned inside writeDocSpec Tx).
-// Returns exists=false if no versioned meta is currently on disk.
-func (db *DB) loadDocSpec(storageNs string) (spec docSpec, exists bool, err error) {
-	if storageNs == "" {
-		return spec, false, errors.New("loadDocSpec: storageNs is required")
-	}
-	layer := layerForStorageNs(storageNs)
-	glob := naming.DocMetaGlobFor(storageNs)
-	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-		_ = tx.AscendKeys(glob, func(k, raw string) bool {
-			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
-				err = fmt.Errorf("loadDocSpec: %s unmarshal: %w", k, e)
-				return false
-			}
-			exists = true
-			return false
-		})
-		return nil
-	})
-	return spec, exists, err
-}
-
-// loadIdxSpec mirrors loadDocSpec for index metadata.
-func (db *DB) loadIdxSpec(idxFullName string) (spec idxSpec, exists bool, err error) {
-	if idxFullName == "" {
-		return spec, false, errors.New("loadIdxSpec: idxFullName is required")
-	}
-	ownerNs, _, perr := naming.ParseIdxFullName(idxFullName)
-	if perr != nil {
-		return spec, false, fmt.Errorf("loadIdxSpec: %w", perr)
-	}
-	layer := layerForStorageNs(ownerNs)
-	glob := naming.IdxMetaGlobFor(idxFullName)
-	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-		_ = tx.AscendKeys(glob, func(k, raw string) bool {
-			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
-				err = fmt.Errorf("loadIdxSpec: %s unmarshal: %w", k, e)
-				return false
-			}
-			exists = true
-			return false
-		})
-		return nil
-	})
-	return spec, exists, err
-}
-
-// deleteStaleDocSpecVersions deletes all versioned doc meta keys for storageNs whose
-// version fingerprint does NOT match keepVersion. Used inside writeDocSpec Tx
-// to enforce the "exactly one latest version on disk" invariant.
-func deleteStaleDocSpecVersions(tx *buntdb.Tx, storageNs, keepVersion string) error {
-	var stale []string
-	_ = tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, _ string) bool {
-		ver := versionFromKey(k)
-		if ver != keepVersion {
-			stale = append(stale, k)
-		}
-		return true
-	})
-	for _, k := range stale {
-		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteStaleDocSpecVersions: %s: %w", k, e)
-		}
-	}
-	return nil
-}
-
-// deleteStaleIdxSpecVersions mirrors deleteStaleDocSpecVersions for index meta keys.
-func deleteStaleIdxSpecVersions(tx *buntdb.Tx, idxFullName, keepVersion string) error {
-	var stale []string
-	_ = tx.AscendKeys(naming.IdxMetaGlobFor(idxFullName), func(k, _ string) bool {
-		ver := versionFromKey(k)
-		if ver != keepVersion {
-			stale = append(stale, k)
-		}
-		return true
-	})
-	for _, k := range stale {
-		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteStaleIdxSpecVersions: %s: %w", k, e)
-		}
-	}
-	return nil
-}
-
-// versionFromKey extracts the 12-hex md5 fingerprint from the LAST segment
-// of a versioned meta key (e.g. "_doc_:user:v_0123456789ab" → "0123456789ab").
-// Returns "" if the key cannot be parsed.
-func versionFromKey(metaKey string) string {
-	last := strings.LastIndex(metaKey, ":")
-	if last < 0 || last+1 >= len(metaKey) {
-		return ""
-	}
-	tail := metaKey[last+1:]
-	if !strings.HasPrefix(tail, "v_") || len(tail) != 2+12 {
-		return ""
-	}
-	return tail[2:]
-}
-
-// ============================================================
-// STEP 2 CORE WRITERS — writeDocSpec / writeIndexSpec
-// ============================================================
-
-// writeDocSpec is the UNIFIED entry point for ALL document spec writes
-// (boot registerSchemas, user REGSCH cmd, future client RegisterSchema path2,
-// fixture helpers). It never accepts a version as an input parameter:
-// the caller supplies only the logical spec (namespace/mem/keyattrs/ttl)
-// and the version fingerprint is computed & stored internally.
-//
-// Behaviour:
-//   - Same MD5 as the latest persisted version → noop (Debug log).
-//   - New / different spec → persist new v_<md5> meta key, delete ALL stale
-//     v_* keys for the same storageNs, overwrite docRegSpec memory map.
-//   - Lifecycle timestamps: first write sets CreatedAt=now UpdatedAt=zero;
-//     subsequent writes preserve original CreatedAt and bump UpdatedAt=now.
-func (db *DB) writeDocSpec(spec docSpec) error {
-	if spec.Namespace == "" {
-		return errors.New("writeDocSpec: namespace is required")
-	}
-	if err := naming.ValidateDocLogicalNamespace(spec.Namespace); err != nil {
-		return fmt.Errorf("writeDocSpec: %w", err)
-	}
-	for i, p := range spec.KeyAttrs {
-		if p == "" {
-			return fmt.Errorf("writeDocSpec: key_attrs[%d] is empty", i)
-		}
-	}
-	storageNs := spec.StorageNs()
-	versionHex, err := canonicalDocMD5(spec)
-	if err != nil {
-		return fmt.Errorf("writeDocSpec %q: md5: %w", storageNs, err)
-	}
-	oldSpec, hadOld, err := db.loadDocSpec(storageNs)
-	if err != nil {
-		return err
-	}
-	if hadOld && oldSpec.Version == versionHex {
-		slog.Debug("writeDocSpec: unchanged fingerprint, skipping",
-			"ns", spec.Namespace, "storage_ns", storageNs, "version", versionHex)
-		return nil
-	}
-
-	now := time.Now().UTC()
-	if hadOld {
-		spec.CreatedAt = oldSpec.CreatedAt
-		spec.UpdatedAt = now
-	} else {
-		spec.CreatedAt = now
-		spec.UpdatedAt = time.Time{}
-	}
-	spec.Version = versionHex
-
-	raw, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("writeDocSpec %q: marshal: %w", storageNs, err)
-	}
-	layer := layerForStorageNs(storageNs)
-	targetKey := naming.DocMetaKey(storageNs, versionHex)
-
-	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
-		if err := deleteStaleDocSpecVersions(tx, storageNs, versionHex); err != nil {
-			return err
-		}
-		_, _, setErr := tx.Set(targetKey, string(raw), nil)
-		return setErr
-	}); err != nil {
-		return fmt.Errorf("writeDocSpec %q: persist %s: %w", storageNs, targetKey, err)
-	}
-
-	db.docRegMu.Lock()
-	db.docRegSpec[storageNs] = spec
-	db.docRegMu.Unlock()
-
-	if hadOld {
-		slog.Info("writeDocSpec: spec upgraded (new fingerprint)",
-			"ns", spec.Namespace, "storage_ns", storageNs,
-			"old_version", oldSpec.Version, "new_version", versionHex,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano),
-			"updated_at", spec.UpdatedAt.Format(time.RFC3339Nano))
-	} else {
-		slog.Info("writeDocSpec: new spec persisted",
-			"ns", spec.Namespace, "storage_ns", storageNs,
-			"version", versionHex,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano))
-	}
-	return nil
-}
-
-// writeIndexSpec mirrors writeDocSpec for index specs. It additionally
-// drops & re-creates the buntdb native index whenever the fingerprint
-// changes (paths/order/pattern drift), ensuring the query comparator stays
-// in sync with the stored metadata.
-func (db *DB) writeIndexSpec(spec idxSpec) error {
-	if spec.OwnerNs == "" {
-		return errors.New("writeIndexSpec: owner_ns is required")
-	}
-	if spec.Logical == "" {
-		return errors.New("writeIndexSpec: logical is required")
-	}
-	fullName := spec.FullName()
-	if spec.KeyPattern == "" {
-		return fmt.Errorf("writeIndexSpec %q: key_pattern is required", fullName)
-	}
-	if len(spec.Paths) == 0 {
-		return fmt.Errorf("writeIndexSpec %q: at least one path is required", fullName)
-	}
-	for i, p := range spec.Paths {
-		if p == "" {
-			return fmt.Errorf("writeIndexSpec %q: paths[%d] is empty", fullName, i)
-		}
-	}
-	patternLayer, constrained, err := resolvePatternLayer(spec.KeyPattern)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: %w", fullName, err)
-	}
-	if !constrained {
-		return fmt.Errorf("writeIndexSpec %q: key_pattern cannot start with wildcard", fullName)
-	}
-
-	versionHex, err := canonicalIdxMD5(spec)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: md5: %w", fullName, err)
-	}
-	oldSpec, hadOld, err := db.loadIdxSpec(fullName)
-	if err != nil {
-		return err
-	}
-	if hadOld && oldSpec.Version == versionHex {
-		slog.Debug("writeIndexSpec: unchanged fingerprint, skipping",
-			"full", fullName, "version", versionHex)
-		return nil
-	}
-
-	metaLayer := layerForStorageNs(spec.OwnerNs)
-	if hadOld {
-		if err := db.store(metaLayer).DropIndex(fullName); err != nil && !errors.Is(err, buntdb.ErrNotFound) {
-			return fmt.Errorf("writeIndexSpec %q: drop stale btree: %w", fullName, err)
-		}
-	}
-	if err := db.store(patternLayer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
-		return fmt.Errorf("writeIndexSpec %q: create btree: %w", fullName, err)
-	}
-
-	now := time.Now().UTC()
-	if hadOld {
-		spec.CreatedAt = oldSpec.CreatedAt
-		spec.UpdatedAt = now
-	} else {
-		spec.CreatedAt = now
-		spec.UpdatedAt = time.Time{}
-	}
-	spec.Version = versionHex
-
-	raw, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: marshal: %w", fullName, err)
-	}
-	targetKey := naming.IdxMetaKey(fullName, versionHex)
-
-	if err := db.store(metaLayer).Update(func(tx *buntdb.Tx) error {
-		if err := deleteStaleIdxSpecVersions(tx, fullName, versionHex); err != nil {
-			return err
-		}
-		_, _, setErr := tx.Set(targetKey, string(raw), nil)
-		return setErr
-	}); err != nil {
-		return fmt.Errorf("writeIndexSpec %q: persist %s: %w", fullName, targetKey, err)
-	}
-
-	db.idxRegMu.Lock()
-	db.idxRegSpec[fullName] = spec
-	db.idxRegMu.Unlock()
-
-	if hadOld {
-		slog.Info("writeIndexSpec: index rebuilt (new fingerprint)",
-			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
-			"old_version", oldSpec.Version, "new_version", versionHex,
-			"paths", spec.Paths,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano),
-			"updated_at", spec.UpdatedAt.Format(time.RFC3339Nano))
-	} else {
-		slog.Info("writeIndexSpec: new index persisted",
-			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
-			"version", versionHex, "paths", spec.Paths,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano))
-	}
-	return nil
-}
-
-// SECTION: Open
-
-func openDB(path string) *DB {
-	if path == "" {
-		slog.Error("failed to open storage", "error", "db path is required")
-		return nil
-	}
-	if path == ":memory:" {
-		slog.Error("failed to open storage", "path", path, "error", `db path must be a file path; ":memory:" is reserved for buntdb in-memory mode`)
-		return nil
-	}
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		slog.Error("failed to open storage", "path", path, "error", "db path must be a file path, not a directory")
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		slog.Error("failed to create db directory", "path", path, "error", err)
-		return nil
-	}
-
-	disk, err := buntdb.Open(path)
-	if err != nil {
-		slog.Error("failed to open buntdb", "path", path, "error", err)
-		return nil
-	}
-
-	mem, err := buntdb.Open(":memory:")
-	if err != nil {
-		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
-		_ = disk.Close()
-		return nil
-	}
-
-	return &DB{
-		disk:       disk,
-		mem:        mem,
-		docRegSpec: map[string]docSpec{},
-		idxRegSpec: map[string]idxSpec{},
-	}
-}
-
-// DB is a lightweight two-layer BuntDB wrapper for the high-frequency
-// operations exposed by redisx.
-//
-// It is designed for two in-process use cases:
-//   - direct embedded access from the same application
-//   - the backing implementation behind RESP X commands
-//
-// redisx always opens two underlying BuntDB instances:
-//   - one primary layer from dbPath
-//   - one dedicated memory-only layer for keys prefixed with "_m_"
-//
-// For lower-level or BuntDB-specific operations, use [DB.Raw].
-type DB struct {
-	disk *buntdb.DB
-	mem  *buntdb.DB
-
-	docRegMu   sync.RWMutex
-	docRegSpec map[string]docSpec
-
-	idxRegMu   sync.RWMutex
-	idxRegSpec map[string]idxSpec
-}
-
-// SECTION: Core DB
-
-// Raw exposes the primary (disk) BuntDB instance for advanced/native use.
-// This is the layer opened from dbPath.
+// Raw exposes the primary (disk) BuntDB instance. For "_m_:" keys use RawMem.
 func (db *DB) Raw() *buntdb.DB {
 	return db.disk
 }
 
-// RawMem exposes the in-memory storage layer used by keys with the "_m_"
-// prefix.
-//
-// Keys routed to this layer are not persisted across restarts.
+// RawMem exposes the in-memory-only storage layer. Keys here are NOT persisted
+// across server restarts.
 func (db *DB) RawMem() *buntdb.DB {
 	return db.mem
 }
 
-// Close closes both the persistent and in-memory storage layers.
-//
-// The first close error is returned, if any.
+// Close closes both storage layers and returns the first error, if any.
 func (db *DB) Close() error {
 	var firstErr error
 	if db.mem != nil {
@@ -527,75 +158,42 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
-// SECTION: Storage Routing
-
-func isMemKey(key string) bool {
-	return naming.HasMemPrefix(key)
+// CreateIndex is a small alias over registerIndexes; see registerIndexes for
+// the actual x.Index → idxSpec conversion + writeIndexSpec persistence flow.
+func (db *DB) CreateIndex(idx x.Index) error {
+	return db.registerIndexes(idx)
 }
 
-func hasLeadingWildcard(keyPattern string) bool {
-	return keyPattern != "" && (keyPattern[0] == '*' || keyPattern[0] == '?')
-}
+// ——— Typed-doc query & update API ———
 
-func layerForKey(key string) storageLayer {
-	if isMemKey(key) {
-		return storageMem
-	}
-	return storageDisk
-}
-
-// resolvePatternLayer reports whether keyPattern alone pins the target layer.
-// A leading wildcard is treated as unconstrained, not an error.
-func resolvePatternLayer(keyPattern string) (storageLayer, bool, error) {
-	if keyPattern == "" {
-		return storageDisk, false, errors.New("key pattern is required")
-	}
-	if hasLeadingWildcard(keyPattern) {
-		return storageDisk, false, nil
-	}
-	return layerForKey(keyPattern), true, nil
-}
-
-func layerForStorageNs(storageNs string) storageLayer {
-	if naming.HasMemPrefix(storageNs) {
-		return storageMem
-	}
-	return storageDisk
-}
-
-// store returns the underlying storage handle for layer.
-func (db *DB) store(layer storageLayer) *buntdb.DB {
-	if layer == storageMem {
-		return db.mem
-	}
-	return db.disk
-}
-
-func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
-	if ttl <= 0 {
-		return nil
-	}
-	return &buntdb.SetOptions{Expires: true, TTL: ttl}
-}
-
-// SECTION: Query And Update
-
-// Update applies one or more x.Mutation values to every doc matched by kr
-// and filter. Each mutation uses sjson path semantics. keyPattern must be
-// one full storage-key glob (cannot start with wildcard).
+// Update is TYPED-DOC ONLY (there is no KV-style UPDATE bypass per the colon-
+// routing SSOT; the cmd.go UPDATE handler already resolved the keyrange anchor
+// to a single storageNs, verified it is registered (non-internal) and rejected
+// KV-shaped bare patterns). Caller provides the key-range + filter that pins
+// to exactly one storage layer; mutations are sjson path writes executed
+// inside a single BuntDB Update tx so either all matched rows change or none
+// do. Primary keys derived from KeyAttrs are re-derived post-mutation; if any
+// pk would drift the whole tx is aborted with zero writes.
 func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		l, ok, lerr := resolveLayer(k)
+		if lerr != nil || !ok {
+			return fmt.Errorf("Update: key %q is not a concrete key (err=%v constrained=%v)", k, lerr, ok)
+		}
+		return l
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	layer, ok := layerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
+		if lerr, isErr := layerObj.(error); isErr {
+			return mo.Err[[]string](lerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", layerObj))
 	}
 	var updatedKeys []string
 	var err error
@@ -664,176 +262,14 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 	return mo.Ok(updatedKeys)
 }
 
-func indexJSONComposite(paths ...string) func(a, b string) bool {
-	if len(paths) == 0 {
-		panic("indexJSONComposite: at least one path is required")
-	}
-	if len(paths) == 1 {
-		return buntdb.IndexJSON(paths[0])
-	}
-	return func(a, b string) bool {
-		for _, p := range paths {
-			ra := gjson.Get(a, p)
-			rb := gjson.Get(b, p)
-			if ra.Less(rb, false) {
-				return true
-			}
-			if rb.Less(ra, false) {
-				return false
-			}
-		}
-		return false
-	}
-}
-
-func (db *DB) CreateIndex(idx x.Index) error {
-	return db.registerIndexes(idx)
-}
-
-func (db *DB) UpsertDoc(s x.Schema) error {
-	return db.registerSchemas(s)
-}
-
-func (db *DB) UpsertIndex(i x.Index) error {
-	return db.registerIndexes(i)
-}
-
-func (db *DB) registerIndexes(indexes ...x.Index) error {
-	for _, idx := range indexes {
-		fullName := idx.Name()
-		if fullName == "" {
-			return fmt.Errorf("index name is required")
-		}
-		ownerNs, logical, err := naming.ParseIdxFullName(fullName)
-		if err != nil {
-			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
-		}
-		spec := idxSpec{
-			OwnerNs:    ownerNs,
-			Logical:    logical,
-			KeyPattern: idx.KeyPattern(),
-			Paths:      idx.Paths(),
-		}
-		if err := db.writeIndexSpec(spec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (db *DB) loadIndexes() error {
-	type kv struct {
-		metaKey string
-		raw     string
-	}
-	patterns := []struct {
-		layer storageLayer
-		glob  string
-	}{
-		{layer: storageDisk, glob: naming.IdxMetaGlob()},
-		{layer: storageMem, glob: naming.IdxMetaGlob()},
-	}
-	db.idxRegMu.Lock()
-	defer db.idxRegMu.Unlock()
-	for _, p := range patterns {
-		var collected []kv
-		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
-				collected = append(collected, kv{metaKey: metaKey, raw: value})
-				return true
-			})
-		})
-		if err != nil {
-			return err
-		}
-		for _, c := range collected {
-			var spec idxSpec
-			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
-				return fmt.Errorf("index %s: unmarshal idxSpec: %w", c.metaKey, err)
-			}
-			if spec.OwnerNs == "" || spec.Logical == "" {
-				return fmt.Errorf("index %s: missing owner_ns/logical", c.metaKey)
-			}
-			fullName := spec.FullName()
-			layer, constrained, err := resolvePatternLayer(spec.KeyPattern)
-			if err != nil {
-				return fmt.Errorf("index %s: %w", fullName, err)
-			}
-			if !constrained {
-				return fmt.Errorf("index %s: key_pattern cannot start with wildcard", fullName)
-			}
-			if len(spec.Paths) == 0 {
-				return fmt.Errorf("index %s: at least one json path is required", fullName)
-			}
-			if err := db.store(layer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
-				return fmt.Errorf("index %s: create btree: %w", fullName, err)
-			}
-			db.idxRegSpec[fullName] = spec
-		}
-	}
-	slog.Debug("index registry loaded", "count", len(db.idxRegSpec))
-	return nil
-}
-
-func (db *DB) loadDocSpecs() error {
-	type kv struct {
-		metaKey string
-		raw     string
-	}
-	patterns := []struct {
-		layer storageLayer
-		glob  string
-	}{
-		{layer: storageDisk, glob: naming.DocMetaGlob()},
-		{layer: storageMem, glob: naming.DocMetaGlob()},
-	}
-	db.docRegMu.Lock()
-	defer db.docRegMu.Unlock()
-	for _, p := range patterns {
-		var collected []kv
-		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
-				collected = append(collected, kv{metaKey: metaKey, raw: value})
-				return true
-			})
-		})
-		if err != nil {
-			return err
-		}
-		for _, c := range collected {
-			var spec docSpec
-			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
-				return fmt.Errorf("doc %s: unmarshal docSpec: %w", c.metaKey, err)
-			}
-			if spec.Namespace == "" {
-				return fmt.Errorf("doc %s: empty namespace", c.metaKey)
-			}
-			db.docRegSpec[spec.StorageNs()] = spec
-		}
-	}
-	slog.Debug("doc registry loaded", "count", len(db.docRegSpec))
-	return nil
-}
-
-func (db *DB) registerSchemas(schemas ...x.Schema) error {
-	for _, sch := range schemas {
-		spec := docSpec{
-			Namespace: sch.Namespace(),
-			Mem:       sch.Mem(),
-			KeyAttrs:  append([]string(nil), sch.KeyAttrs()...),
-			TTL:       sch.TTL(),
-		}
-		if err := db.writeDocSpec(spec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// SearchIndex scans one registered index on its bound storage layer,
-// narrows by kr and optional filter, and returns matched JSON documents in
-// index order. The kr KeyRange cannot start with wildcard and must target
-// the same layer as the index.
+// SearchIndex scans via a buntdb-native secondary index handle. The index
+// name must already be registered (REGIDX / boot registerSchemas seed or
+// runtime REGIDX); an unregistered name returns Err "index not found". Key-
+// range layer and index ownerNs layer must match (cross-layer searches are
+// parameter-ERR). Matched rows are optionally narrowed by filter.Eval; the
+// SEARCHINDEX command also respects colon-routing (cmd.go searchIndexCommand
+// — index name is always logical, KV-passthrough route is SEARCHKEY only),
+// per the typed-doc-SSOT for registry-bound queries.
 func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
@@ -845,19 +281,26 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 	}
-	layer := storageDisk
-	if naming.HasMemPrefix(idxSpec.OwnerNs) {
-		layer = storageMem
+	layer, constrained, lerr := resolveLayer(idxSpec.OwnerNs)
+	if lerr != nil || !constrained {
+		return mo.Err[[]string](fmt.Errorf("SearchIndex: owner_ns %q is not a concrete ns (err=%v constrained=%v)", idxSpec.OwnerNs, lerr, constrained))
 	}
 	krLayerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		kl, kok, klerr := resolveLayer(k)
+		if klerr != nil || !kok {
+			return fmt.Errorf("SearchIndex: key %q is not a concrete key (err=%v constrained=%v)", k, klerr, kok)
+		}
+		return kl
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	krLayer, ok := krLayerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", krLayerObj))
+		if klerr, isErr := krLayerObj.(error); isErr {
+			return mo.Err[[]string](klerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", krLayerObj))
 	}
 	if krLayer != layer {
 		return mo.Err[[]string](fmt.Errorf("key range targets a different storage layer than index %s", indexName))
@@ -905,23 +348,33 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	return mo.Ok(results)
 }
 
-// SearchKey resolves one sealed x.KeyRange to a single storage layer, walks
-// the matching default storage-index key range using native BTree iterators,
-// applies the optional filter, and returns matched JSON documents in ASC or
-// DESC key order. The KeyRange must pin exactly one storage layer.
+// SearchKey walks the raw storage-key order (no secondary index) for a key-
+// range; used both for typed-doc queries (colon-routing doc-path, KeyRange
+// anchor resolves to storageNs) AND for generic KV-pattern passthrough (colon-
+// routing KV-path, caller supplies a wildcard pattern on keys that contain
+// ':'). The cmd.go searchKeyCommand already handled the 4-branch KEYS-style
+// colon-routing before this fn is invoked; this method does NOT consult the
+// typed-doc registry for KV-pattern forms.
 func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		l, ok, lerr := resolveLayer(k)
+		if lerr != nil || !ok {
+			return fmt.Errorf("SearchKey: key %q is not a concrete key (err=%v constrained=%v)", k, lerr, ok)
+		}
+		return l
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	layer, ok := layerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
+		if lerr, isErr := layerObj.(error); isErr {
+			return mo.Err[[]string](lerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", layerObj))
 	}
 
 	dir := x.RangeAsc
@@ -946,73 +399,72 @@ func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]s
 	return mo.Ok(results)
 }
 
-// SECTION: Key Value
+// ——— Raw KV passthrough (Set/SetNX/Get/Delete/Keys) ———
+//
+// These methods are the thin storage-layer counterparts to the RESP KV
+// commands. They implement 0 registry gates: if the caller already routed a
+// key with ':' (colon-routing KV-path) it reaches here as a full storage
+// key; the typed-doc registry / KeyAttrs / JSON schema checks and the
+// internal-namespace write-guard (_doc_/_idx_/_auth_ via validateKVMutationKey)
+// are all performed ABOVE this layer (cmd.go handlers + checker.go).
 
-// Set stores one string value under key.
-//
-// Routing rules:
-//   - keys prefixed with "_m_" are stored in the in-memory layer
-//   - all other keys are stored in the persistent layer
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	SET <key> <value>
+// Set stores value under key (unconditional overwrite). "_m_:" prefix routes
+// to the in-memory layer. RESP equivalent: SET.
 func (db *DB) Set(key string, value string) error {
-	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return err
+	}
+	if !constrained {
+		return fmt.Errorf("Set: key %q is a pattern, not a concrete key", key)
+	}
+	return db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
 }
 
-// SetWithTtl stores one string value under key with an optional TTL.
-//
-// A positive ttl makes the key expire automatically. A zero or negative ttl
-// behaves the same as [DB.Set].
-//
-// key must be the full storage key.
-//
-// RESP equivalents:
-//
-//	SET <key> <value> EX <seconds>
-//	SETEX <key> <seconds> <value>
+// SetWithTtl sets key→value with optional positive TTL (zero/negative = no
+// TTL, same as Set). autoTTLFromKey injects the doc TTL when the caller
+// comes from a typed-doc SET/SETEX/SETNX handler. RESP: SET EX / SETEX.
 func (db *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
 	ttl = db.autoTTLFromKey(key, ttl)
 	opt := setOptionsForTTL(ttl)
 	if opt == nil {
 		return db.Set(key, value)
 	}
-	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return err
+	}
+	if !constrained {
+		return fmt.Errorf("SetWithTtl: key %q is a pattern, not a concrete key", key)
+	}
+	return db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, opt)
 		return err
 	})
 }
 
-// SetNX stores value only when key does not already exist.
-//
-// The returned boolean reports whether the write happened.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	SETNX <key> <value>
+// SetNX sets key→value only when key does NOT already exist (Redis SETNX).
+// Returns true when the write actually happened.
 func (db *DB) SetNX(key string, value string) (bool, error) {
 	return db.SetNXWithTtl(key, value, 0)
 }
 
-// SetNXWithTtl stores value only when key does not already exist, and applies
-// the provided TTL when it is positive.
-//
-// The returned boolean reports whether the write happened.
-//
-// key must be the full storage key.
+// SetNXWithTtl is SetNX with a positive TTL applied to newly-created keys.
 func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, error) {
 	ttl = db.autoTTLFromKey(key, ttl)
 	var set bool
 	opt := setOptionsForTTL(ttl)
-	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return false, err
+	}
+	if !constrained {
+		return false, fmt.Errorf("SetNXWithTtl: key %q is a pattern, not a concrete key", key)
+	}
+	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == buntdb.ErrNotFound {
 			_, _, err = tx.Set(key, value, opt)
@@ -1029,18 +481,17 @@ func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, e
 	return set, nil
 }
 
-// Get returns the string value stored under key.
-//
-// A missing key is returned as an error result.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	GET <key>
+// Get returns the value stored under key. Missing key = Err result. RESP: GET.
 func (db *DB) Get(key string) mo.Result[string] {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return mo.Err[string](err)
+	}
+	if !constrained {
+		return mo.Err[string](fmt.Errorf("Get: key %q is a pattern, not a concrete key", key))
+	}
 	var val string
-	err := db.store(layerForKey(key)).View(func(tx *buntdb.Tx) error {
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Get(key)
 		return innerErr
@@ -1052,18 +503,20 @@ func (db *DB) Get(key string) mo.Result[string] {
 	return mo.Ok(val)
 }
 
-// Delete removes key from its routed storage layer.
-//
-// The returned boolean reports whether the key existed.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	DEL <key>
+// Delete removes key from its routed layer. Returns true if the key existed.
+// RESP equivalent: DEL single-key form. Multi-key DEL, doc-path DEL ns
+// <pk1> [pk2…] and the "multi-KV DEL not allowed" guard are all enforced
+// above this layer in cmd.go delCommand.
 func (db *DB) Delete(key string) (bool, error) {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return false, err
+	}
+	if !constrained {
+		return false, fmt.Errorf("Delete: key %q is a pattern, not a concrete key", key)
+	}
 	var val string
-	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Delete(key)
 		if innerErr == buntdb.ErrNotFound {
@@ -1077,16 +530,13 @@ func (db *DB) Delete(key string) (bool, error) {
 	return len(val) > 0, nil
 }
 
-// Keys resolves one full storage-key pattern to one storage layer first, then
-// returns all matching keys from that layer.
-//
-// keyPattern uses key glob matching such as "*" and "?".
-//
-// RESP equivalent:
-//
-//	KEYS <key_pattern>
+// Keys returns storage keys matching a single-layer pinned pattern. Pattern
+// cannot start with wildcard (resolveLayer enforces single layer).
+// The cmd.go keysCommand 4-branch colon-routing logic sits above this call:
+// ':' in pattern → KV-glob straight through; no ':' + bare registered ns →
+// auto-scoped `<ns>:*`; no ':' + wildcard → ERR. RESP: KEYS.
 func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
-	layer, constrained, err := resolvePatternLayer(keyPattern)
+	layer, constrained, err := resolveLayer(keyPattern)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}
@@ -1106,6 +556,626 @@ func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
 	sort.Strings(keys)
 	return mo.Ok(keys)
 }
+
+// ——— Private (unexported) helpers ———
+
+// ——— Meta helpers: fingerprint + meta-key load/delete (no multi-version) ———
+
+// md5VersionHex computes a 12-char truncated MD5 over canonical JSON-encoded v.
+// Callers always pass an anonymous struct that intentionally excludes Version/
+// CreatedAt/UpdatedAt, so fingerprints are semantic-only and stable over time.
+func md5VersionHex(v any) (string, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("md5VersionHex: marshal: %w", err)
+	}
+	sum := md5.Sum(raw)
+	return hex.EncodeToString(sum[:])[:12], nil
+}
+
+// canonicalDocMD5 returns the canonical MD5 for a docSpec. Only the four
+// user-visible x.Schema fields are hashed (Namespace/Mem/KeyAttrs/TTL); the
+// three server-internal fields (Version/CreatedAt/UpdatedAt) are deliberately
+// excluded.
+func canonicalDocMD5(spec docSpec) (string, error) {
+	if len(spec.KeyAttrs) == 0 {
+		spec.KeyAttrs = []string{}
+	}
+	return md5VersionHex(struct {
+		Namespace string        `json:"namespace"`
+		Mem       bool          `json:"mem"`
+		KeyAttrs  []string      `json:"key_attrs"`
+		TTL       time.Duration `json:"ttl_ns"`
+	}{
+		Namespace: spec.Namespace,
+		Mem:       spec.Mem,
+		KeyAttrs:  append([]string(nil), spec.KeyAttrs...),
+		TTL:       spec.TTL,
+	})
+}
+
+// canonicalIdxMD5 mirrors canonicalDocMD5 for idxSpec. Dots inside JSON paths
+// are collapsed to underscores before hashing so buntdb comparator key-paths
+// are always stable regardless of input spelling.
+func canonicalIdxMD5(spec idxSpec) (string, error) {
+	paths := make([]string, len(spec.Paths))
+	for i, p := range spec.Paths {
+		paths[i] = strings.ReplaceAll(p, ".", "_")
+	}
+	if len(paths) == 0 {
+		paths = []string{}
+	}
+	return md5VersionHex(struct {
+		OwnerNs    string   `json:"owner_ns"`
+		Logical    string   `json:"logical"`
+		KeyPattern string   `json:"key_pattern"`
+		Paths      []string `json:"paths"`
+	}{
+		OwnerNs:    spec.OwnerNs,
+		Logical:    spec.Logical,
+		KeyPattern: spec.KeyPattern,
+		Paths:      paths,
+	})
+}
+
+// ——— Storage routing helpers ———
+
+// hasLeadingWildcard reports a pattern is unbounded (starts with * or ?).
+// Unconstrained patterns are treated as "unpinned to any single layer".
+func hasLeadingWildcard(keyPattern string) bool {
+	return keyPattern != "" && (keyPattern[0] == '*' || keyPattern[0] == '?')
+}
+
+// resolveLayer is the single source of truth for storage-layer routing.
+// It unifies the previous layerForKey / layerForStorageNs / resolvePatternLayer
+// / isMemKey helpers. Callers ALWAYS handle all three returns explicitly:
+//   - s == ""                 → (disk, false, err)
+//   - s starts with '*'/'?'   → (disk, false, nil)    // pattern is unconstrained
+//   - otherwise ("_m_:" pref) → (mem,  true,  nil)
+//   - otherwise (flat ns/key) → (disk, true,  nil)
+func resolveLayer(s string) (storageLayer, bool, error) {
+	if s == "" {
+		return storageDisk, false, errors.New("storage key or pattern is required")
+	}
+	if hasLeadingWildcard(s) {
+		return storageDisk, false, nil
+	}
+	if naming.HasMemPrefix(s) {
+		return storageMem, true, nil
+	}
+	return storageDisk, true, nil
+}
+
+// store returns the BuntDB handle for the given layer (disk XOR mem).
+func (db *DB) store(layer storageLayer) *buntdb.DB {
+	if layer == storageMem {
+		return db.mem
+	}
+	return db.disk
+}
+
+// setOptionsForTTL returns nil for TTL<=0 (persist forever) or a buntdb
+// SetOptions instance that expires after the provided TTL.
+func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
+	if ttl <= 0 {
+		return nil
+	}
+	return &buntdb.SetOptions{Expires: true, TTL: ttl}
+}
+
+// indexJSONComposite builds a buntdb-index comparator over one or more JSON
+// paths. Single path delegates to buntdb.IndexJSON; multiple paths produce a
+// lexicographic multi-field comparator that evaluates each gjson path in order
+// and returns the first non-equal result.
+func indexJSONComposite(paths ...string) func(a, b string) bool {
+	if len(paths) == 0 {
+		panic("indexJSONComposite: at least one path is required")
+	}
+	if len(paths) == 1 {
+		return buntdb.IndexJSON(paths[0])
+	}
+	return func(a, b string) bool {
+		for _, p := range paths {
+			ra := gjson.Get(a, p)
+			rb := gjson.Get(b, p)
+			if ra.Less(rb, false) {
+				return true
+			}
+			if rb.Less(ra, false) {
+				return false
+			}
+		}
+		return false
+	}
+}
+
+// ——— Meta key read/write + registry write lifecycle ———
+
+// loadDocSpec reads the single persisted doc spec key for a storageNs.
+// exists=false means the namespace is not registered (registry fail-closed
+// invariant for typed-doc paths). Boot (loadDocSpecs) and writeDocSpec are
+// the only writers; this is the single read-path for the "exactly one live
+// version" invariant.
+func (db *DB) loadDocSpec(storageNs string) (spec docSpec, exists bool, err error) {
+	if storageNs == "" {
+		return spec, false, errors.New("loadDocSpec: storageNs is required")
+	}
+	layer, constrained, lerr := resolveLayer(storageNs)
+	if lerr != nil || !constrained {
+		return spec, false, fmt.Errorf("loadDocSpec: storageNs %q is not a concrete ns (err=%v constrained=%v)", storageNs, lerr, constrained)
+	}
+	glob := naming.DocMetaGlobFor(storageNs)
+	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
+		_ = tx.AscendKeys(glob, func(k, raw string) bool {
+			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
+				err = fmt.Errorf("loadDocSpec: %s unmarshal: %w", k, e)
+				return false
+			}
+			exists = true
+			return false
+		})
+		return nil
+	})
+	return spec, exists, err
+}
+
+// loadIdxSpec mirrors loadDocSpec for an index fullName.
+func (db *DB) loadIdxSpec(idxFullName string) (spec idxSpec, exists bool, err error) {
+	if idxFullName == "" {
+		return spec, false, errors.New("loadIdxSpec: idxFullName is required")
+	}
+	ownerNs, _, perr := naming.ParseIdxFullName(idxFullName)
+	if perr != nil {
+		return spec, false, fmt.Errorf("loadIdxSpec: %w", perr)
+	}
+	layer, constrained, lerr := resolveLayer(ownerNs)
+	if lerr != nil || !constrained {
+		return spec, false, fmt.Errorf("loadIdxSpec: ownerNs %q is not a concrete ns (err=%v constrained=%v)", ownerNs, lerr, constrained)
+	}
+	glob := naming.IdxMetaGlobFor(idxFullName)
+	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
+		_ = tx.AscendKeys(glob, func(k, raw string) bool {
+			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
+				err = fmt.Errorf("loadIdxSpec: %s unmarshal: %w", k, e)
+				return false
+			}
+			exists = true
+			return false
+		})
+		return nil
+	})
+	return spec, exists, err
+}
+
+// deleteDocSpecMeta deletes the single persisted doc meta key for storageNs
+// inside a running BuntDB tx. Exactly one live key per storageNs is the
+// invariant; if none exist the call is a no-op (the caller then decides
+// whether this is "not registered" via a pre-probe).
+//
+// Do NOT call Write operations inside AscendKeys callbacks (BuntDB iter-then-
+// write rule); doomed is collected first, then deleted in a second pass.
+func deleteDocSpecMeta(tx *buntdb.Tx, storageNs string) error {
+	var doomed []string
+	_ = tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, _ string) bool {
+		doomed = append(doomed, k)
+		return true
+	})
+	for _, k := range doomed {
+		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
+			return fmt.Errorf("deleteDocSpecMeta: %s: %w", k, e)
+		}
+	}
+	return nil
+}
+
+// deleteIdxSpecMeta mirrors deleteDocSpecMeta for an index fullName.
+func deleteIdxSpecMeta(tx *buntdb.Tx, idxFullName string) error {
+	var doomed []string
+	_ = tx.AscendKeys(naming.IdxMetaGlobFor(idxFullName), func(k, _ string) bool {
+		doomed = append(doomed, k)
+		return true
+	})
+	for _, k := range doomed {
+		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
+			return fmt.Errorf("deleteIdxSpecMeta: %s: %w", k, e)
+		}
+	}
+	return nil
+}
+
+// ——— Core writers: writeDocSpec / writeIndexSpec ———
+
+// writeDocSpec is the single entry point for doc-spec writes (REGSCH command,
+// boot registerSchemas, admin seed fixtures). Input spec carries only the
+// four user-visible x.Schema fields; Version/CreatedAt/UpdatedAt are computed
+// & stamped here internally.
+//
+// Invariants enforced:
+//   - MD5 unchanged → noop.
+//   - MD5 changed → atomic BuntDB Update(): deleteDocSpecMeta then Set the
+//     new v_<md5> meta key (so the "exactly one live version" invariant is
+//     kept within a single tx).
+//   - Only after the Update succeeds do we overwrite docRegSpec memory map
+//     under docRegMu (no partial state on disk-write failure).
+//   - CreatedAt preserved across upgrades; UpdatedAt bumped only on change.
+func (db *DB) writeDocSpec(spec docSpec) error {
+	if spec.Namespace == "" {
+		return errors.New("writeDocSpec: namespace is required")
+	}
+	if err := naming.ValidateDocLogicalNamespace(spec.Namespace); err != nil {
+		return fmt.Errorf("writeDocSpec: %w", err)
+	}
+	for i, p := range spec.KeyAttrs {
+		if p == "" {
+			return fmt.Errorf("writeDocSpec: key_attrs[%d] is empty", i)
+		}
+	}
+	storageNs := spec.StorageNs()
+	versionHex, err := canonicalDocMD5(spec)
+	if err != nil {
+		return fmt.Errorf("writeDocSpec %q: md5: %w", storageNs, err)
+	}
+	oldSpec, hadOld, err := db.loadDocSpec(storageNs)
+	if err != nil {
+		return err
+	}
+	if hadOld && oldSpec.Version == versionHex {
+		slog.Debug("writeDocSpec: unchanged fingerprint, skipping",
+			"ns", spec.Namespace, "storage_ns", storageNs, "version", versionHex)
+		return nil
+	}
+
+	now := time.Now().UTC()
+	if hadOld {
+		spec.CreatedAt = oldSpec.CreatedAt
+		spec.UpdatedAt = now
+	} else {
+		spec.CreatedAt = now
+		spec.UpdatedAt = time.Time{}
+	}
+	spec.Version = versionHex
+
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("writeDocSpec %q: marshal: %w", storageNs, err)
+	}
+	layer, constrained, lerr := resolveLayer(storageNs)
+	if lerr != nil || !constrained {
+		return fmt.Errorf("writeDocSpec %q: storage_ns is not a concrete ns (err=%v constrained=%v)", storageNs, lerr, constrained)
+	}
+	targetKey := naming.DocMetaKey(storageNs, versionHex)
+
+	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+		if err := deleteDocSpecMeta(tx, storageNs); err != nil {
+			return err
+		}
+		_, _, setErr := tx.Set(targetKey, string(raw), nil)
+		return setErr
+	}); err != nil {
+		return fmt.Errorf("writeDocSpec %q: persist %s: %w", storageNs, targetKey, err)
+	}
+
+	db.docRegMu.Lock()
+	db.docRegSpec[storageNs] = spec
+	db.docRegMu.Unlock()
+
+	if hadOld {
+		slog.Info("writeDocSpec: spec upgraded (new fingerprint)",
+			"ns", spec.Namespace, "storage_ns", storageNs,
+			"old_version", oldSpec.Version, "new_version", versionHex,
+			"created_at", spec.CreatedAt.Format(time.RFC3339Nano),
+			"updated_at", spec.UpdatedAt.Format(time.RFC3339Nano))
+	} else {
+		slog.Info("writeDocSpec: new spec persisted",
+			"ns", spec.Namespace, "storage_ns", storageNs,
+			"version", versionHex,
+			"created_at", spec.CreatedAt.Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+// writeIndexSpec mirrors writeDocSpec for indexes. Extra behaviour vs
+// writeDocSpec:
+//   - On fingerprint change (paths/order/key_pattern drift) the buntdb native
+//     btree index is dropped then re-created before the meta-key is written;
+//     the query comparator is thus always in sync with the stored meta-key.
+//   - CreateIndex happens OUTSIDE idxRegMu (btree operations are potentially
+//     expensive). The lock is held only for the final idxRegSpec map write.
+func (db *DB) writeIndexSpec(spec idxSpec) error {
+	if spec.OwnerNs == "" {
+		return errors.New("writeIndexSpec: owner_ns is required")
+	}
+	if spec.Logical == "" {
+		return errors.New("writeIndexSpec: logical is required")
+	}
+	fullName := spec.FullName()
+	if spec.KeyPattern == "" {
+		return fmt.Errorf("writeIndexSpec %q: key_pattern is required", fullName)
+	}
+	if len(spec.Paths) == 0 {
+		return fmt.Errorf("writeIndexSpec %q: at least one path is required", fullName)
+	}
+	for i, p := range spec.Paths {
+		if p == "" {
+			return fmt.Errorf("writeIndexSpec %q: paths[%d] is empty", fullName, i)
+		}
+	}
+	patternLayer, constrained, err := resolveLayer(spec.KeyPattern)
+	if err != nil {
+		return fmt.Errorf("writeIndexSpec %q: %w", fullName, err)
+	}
+	if !constrained {
+		return fmt.Errorf("writeIndexSpec %q: key_pattern cannot start with wildcard", fullName)
+	}
+
+	versionHex, err := canonicalIdxMD5(spec)
+	if err != nil {
+		return fmt.Errorf("writeIndexSpec %q: md5: %w", fullName, err)
+	}
+	oldSpec, hadOld, err := db.loadIdxSpec(fullName)
+	if err != nil {
+		return err
+	}
+	if hadOld && oldSpec.Version == versionHex {
+		slog.Debug("writeIndexSpec: unchanged fingerprint, skipping",
+			"full", fullName, "version", versionHex)
+		return nil
+	}
+
+	metaLayer, metaConstrained, metaLerr := resolveLayer(spec.OwnerNs)
+	if metaLerr != nil || !metaConstrained {
+		return fmt.Errorf("writeIndexSpec %q: owner_ns %q is not a concrete ns (err=%v constrained=%v)", fullName, spec.OwnerNs, metaLerr, metaConstrained)
+	}
+	if hadOld {
+		if err := db.store(metaLayer).DropIndex(fullName); err != nil && !errors.Is(err, buntdb.ErrNotFound) {
+			return fmt.Errorf("writeIndexSpec %q: drop prior btree: %w", fullName, err)
+		}
+	}
+	if err := db.store(patternLayer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
+		return fmt.Errorf("writeIndexSpec %q: create btree: %w", fullName, err)
+	}
+
+	now := time.Now().UTC()
+	if hadOld {
+		spec.CreatedAt = oldSpec.CreatedAt
+		spec.UpdatedAt = now
+	} else {
+		spec.CreatedAt = now
+		spec.UpdatedAt = time.Time{}
+	}
+	spec.Version = versionHex
+
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("writeIndexSpec %q: marshal: %w", fullName, err)
+	}
+	targetKey := naming.IdxMetaKey(fullName, versionHex)
+
+	if err := db.store(metaLayer).Update(func(tx *buntdb.Tx) error {
+		if err := deleteIdxSpecMeta(tx, fullName); err != nil {
+			return err
+		}
+		_, _, setErr := tx.Set(targetKey, string(raw), nil)
+		return setErr
+	}); err != nil {
+		return fmt.Errorf("writeIndexSpec %q: persist %s: %w", fullName, targetKey, err)
+	}
+
+	db.idxRegMu.Lock()
+	db.idxRegSpec[fullName] = spec
+	db.idxRegMu.Unlock()
+
+	if hadOld {
+		slog.Info("writeIndexSpec: index rebuilt (new fingerprint)",
+			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
+			"old_version", oldSpec.Version, "new_version", versionHex,
+			"paths", spec.Paths,
+			"created_at", spec.CreatedAt.Format(time.RFC3339Nano),
+			"updated_at", spec.UpdatedAt.Format(time.RFC3339Nano))
+	} else {
+		slog.Info("writeIndexSpec: new index persisted",
+			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
+			"version", versionHex, "paths", spec.Paths,
+			"created_at", spec.CreatedAt.Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+// openDB constructs a two-layer DB instance (disk file + volatile in-memory
+// layer for "_m_:" prefixed keys). Note that the "_m_:<ns>" prefix itself is
+// reserved and rejected by HasUnderscorePrefix in the checker layer (above the
+// storage layer) — the store simply routes; the semantic gate lives in
+// checker.go / cmd.go handlers.
+func openDB(path string) *DB {
+	if path == "" {
+		slog.Error("failed to open storage", "error", "db path is required")
+		return nil
+	}
+	if path == ":memory:" {
+		slog.Error("failed to open storage", "path", path, "error", `db path must be a file path; ":memory:" is reserved for buntdb in-memory mode`)
+		return nil
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		slog.Error("failed to open storage", "path", path, "error", "db path must be a file path, not a directory")
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Error("failed to create db directory", "path", path, "error", err)
+		return nil
+	}
+
+	disk, err := buntdb.Open(path)
+	if err != nil {
+		slog.Error("failed to open buntdb", "path", path, "error", err)
+		return nil
+	}
+
+	mem, err := buntdb.Open(":memory:")
+	if err != nil {
+		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
+		_ = disk.Close()
+		return nil
+	}
+
+	return &DB{
+		disk:       disk,
+		mem:        mem,
+		docRegSpec: map[string]docSpec{},
+		idxRegSpec: map[string]idxSpec{},
+	}
+}
+
+// registerIndexes converts one or more x.Index values into idxSpec and
+// delegates to writeIndexSpec (see writeIndexSpec for the MD5-fingerprint +
+// btree lifecycle). Used by: REGIDX cmd, CreateIndex alias and boot fixtures.
+func (db *DB) registerIndexes(indexes ...x.Index) error {
+	for _, idx := range indexes {
+		fullName := idx.Name()
+		if fullName == "" {
+			return fmt.Errorf("index name is required")
+		}
+		ownerNs, logical, err := naming.ParseIdxFullName(fullName)
+		if err != nil {
+			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
+		}
+		spec := idxSpec{
+			OwnerNs:    ownerNs,
+			Logical:    logical,
+			KeyPattern: idx.KeyPattern(),
+			Paths:      idx.Paths(),
+		}
+		if err := db.writeIndexSpec(spec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadIndexes scans disk+mem layers for persisted idx meta keys and mounts
+// every idxSpec found. Intentionally runs BEFORE serving begins (openDB →
+// StartWithConfig bootstrap). Caller holds idxRegMu for the entire pass.
+//
+// The "no multi-version" invariant applies here: writeIndexSpec always
+// deletes the prior meta key before writing the new one, so AscendKeys only
+// ever returns 0 or 1 matches per fullName; there is no version-priority
+// dedup step because it cannot happen.
+func (db *DB) loadIndexes() error {
+	type kv struct {
+		metaKey string
+		raw     string
+	}
+	patterns := []struct {
+		layer storageLayer
+		glob  string
+	}{
+		{layer: storageDisk, glob: naming.IdxMetaGlob()},
+		{layer: storageMem, glob: naming.IdxMetaGlob()},
+	}
+	db.idxRegMu.Lock()
+	defer db.idxRegMu.Unlock()
+	for _, p := range patterns {
+		var collected []kv
+		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
+				collected = append(collected, kv{metaKey: metaKey, raw: value})
+				return true
+			})
+		})
+		if err != nil {
+			return err
+		}
+		for _, c := range collected {
+			var spec idxSpec
+			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
+				return fmt.Errorf("index %s: unmarshal idxSpec: %w", c.metaKey, err)
+			}
+			if spec.OwnerNs == "" || spec.Logical == "" {
+				return fmt.Errorf("index %s: missing owner_ns/logical", c.metaKey)
+			}
+			fullName := spec.FullName()
+			layer, constrained, err := resolveLayer(spec.KeyPattern)
+			if err != nil {
+				return fmt.Errorf("index %s: %w", fullName, err)
+			}
+			if !constrained {
+				return fmt.Errorf("index %s: key_pattern cannot start with wildcard", fullName)
+			}
+			if len(spec.Paths) == 0 {
+				return fmt.Errorf("index %s: at least one json path is required", fullName)
+			}
+			if err := db.store(layer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
+				return fmt.Errorf("index %s: create btree: %w", fullName, err)
+			}
+			db.idxRegSpec[fullName] = spec
+		}
+	}
+	slog.Debug("index registry loaded", "count", len(db.idxRegSpec))
+	return nil
+}
+
+// loadDocSpecs mirrors loadIndexes for the doc-spec registry. Same "exactly-
+// one-version-per-storageNs invariant applies; AscendKeys dedup step is unnecessary.
+func (db *DB) loadDocSpecs() error {
+	type kv struct {
+		metaKey string
+		raw     string
+	}
+	patterns := []struct {
+		layer storageLayer
+		glob  string
+	}{
+		{layer: storageDisk, glob: naming.DocMetaGlob()},
+		{layer: storageMem, glob: naming.DocMetaGlob()},
+	}
+	db.docRegMu.Lock()
+	defer db.docRegMu.Unlock()
+	for _, p := range patterns {
+		var collected []kv
+		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
+				collected = append(collected, kv{metaKey: metaKey, raw: value})
+				return true
+			})
+		})
+		if err != nil {
+			return err
+		}
+		for _, c := range collected {
+			var spec docSpec
+			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
+				return fmt.Errorf("doc %s: unmarshal docSpec: %w", c.metaKey, err)
+			}
+			if spec.Namespace == "" {
+				return fmt.Errorf("doc %s: empty namespace", c.metaKey)
+			}
+			db.docRegSpec[spec.StorageNs()] = spec
+		}
+	}
+	slog.Debug("doc registry loaded", "count", len(db.docRegSpec))
+	return nil
+}
+
+// registerSchemas converts x.Schema values into docSpec and delegates to
+// writeDocSpec (the single persistence entry point). Used by: REGSCH cmd,
+// boot fixtures. x.Schema only provides the 4 user-visible fields; the 3
+// internal fields (Version/CreatedAt/UpdatedAt) are stamped inside
+// writeDocSpec.
+func (db *DB) registerSchemas(schemas ...x.Schema) error {
+	for _, sch := range schemas {
+		spec := docSpec{
+			Namespace: sch.Namespace(),
+			Mem:       sch.Mem(),
+			KeyAttrs:  append([]string(nil), sch.KeyAttrs()...),
+			TTL:       sch.TTL(),
+		}
+		if err := db.writeDocSpec(spec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ——— Key-range iteration + apply pipeline ———
 
 func withLimit(limit int, fn func(key, value string) bool) func(key, value string) bool {
 	if limit <= 0 {
@@ -1324,11 +1394,27 @@ func applyKeyRange(tx *buntdb.Tx, kr x.KeyRange, dir x.RangeDirection, fn func(k
 	panic("applyKeyRange: unhandled KeyRangeKind " + kind.String())
 }
 
-// ============================================================
-// Internal helpers for atomic batched writes + index drop.
-// Batch atomicity enforces single storage layer (disk XOR mem).
-// ============================================================
+// ——— Registry drop + atomic batched writes ———
+//
+// Registry-drop semantics:
+//   - DROPIDX = dropIndexByFullName (deletes btree handle + idx meta key +
+//     idxRegSpec map entry; coarse idxRegMu lock held for the entire op,
+//     symmetric with DROPSCH).
+//   - DROPSCH = dropSchemaByLogicalNs. Extra guard vs DROPIDX: attached
+//     index check — any idxRegSpec ownerNs matching logicalNs (disk XOR mem)
+//     → hard ERR listing the names, caller must DROPIDX first.
+//
+// Batch atomicity invariants (setBatchAtomic / deleteBatchAtomic):
+//   - All keys in one batch target the SAME storage layer (disk XOR mem),
+//     i.e. the caller already ensured a consistent Mem flag across payloads.
+//   - The whole batch runs inside a single BuntDB Update tx; any sub-error
+//     aborts the tx so no half-written state survives.
 
+// dropIndexByFullName is the DROPIDX command implementation (1 arg = fullName
+// or 2 args = ownerNs + logical, resolved in cmd.go dropIdxCommand). idxRegMu
+// is held for the entire op (spec read → btree DropIndex → meta probe/delete
+// → map delete). Admin ops are low frequency so coarse lock scope keeps the
+// reasoning symmetric with DROPSCH.
 func (db *DB) dropIndexByFullName(fullName string) error {
 	if db == nil {
 		return errors.New("dropIndexByFullName: db is nil")
@@ -1340,7 +1426,14 @@ func (db *DB) dropIndexByFullName(fullName string) error {
 	if err != nil {
 		return fmt.Errorf("dropIndexByFullName: %w", err)
 	}
-	layer := layerForStorageNs(ownerNs)
+	layer, constrained, lerr := resolveLayer(ownerNs)
+	if lerr != nil || !constrained {
+		return fmt.Errorf("dropIndexByFullName: ownerNs %q is not a concrete ns (err=%v constrained=%v)", ownerNs, lerr, constrained)
+	}
+	// Symmetric with dropSchemaByLogicalNs: acquire the registry write-lock up
+	// front for the entire operation (spec lookup → btree DropIndex → meta
+	// probe/delete → map delete). Admin registry ops are low frequency so the
+	// coarse lock scope keeps reasoning simple and symmetric with DROPSCH.
 	db.idxRegMu.Lock()
 	defer db.idxRegMu.Unlock()
 	spec, ok := db.idxRegSpec[fullName]
@@ -1351,22 +1444,22 @@ func (db *DB) dropIndexByFullName(fullName string) error {
 		return fmt.Errorf("dropIndexByFullName: drop btree: %w", err)
 	}
 	glob := naming.IdxMetaGlobFor(fullName)
-	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
-		var keys []string
-		if err := tx.AscendKeys(glob, func(k, _ string) bool {
-			keys = append(keys, k)
-			return true
-		}); err != nil {
-			return err
-		}
-		for _, k := range keys {
-			if _, delErr := tx.Delete(k); delErr != nil && !errors.Is(delErr, buntdb.ErrNotFound) {
-				return delErr
-			}
-		}
+	hasAnyMeta := false
+	if err := db.store(layer).View(func(tx *buntdb.Tx) error {
+		_ = tx.AscendKeys(glob, func(_, _ string) bool {
+			hasAnyMeta = true
+			return false
+		})
 		return nil
 	}); err != nil {
-		return fmt.Errorf("dropIndexByFullName: delete %s meta: %w", fullName, err)
+		return fmt.Errorf("dropIndexByFullName: probe %s meta: %w", fullName, err)
+	}
+	if hasAnyMeta {
+		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
+			return deleteIdxSpecMeta(tx, fullName)
+		}); err != nil {
+			return fmt.Errorf("dropIndexByFullName: delete %s meta: %w", fullName, err)
+		}
 	}
 	delete(db.idxRegSpec, fullName)
 	slog.Debug("index dropped",
@@ -1375,6 +1468,11 @@ func (db *DB) dropIndexByFullName(fullName string) error {
 	return nil
 }
 
+// dropSchemaByLogicalNs is the DROPSCH command implementation. It checks for
+// attached indexes first (hard ERR with names when count>0; caller drops them
+// via DROPIDX first), then deletes meta keys + docRegSpec entries on disk
+// AND mem layers (both candidates probed). Coarse docRegMu lock is held for
+// the candidates loop (symmetric with DROPIDX).
 func (db *DB) dropSchemaByLogicalNs(logicalNs string) error {
 	if db == nil {
 		return errors.New("dropSchemaByLogicalNs: db is nil")
@@ -1413,25 +1511,20 @@ func (db *DB) dropSchemaByLogicalNs(logicalNs string) error {
 	defer db.docRegMu.Unlock()
 	anyFound := false
 	for _, cand := range candidates {
-		glob := naming.DocMetaGlobFor(cand.storageNs)
-		var metaKeys []string
+		foundOnLayer := false
 		if viewErr := db.store(cand.layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(glob, func(k, _ string) bool {
-				metaKeys = append(metaKeys, k)
-				return true
+			_ = tx.AscendKeys(naming.DocMetaGlobFor(cand.storageNs), func(_, _ string) bool {
+				foundOnLayer = true
+				return false
 			})
+			return nil
 		}); viewErr != nil {
-			return fmt.Errorf("dropSchemaByLogicalNs: scan %s meta: %w", cand.storageNs, viewErr)
+			return fmt.Errorf("dropSchemaByLogicalNs: probe %s meta: %w", cand.storageNs, viewErr)
 		}
-		if len(metaKeys) > 0 {
+		if foundOnLayer {
 			anyFound = true
 			if upErr := db.store(cand.layer).Update(func(tx *buntdb.Tx) error {
-				for _, k := range metaKeys {
-					if _, delErr := tx.Delete(k); delErr != nil && !errors.Is(delErr, buntdb.ErrNotFound) {
-						return delErr
-					}
-				}
-				return nil
+				return deleteDocSpecMeta(tx, cand.storageNs)
 			}); upErr != nil {
 				return fmt.Errorf("dropSchemaByLogicalNs: delete %s meta: %w", cand.storageNs, upErr)
 			}
@@ -1448,21 +1541,28 @@ func (db *DB) dropSchemaByLogicalNs(logicalNs string) error {
 	return nil
 }
 
-type batchedWrite struct {
-	Key   string
-	Value string
-	TTL   time.Duration
-}
-
-var errNxPreconditionFailed = errors.New("setBatchAtomic: nx precondition failed — one or more keys already exist")
-
+// setBatchAtomic writes many (Key, Value, TTL) tuples inside a SINGLE BuntDB
+// Update tx so either all tuples commit or none do. Used by cmd.go
+// setCommand/setExCommand/setNxCommand for doc-path multi-JSON mode.
+//
+// Enforced invariants:
+//   - One storage layer only (disk XOR mem) — if the batch mixes "_m_:" keys
+//     with regular keys the caller gets a "cannot span storage layers" ERR.
+//   - No duplicate keys within a single batch (pk collision on doc-path same
+//     namespace).
+//   - nxMode=true (SETNX): ALL keys must be not-found before this call; any
+//     single existing key → errNxPreconditionFailed (SETNX all-or-nothing
+//     semantics, cmd.go returns integer count of actually-set keys = 0).
 func (db *DB) setBatchAtomic(batch []batchedWrite, nxMode bool) (int, error) {
 	if len(batch) == 0 {
 		return 0, nil
 	}
 	layers := make(map[storageLayer][]batchedWrite, 2)
 	for _, w := range batch {
-		l := layerForKey(w.Key)
+		l, constrained, lerr := resolveLayer(w.Key)
+		if lerr != nil || !constrained {
+			return 0, fmt.Errorf("setBatchAtomic: key %q is not a concrete key (err=%v constrained=%v)", w.Key, lerr, constrained)
+		}
 		layers[l] = append(layers[l], w)
 	}
 	if len(layers) != 1 {
@@ -1513,13 +1613,23 @@ func (db *DB) setBatchAtomic(batch []batchedWrite, nxMode bool) (int, error) {
 	return applied, nil
 }
 
+// deleteBatchAtomic deletes many keys inside a single BuntDB Update tx
+// (all-or-nothing). Used by cmd.go delCommand for doc-path multi-pk mode:
+// `DEL <registered-ns> <pk1> [pk2 …]`.
+//
+// Same invariants as setBatchAtomic: single storage layer, no duplicate keys
+// within the batch. The "KV-path multi-DEL forbidden" guard (argc≥3 +
+// classifyArg1(arg1) has ':') is enforced above this in cmd.go delCommand.
 func (db *DB) deleteBatchAtomic(keys []string) (int, error) {
 	if len(keys) == 0 {
 		return 0, nil
 	}
 	layers := make(map[storageLayer][]string, 2)
 	for _, k := range keys {
-		l := layerForKey(k)
+		l, constrained, lerr := resolveLayer(k)
+		if lerr != nil || !constrained {
+			return 0, fmt.Errorf("deleteBatchAtomic: key %q is not a concrete key (err=%v constrained=%v)", k, lerr, constrained)
+		}
 		layers[l] = append(layers[l], k)
 	}
 	if len(layers) != 1 {

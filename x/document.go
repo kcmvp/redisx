@@ -615,7 +615,7 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 // ------------------------------------------------------------
 // Rule: arg1 is the raw full storage key. No JSON parsing, no registry
 // lookup, zero introspection. The key is routed to mem or disk purely
-// by the "_m_:" prefix (via layerForKey).
+// by the "_m_:" prefix (via resolveLayer).
 //
 // ADDITIONAL USER RULE: Every KV full key MUST contain ':' somewhere
 // (enforced by validateKVFullKey at the command gate). A bare no-colon
