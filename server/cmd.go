@@ -261,6 +261,45 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 	}
 
 	if err := acquireAuthConn(db, providedKey); err == nil {
+		// If the provided AUTH key is a port-role-bound key (exists in EITHER
+		// the app or ctrl accept sets), immediately validate that it matches the role
+		// of the listener the client connected to. This is fail-fast, so that
+		// a connection dialed to the app port with a ctrl-only key gets
+		// WRONGPASS on AUTH itself rather than only on the next command.
+		// External limit keys and IPC keys (values not in EITHER set) continue
+		// to pass through without role validation here.
+		appValues, ctrlValues, defaultApp, defaultCtrl, lerr := loadAllAuthPortKeys(db)
+		if lerr == nil && (len(appValues) > 0 || len(ctrlValues) > 0) {
+			_, inApp := appValues[providedKey]
+			_, inCtrl := ctrlValues[providedKey]
+			if inApp || inCtrl {
+				role := connPortRole(conn)
+				switch role {
+				case portRoleApp:
+					if !inApp {
+						msg := "WRONGPASS invalid or wrong auth key for app port"
+						if defaultCtrl != "" && providedKey == defaultCtrl {
+							msg += " (looks like you supplied the ctrl_0 key to the app port)"
+						}
+						conn.WriteError(msg)
+						slog.Warn("AUTH role mismatch: ctrl-only key provided on app port, rejected", "remote", conn.RemoteAddr(), "auth_key", providedKey)
+						_ = conn.Close()
+						return
+					}
+				case portRoleCtrl:
+					if !inCtrl {
+						msg := "WRONGPASS invalid or wrong auth key for ctrl port"
+						if defaultApp != "" && providedKey == defaultApp {
+							msg += " (looks like you supplied the app_0 key to the ctrl port)"
+						}
+						conn.WriteError(msg)
+						slog.Warn("AUTH role mismatch: app-only key provided on ctrl port, rejected", "remote", conn.RemoteAddr(), "auth_key", providedKey)
+						_ = conn.Close()
+						return
+					}
+				}
+			}
+		}
 		conn.SetContext(providedKey)
 		conn.WriteString("OK")
 		slog.Info("connection authenticated", "remote", conn.RemoteAddr(), "auth_key", providedKey)

@@ -35,6 +35,11 @@ const (
 	storageMem
 )
 
+const (
+	installedAppAuth  = "app_0"
+	installedCtrlAuth = "ctrl_0"
+)
+
 // docSpec stores a single registered typed-document schema (the server-
 // internal enriched version of x.Schema). It always contains exactly one live
 // copy per storageNs (the "no multi-version" invariant). The three internal
@@ -142,6 +147,28 @@ func (db *DB) RawMem() *buntdb.DB {
 	return db.mem
 }
 
+// EffectiveAuthKeys returns the two effective port-role-bound auth keys that
+// are persisted on disk under `_auth_:app_0` and `_auth_:ctrl_0`. These are
+// the keys printed on the bootstrap banner whenever any slot was generated.
+// Empty strings are returned for slots that have not been written yet
+// (should never happen after a successful StartWithConfig bootstrap).
+// SSoT = direct DB read from `_auth_` namespace, no in-memory cache.
+func (db *DB) EffectiveAuthKeys() (app_0, ctrl_0 string) {
+	if db == nil || db.disk == nil {
+		return "", ""
+	}
+	_ = db.disk.View(func(tx *buntdb.Tx) error {
+		if v, err := tx.Get(naming.AuthStorageKey(installedAppAuth)); err == nil {
+			app_0 = v
+		}
+		if v, err := tx.Get(naming.AuthStorageKey(installedCtrlAuth)); err == nil {
+			ctrl_0 = v
+		}
+		return nil
+	})
+	return app_0, ctrl_0
+}
+
 // Close closes both storage layers and returns the first error, if any.
 func (db *DB) Close() error {
 	var firstErr error
@@ -185,8 +212,8 @@ func (db *DB) bootstrapAuth(seedApp, seedCtrl string) (finalApp, finalCtrl strin
 	if db == nil || db.disk == nil {
 		return "", "", false, fmt.Errorf("bootstrapAuth: storage not initialised")
 	}
-	appKey := naming.AuthStorageKey("app_0")
-	ctrlKey := naming.AuthStorageKey("ctrl_0")
+	appKey := naming.AuthStorageKey(installedAppAuth)
+	ctrlKey := naming.AuthStorageKey(installedCtrlAuth)
 
 	var storedApp, storedCtrl string
 	err = db.disk.View(func(tx *buntdb.Tx) error {

@@ -195,7 +195,7 @@ func TestBootstrapAuth_Case2_4_PersistedNoSeeds(t *testing.T) {
 func TestBootstrapAuth_Case2_1_AppSeedOverwrite(t *testing.T) {
 	// App=Y ctrl=N → overwrite app slot, ctrl stays persisted; no generation (ctrl already had value).
 	db := mustOpenDB(t, mustTempDBFile(t, "c2-1"))
-	a0, c0, _, err1 := db.bootstrapAuth("", "")
+	_, c0, _, err1 := db.bootstrapAuth("", "")
 	if err1 != nil {
 		t.Fatalf("first err: %v", err1)
 	}
@@ -218,7 +218,7 @@ func TestBootstrapAuth_Case2_1_AppSeedOverwrite(t *testing.T) {
 func TestBootstrapAuth_Case2_2_CtrlSeedOverwrite(t *testing.T) {
 	// App=N ctrl=Y → overwrite ctrl, app unchanged; anyGenerated=false.
 	db := mustOpenDB(t, mustTempDBFile(t, "c2-2"))
-	a0, c0, _, err1 := db.bootstrapAuth("", "")
+	a0, _, _, err1 := db.bootstrapAuth("", "")
 	if err1 != nil {
 		t.Fatalf("first err: %v", err1)
 	}

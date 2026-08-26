@@ -86,8 +86,8 @@ func loadAllAuthPortKeys(db *DB) (appValues, ctrlValues map[string]struct{}, def
 	}
 	appPrefix := naming.AuthStorageKey("app_")
 	ctrlPrefix := naming.AuthStorageKey("ctrl_")
-	app0 := naming.AuthStorageKey("app_0")
-	ctrl0 := naming.AuthStorageKey("ctrl_0")
+	app0 := naming.AuthStorageKey(installedAppAuth)
+	ctrl0 := naming.AuthStorageKey(installedCtrlAuth)
 	appValues = map[string]struct{}{}
 	ctrlValues = map[string]struct{}{}
 	terr := db.disk.View(func(tx *buntdb.Tx) error {
@@ -154,13 +154,20 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 	if authedKey == "" {
 		return false
 	}
+	// If the key the client used for AUTH does NOT match ANY port-role-bound
+	// value set (i.e. it's an external limit-based key or a legacy key), we
+	// don't enforce role binding via gate2 (role binding is for _auth_:app_N /
+	// ctrl_N values only). In that case let the request through and let later
+	// gates (command-word, mtls, internal write-guard) enforce if needed.
+	_, inApp := appValues[authedKey]
+	_, inCtrl := ctrlValues[authedKey]
+	if !inApp && !inCtrl {
+		return false
+	}
 	role := connPortRole(conn)
 	switch role {
 	case portRoleApp:
-		if len(appValues) == 0 {
-			return false
-		}
-		if _, ok := appValues[authedKey]; !ok {
+		if !inApp {
 			slog.Warn("Gate2 reject: app-port conn authenticated with wrong-role key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
 			msg := "WRONGPASS invalid or wrong auth key for app port"
@@ -171,10 +178,7 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 			return true
 		}
 	case portRoleCtrl:
-		if len(ctrlValues) == 0 {
-			return false
-		}
-		if _, ok := ctrlValues[authedKey]; !ok {
+		if !inCtrl {
 			slog.Warn("Gate2 reject: ctrl-port conn authenticated with wrong-role key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
 			msg := "WRONGPASS invalid or wrong auth key for ctrl port"

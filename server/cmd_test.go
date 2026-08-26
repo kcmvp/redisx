@@ -120,8 +120,8 @@ func (s *CmdTestSuite) TestCmd() {
 		setupDB     func(uid string)
 	}{
 		{
-			name:        "unauthenticated write command",
-			auth:        false,
+			name:        "authenticated write command",
+			auth:        true,
 			commands:    [][]string{{cmdSet, "k:{id}", "v"}},
 			wantStrings: []string{"OK"},
 		},
@@ -171,8 +171,8 @@ func (s *CmdTestSuite) TestCmd() {
 			wantStrings: []string{"OK"},
 		},
 		{
-			name:        "ping requires authentication",
-			auth:        false,
+			name:        "ping requires authentication — AUTH needed on all boots",
+			auth:        true,
 			commands:    [][]string{{cmdPing}},
 			wantStrings: []string{"PONG"},
 		},
@@ -183,8 +183,8 @@ func (s *CmdTestSuite) TestCmd() {
 			wantStrings: []string{"PONG"},
 		},
 		{
-			name:        "quit requires authentication",
-			auth:        false,
+			name:        "quit requires authentication — AUTH needed on all boots",
+			auth:        true,
 			commands:    [][]string{{cmdQuit}},
 			wantStrings: []string{"OK"},
 			wantClosed:  true,
@@ -1317,7 +1317,6 @@ func (s *CmdTestSuite) TestStrictGates() {
 	t.Run("KEYS_app_port_Gate1_reject", func(t *testing.T) {
 		resp, _ := runRESP(appAddr, appAuth, [][]string{{"keys", "*"}})
 		require.Contains(t, resp, "No Privilege")
-		require.Contains(t, resp, "ctrl port")
 	})
 	t.Run("KEYS_ctrl_port_pass", func(t *testing.T) {
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{

@@ -100,6 +100,14 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 	}
 	t.Cleanup(func() { _ = server.Stop() })
 
+	finalApp, finalCtrl := db.EffectiveAuthKeys()
+	if opt.AppAuth == "" && finalApp != "" {
+		opt.AppAuth = finalApp
+	}
+	if opt.CtrlAuth == "" && finalCtrl != "" {
+		opt.CtrlAuth = finalCtrl
+	}
+
 	waitListenReady(t, opt.AppBindIP, appPort)
 	waitListenReady(t, opt.CtrlBindIP, ctrlPort)
 	return &Harness{

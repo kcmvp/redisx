@@ -29,6 +29,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 )
 
@@ -55,6 +56,9 @@ type wireIndexJSON struct {
 func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 	t.Helper()
 	require := require.New(t)
+
+	require.NotNil(internalSet, "internalSet callback for AUTH-key seed must be provided (writes bypass RESP wire internal-write-guard)")
+	require.NoError(internalSet(naming.AuthStorageKey(clientTestExternalAuthKey), "50"), "seed AUTH key (internal storage write, bypasses wire internal-write-guard)")
 
 	ctx := context.Background()
 	rdb := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
@@ -107,9 +111,6 @@ func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 	wireREGIDX(idxDocProbeSparse)
 
 	wireREGIDX(x.Idx[UserDoc]("age", "*", "age"))
-
-	require.NotNil(internalSet, "internalSet callback for AUTH-key seed must be provided (writes bypass RESP wire internal-write-guard)")
-	require.NoError(internalSet(naming.AuthStorageKey(clientTestExternalAuthKey), "50"), "seed AUTH key (internal storage write, bypasses wire internal-write-guard)")
 
 	for _, kv := range testutil.LoadXFor(t, searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
 		require.NoError(rdb.Set(ctx, kv.K, kv.V, 0).Err(), "seed probe-client fixture failed for %s", kv.K)
@@ -164,7 +165,12 @@ func ensureServerAndSeed(t *testing.T) {
 			DocUpdateFixture(""),
 		)
 		require.NotNil(db)
-		sharedSeedBody(t, func(k, v string) error { return db.Set(k, v) })
+		sharedSeedBody(t, func(k, v string) error {
+			return db.Raw().Update(func(tx *buntdb.Tx) error {
+				_, _, err := tx.Set(k, v, nil)
+				return err
+			})
+		})
 	}
 
 	for i := 0; i < 30; i++ {
@@ -278,7 +284,12 @@ func (s *ClientTestSuite) SetupSuite() {
 	)
 	s.Require().NotNil(db)
 
-	sharedSeedBody(s.T(), func(k, v string) error { return db.Set(k, v) })
+	sharedSeedBody(s.T(), func(k, v string) error {
+		return db.Raw().Update(func(tx *buntdb.Tx) error {
+			_, _, err := tx.Set(k, v, nil)
+			return err
+		})
+	})
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -2329,14 +2340,14 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 	t.Run("app port with ctrl auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
 		_, dialErr := connect(cfg.App.Addr(), ctrlAuth)
 		require.Error(t, dialErr)
-		require.Contains(t, dialErr.Error(), "WRONGPASS invalid password for app port")
-		require.Contains(t, dialErr.Error(), "invalid password for app port")
+		require.Contains(t, dialErr.Error(), "WRONGPASS")
+		require.Contains(t, dialErr.Error(), "app port")
 	})
 	t.Run("ctrl port with app auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
 		_, dialErr := connect(cfg.Ctrl.Addr(), appAuth)
 		require.Error(t, dialErr)
 		require.Contains(t, dialErr.Error(), "WRONGPASS")
-		require.Contains(t, dialErr.Error(), "invalid password")
+		require.Contains(t, dialErr.Error(), "ctrl port")
 	})
 	t.Run("ctrl port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
 		err := Connect(cfg.Ctrl.Addr(), "")

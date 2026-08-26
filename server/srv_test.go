@@ -828,9 +828,10 @@ func (s *ServerTestSuite) TestAppPortHasNoAuthNsPrivilege() {
 	}
 
 	// Spot check: non-_auth_ key still works normally on app port (sanity
-	// guard: we didn't accidentally block every GET/SET).
-	_ = rawCmd(t, appConn, 250*time.Millisecond, "SET", "user-k", "hello")
-	getResp := rawCmd(t, appConn, 250*time.Millisecond, "GET", "user-k")
+	// guard: we didn't accidentally block every GET/SET). Keys must contain
+	// a namespace colon separator per KV key policy.
+	_ = rawCmd(t, appConn, 250*time.Millisecond, "SET", "appns:user-k", "hello")
+	getResp := rawCmd(t, appConn, 250*time.Millisecond, "GET", "appns:user-k")
 	if !strings.Contains(getResp, "hello") {
 		t.Fatalf("expected app-port plain GET/SET to work normally, got %q", getResp)
 	}
@@ -920,8 +921,11 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: app0Auth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrl0Auth},
 	}
-	db, ok := setupDB(cfg.DataPath, cfg.Schemas)
-	s.Require().True(ok)
+	db := StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil")
+	}
+	defer func() { _ = Stop() }()
 
 	// —— Seed extra account-1 slots directly via Raw disk layer.
 	//    (Ctrl-only operational operation; the app port would hit No
@@ -935,64 +939,42 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 	seedBootstrapAuthKV(t, db, app1Slot, app1Auth)
 	seedBootstrapAuthKV(t, db, ctrl1Slot, ctrl1Auth)
 
-	svc, err := StartWithConfig(cfg)
-	if err != nil {
-		t.Fatalf("StartWithConfig: %v", err)
-	}
-	defer func() { _ = svc.Stop() }()
-
-	// Helper: raw AUTH + immediately run a single plain PING and return the
-	// concatenated AUTH + PING raw RESP output. We split + inspect them.
-	authThenPing := func(net *net.TCPConn, auth string) (authResp, pingResp string) {
+	// Helper: dials TCP, issues AUTH then, if AUTH succeeded (reply contained
+	// +OK), issues a single plain PING. If AUTH failed (server replied with
+	// an error and closed the connection) we skip the PING step to avoid
+	// reading EOF on a closed socket.
+	authThenPing := func(dialAddr, auth string) (authResp, pingResp string) {
 		t.Helper()
-		raw := ""
-		if strings.ToUpper(auth) != "<empty>" {
-			raw += rawCmd(t, net, 300*time.Millisecond, "AUTH", auth)
+		n, derr := net.Dial("tcp", dialAddr)
+		s.Require().NoError(derr)
+		defer func() { _ = n.Close() }()
+		ar := rawCmd(t, n, 300*time.Millisecond, "AUTH", auth)
+		authResp = ar
+		if strings.Contains(ar, "+OK") {
+			pingResp = rawCmd(t, n, 300*time.Millisecond, "PING")
 		}
-		return raw, rawCmd(t, net, 300*time.Millisecond, "PING")
+		return authResp, pingResp
 	}
 
-	appDial := func() *net.TCPConn {
-		n, derr := net.Dial("tcp", cfg.App.Addr())
-		s.Require().NoError(derr)
-		return n.(*net.TCPConn)
-	}
-	ctrlDial := func() *net.TCPConn {
-		n, derr := net.Dial("tcp", cfg.Ctrl.Addr())
-		s.Require().NoError(derr)
-		return n.(*net.TCPConn)
-	}
-
-	// Case 1a — app port, AUTH with ctrl0 → WRONGPASS on next PING
+	// Case 1a — app port, AUTH with ctrl0 → AUTH itself returns WRONGPASS
+	// (fail-fast: AUTH command checks role binding, not delayed to first cmd).
 	{
-		c := appDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, ctrl0Auth)
-		if !strings.Contains(authR, "+OK") {
-			t.Fatalf("[app/ctrl0-auth] AUTH response = %q want +OK (AUTH itself doesn't gate role)", authR)
-		}
-		if !strings.Contains(pingR, "WRONGPASS") {
-			t.Fatalf("[app/ctrl0-auth] next PING = %q want substring WRONGPASS", pingR)
+		authR, _ := authThenPing(cfg.App.Addr(), ctrl0Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl0-auth] AUTH response = %q want substring WRONGPASS", authR)
 		}
 	}
-	// Case 1b — ctrl port, AUTH with app0 → WRONGPASS on next PING
+	// Case 1b — ctrl port, AUTH with app0 → AUTH itself returns WRONGPASS
 	{
-		c := ctrlDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, app0Auth)
-		if !strings.Contains(authR, "+OK") {
-			t.Fatalf("[ctrl/app0-auth] AUTH response = %q want +OK", authR)
-		}
-		if !strings.Contains(pingR, "WRONGPASS") {
-			t.Fatalf("[ctrl/app0-auth] next PING = %q want substring WRONGPASS", pingR)
+		authR, _ := authThenPing(cfg.Ctrl.Addr(), app0Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app0-auth] AUTH response = %q want substring WRONGPASS", authR)
 		}
 	}
 
 	// Case 2a — app port with correct app0 AUTH → PING returns PONG
 	{
-		c := appDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, app0Auth)
+		authR, pingR := authThenPing(cfg.App.Addr(), app0Auth)
 		if !strings.Contains(authR, "+OK") {
 			t.Fatalf("[app/app0-auth] AUTH = %q want +OK", authR)
 		}
@@ -1002,9 +984,7 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 	}
 	// Case 2b — ctrl port with correct ctrl0 AUTH → PING returns PONG
 	{
-		c := ctrlDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, ctrl0Auth)
+		authR, pingR := authThenPing(cfg.Ctrl.Addr(), ctrl0Auth)
 		if !strings.Contains(authR, "+OK") {
 			t.Fatalf("[ctrl/ctrl0-auth] AUTH = %q want +OK", authR)
 		}
@@ -1013,12 +993,11 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 		}
 	}
 
-	// Case 3a — account 1 app key on app port → PONG good; same key on ctrl
-	// port → next PING = WRONGPASS
+	// Case 3a — account 1 app key on app port → AUTH +OK then PING +PONG;
+	// same key on ctrl port → AUTH itself returns WRONGPASS (fail-fast role
+	// match inside AUTH command, same as Case 1).
 	{
-		c := appDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, app1Auth)
+		authR, pingR := authThenPing(cfg.App.Addr(), app1Auth)
 		if !strings.Contains(authR, "+OK") {
 			t.Fatalf("[app/app1-auth] AUTH = %q want +OK", authR)
 		}
@@ -1027,22 +1006,15 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 		}
 	}
 	{
-		c := ctrlDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, app1Auth)
-		if !strings.Contains(authR, "+OK") {
-			t.Fatalf("[ctrl/app1-auth] AUTH = %q want +OK (acquireAuthConn should match _auth_:app_*)", authR)
-		}
-		if !strings.Contains(pingR, "WRONGPASS") {
-			t.Fatalf("[ctrl/app1-auth] PING = %q want WRONGPASS — app1 slot only valid on app port", pingR)
+		authR, _ := authThenPing(cfg.Ctrl.Addr(), app1Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app1-auth] AUTH = %q want substring WRONGPASS — app1 slot only valid on app port", authR)
 		}
 	}
-	// Case 3b — account 1 ctrl key on ctrl port → PONG good; same key on app
-	// port → next PING = WRONGPASS
+	// Case 3b — account 1 ctrl key on ctrl port → AUTH +OK then PING +PONG;
+	// same key on app port → AUTH itself returns WRONGPASS (fail-fast).
 	{
-		c := ctrlDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, ctrl1Auth)
+		authR, pingR := authThenPing(cfg.Ctrl.Addr(), ctrl1Auth)
 		if !strings.Contains(authR, "+OK") {
 			t.Fatalf("[ctrl/ctrl1-auth] AUTH = %q want +OK", authR)
 		}
@@ -1051,14 +1023,9 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 		}
 	}
 	{
-		c := appDial()
-		defer func() { _ = c.Close() }()
-		authR, pingR := authThenPing(c, ctrl1Auth)
-		if !strings.Contains(authR, "+OK") {
-			t.Fatalf("[app/ctrl1-auth] AUTH = %q want +OK (acquireAuthConn should match _auth_:ctrl_*)", authR)
-		}
-		if !strings.Contains(pingR, "WRONGPASS") {
-			t.Fatalf("[app/ctrl1-auth] PING = %q want WRONGPASS — ctrl1 slot only valid on ctrl port", pingR)
+		authR, _ := authThenPing(cfg.App.Addr(), ctrl1Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl1-auth] AUTH = %q want substring WRONGPASS — ctrl1 slot only valid on ctrl port", authR)
 		}
 	}
 }

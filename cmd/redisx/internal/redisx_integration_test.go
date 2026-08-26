@@ -30,7 +30,16 @@ type integCase struct {
 func runIntegCase(t *testing.T, c integCase) {
 	t.Helper()
 	hrn := h.NewHarness(t, c.Harness)
-	opts := session.Options{TimeoutMs: 2500, Auth: c.DialAuth}
+	dialAuth := c.DialAuth
+	if dialAuth == "" && c.WantNewShellSub == "" {
+		switch c.DialRole {
+		case dialCtrl:
+			dialAuth = hrn.CtrlAuth
+		case dialApp:
+			dialAuth = hrn.AppAuth
+		}
+	}
+	opts := session.Options{TimeoutMs: 2500, Auth: dialAuth}
 	switch c.DialRole {
 	case dialCtrl:
 		opts.Host = hrn.CtrlBind()
