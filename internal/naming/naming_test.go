@@ -9,6 +9,8 @@ import (
 // ============================================================
 // §1 Q1.1 Matrix: disk/mem key shapes (Build* + Split* round-trip)
 // ============================================================
+const testMD512 = "0123456789ab"
+
 type matrixRow struct {
 	name          string
 	logicalNs     string
@@ -35,8 +37,8 @@ var coreMatrix = []matrixRow{
 		idxFullArgs:      struct{ logicalIndex string }{logicalIndex: "age"},
 		wantStorageNs:    "user",
 		wantStorageKey:   "user:0100",
-		wantDocMetaKey:   "_doc_:user",
-		wantIdxMetaKey:   "_idx_:user:age",
+		wantDocMetaKey:   "_doc_:user:v_" + testMD512,
+		wantIdxMetaKey:   "_idx_:user:age:v_" + testMD512,
 		wantIdxFull:      "user:age",
 		wantAuthStoreKey: "_auth_:0100",
 	},
@@ -48,8 +50,8 @@ var coreMatrix = []matrixRow{
 		idxFullArgs:      struct{ logicalIndex string }{logicalIndex: "score"},
 		wantStorageNs:    "tenantuser",
 		wantStorageKey:   "tenantuser:acme_202",
-		wantDocMetaKey:   "_doc_:tenantuser",
-		wantIdxMetaKey:   "_idx_:tenantuser:score",
+		wantDocMetaKey:   "_doc_:tenantuser:v_" + testMD512,
+		wantIdxMetaKey:   "_idx_:tenantuser:score:v_" + testMD512,
 		wantIdxFull:      "tenantuser:score",
 		wantAuthStoreKey: "_auth_:demo-key",
 	},
@@ -61,8 +63,8 @@ var coreMatrix = []matrixRow{
 		idxFullArgs:      struct{ logicalIndex string }{logicalIndex: "hitratio"},
 		wantStorageNs:    "_m_:hot",
 		wantStorageKey:   "_m_:hot:0100",
-		wantDocMetaKey:   "_doc_:_m_:hot",
-		wantIdxMetaKey:   "_idx_:_m_:hot:hitratio",
+		wantDocMetaKey:   "_doc_:_m_:hot:v_" + testMD512,
+		wantIdxMetaKey:   "_idx_:_m_:hot:hitratio:v_" + testMD512,
 		wantIdxFull:      "_m_:hot:hitratio",
 		wantAuthStoreKey: "_auth_:ext-50",
 	},
@@ -74,8 +76,8 @@ var coreMatrix = []matrixRow{
 		idxFullArgs:      struct{ logicalIndex string }{logicalIndex: "price"},
 		wantStorageNs:    "_m_:cache",
 		wantStorageKey:   "_m_:cache:acme_7",
-		wantDocMetaKey:   "_doc_:_m_:cache",
-		wantIdxMetaKey:   "_idx_:_m_:cache:price",
+		wantDocMetaKey:   "_doc_:_m_:cache:v_" + testMD512,
+		wantIdxMetaKey:   "_idx_:_m_:cache:price:v_" + testMD512,
 		wantIdxFull:      "_m_:cache:price",
 		wantAuthStoreKey: "_auth_:abc",
 	},
@@ -87,8 +89,8 @@ var coreMatrix = []matrixRow{
 		idxFullArgs:      struct{ logicalIndex string }{logicalIndex: "cat"},
 		wantStorageNs:    "product",
 		wantStorageKey:   "product:sku",
-		wantDocMetaKey:   "_doc_:product",
-		wantIdxMetaKey:   "_idx_:product:cat",
+		wantDocMetaKey:   "_doc_:product:v_" + testMD512,
+		wantIdxMetaKey:   "_idx_:product:cat:v_" + testMD512,
 		wantIdxFull:      "product:cat",
 		wantAuthStoreKey: "_auth_:k",
 	},
@@ -106,15 +108,15 @@ func TestCoreMatrix_BuildShapeCheck(t *testing.T) {
 			if storageKey != r.wantStorageKey {
 				t.Fatalf("BuildStorageKey(%q, %q) = %q, want %q", storageNs, pkSuffix, storageKey, r.wantStorageKey)
 			}
-			if got := DocMetaKey(storageNs); got != r.wantDocMetaKey {
-				t.Fatalf("DocMetaKey(%q) = %q, want %q", storageNs, got, r.wantDocMetaKey)
+			if got := DocMetaKey(storageNs, testMD512); got != r.wantDocMetaKey {
+				t.Fatalf("DocMetaKey(%q, %q) = %q, want %q", storageNs, testMD512, got, r.wantDocMetaKey)
 			}
 			idxFull := BuildIdxFullName(storageNs, r.idxFullArgs.logicalIndex)
 			if idxFull != r.wantIdxFull {
 				t.Fatalf("BuildIdxFullName(%q, %q) = %q, want %q", storageNs, r.idxFullArgs.logicalIndex, idxFull, r.wantIdxFull)
 			}
-			if got := IdxMetaKey(idxFull); got != r.wantIdxMetaKey {
-				t.Fatalf("IdxMetaKey(%q) = %q, want %q", idxFull, got, r.wantIdxMetaKey)
+			if got := IdxMetaKey(idxFull, testMD512); got != r.wantIdxMetaKey {
+				t.Fatalf("IdxMetaKey(%q, %q) = %q, want %q", idxFull, testMD512, got, r.wantIdxMetaKey)
 			}
 			if got := StorageNsKeyPattern(storageNs); got != storageNs+":*" {
 				t.Fatalf("StorageNsKeyPattern(%q) = %q, want %q", storageNs, got, storageNs+":*")
@@ -124,7 +126,7 @@ func TestCoreMatrix_BuildShapeCheck(t *testing.T) {
 	if got := AuthStorageKey("external-50"); got != "_auth_:external-50" {
 		t.Fatalf("AuthStorageKey = %q", got)
 	}
-	if DocMetaGlob() != "_doc_:*" || IdxMetaGlob() != "_idx_:*" || AuthStorageGlob() != "_auth_:*" {
+	if DocMetaGlob() != "_doc_:*:v_*" || IdxMetaGlob() != "_idx_:*:v_*" || AuthStorageGlob() != "_auth_:*" {
 		t.Fatalf("globs mismatch: doc=%s idx=%s auth=%s", DocMetaGlob(), IdxMetaGlob(), AuthStorageGlob())
 	}
 }
@@ -216,7 +218,7 @@ func TestInvariants_Predicates(t *testing.T) {
 		{"user", false, false, "user", false},
 		{"_m_:hot", false, true, "hot", true},
 		{"_m_:hot:0100", false, true, "hot:0100", true},
-		{"_doc_:_m_:hot", false, false, "_doc_:_m_:hot", false}, // head 非 _m_:
+		{"_doc_:_m_:hot", false, false, "_doc_:_m_:hot", false}, // head prefix is NOT "_m_:"
 	}
 	for _, c := range cases {
 		t.Run("pred-"+c.in, func(t *testing.T) {
@@ -266,9 +268,11 @@ func TestInvariants_BuildStorageNs_LastColonUniqueness(t *testing.T) {
 
 func TestInvariants_MemDocMetaKey_ContainsDoubleColon(t *testing.T) {
 	memNs := BuildStorageNs("hot", true)
-	dk := DocMetaKey(memNs)
-	if dk != "_doc_:_m_:hot" || strings.Count(dk, ":") != 2 {
-		t.Fatalf("mem doc meta key should have 2 colons, got %q (ncolons=%d)", dk, strings.Count(dk, ":"))
+	dk := DocMetaKey(memNs, testMD512)
+	want := "_doc_:_m_:hot:v_" + testMD512
+	if dk != want || strings.Count(dk, ":") != 3 {
+		t.Fatalf("mem doc meta key should be %q with 3 colons, got %q (ncolons=%d)",
+			want, dk, strings.Count(dk, ":"))
 	}
 }
 
@@ -395,8 +399,8 @@ func TestBuildersPanicOnInvalidInputs(t *testing.T) {
 		{"BuildStorageKey colon pk", func() { _ = BuildStorageKey("user", "pk:has") }},
 		{"BuildIdxFullName empty ns", func() { _ = BuildIdxFullName("", "age") }},
 		{"BuildIdxFullName bad logical", func() { _ = BuildIdxFullName("user", "user_age") }},
-		{"DocMetaKey empty", func() { _ = DocMetaKey("") }},
-		{"IdxMetaKey empty", func() { _ = IdxMetaKey("") }},
+		{"DocMetaKey empty", func() { _ = DocMetaKey("", "") }},
+		{"IdxMetaKey empty", func() { _ = IdxMetaKey("", "") }},
 		{"AuthStorageKey empty", func() { _ = AuthStorageKey("") }},
 		{"StorageNsKeyPattern empty", func() { _ = StorageNsKeyPattern("") }},
 	}
@@ -447,8 +451,9 @@ func TestMetaKeyShape_DocMem(t *testing.T) {
 	if !strings.HasPrefix(ns, docMetaNsPrefix+"_m_") || pk != "hot" {
 		t.Logf("(OK: callers of Doc meta keys know suffix represents storageNs, not pk) split %q => ns=%q, pk=%q", "_doc_:_m_:hot", ns, pk)
 	}
-	// DocMetaKey("_m_:hot") == "_doc_:_m_:hot" （断言 doc meta key 正确生成，split 不需要自动重解释，caller 自行知道 meta 语义）
-	if got := DocMetaKey("_m_:hot"); got != "_doc_:_m_:hot" {
-		t.Fatalf("DocMetaKey(\"_m_:hot\")=%q want _doc_:_m_:hot", got)
+	// DocMetaKey("_m_:hot") == "_doc_:_m_:hot:v_<12-hex>" (new versioning scheme: 12-hex MD5 suffix; asserts the doc meta key is built correctly — callers already know what meta-semantics they are dealing with)
+	wantMeta := "_doc_:_m_:hot:v_" + testMD512
+	if got := DocMetaKey("_m_:hot", testMD512); got != wantMeta {
+		t.Fatalf("DocMetaKey(\"_m_:hot\", %q)=%q want %q", testMD512, got, wantMeta)
 	}
 }

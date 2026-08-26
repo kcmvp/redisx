@@ -41,7 +41,7 @@ func RunCreateIdxWizard(sess *session.Session, cache *session.Cache) error {
 		return err
 	}
 	if len(docs) == 0 {
-		return fmt.Errorf("no Doc schemas registered yet — run regdoc / !createdoc first before creating any index")
+		return fmt.Errorf("no Doc schemas registered yet — run regsch / !createsch first before creating any index")
 	}
 	ownerRows := make([][]string, 0, len(docs))
 	for i, d := range docs {
@@ -88,12 +88,34 @@ func RunCreateIdxWizard(sess *session.Session, cache *session.Cache) error {
 	}
 	widgets.PrintTable(os.Stdout, []string{"Item", "Value"}, reviewRows)
 	fmt.Println()
-	fmt.Println(cBold(cCyan("── RegIdx Payload (RESP wire) ──")))
-	fmt.Printf("  regidx %s %s %s", ownerNS, res.Logical, res.Path)
-	if res.Unique {
-		fmt.Print(" UNIQUE")
+	type idxSpecWire struct {
+		OwnerNs    string   `json:"owner_ns"`
+		Logical    string   `json:"logical"`
+		Paths      []string `json:"paths"`
+		KeyPattern string   `json:"key_pattern,omitempty"`
+		Unique     bool     `json:"unique,omitempty"`
+		Type       string   `json:"type,omitempty"`
 	}
-	fmt.Printf(" TYPE %s\n\n", wireType)
+	ownerMem := naming.HasMemPrefix(ownerNS)
+	nsScope := ownerNS
+	if !ownerMem {
+		nsScope = "_d_" + ownerNS
+	}
+	pathList := strings.Split(strings.ReplaceAll(res.Path, ".", "_"), ",")
+	spec := idxSpecWire{
+		OwnerNs:    ownerNS,
+		Logical:    strings.ToLower(res.Logical),
+		Paths:      pathList,
+		KeyPattern: nsScope + ":*",
+		Unique:     res.Unique,
+		Type:       wireType,
+	}
+	specBytes, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("build regidx payload: %w", err)
+	}
+	fmt.Println(cBold(cCyan("── RegIdx Payload (1-arg JSON wire) ──")))
+	fmt.Printf("  regidx %s\n\n", string(specBytes))
 
 	confirmAction := fmt.Sprintf("build %s INDEX on %s %s UNIQUE=%t", wireType, ownerNS, res.Path, res.Unique)
 	ok, err := p.ConfirmKeyword("CREATE", confirmAction)
@@ -104,11 +126,7 @@ func RunCreateIdxWizard(sess *session.Session, cache *session.Cache) error {
 		fmt.Println(cYellow("cancelled."))
 		return nil
 	}
-	callArgs := []any{"regidx", ownerNS, res.Logical, res.Path}
-	if res.Unique {
-		callArgs = append(callArgs, "UNIQUE")
-	}
-	callArgs = append(callArgs, "TYPE", wireType)
+	callArgs := []any{"regidx", string(specBytes)}
 
 	v, err := sess.RawDo(callArgs).Result()
 	if err != nil {
@@ -197,17 +215,34 @@ func runCreateIdxForm(p *tui.Prompter, docs []map[string]any) (*IdxFormResult, e
 }
 
 func FetchDocList(sess *session.Session) ([]map[string]any, error) {
-	v, err := sess.RawDo([]any{"lsdoc"}).Result()
+	docGlob := naming.DocMetaGlob()
+	v, err := sess.RawDo([]any{"KEYS", docGlob}).Result()
 	if err != nil {
 		return nil, err
 	}
-	s, ok := v.(string)
+	raws, ok := v.([]any)
 	if !ok {
-		return nil, fmt.Errorf("lsdoc returned unexpected type %T", v)
+		return nil, fmt.Errorf("KEYS %s returned unexpected type %T", docGlob, v)
 	}
-	var out []map[string]any
-	if err := json.Unmarshal([]byte(s), &out); err != nil {
-		return nil, fmt.Errorf("lsdoc JSON parse failed: %w", err)
+	out := make([]map[string]any, 0, len(raws))
+	for _, entry := range raws {
+		key, ok := entry.(string)
+		if !ok {
+			continue
+		}
+		val, err := sess.RawDo([]any{"GET", key}).Result()
+		if err != nil {
+			return nil, fmt.Errorf("GET doc meta %s: %w", key, err)
+		}
+		s, ok := val.(string)
+		if !ok {
+			continue
+		}
+		var d map[string]any
+		if err := json.Unmarshal([]byte(s), &d); err != nil {
+			continue
+		}
+		out = append(out, d)
 	}
 	return out, nil
 }
@@ -277,7 +312,7 @@ func RunDropIdxWizard(sess *session.Session, cache *session.Cache) error {
 	}
 	p := tui.NewPrompter()
 
-	fmt.Println(cBold(cMagenta("─── !dropindex — Phase 1/2: Identify (irreversible after phase 2)")))
+	fmt.Println(cBold(cMagenta("─── !dropidx — Phase 1/2: Identify (irreversible after phase 2)")))
 	fmt.Println(cYellow("  Indexes are addressed as <owner_ns>.<logical_name>."))
 	ownerNS, err := p.Input(tui.InputField{Title: "Owner Doc namespace", Validate: ValidateNS})
 	if err != nil {
@@ -300,7 +335,7 @@ func RunDropIdxWizard(sess *session.Session, cache *session.Cache) error {
 		return nil
 	}
 
-	fmt.Println(cBold(cMagenta("\n─── !dropindex — Phase 2/2: DESTROY confirm")))
+	fmt.Println(cBold(cMagenta("\n─── !dropidx — Phase 2/2: DESTROY confirm")))
 	fmt.Println(cRed("  After this, index data is dropped and cannot be rebuilt automatically."))
 	ok, err := p.ConfirmKeyword("DESTROY", fmt.Sprintf("drop index %s", fullName))
 	if err != nil {
@@ -311,12 +346,12 @@ func RunDropIdxWizard(sess *session.Session, cache *session.Cache) error {
 		return nil
 	}
 
-	res, err := sess.RawDo([]any{"delidx", ownerNS, logical}).Result()
+	res, err := sess.RawDo([]any{"dropidx", ownerNS, logical}).Result()
 	if err != nil {
 		return err
 	}
 	cache.Invalidate()
-	fmt.Println(cGreen("✓ submitted delidx — server reply:"))
+	fmt.Println(cGreen("✓ submitted dropidx — server reply:"))
 	PrintAny(os.Stdout, res)
 	return nil
 }

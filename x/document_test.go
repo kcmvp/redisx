@@ -67,9 +67,9 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 		naming.JoinPKAttrValues([]string{"acme", "7"}),
 		"cheatsheet suffix = {tenant}_{id} for {acme,7} → \"acme_7\"")
 
-	require.Equal(t, "_doc_:user",
-		naming.DocMetaKey(naming.BuildStorageNs("user", false)),
-		"cheatsheet UserDoc doc meta = _doc_:{storageNs} → \"_doc_:user\"")
+	require.Equal(t, "_doc_:user:v_placeholder",
+		naming.DocMetaKey(naming.BuildStorageNs("user", false), "placeholder"),
+		"cheatsheet UserDoc doc meta = _doc_:{storageNs}:v_<12hex> → \"_doc_:user:v_placeholder\"")
 
 	userAgeIdxName, err := ValidateIdxName[cheatsheetUserDoc]("age")
 	require.NoError(t, err)
@@ -77,8 +77,8 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 		"cheatsheet UserDoc index \"age\" full name = {storageNs}:age → \"user:age\"")
 	require.Equal(t, userAgeIdxName, Idx[cheatsheetUserDoc]("age", "*", "age").Name(),
 		"ValidateIdxName[T] and Idx[T].Name must agree on the full index name")
-	require.Equal(t, "_idx_:user:age", naming.IdxMetaKey(userAgeIdxName),
-		"cheatsheet UserDoc index meta = _idx_:{indexFullName} → \"_idx_:user:age\"")
+	require.Equal(t, "_idx_:user:age:v_placeholder", naming.IdxMetaKey(userAgeIdxName, "placeholder"),
+		"cheatsheet UserDoc index meta = _idx_:{indexFullName}:v_<12hex> → \"_idx_:user:age:v_placeholder\"")
 
 	// ------------------------------------------------------------
 	// SessionDoc (mem)
@@ -97,9 +97,9 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 	require.Equal(t, sessFullByGenericAPI, sessFullByMethod,
 		"Key[T] and StorageKey(d) must agree on mem full storage key")
 
-	require.Equal(t, "_doc_:_m_:session",
-		naming.DocMetaKey(naming.BuildStorageNs("session", true)),
-		"cheatsheet SessionDoc doc meta = _doc_:_m_:session")
+	require.Equal(t, "_doc_:_m_:session:v_placeholder",
+		naming.DocMetaKey(naming.BuildStorageNs("session", true), "placeholder"),
+		"cheatsheet SessionDoc doc meta = _doc_:_m_:session:v_<12hex>")
 
 	sessLastIdxName, err := ValidateIdxName[cheatsheetSessionDoc]("last")
 	require.NoError(t, err)
@@ -107,8 +107,8 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 		"cheatsheet SessionDoc index \"last\" full name = _m_:session:last")
 	require.Equal(t, sessLastIdxName, Idx[cheatsheetSessionDoc]("last", "*", "last_ts").Name(),
 		"ValidateIdxName[T] and Idx[T].Name must agree on mem index name")
-	require.Equal(t, "_idx_:_m_:session:last", naming.IdxMetaKey(sessLastIdxName),
-		"cheatsheet SessionDoc index meta = _idx_:_m_:session:last")
+	require.Equal(t, "_idx_:_m_:session:last:v_placeholder", naming.IdxMetaKey(sessLastIdxName, "placeholder"),
+		"cheatsheet SessionDoc index meta = _idx_:_m_:session:last:v_<12hex>")
 }
 
 // TestCheatsheetSchemaReference_KeyAttrValueContainingColonRejects mirrors

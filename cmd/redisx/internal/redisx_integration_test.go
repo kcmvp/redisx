@@ -4,7 +4,6 @@
 package internal
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
@@ -75,24 +74,26 @@ var sharedAfterPingOK = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 
 var sharedAfterAdminSkeletonCmd = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	t.Helper()
-	r := sh.RawDo([]any{"LSDOC"})
-	s, err := r.Result()
+	r := sh.RawDo([]any{"REGSCH", `{"namespace":"skeletontest","mem":false,"key_attrs":["id"],"ttl_ns":0}`})
+	_, err := r.Result()
 	if err != nil {
-		if !strings.Contains(err.Error(), "not implemented yet") {
-			t.Fatalf("LSDOC err=%v want skeleton 'not implemented yet'", err)
-		}
-		return
+		t.Fatalf("REGSCH expected OK (registry implemented), err=%v", err)
 	}
-	if !strings.Contains(fmt.Sprintf("%s", s), "not implemented yet") {
-		t.Fatalf("LSDOC=%q want skeleton marker", s)
+	r = sh.RawDo([]any{"DROPSCH", "skeletontest"})
+	_, err = r.Result()
+	if err != nil {
+		t.Fatalf("DROPSCH expected OK on just-registered doc, err=%v", err)
 	}
-	r = sh.RawDo([]any{"REGDOC"})
+	r = sh.RawDo([]any{"REGSCH"})
 	_, err = r.Result()
 	if err == nil {
-		t.Fatalf("REGDOC no-args should fail Gate3, got nil error")
+		t.Fatalf("REGSCH no-args should fail Gate3, got nil error")
 	}
-	if !strings.Contains(err.Error(), "expected >=") && !strings.Contains(err.Error(), "Usage") {
-		t.Fatalf("REGDOC no-args Gate3 missing: %v", err)
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, "expected >=") &&
+		!strings.Contains(msg, "usage") &&
+		!strings.Contains(msg, "wrong number") {
+		t.Fatalf("REGSCH no-args Gate3 missing: %v", err)
 	}
 }
 
@@ -114,15 +115,16 @@ var sharedAfterSetGetOK = func(t *testing.T, sh *session.Session, _ *h.Harness) 
 
 var sharedAfterAdminCmdOnAppPortBlocked = func(t *testing.T, sh *session.Session, _ *h.Harness) {
 	t.Helper()
-	r := sh.RawDo([]any{"LSDOC"})
+	r := sh.RawDo([]any{"REGSCH", `{"namespace":"test","mem":false,"key_attrs":["id"]}`})
 	_, err := r.Result()
 	if err == nil {
-		t.Fatalf("LSDOC on app-port must Gate1 reject, got nil error")
+		t.Fatalf("REGSCH on app-port must Gate1 reject, got nil error")
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "app port") &&
-		!strings.Contains(msg, "admin-only commands are not available") {
-		t.Fatalf("app-port LSDOC missing Gate1 hint in: %v", err)
+		!strings.Contains(msg, "admin-only commands are not available") &&
+		!strings.Contains(msg, "No Privilege") {
+		t.Fatalf("app-port REGSCH missing Gate1 hint in: %v", err)
 	}
 	if err := sh.RawDo([]any{"SET", "app:k", "2"}).Err(); err != nil {
 		t.Fatalf("app-port SET failed: %v", err)
@@ -161,7 +163,7 @@ func TestRdxmE2E(t *testing.T) {
 			WantNewShellSub: "server admin-port requires AUTH. Pass the admin-auth key via",
 		},
 		{
-			Name:      "admin_auth_set_user_passes_correct_key_connects_runs_lsdoc_skeleton",
+			Name:      "admin_auth_set_user_passes_correct_key_connects_runs_registry_skeleton",
 			Harness:   h.HarnessOpts{AdminAuth: "abc123"},
 			DialRole:  dialAdmin,
 			DialAuth:  "abc123",

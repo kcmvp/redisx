@@ -63,7 +63,7 @@ func updClientRawGet(raw, path string) string { return gjson.Get(raw, path).Stri
 func (s *SearchKeyRangeSuite) TestSearchKeyRangeSeedCountIs100() {
 	s.ensureConnectedClientAndAuth()
 	kr := x.KeysPattern(krClientID("*"))
-	got := SearchKey(kr, nil, false)
+	got := SearchKeyRaw(kr, nil, false)
 	s.False(got.IsError(), "SearchKey err: %v", got.Error())
 	s.Len(got.MustGet(), testutil.CountX())
 }
@@ -72,12 +72,12 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
 	s.ensureConnectedClientAndAuth()
 
 	krWrongPrefix := x.KeysPattern("probe-client:*")
-	resWrong := SearchKey(krWrongPrefix, nil, false)
+	resWrong := SearchKeyRaw(krWrongPrefix, nil, false)
 	s.False(resWrong.IsError())
 	s.Empty(resWrong.MustGet())
 
 	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
-	resServer := SearchKey(krServer, nil, false)
+	resServer := SearchKeyRaw(krServer, nil, false)
 	s.False(resServer.IsError())
 	s.Empty(resServer.MustGet())
 }
@@ -85,7 +85,7 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
 func (s *SearchKeyRangeSuite) TestSearchKeyRangeFullMatrix_TABLE_DRIVEN() {
 	s.ensureConnectedClientAndAuth()
 	run := func(kr x.KeyRange, desc bool) ([]string, bool, string) {
-		res := SearchKey(kr, nil, desc)
+		res := SearchKeyRaw(kr, nil, desc)
 		if res.IsError() {
 			return nil, false, res.Error().Error()
 		}
@@ -96,9 +96,9 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeFullMatrix_TABLE_DRIVEN() {
 
 func (s *SearchKeyRangeSuite) TestSearchKeyRangeGtGteGapEqualsOne() {
 	s.ensureConnectedClientAndAuth()
-	gte := SearchKey(x.KeysGte(krClientID("p027")), nil, false)
+	gte := SearchKeyRaw(x.KeysGte(krClientID("p027")), nil, false)
 	s.Require().False(gte.IsError())
-	gt := SearchKey(x.KeysGt(krClientID("p027")), nil, false)
+	gt := SearchKeyRaw(x.KeysGt(krClientID("p027")), nil, false)
 	s.Require().False(gt.IsError())
 	testutil.AssertGtGteGap1(s.T(),
 		testutil.XIDsFromValues(gte.MustGet()),
@@ -108,9 +108,9 @@ func (s *SearchKeyRangeSuite) TestSearchKeyRangeGtGteGapEqualsOne() {
 
 func (s *SearchKeyRangeSuite) TestSearchKeyRangeLtLteGapEqualsOne() {
 	s.ensureConnectedClientAndAuth()
-	lte := SearchKey(x.KeysLte(krClientID("p072")), nil, false)
+	lte := SearchKeyRaw(x.KeysLte(krClientID("p072")), nil, false)
 	s.Require().False(lte.IsError())
-	lt := SearchKey(x.KeysLt(krClientID("p072")), nil, false)
+	lt := SearchKeyRaw(x.KeysLt(krClientID("p072")), nil, false)
 	s.Require().False(lt.IsError())
 	testutil.AssertLtLteGap1(s.T(),
 		testutil.XIDsFromValues(lte.MustGet()),
@@ -122,7 +122,7 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeScoreSeedCountIs100() {
 	s.ensureConnectedClientAndAuth()
 	kr := x.KeysPattern(krClientID("*"))
 	idxName := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
-	got := SearchIndex(idxName, kr, nil, false)
+	got := SearchIndexRaw(idxName, kr, nil, false)
 	s.False(got.IsError(), "SearchIndex score ASC err: %v", got.Error())
 	s.Len(got.MustGet(), testutil.CountX())
 }
@@ -132,13 +132,13 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeScoreOrderingMatchesSearchKeyI
 	krAll := x.KeysPattern(krClientID("*"))
 	idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
 
-	siAsc := SearchIndex(idxScore, krAll, nil, false)
+	siAsc := SearchIndexRaw(idxScore, krAll, nil, false)
 	s.Require().False(siAsc.IsError())
-	skAsc := SearchKey(krAll, nil, false)
+	skAsc := SearchKeyRaw(krAll, nil, false)
 	s.Require().False(skAsc.IsError())
-	siDesc := SearchIndex(idxScore, krAll, nil, true)
+	siDesc := SearchIndexRaw(idxScore, krAll, nil, true)
 	s.Require().False(siDesc.IsError())
-	skDesc := SearchKey(krAll, nil, true)
+	skDesc := SearchKeyRaw(krAll, nil, true)
 	s.Require().False(skDesc.IsError())
 
 	testutil.AssertScoreEqSKId(s.T(),
@@ -152,7 +152,7 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeFullMatrix_TABLE_DRIVEN() {
 	s.ensureConnectedClientAndAuth()
 	idxName := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
 	run := func(n string, kr x.KeyRange, desc bool) ([]string, bool, string) {
-		res := SearchIndex(n, kr, nil, desc)
+		res := SearchIndexRaw(n, kr, nil, desc)
 		if res.IsError() {
 			return nil, false, res.Error().Error()
 		}
@@ -165,11 +165,11 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeBucketTiebreakersLexicographic
 	s.ensureConnectedClientAndAuth()
 	krAll := x.KeysPattern(krClientID("*"))
 	idxBucket := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "bucket")
-	eqA := SearchIndex(idxBucket, krAll, x.Eq("bucket", "A"), false)
+	eqA := SearchIndexRaw(idxBucket, krAll, x.Eq("bucket", "A"), false)
 	s.Require().False(eqA.IsError())
-	eqC := SearchIndex(idxBucket, krAll, x.Eq("bucket", "C"), false)
+	eqC := SearchIndexRaw(idxBucket, krAll, x.Eq("bucket", "C"), false)
 	s.Require().False(eqC.IsError())
-	all := SearchIndex(idxBucket, krAll, nil, false)
+	all := SearchIndexRaw(idxBucket, krAll, nil, false)
 	s.Require().False(all.IsError())
 	testutil.AssertBucketDistribution(s.T(),
 		testutil.XIDsFromValues(eqA.MustGet()),
@@ -181,7 +181,7 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeSparseAmtLimit10() {
 	s.ensureConnectedClientAndAuth()
 	krLimit := x.KeysPattern(krClientID("*")).Limit(10)
 	idxSparse := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "sparseamt")
-	si := SearchIndex(idxSparse, krLimit, nil, false)
+	si := SearchIndexRaw(idxSparse, krLimit, nil, false)
 	s.Require().False(si.IsError())
 	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(si.MustGet()))
 }
@@ -190,7 +190,7 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchRejects() {
 	s.ensureConnectedClientAndAuth()
 	krDisk := x.KeysPattern("user:*")
 	idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
-	res := SearchIndex(idxScore, krDisk, nil, false)
+	res := SearchIndexRaw(idxScore, krDisk, nil, false)
 	s.True(res.IsError(), "got Ok len=%d", len(res.OrEmpty()))
 	s.Contains(res.Error().Error(), "different storage layer")
 }
@@ -198,14 +198,14 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchRejects() {
 func (s *SearchKeyRangeSuite) TestSearchIndexRange_InvalidInputs_EmptyIndexAndNilKeyrange() {
 	s.ensureConnectedClientAndAuth()
 	s.Run("empty index name → early error", func() {
-		res := SearchIndex("", x.KeysPattern(krClientID("*")), nil, false)
+		res := SearchIndexRaw("", x.KeysPattern(krClientID("*")), nil, false)
 		s.Require().True(res.IsError(), "expected Err for empty indexName; got Ok len=%d", len(res.OrEmpty()))
 		s.Contains(res.Error().Error(), "index name is required",
 			"err=%v", res.Error())
 	})
 	s.Run("nil keyrange → early error", func() {
 		idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
-		res := SearchIndex(idxScore, nil, nil, false)
+		res := SearchIndexRaw(idxScore, nil, nil, false)
 		s.Require().True(res.IsError(), "expected Err for nil kr; got Ok len=%d", len(res.OrEmpty()))
 		s.Contains(res.Error().Error(), "key range is required",
 			"err=%v", res.Error())
@@ -254,7 +254,7 @@ func (s *UpdateKeyRangeSuite) SetupTest() {
 	clientSuite.SetupTest()
 	s.ensureConnectedClientAndAuth()
 	for _, kv := range testutil.LoadXFor(s.T(), updateKRClientNamespace, testutil.KeyRangeFixtureMem()) {
-		err := Set(kv.K, kv.V)
+		err := SetRaw(kv.K, kv.V)
 		s.Require().NoError(err, "UpdateKR SetupTest Set key=%s err=%v", kv.K, err)
 	}
 }
@@ -267,21 +267,21 @@ func (s *UpdateKeyRangeSuite) ensureConnectedClientAndAuth() {
 
 func (s *UpdateKeyRangeSuite) TestSeedCountMatchesSearchKey() {
 	allKr := x.KeysPattern(updClientID("*"))
-	skRes := SearchKey(allKr, nil, false)
+	skRes := SearchKeyRaw(allKr, nil, false)
 	s.Require().False(skRes.IsError(), "SK err: %v", skRes.Error())
 	s.Len(skRes.MustGet(), testutil.CountX(), "UpdateKR seed count should equal fixture count")
 }
 
 func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
-	resWrong := Update(x.KeysPattern("probe-client:*"), nil, x.Set("tag_contam", true))
+	resWrong := UpdateRaw(x.KeysPattern("probenegcli:*"), nil, x.Set("tag_contam", true))
 	s.False(resWrong.IsError())
-	s.Empty(resWrong.MustGet(), "cross-contam probe-client prefix should hit zero keys")
+	s.Empty(resWrong.MustGet(), "cross-contam probenegcli prefix should hit zero keys")
 
-	resServer := Update(x.KeysPattern(testutil.XKeyPrefix("probeserver", true)+"*"), nil, x.Set("tag_contam", true))
+	resServer := UpdateRaw(x.KeysPattern(testutil.XKeyPrefix("probeserver", true)+"*"), nil, x.Set("tag_contam", true))
 	s.False(resServer.IsError())
 	s.Empty(resServer.MustGet(), "cross-contam probe-server prefix should hit zero keys")
 
-	skAll := SearchKey(x.KeysPattern(updClientID("*")), nil, false)
+	skAll := SearchKeyRaw(x.KeysPattern(updClientID("*")), nil, false)
 	s.Require().False(skAll.IsError())
 	for _, v := range skAll.MustGet() {
 		got := updClientRawGet(v, "tag_contam")
@@ -291,13 +291,13 @@ func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
 
 func (s *UpdateKeyRangeSuite) TestBulkSetAllTagThenVerifyViaSearchKey() {
 	allKr := x.KeysPattern(updClientID("*"))
-	res := Update(allKr, nil, x.Set("update_tagged", "bulk_all"))
+	res := UpdateRaw(allKr, nil, x.Set("update_tagged", "bulk_all"))
 	s.Require().False(res.IsError(), "Update bulk_all err: %v", res.Error())
 	keys := res.MustGet()
 	s.Len(keys, testutil.CountX())
 	sort.Strings(keys)
 
-	skAfter := SearchKey(allKr, nil, false)
+	skAfter := SearchKeyRaw(allKr, nil, false)
 	s.Require().False(skAfter.IsError())
 	after := skAfter.MustGet()
 	s.Len(after, testutil.CountX())
@@ -314,14 +314,14 @@ func (s *UpdateKeyRangeSuite) TestUpdateAllKeyRangeCtorShapes_TABLE_DRIVEN() {
 		return fmt.Sprintf("e%d", epoch)
 	}
 	runAsc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
-		res := Update(kr, nil, x.Set("ctor_shape", tag))
+		res := UpdateRaw(kr, nil, x.Set("ctor_shape", tag))
 		if res.IsError() {
 			return nil, false, res.Error().Error()
 		}
 		return updClientIDFromStorage(res.MustGet()), true, ""
 	}
 	runDesc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
-		res := Update(kr, nil, x.Set("ctor_shape", tag))
+		res := UpdateRaw(kr, nil, x.Set("ctor_shape", tag))
 		if res.IsError() {
 			return nil, false, res.Error().Error()
 		}
@@ -333,7 +333,7 @@ func (s *UpdateKeyRangeSuite) TestUpdateAllKeyRangeCtorShapes_TABLE_DRIVEN() {
 	}
 	assertCtorShapeWritten := func(caseName, label string, wantCount int, verifyRange x.KeyRange, wantTag string) {
 		s.T().Helper()
-		skRes := SearchKey(verifyRange, nil, false)
+		skRes := SearchKeyRaw(verifyRange, nil, false)
 		s.Require().False(skRes.IsError(), "%s/%s: SearchKey after Update err: %v", caseName, label, skRes.Error())
 		values := skRes.MustGet()
 		var count int
@@ -430,11 +430,11 @@ func assertClientKRResult(t *testing.T, caseName, label string, wantAsc, ids []s
 
 func (s *UpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
 	krGte := x.KeysGte(updClientID("p027"))
-	resGte := Update(krGte, nil, x.Set("boundary", "gte"))
+	resGte := UpdateRaw(krGte, nil, x.Set("boundary", "gte"))
 	s.Require().False(resGte.IsError())
 	idsGte := updClientIDFromStorage(resGte.MustGet())
 
-	skGte := SearchKey(krGte, nil, false)
+	skGte := SearchKeyRaw(krGte, nil, false)
 	s.Require().False(skGte.IsError())
 	gotGte := skGte.MustGet()
 	s.Len(gotGte, len(idsGte), "Gte SK sweep after Update expected len=%d got=%d", len(idsGte), len(gotGte))
@@ -444,11 +444,11 @@ func (s *UpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
 	}
 
 	krGt := x.KeysGt(updClientID("p027"))
-	resGt := Update(krGt, nil, x.Set("boundary", "gt"))
+	resGt := UpdateRaw(krGt, nil, x.Set("boundary", "gt"))
 	s.Require().False(resGt.IsError())
 	idsGt := updClientIDFromStorage(resGt.MustGet())
 
-	skGt := SearchKey(krGt, nil, false)
+	skGt := SearchKeyRaw(krGt, nil, false)
 	s.Require().False(skGt.IsError())
 	gotGt := skGt.MustGet()
 	s.Len(gotGt, len(idsGt), "Gt SK sweep after Update expected len=%d got=%d", len(idsGt), len(gotGt))
@@ -462,11 +462,11 @@ func (s *UpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
 
 func (s *UpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
 	krLte := x.KeysLte(updClientID("p072"))
-	resLte := Update(krLte, nil, x.Set("boundary", "lte"))
+	resLte := UpdateRaw(krLte, nil, x.Set("boundary", "lte"))
 	s.Require().False(resLte.IsError())
 	idsLte := updClientIDFromStorage(resLte.MustGet())
 
-	skLte := SearchKey(krLte, nil, false)
+	skLte := SearchKeyRaw(krLte, nil, false)
 	s.Require().False(skLte.IsError())
 	gotLte := skLte.MustGet()
 	s.Len(gotLte, len(idsLte), "Lte SK sweep after Update expected len=%d got=%d", len(idsLte), len(gotLte))
@@ -476,11 +476,11 @@ func (s *UpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
 	}
 
 	krLt := x.KeysLt(updClientID("p072"))
-	resLt := Update(krLt, nil, x.Set("boundary", "lt"))
+	resLt := UpdateRaw(krLt, nil, x.Set("boundary", "lt"))
 	s.Require().False(resLt.IsError())
 	idsLt := updClientIDFromStorage(resLt.MustGet())
 
-	skLt := SearchKey(krLt, nil, false)
+	skLt := SearchKeyRaw(krLt, nil, false)
 	s.Require().False(skLt.IsError())
 	gotLt := skLt.MustGet()
 	s.Len(gotLt, len(idsLt), "Lt SK sweep after Update expected len=%d got=%d", len(idsLt), len(gotLt))
@@ -495,12 +495,12 @@ func (s *UpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
 func (s *UpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
 	allKr := x.KeysPattern(updClientID("*"))
 
-	fullRes := Update(allKr, nil, x.Set("lim", "full"))
+	fullRes := UpdateRaw(allKr, nil, x.Set("lim", "full"))
 	s.Require().False(fullRes.IsError(), "full err=%v", fullRes.Error())
 	full := fullRes.MustGet()
 	s.Len(full, testutil.CountX())
 	sort.Strings(full)
-	skFull := SearchKey(allKr, nil, false)
+	skFull := SearchKeyRaw(allKr, nil, false)
 	s.Require().False(skFull.IsError())
 	gotFull := skFull.MustGet()
 	s.Len(gotFull, testutil.CountX())
@@ -509,13 +509,13 @@ func (s *UpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
 		s.Equal("full", got, "Update lim=full value mismatch: raw=%s", v)
 	}
 
-	limitRes := Update(x.KeysPattern(updClientID("*")).Limit(7), nil, x.Set("lim", "7"))
+	limitRes := UpdateRaw(x.KeysPattern(updClientID("*")).Limit(7), nil, x.Set("lim", "7"))
 	s.Require().False(limitRes.IsError(), "limit err=%v", limitRes.Error())
 	lim := limitRes.MustGet()
 	s.Len(lim, 7, "Limit(7) must truncate at callback=7, got len=%d", len(lim))
 	sort.Strings(lim)
 	s.Equal(full[:7], lim, "Limit(7) updated keys must equal ASC first-7 of full set — proves early-stop at callback")
-	skLim := SearchKey(allKr, nil, false)
+	skLim := SearchKeyRaw(allKr, nil, false)
 	s.Require().False(skLim.IsError())
 	gotLim := skLim.MustGet()
 	var cntLim7 int
@@ -532,12 +532,12 @@ func (s *UpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
 
 func (s *UpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
 	filter := x.Eq("bucket", "A")
-	res := Update(x.KeysPattern(updClientID("*")), filter, x.Set("filtered_tag", "A-only"))
+	res := UpdateRaw(x.KeysPattern(updClientID("*")), filter, x.Set("filtered_tag", "A-only"))
 	s.Require().False(res.IsError(), "filtered err=%v", res.Error())
 	ids := updClientIDFromStorage(res.MustGet())
 	s.Len(ids, 34, "Update+filter Eq(bucket,A) should match 34 bucket=A rows")
 
-	skAll := SearchKey(x.KeysPattern(updClientID("*")), nil, false)
+	skAll := SearchKeyRaw(x.KeysPattern(updClientID("*")), nil, false)
 	s.Require().False(skAll.IsError())
 	var count int
 	for _, v := range skAll.MustGet() {
@@ -549,13 +549,13 @@ func (s *UpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
 }
 
 func (s *UpdateKeyRangeSuite) TestNilKRRejects() {
-	res := Update(nil, nil, x.Set("nil_tag", true))
+	res := UpdateRaw(nil, nil, x.Set("nil_tag", true))
 	s.Require().True(res.IsError(), "nil kr must reject")
 	s.Contains(res.Error().Error(), "key range is required")
 }
 
 func (s *UpdateKeyRangeSuite) TestEmptyValuesRejects() {
-	res := Update(x.KeysPattern(updClientID("*")), nil)
+	res := UpdateRaw(x.KeysPattern(updClientID("*")), nil)
 	s.Require().True(res.IsError(), "no mutation values must reject")
 	s.Contains(res.Error().Error(), "no update values provided")
 }

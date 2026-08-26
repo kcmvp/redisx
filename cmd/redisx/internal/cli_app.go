@@ -141,7 +141,7 @@ It connects ONLY via the RESP wire protocol to the redisx ADMIN PORT
 (default 127.0.0.1:7381). It never opens the database files directly.
 
 Run without sub-commands to enter the interactive REPL. Pass sub-commands
-to execute a single action and exit (e.g. "redisx lsdoc").
+to execute a single action and exit (e.g. "redisx regsch").
 
 `)
 			} else {
@@ -193,11 +193,11 @@ to execute a single action and exit.
 						continue
 					}
 					switch name {
-					case "regdoc", "lsdoc", "desdoc", "!createdoc", "!listdocs", "!describedoc":
+					case "regsch", "dropsch", "!createsch":
 						if !hasTypedDocs {
 							continue
 						}
-					case "regidx", "lsidx", "delidx", "!createindex", "!dropindex", "!listindexes":
+					case "regidx", "dropidx", "!createidx", "!dropidx":
 						if !hasTypedIndexes {
 							continue
 						}
@@ -272,8 +272,8 @@ func groupOf(name string) string {
 	switch name {
 	case "searchkey", "searchindex", "update":
 		return "Extended Commands"
-	case "regdoc", "lsdoc", "desdoc", "!createdoc", "!listdocs", "!describedoc",
-		"regidx", "lsidx", "delidx", "!createindex", "!dropindex", "!listindexes":
+	case "regsch", "dropsch", "!createsch",
+		"regidx", "dropidx", "!createidx", "!dropidx":
 		return "Meta Management"
 	}
 	return "Basic Commands"

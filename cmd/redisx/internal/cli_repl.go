@@ -148,9 +148,9 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 			continue
 		}
 		switch {
-		case (name == "regdoc" || name == "lsdoc" || name == "desdoc" || name == "!createdoc" || name == "!listdocs" || name == "!describedoc") && !hasDocs:
+		case (name == "regsch" || name == "dropsch" || name == "!createsch") && !hasDocs:
 			continue
-		case (name == "regidx" || name == "lsidx" || name == "delidx" || name == "!createindex" || name == "!dropindex" || name == "!listindexes") && !hasIdx:
+		case (name == "regidx" || name == "dropidx" || name == "!createidx" || name == "!dropidx") && !hasIdx:
 			continue
 		case (name == "searchkey" || name == "searchindex" || name == "update") && !hasSearch:
 			continue
@@ -203,7 +203,7 @@ func printCommands(app *tui.CLIApp, data *AppData, want string) {
 		}
 		fmt.Println()
 	}
-	fmt.Println("Hint: type `commands <name>` for detailed help; `regdoc` / `regidx` without args run an interactive wizard.")
+	fmt.Println("Hint: type `commands <name>` for detailed help; `regsch` / `regidx` without args run an interactive wizard.")
 }
 
 func fetchServerCommandsGroups(data *AppData) (groups map[string][][2]string, order []string, roleLine string, ok bool) {
@@ -282,15 +282,15 @@ func printServerCommandsList(data *AppData, groups map[string][][2]string, order
 			fmt.Println(cDim("(commands list above comes from the handshake HELLO reply; server upgrade auto-syncs when shell reconnects)"))
 		}
 	}
-	fmt.Println("Hint: type `commands <name>` for detailed help; `regdoc` / `regidx` without args run an interactive wizard.")
+	fmt.Println("Hint: type `commands <name>` for detailed help; `regsch` / `regidx` without args run an interactive wizard.")
 }
 
 func groupOfForCommands(name string) string {
 	switch name {
 	case "searchkey", "searchindex", "update":
 		return "Extended"
-	case "regdoc", "lsdoc", "desdoc", "!createdoc", "!listdocs", "!describedoc",
-		"regidx", "lsidx", "delidx", "!createindex", "!dropindex", "!listindexes":
+	case "regsch", "dropsch", "!createsch",
+		"regidx", "dropidx", "!createidx", "!dropidx":
 		return "Meta Management"
 	}
 	return "Basic"

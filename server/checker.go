@@ -83,7 +83,39 @@ func validateKVFullKey(fullKey string) error {
 		return fmt.Errorf("kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator())
 	}
 	if naming.HasUnderscorePrefix(fullKey) {
-		return fmt.Errorf("kv-pattern key must not start with internal prefix")
+		head := fullKey
+		if p := strings.IndexByte(head, naming.StorageKeySeparator()[0]); p >= 0 {
+			head = head[:p]
+		}
+		if head == naming.MemNsPrefix() {
+			suffix := fullKey[len(head)+1:]
+			if p2 := strings.IndexByte(suffix, naming.StorageKeySeparator()[0]); p2 >= 0 {
+				head = head + naming.StorageKeySeparator() + suffix[:p2]
+			}
+		}
+		if !naming.IsInternalStorageNs(head) {
+			return fmt.Errorf("kv-pattern key must not start with reserved internal prefix %q", head)
+		}
+	}
+	return nil
+}
+
+func validateKVMutationKey(fullKey string) error {
+	if err := validateKVFullKey(fullKey); err != nil {
+		return err
+	}
+	head := fullKey
+	if p := strings.IndexByte(head, naming.StorageKeySeparator()[0]); p >= 0 {
+		head = head[:p]
+	}
+	if head == naming.MemNsPrefix() {
+		suffix := fullKey[len(head)+1:]
+		if p2 := strings.IndexByte(suffix, naming.StorageKeySeparator()[0]); p2 >= 0 {
+			head = head + naming.StorageKeySeparator() + suffix[:p2]
+		}
+	}
+	if naming.IsInternalStorageNs(head) {
+		return fmt.Errorf("internal storage namespace %q is managed exclusively via dedicated registry commands (REGSCH/DROPSCH/REGIDX/DROPIDX/AUTH); direct KV mutation via SET/SETEX/SETNX/DEL is forbidden", head)
 	}
 	return nil
 }

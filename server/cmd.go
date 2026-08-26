@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +15,6 @@ import (
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
-	"github.com/tidwall/sjson"
 )
 
 func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
@@ -123,24 +121,38 @@ func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 		map[string]any{"name": "searchkey", "usage": usageOrProto("SEARCHKEY", "SEARCHKEY <predicate_json>  — typed doc+index search: filter → pick key")},
 		map[string]any{"name": "searchindex", "usage": usageOrProto("SEARCHINDEX", "SEARCHINDEX <ns> <idx_name> <query>  — query a named typed index")},
 	}
-	meta := make([]any, 0, len(proto.Registry))
+	meta := make([]any, 0, 4)
 	{
-		order := []string{
-			proto.CmdRegisterDoc, proto.CmdListDocs, proto.CmdDescribeDoc,
-			proto.CmdRegisterIndex, proto.CmdListIndexes, proto.CmdDropIndex,
-		}
-		for _, name := range order {
-			spec, ok := proto.Registry[strings.ToLower(name)]
-			if ok {
-				meta = append(meta, map[string]any{
-					"name":     strings.ToLower(spec.CmdWord),
-					"role":     "admin_only",
-					"min_args": spec.Argc.MinArgs,
-					"max_args": spec.Argc.MaxArgs,
-					"usage":    spec.Usage,
-				})
-			}
-		}
+		// 4 registry pair commands. They are ordinary commands at the
+		// dispatcher level; all semantic checks live inside the handlers.
+		meta = append(meta, map[string]any{
+			"name":     "regsch",
+			"role":     "shared_biz",
+			"min_args": 1,
+			"max_args": 1,
+			"usage":    proto.UsageRegisterSchema,
+		})
+		meta = append(meta, map[string]any{
+			"name":     "dropsch",
+			"role":     "shared_biz",
+			"min_args": 1,
+			"max_args": 1,
+			"usage":    proto.UsageDropSchema,
+		})
+		meta = append(meta, map[string]any{
+			"name":     "regidx",
+			"role":     "shared_biz",
+			"min_args": 1,
+			"max_args": 1,
+			"usage":    proto.UsageRegisterIndex,
+		})
+		meta = append(meta, map[string]any{
+			"name":     "dropidx",
+			"role":     "shared_biz",
+			"min_args": 1,
+			"max_args": 2,
+			"usage":    proto.UsageDropIndex,
+		})
 	}
 	out := map[string]any{
 		"server":     "redisx",
@@ -192,11 +204,11 @@ func quitCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 	_ = conn.Close()
 }
 
-func usageOrProto(cmdWord, fallback string) string {
-	spec, ok := proto.Registry[strings.ToLower(cmdWord)]
-	if ok && spec.Usage != "" {
-		return spec.Usage
-	}
+func usageOrProto(_ string, fallback string) string {
+	// Registry commands are ordinary commands; usage strings live inline at
+	// each handler and in the proto.Usage* constants that feed the handshake
+	// meta group. This helper stays as a pass-through so legacy basic KV
+	// command argc-error call sites keep working unchanged.
 	return fallback
 }
 
@@ -257,7 +269,7 @@ func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 
 	switch classifyArg1(arg1) {
 	case argShapeKV:
-		if err := validateKVFullKey(arg1); err != nil {
+		if err := validateKVMutationKey(arg1); err != nil {
 			conn.WriteError("ERR SET " + err.Error())
 			return
 		}
@@ -285,7 +297,7 @@ func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 		doc, ok := db.lookupDocByLogicalOrStorageNs(ns)
 		if !ok {
 			if appearsDocIntentJSON(valueRaw) {
-				conn.WriteError(fmt.Sprintf("ERR SET namespace %q not registered — doc-pattern requires REGDOC first", ns))
+				conn.WriteError(fmt.Sprintf("ERR SET namespace %q not registered — doc-pattern requires REGSCH first", ns))
 			} else {
 				conn.WriteError(fmt.Sprintf("ERR SET kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator()))
 			}
@@ -368,7 +380,7 @@ func setExCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 	val := string(cmd.Args[3])
 	switch classifyArg1(arg1) {
 	case argShapeKV:
-		if err := validateKVFullKey(arg1); err != nil {
+		if err := validateKVMutationKey(arg1); err != nil {
 			conn.WriteError("ERR SETEX " + err.Error())
 			return
 		}
@@ -383,7 +395,7 @@ func setExCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 		doc, ok := db.lookupDocByLogicalOrStorageNs(ns)
 		if !ok {
 			if appearsDocIntentJSON(val) {
-				conn.WriteError(fmt.Sprintf("ERR SETEX namespace %q not registered — doc-pattern requires REGDOC first", ns))
+				conn.WriteError(fmt.Sprintf("ERR SETEX namespace %q not registered — doc-pattern requires REGSCH first", ns))
 			} else {
 				conn.WriteError(fmt.Sprintf("ERR SETEX kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator()))
 			}
@@ -443,7 +455,7 @@ func setNxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 	val := string(cmd.Args[2])
 	switch classifyArg1(arg1) {
 	case argShapeKV:
-		if err := validateKVFullKey(arg1); err != nil {
+		if err := validateKVMutationKey(arg1); err != nil {
 			conn.WriteError("ERR SETNX " + err.Error())
 			return
 		}
@@ -461,7 +473,7 @@ func setNxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSu
 		doc, ok := db.lookupDocByLogicalOrStorageNs(ns)
 		if !ok {
 			if appearsDocIntentJSON(val) {
-				conn.WriteError(fmt.Sprintf("ERR SETNX namespace %q not registered — doc-pattern requires REGDOC first", ns))
+				conn.WriteError(fmt.Sprintf("ERR SETNX namespace %q not registered — doc-pattern requires REGSCH first", ns))
 			} else {
 				conn.WriteError(fmt.Sprintf("ERR SETNX kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator()))
 			}
@@ -565,7 +577,7 @@ func getCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 		}
 		doc, ok := db.lookupDocByLogicalOrStorageNs(ns)
 		if !ok {
-			conn.WriteError(fmt.Sprintf("ERR GET namespace %q not registered — doc-pattern requires REGDOC first", ns))
+			conn.WriteError(fmt.Sprintf("ERR GET namespace %q not registered — doc-pattern requires REGSCH first", ns))
 			return
 		}
 		fullKey := naming.BuildStorageKey(doc.StorageNs, suffix)
@@ -592,7 +604,7 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 		arg1 := string(cmd.Args[1])
 		switch classifyArg1(arg1) {
 		case argShapeKV:
-			if err := validateKVFullKey(arg1); err != nil {
+			if err := validateKVMutationKey(arg1); err != nil {
 				conn.WriteError("ERR DEL " + err.Error())
 				return
 			}
@@ -616,9 +628,13 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 		}
 	}
 	arg1 := string(cmd.Args[1])
+	if classifyArg1(arg1) == argShapeKV {
+		conn.WriteError("ERR DEL kv-pattern takes exactly one full key; to delete multiple KV-path keys issue separate DEL commands, or use doc-path form `DEL <registered-ns> <pk1> [pk2 …]` to delete multiple pk-suffix values for a single registered typed-document namespace.")
+		return
+	}
 	doc, ok := db.lookupDocByLogicalOrStorageNs(arg1)
 	if !ok {
-		conn.WriteError(fmt.Sprintf("ERR DEL namespace %q not registered — doc-pattern requires REGDOC first", arg1))
+		conn.WriteError(fmt.Sprintf("ERR DEL namespace %q not registered — doc-pattern requires REGSCH first", arg1))
 		return
 	}
 	suffixes := make([]string, 0, len(cmd.Args)-2)
@@ -656,6 +672,22 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 	if naming.HasUnderscorePrefix(keyPattern) {
 		conn.WriteError("ERR forbidden key pattern")
 		return
+	}
+
+	if !naming.HasMemPrefix(keyPattern) && !naming.IsInternalStorageNs(keyPattern) {
+		if strings.Contains(keyPattern, naming.StorageKeySeparator()) {
+		} else if strings.ContainsAny(keyPattern, "*?[") {
+			conn.WriteError("ERR KEYS for doc-path requires bare <storageNs> without wildcards or colons. Glob patterns like 'abc*' on a naked namespace fragment are forbidden; patterns containing ':' (like 'app:prefix*') are treated as raw KV-path and allowed freely. Use SEARCHKEY <ns> <keyrange_json> for typed-document scoped queries.")
+			return
+		} else {
+			if !naming.IsInternalStorageNs(keyPattern) {
+				if _, ok := db.lookupDocByStorageNs(keyPattern); !ok {
+					conn.WriteError(fmt.Sprintf("ERR KEYS namespace %q is not registered — doc-path KEYS requires REGSCH first. For raw KV enumeration, pass a pattern containing ':' (e.g. '%s:*' or '%s:prefix*').", keyPattern, keyPattern, keyPattern))
+					return
+				}
+			}
+			keyPattern = naming.BuildStorageKey(keyPattern, "*")
+		}
 	}
 
 	res := db.Keys(keyPattern)
@@ -852,7 +884,7 @@ func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon
 	}
 	if !naming.IsInternalStorageNs(ownerNs) {
 		if _, ok := db.lookupDocByStorageNs(ownerNs); !ok {
-			conn.WriteError(fmt.Sprintf("ERR SEARCHINDEX index %q belongs to namespace %q which is not registered — doc-pattern requires REGDOC first", indexName, ownerNs))
+			conn.WriteError(fmt.Sprintf("ERR SEARCHINDEX index %q belongs to namespace %q which is not registered — doc-pattern requires REGSCH first", indexName, ownerNs))
 			return
 		}
 	}
@@ -940,12 +972,15 @@ func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	}
 
 	anchor := x.LayerRoutingAnchor(kr)
-	if !strings.Contains(anchor, ":") {
-		if storageNs, nsErr := storageNsFromKRAnchor(anchor); nsErr == nil && storageNs != "" {
-			if _, ok := db.lookupDocByStorageNs(storageNs); !ok {
-				conn.WriteError(fmt.Sprintf("ERR UPDATE namespace %q (resolved from key-range anchor %q) is not registered — doc-pattern requires REGDOC first", storageNs, anchor))
-				return
-			}
+	storageNs, nsErr := storageNsFromKRAnchor(anchor)
+	if nsErr != nil || storageNs == "" {
+		conn.WriteError("ERR UPDATE operates on typed documents only; key-range must be anchored to a registered storage namespace prefix (format: '<storageNs>:<range-suffixes>'). Use SET on the KV-path (arg1 contains ':' for full-key writes) to mutate arbitrary raw keys, or use doc-path UPDATE with a KeyRange scoped to a single registered namespace.")
+		return
+	}
+	if !naming.IsInternalStorageNs(storageNs) {
+		if _, ok := db.lookupDocByStorageNs(storageNs); !ok {
+			conn.WriteError(fmt.Sprintf("ERR UPDATE namespace %q (resolved from key-range anchor %q) is not registered — doc-pattern requires REGSCH first", storageNs, anchor))
+			return
 		}
 	}
 
@@ -1012,7 +1047,7 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 	if !strings.Contains(anchor, ":") {
 		if storageNs, nsErr := storageNsFromKRAnchor(anchor); nsErr == nil && storageNs != "" {
 			if _, ok := db.lookupDocByStorageNs(storageNs); !ok {
-				conn.WriteError(fmt.Sprintf("ERR SEARCHKEY namespace %q (resolved from key-range anchor %q) is not registered — doc-pattern requires REGDOC first", storageNs, anchor))
+				conn.WriteError(fmt.Sprintf("ERR SEARCHKEY namespace %q (resolved from key-range anchor %q) is not registered — doc-pattern requires REGSCH first", storageNs, anchor))
 				return
 			}
 		}
@@ -1083,357 +1118,143 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 	}
 }
 
-func regDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+func regSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 {
-		conn.WriteError("ERR wrong number of arguments for 'regdoc' command: usage: REGDOC <json-spec>")
+		conn.WriteError("ERR wrong number of arguments for 'regsch' command: usage: REGSCH <json-spec>")
 		return
 	}
 	rawJSON := string(cmd.Args[1])
 	if !gjson.Valid(rawJSON) {
-		conn.WriteError("ERR REGDOC invalid JSON format")
+		conn.WriteError("ERR REGSCH invalid JSON format")
 		return
 	}
 	var rawMap map[string]any
 	if err := json.Unmarshal([]byte(rawJSON), &rawMap); err != nil {
-		conn.WriteError("ERR REGDOC invalid JSON: " + err.Error())
+		conn.WriteError("ERR REGSCH invalid JSON: " + err.Error())
 		return
 	}
 	if _, has := rawMap["indexes"]; has {
-		conn.WriteError("ERR REGDOC schema contains reserved field 'indexes'; register indexes via REGIDX, not inside REGDOC payload")
+		conn.WriteError("ERR REGSCH schema contains reserved field 'indexes'; register indexes via REGIDX, not inside REGSCH payload")
 		return
 	}
 	var spec docSpec
 	dec := json.NewDecoder(strings.NewReader(rawJSON))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
-		conn.WriteError("ERR REGDOC schema: " + err.Error())
+		conn.WriteError("ERR REGSCH schema: " + err.Error())
 		return
 	}
-	regKey := spec.StorageNs()
-	db.docRegMu.RLock()
-	_, exists := db.docRegSpec[regKey]
-	db.docRegMu.RUnlock()
-	if exists {
-		conn.WriteError("ERR REGDOC namespace already registered: " + regKey +
-			" — drop it first before re-registering with different spec")
-		return
-	}
-	if err := db.applyDocSpec(spec, nil); err != nil {
-		conn.WriteError("ERR REGDOC " + err.Error())
+	if err := db.writeDocSpec(spec); err != nil {
+		conn.WriteError("ERR REGSCH " + err.Error())
 		return
 	}
 	conn.WriteString("OK")
 }
 
-func lsDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) > 2 {
-		conn.WriteError("ERR wrong number of arguments for 'lsdoc' command: usage: LSDOC [pattern]")
-		return
-	}
-	db.docRegMu.Lock()
-	specs := make([]docSpec, 0, len(db.docRegSpec))
-	for _, s := range db.docRegSpec {
-		specs = append(specs, s)
-	}
-	db.docRegMu.Unlock()
-	sort.Slice(specs, func(i, j int) bool { return specs[i].StorageNs() < specs[j].StorageNs() })
-	conn.WriteArray(len(specs))
-	for _, s := range specs {
-		raw, err := json.Marshal(s)
-		if err != nil {
-			conn.WriteNull()
-			continue
-		}
-		layer := storageDisk
-		if s.Mem {
-			layer = storageMem
-		}
-		metaKey := naming.DocMetaKey(s.StorageNs())
-		_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-			meta, gErr := tx.Get(metaKey)
-			if gErr == nil {
-				if ca := gjson.Get(meta, "created_at").String(); ca != "" {
-					if raw, err = sjson.SetBytes(raw, "created_at", ca); err != nil {
-						return nil
-					}
-				}
-			}
-			return nil
-		})
-		conn.WriteBulk(raw)
-	}
-}
-
-func desDocCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 2 {
-		conn.WriteError("ERR wrong number of arguments for 'desdoc' command: usage: DESDOC <logical-namespace>")
+func dropSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	argc := len(cmd.Args)
+	if argc < 2 || argc > 2 {
+		conn.WriteError("ERR wrong number of arguments for 'dropsch' command: usage: DROPSCH <logical_ns>")
 		return
 	}
 	logicalNs := string(cmd.Args[1])
 	if err := naming.ValidateDocLogicalNamespace(logicalNs); err != nil {
-		conn.WriteError("ERR DESDOC " + err.Error())
+		conn.WriteError("ERR DROPSCH " + err.Error())
 		return
 	}
-	db.docRegMu.Lock()
-	var found docSpec
-	var storageNs string
-	var hasDoc bool
-	for _, s := range db.docRegSpec {
-		if s.Namespace == logicalNs {
-			found = s
-			storageNs = s.StorageNs()
-			hasDoc = true
-			break
-		}
-	}
-	db.docRegMu.Unlock()
-	if !hasDoc {
-		conn.WriteError(fmt.Sprintf("ERR DESDOC namespace %q not registered", logicalNs))
+	if err := db.dropSchemaByLogicalNs(logicalNs); err != nil {
+		conn.WriteError("ERR DROPSCH " + err.Error())
 		return
 	}
-	raw, err := json.Marshal(found)
-	if err != nil {
-		conn.WriteError("ERR DESDOC marshal: " + err.Error())
-		return
-	}
-	layer := storageDisk
-	if found.Mem {
-		layer = storageMem
-	}
-	docMetaKey := naming.DocMetaKey(storageNs)
-	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-		meta, gErr := tx.Get(docMetaKey)
-		if gErr == nil {
-			if ca := gjson.Get(meta, "created_at").String(); ca != "" {
-				if raw, err = sjson.SetBytes(raw, "created_at", ca); err != nil {
-					return nil
-				}
-			}
-		}
-		return nil
-	})
-	db.idxRegMu.Lock()
-	matching := make([]idxSpec, 0)
-	for _, i := range db.idxRegSpec {
-		base, _ := naming.StripMemPrefixIfMem(i.OwnerNs)
-		if base == logicalNs || i.OwnerNs == storageNs {
-			matching = append(matching, i)
-		}
-	}
-	db.idxRegMu.Unlock()
-	sort.Slice(matching, func(i, j int) bool { return matching[i].FullName() < matching[j].FullName() })
-	idxRaw := make([]json.RawMessage, 0, len(matching))
-	for _, i := range matching {
-		iraw, ierr := json.Marshal(i)
-		if ierr != nil {
-			continue
-		}
-		ilayer := storageDisk
-		if naming.HasMemPrefix(i.OwnerNs) {
-			ilayer = storageMem
-		}
-		idxMeta := naming.IdxMetaKey(i.FullName())
-		_ = db.store(ilayer).View(func(tx *buntdb.Tx) error {
-			meta, gErr := tx.Get(idxMeta)
-			if gErr == nil {
-				if ca := gjson.Get(meta, "created_at").String(); ca != "" {
-					if iraw, ierr = sjson.SetBytes(iraw, "created_at", ca); ierr != nil {
-						return nil
-					}
-				}
-			}
-			return nil
-		})
-		if base, ok := naming.StripMemPrefixIfMem(i.OwnerNs); ok {
-			if iraw, err = sjson.SetBytes(iraw, "owner_doc_logical_ns", base); err != nil {
-				continue
-			}
-		}
-		idxRaw = append(idxRaw, iraw)
-	}
-	out, err := sjson.SetRawBytes(raw, "indexes", []byte(mustMarshal(idxRaw)))
-	if err != nil {
-		conn.WriteError("ERR DESDOC marshal: " + err.Error())
-		return
-	}
-	conn.WriteBulk(out)
-}
-
-func lsIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) > 2 {
-		conn.WriteError("ERR wrong number of arguments for 'lsidx' command: usage: LSIDX [logical-namespace]")
-		return
-	}
-	filter := ""
-	if len(cmd.Args) == 2 {
-		filter = string(cmd.Args[1])
-		if err := naming.ValidateDocLogicalNamespace(filter); err != nil {
-			conn.WriteError("ERR LSIDX " + err.Error())
-			return
-		}
-	}
-	db.idxRegMu.Lock()
-	all := make([]idxSpec, 0, len(db.idxRegSpec))
-	for _, i := range db.idxRegSpec {
-		if filter != "" {
-			base, _ := naming.StripMemPrefixIfMem(i.OwnerNs)
-			if base != filter {
-				continue
-			}
-		}
-		all = append(all, i)
-	}
-	db.idxRegMu.Unlock()
-	sort.Slice(all, func(i, j int) bool { return all[i].FullName() < all[j].FullName() })
-	conn.WriteArray(len(all))
-	for _, i := range all {
-		raw, err := json.Marshal(i)
-		if err != nil {
-			conn.WriteNull()
-			continue
-		}
-		layer := storageDisk
-		if naming.HasMemPrefix(i.OwnerNs) {
-			layer = storageMem
-		}
-		metaKey := naming.IdxMetaKey(i.FullName())
-		_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-			meta, gErr := tx.Get(metaKey)
-			if gErr == nil {
-				if ca := gjson.Get(meta, "created_at").String(); ca != "" {
-					if raw, err = sjson.SetBytes(raw, "created_at", ca); err != nil {
-						return nil
-					}
-				}
-			}
-			return nil
-		})
-		if base, ok := naming.StripMemPrefixIfMem(i.OwnerNs); ok {
-			if raw, err = sjson.SetBytes(raw, "owner_doc_logical_ns", base); err != nil {
-				continue
-			}
-		}
-		conn.WriteBulk(raw)
-	}
+	conn.WriteString("OK")
 }
 
 func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	argc := len(cmd.Args)
-	if argc < 2 {
-		conn.WriteError("ERR wrong number of arguments for 'regidx' command: usage: REGIDX <json-spec>  or  REGIDX <owner_ns> <logical> <path1[,path2,...]> [UNIQUE] [TYPE <type>]")
+	if argc != 2 {
+		conn.WriteError("ERR wrong number of arguments for 'regidx' command: usage: " + proto.UsageRegisterIndex)
 		return
 	}
 	var spec idxSpec
-	if argc == 2 {
-		rawJSON := string(cmd.Args[1])
-		if !gjson.Valid(rawJSON) {
-			conn.WriteError("ERR REGIDX invalid JSON format")
-			return
-		}
-		var rawMap map[string]any
-		if err := json.Unmarshal([]byte(rawJSON), &rawMap); err != nil {
-			conn.WriteError("ERR REGIDX invalid JSON: " + err.Error())
-			return
-		}
-		if v, ok := rawMap["full_name"].(string); ok && v != "" {
-			ownerNs, logical, err := naming.ParseIdxFullName(v)
-			if err != nil {
-				conn.WriteError("ERR REGIDX " + err.Error())
-				return
-			}
-			spec.OwnerNs = ownerNs
-			spec.Logical = logical
-		} else if on, _ := rawMap["owner_ns"].(string); on != "" {
-			lg, _ := rawMap["logical"].(string)
-			if lg == "" {
-				if v := gjson.Get(rawJSON, "owner_doc_logical_ns").String(); v != "" {
-					ownerMem := naming.HasMemPrefix(on)
-					if !ownerMem {
-						ownerMem = gjson.Get(rawJSON, "owner_mem").Bool()
-					}
-					if err := naming.ValidateDocLogicalNamespace(v); err != nil {
-						conn.WriteError("ERR REGIDX " + err.Error())
-						return
-					}
-					on = naming.BuildStorageNs(v, ownerMem)
-					rawMap["owner_ns"] = on
-				}
-				lg = gjson.Get(rawJSON, "logical").String()
-			}
-			if on == "" || lg == "" {
-				conn.WriteError("ERR REGIDX either full_name or (owner_ns + logical) is required")
-				return
-			}
-			if err := naming.ValidateLogicalIndexName(lg); err != nil {
-				conn.WriteError("ERR REGIDX " + err.Error())
-				return
-			}
-			spec.OwnerNs = on
-			spec.Logical = strings.ToLower(lg)
-		} else if v := gjson.Get(rawJSON, "owner_doc_logical_ns").String(); v != "" {
-			lg := gjson.Get(rawJSON, "logical").String()
-			if lg == "" {
-				conn.WriteError("ERR REGIDX logical is required")
-				return
-			}
-			ownerMem := gjson.Get(rawJSON, "owner_mem").Bool()
-			if err := naming.ValidateDocLogicalNamespace(v); err != nil {
-				conn.WriteError("ERR REGIDX " + err.Error())
-				return
-			}
-			if err := naming.ValidateLogicalIndexName(lg); err != nil {
-				conn.WriteError("ERR REGIDX " + err.Error())
-				return
-			}
-			spec.OwnerNs = naming.BuildStorageNs(v, ownerMem)
-			spec.Logical = strings.ToLower(lg)
-		} else {
-			conn.WriteError("ERR REGIDX either full_name or owner_ns + logical is required")
-			return
-		}
-		paths, err := normalizeIndexPathFields(rawMap)
+	rawJSON := string(cmd.Args[1])
+	if !gjson.Valid(rawJSON) {
+		conn.WriteError("ERR REGIDX invalid JSON format")
+		return
+	}
+	var rawMap map[string]any
+	if err := json.Unmarshal([]byte(rawJSON), &rawMap); err != nil {
+		conn.WriteError("ERR REGIDX invalid JSON: " + err.Error())
+		return
+	}
+	if v, ok := rawMap["full_name"].(string); ok && v != "" {
+		ownerNs, logical, err := naming.ParseIdxFullName(v)
 		if err != nil {
 			conn.WriteError("ERR REGIDX " + err.Error())
 			return
-		}
-		spec.Paths = paths
-		spec.KeyPattern, _ = rawMap["key_pattern"].(string)
-		// restore owner_ns/logical from explicit resolution above (takes precedence over raw JSON)
-		if spec.OwnerNs == "" {
-			spec.OwnerNs, _ = rawMap["owner_ns"].(string)
-		}
-		if spec.Logical == "" {
-			spec.Logical, _ = rawMap["logical"].(string)
-		}
-	} else if argc >= 4 && argc <= 7 {
-		owner := string(cmd.Args[1])
-		logical := string(cmd.Args[2])
-		pathArg := string(cmd.Args[3])
-		if err := naming.ValidateDocLogicalNamespace(owner); err != nil {
-			conn.WriteError("ERR REGIDX " + err.Error())
-			return
-		}
-		if err := naming.ValidateLogicalIndexName(logical); err != nil {
-			conn.WriteError("ERR REGIDX " + err.Error())
-			return
-		}
-		paths, err := splitAndNormalizeIndexPaths(pathArg)
-		if err != nil {
-			conn.WriteError("ERR REGIDX " + err.Error())
-			return
-		}
-		ownerMem := naming.HasMemPrefix(owner)
-		ownerNs := owner
-		if !ownerMem {
-			ownerNs = naming.BuildStorageNs(owner, false)
 		}
 		spec.OwnerNs = ownerNs
-		spec.Logical = strings.ToLower(logical)
-		spec.Paths = paths
-		spec.KeyPattern = naming.StorageNsScope(ownerNs) + "*"
+		spec.Logical = logical
+	} else if on, _ := rawMap["owner_ns"].(string); on != "" {
+		lg, _ := rawMap["logical"].(string)
+		if lg == "" {
+			if v := gjson.Get(rawJSON, "owner_doc_logical_ns").String(); v != "" {
+				ownerMem := naming.HasMemPrefix(on)
+				if !ownerMem {
+					ownerMem = gjson.Get(rawJSON, "owner_mem").Bool()
+				}
+				if err := naming.ValidateDocLogicalNamespace(v); err != nil {
+					conn.WriteError("ERR REGIDX " + err.Error())
+					return
+				}
+				on = naming.BuildStorageNs(v, ownerMem)
+				rawMap["owner_ns"] = on
+			}
+			lg = gjson.Get(rawJSON, "logical").String()
+		}
+		if on == "" || lg == "" {
+			conn.WriteError("ERR REGIDX either full_name or (owner_ns + logical) is required")
+			return
+		}
+		if err := naming.ValidateLogicalIndexName(lg); err != nil {
+			conn.WriteError("ERR REGIDX " + err.Error())
+			return
+		}
+		spec.OwnerNs = on
+		spec.Logical = strings.ToLower(lg)
+	} else if v := gjson.Get(rawJSON, "owner_doc_logical_ns").String(); v != "" {
+		lg := gjson.Get(rawJSON, "logical").String()
+		if lg == "" {
+			conn.WriteError("ERR REGIDX logical is required")
+			return
+		}
+		ownerMem := gjson.Get(rawJSON, "owner_mem").Bool()
+		if err := naming.ValidateDocLogicalNamespace(v); err != nil {
+			conn.WriteError("ERR REGIDX " + err.Error())
+			return
+		}
+		if err := naming.ValidateLogicalIndexName(lg); err != nil {
+			conn.WriteError("ERR REGIDX " + err.Error())
+			return
+		}
+		spec.OwnerNs = naming.BuildStorageNs(v, ownerMem)
+		spec.Logical = strings.ToLower(lg)
 	} else {
-		conn.WriteError("ERR wrong number of arguments for 'regidx' command: usage: REGIDX <json-spec>  or  REGIDX <owner_ns> <logical> <path1[,path2,...]> [UNIQUE] [TYPE <type>]")
+		conn.WriteError("ERR REGIDX either full_name or owner_ns + logical is required")
 		return
+	}
+	paths, err := normalizeIndexPathFields(rawMap)
+	if err != nil {
+		conn.WriteError("ERR REGIDX " + err.Error())
+		return
+	}
+	spec.Paths = paths
+	spec.KeyPattern, _ = rawMap["key_pattern"].(string)
+	// restore owner_ns/logical from explicit resolution above (takes precedence over raw JSON)
+	if spec.OwnerNs == "" {
+		spec.OwnerNs, _ = rawMap["owner_ns"].(string)
+	}
+	if spec.Logical == "" {
+		spec.Logical, _ = rawMap["logical"].(string)
 	}
 	if spec.OwnerNs == "" || spec.Logical == "" {
 		conn.WriteError("ERR REGIDX owner_ns and logical are required")
@@ -1445,25 +1266,16 @@ func regIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	for i, p := range spec.Paths {
 		spec.Paths[i] = strings.ReplaceAll(p, ".", "_")
 	}
-	fullName := spec.FullName()
-	db.idxRegMu.RLock()
-	_, exists := db.idxRegSpec[fullName]
-	db.idxRegMu.RUnlock()
-	if exists {
-		conn.WriteError("ERR REGIDX index already registered: " + fullName +
-			" — drop it first before re-registering with different spec")
-		return
-	}
-	if err := db.applyIndexSpec(spec, true); err != nil {
+	if err := db.writeIndexSpec(spec); err != nil {
 		conn.WriteError("ERR REGIDX " + err.Error())
 		return
 	}
 	conn.WriteString("OK")
 }
 
-func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+func dropIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) < 2 || len(cmd.Args) > 3 {
-		conn.WriteError("ERR wrong number of arguments for 'delidx' command: usage: DELIDX <fullName>  or  DELIDX <logicalNs> <logicalIdxName>")
+		conn.WriteError("ERR wrong number of arguments for 'dropidx' command: usage: DROPIDX <fullName>  or  DROPIDX <logicalNs> <logicalIdxName>")
 		return
 	}
 	var err error
@@ -1473,11 +1285,11 @@ func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		ns := string(cmd.Args[1])
 		logical := string(cmd.Args[2])
 		if errV := naming.ValidateDocLogicalNamespace(ns); errV != nil {
-			conn.WriteError("ERR DELIDX " + errV.Error())
+			conn.WriteError("ERR DROPIDX " + errV.Error())
 			return
 		}
 		if errV := naming.ValidateLogicalIndexName(logical); errV != nil {
-			conn.WriteError("ERR DELIDX " + errV.Error())
+			conn.WriteError("ERR DROPIDX " + errV.Error())
 			return
 		}
 		memNs := naming.BuildStorageNs(ns, true)
@@ -1499,7 +1311,7 @@ func delIdxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 		}
 	}
 	if err != nil {
-		conn.WriteError("ERR DELIDX " + err.Error())
+		conn.WriteError("ERR DROPIDX " + err.Error())
 		return
 	}
 	conn.WriteString("OK")
@@ -1511,22 +1323,6 @@ func mustMarshal(v any) string {
 		return "[]"
 	}
 	return string(b)
-}
-
-func splitAndNormalizeIndexPaths(csv string) ([]string, error) {
-	if csv == "" {
-		return nil, fmt.Errorf("at least one json path is required (composite indexes use comma: path1,path2,...)")
-	}
-	raw := strings.Split(csv, ",")
-	out := make([]string, 0, len(raw))
-	for _, p := range raw {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			return nil, fmt.Errorf("composite index path list contains empty entry; usage: REGIDX owner logical path1,path2,...")
-		}
-		out = append(out, p)
-	}
-	return out, nil
 }
 
 func normalizeIndexPathFields(rawMap map[string]any) ([]string, error) {

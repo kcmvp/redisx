@@ -38,7 +38,10 @@ func TestValidateKVFullKey(t *testing.T) {
 		phrase  string
 	}{
 		{name: "no colon bare key", key: "userkey", wantErr: true, phrase: "namespace separator"},
-		{name: "internal underscore prefix even w/ colon", key: "_doc_:abc", wantErr: true, phrase: "internal prefix"},
+		{name: "internal doc underscore prefix READ ALLOWED (passthrough for GET/KEYS)", key: "_doc_:abc", wantErr: false},
+		{name: "internal idx underscore prefix READ ALLOWED", key: "_idx_:user_age:v_123", wantErr: false},
+		{name: "internal auth underscore prefix READ ALLOWED", key: "_auth_:somekey", wantErr: false},
+		{name: "unrecognised underscore shape (future expansion) REJECTED even w/ colon", key: "_future_:abc", wantErr: true, phrase: "reserved internal prefix"},
 		{name: "plain kv with colon", key: "app:config:item", wantErr: false},
 		{name: "mem layer with colon", key: "_m_:user:abc", wantErr: false},
 		{name: "simple ns:pk", key: "user:123", wantErr: false},
@@ -46,6 +49,35 @@ func TestValidateKVFullKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateKVFullKey(tt.key)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.phrase)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateKVMutationKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr bool
+		phrase  string
+	}{
+		{name: "no colon bare key", key: "userkey", wantErr: true, phrase: "namespace separator"},
+		{name: "_doc_: WRITE REJECTED (dedicated registry cmd)", key: "_doc_:abc", wantErr: true, phrase: "managed exclusively via dedicated"},
+		{name: "_idx_: WRITE REJECTED", key: "_idx_:user_age:v_123", wantErr: true, phrase: "dedicated registry commands"},
+		{name: "_auth_: WRITE REJECTED", key: "_auth_:leak", wantErr: true, phrase: "REGSCH/DROPSCH/REGIDX/DROPIDX/AUTH"},
+		{name: "unrecognised underscore WRITE REJECTED", key: "_future_:abc", wantErr: true, phrase: "reserved internal prefix"},
+		{name: "normal user:pk WRITE OK", key: "user:123", wantErr: false},
+		{name: "mem layer WRITE OK (not internal)", key: "_m_:user:abc", wantErr: false},
+		{name: "app:prefix WRITE OK", key: "app:config:item", wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateKVMutationKey(tt.key)
 			if tt.wantErr {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), tt.phrase)
@@ -135,8 +167,8 @@ func TestLookupDocByLogicalOrStorageNs(t *testing.T) {
 	db := openDB(testutil.DBPath(t))
 	require.NotNil(t, db)
 	defer func() { _ = db.Close() }()
-	require.NoError(t, db.applyDocSpec(docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}, nil))
-	require.NoError(t, db.applyDocSpec(docSpec{Namespace: "session", Mem: true, KeyAttrs: []string{"sid"}, TTL: 0}, nil))
+	require.NoError(t, db.writeDocSpec(docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}))
+	require.NoError(t, db.writeDocSpec(docSpec{Namespace: "session", Mem: true, KeyAttrs: []string{"sid"}, TTL: 0}))
 
 	disk := naming.BuildStorageNs("user", false)
 	mem := naming.BuildStorageNs("session", true)
@@ -167,7 +199,7 @@ func TestAutoTTLFromKey(t *testing.T) {
 	db := openDB(testutil.DBPath(t))
 	require.NotNil(t, db)
 	defer func() { _ = db.Close() }()
-	require.NoError(t, db.applyDocSpec(docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}, nil))
+	require.NoError(t, db.writeDocSpec(docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}))
 
 	key := naming.BuildStorageKey(naming.BuildStorageNs("user", false), "abc")
 	require.Equal(t, 3*time.Hour, db.autoTTLFromKey(key, 3*time.Hour), "explicit wins")
@@ -176,6 +208,6 @@ func TestAutoTTLFromKey(t *testing.T) {
 	uk := naming.BuildStorageKey(naming.BuildStorageNs("unknownns", false), "x")
 	require.Equal(t, time.Duration(0), db.autoTTLFromKey(uk, 0))
 
-	internal := naming.DocMetaKey("any")
+	internal := naming.DocMetaKey("any", "placeholder")
 	require.Equal(t, time.Duration(0), db.autoTTLFromKey(internal, 0))
 }

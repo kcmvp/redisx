@@ -147,12 +147,12 @@ func RunCreateDocWizard(sess *session.Session, cache *session.Cache) error {
 		fmt.Println(cYellow("cancelled."))
 		return nil
 	}
-	v, err := sess.RawDo([]any{"regdoc", string(specRaw)}).Result()
+	v, err := sess.RawDo([]any{"regsch", string(specRaw)}).Result()
 	if err != nil {
 		return err
 	}
 	cache.Invalidate()
-	fmt.Println(cGreen("✓ submitted regdoc — server reply:"))
+	fmt.Println(cGreen("✓ submitted regsch — server reply:"))
 	PrintAny(os.Stdout, v)
 	return nil
 }

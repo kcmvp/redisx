@@ -76,18 +76,24 @@ func BuildIdxFullName(storageNs, logical string) string {
 	return storageNs + storageKeySeparator + logical
 }
 
-func DocMetaKey(storageNs string) string {
+func DocMetaKey(storageNs, version string) string {
 	if storageNs == "" {
 		panic("naming.DocMetaKey: storageNs is required")
 	}
-	return docMetaNsPrefix + storageKeySeparator + storageNs
+	if version == "" {
+		panic("naming.DocMetaKey: version is required (md5 hex 12-char truncated)")
+	}
+	return docMetaNsPrefix + storageKeySeparator + storageNs + storageKeySeparator + "v_" + version
 }
 
-func IdxMetaKey(idxFullName string) string {
+func IdxMetaKey(idxFullName, version string) string {
 	if idxFullName == "" {
 		panic("naming.IdxMetaKey: idxFullName is required")
 	}
-	return idxMetaNsPrefix + storageKeySeparator + idxFullName
+	if version == "" {
+		panic("naming.IdxMetaKey: version is required (md5 hex 12-char truncated)")
+	}
+	return idxMetaNsPrefix + storageKeySeparator + idxFullName + storageKeySeparator + "v_" + version
 }
 
 func AuthStorageKey(keyName string) string {
@@ -97,8 +103,33 @@ func AuthStorageKey(keyName string) string {
 	return authNsPrefix + storageKeySeparator + keyName
 }
 
-func DocMetaGlob() string     { return docMetaNsPrefix + storageKeySeparator + globSuffix }
-func IdxMetaGlob() string     { return idxMetaNsPrefix + storageKeySeparator + globSuffix }
+func DocMetaGlob() string {
+	return docMetaNsPrefix + storageKeySeparator + globSuffix + storageKeySeparator + "v_" + globSuffix
+}
+func IdxMetaGlob() string {
+	return idxMetaNsPrefix + storageKeySeparator + globSuffix + storageKeySeparator + "v_" + globSuffix
+}
+
+// DocMetaGlobFor returns the glob pattern matching ALL versioned meta keys for
+// a single logical document namespace (e.g. "_doc_:user:v_*"). Used by
+// writeDocSpec list-older-versions branch to find and clean stale MD5-based
+// meta keys for the same logical storageNs.
+func DocMetaGlobFor(storageNs string) string {
+	if storageNs == "" {
+		panic("naming.DocMetaGlobFor: storageNs is required")
+	}
+	return docMetaNsPrefix + storageKeySeparator + storageNs + storageKeySeparator + "v_" + globSuffix
+}
+
+// IdxMetaGlobFor returns the glob pattern matching ALL versioned meta keys
+// for a single logical index full name (e.g. "_idx_:user:age:v_*").
+func IdxMetaGlobFor(idxFullName string) string {
+	if idxFullName == "" {
+		panic("naming.IdxMetaGlobFor: idxFullName is required")
+	}
+	return idxMetaNsPrefix + storageKeySeparator + idxFullName + storageKeySeparator + "v_" + globSuffix
+}
+
 func AuthStorageGlob() string { return authNsPrefix + storageKeySeparator + globSuffix }
 
 func StorageNsKeyPattern(storageNs string) string {

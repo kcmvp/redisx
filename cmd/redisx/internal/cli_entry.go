@@ -67,10 +67,10 @@ func bannerLinesFor(caps session.Capabilities, host, port string) []string {
 	basicPure := []string{"ping", "!version / !clear", "!help", "quit / exit (Ctrl-C)"}
 	metaPure := []string{}
 	if hasTypedDocs {
-		metaPure = append(metaPure, "docs:  regdoc / lsdoc / desdoc / !createdoc / !describedoc")
+		metaPure = append(metaPure, "docs:  regsch / dropsch / !createsch")
 	}
 	if hasTypedIndexes {
-		metaPure = append(metaPure, "idx:   regidx / lsidx / delidx / !createindex / !dropindex / !listindexes")
+		metaPure = append(metaPure, "idx:   regidx / dropidx / !createidx / !dropidx")
 	}
 	extPure := []string{}
 	if hasSearch {

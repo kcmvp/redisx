@@ -22,7 +22,7 @@ import (
 //
 //  1. If arg1 does NOT contain ':' → Doc Pattern. arg1 is treated as a
 //     logical document namespace and MUST have been registered via
-//     server.Start(schemas…) or the REGDOC admin command. A bare no-colon
+//     server.Start(schemas…) or the REGSCH admin command. A bare no-colon
 //     key that is not a registered namespace is rejected outright; the
 //     system never falls back to plain-KV mode for it.
 //  2. If arg1 contains ':' → KV Pattern. arg1 is treated as the literal

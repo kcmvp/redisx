@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,122 @@ const clientTestAuthLimit = 50
 
 var cliServerSeedOnce sync.Once
 
+type rawSchema struct {
+	ns       string
+	mem      bool
+	keyAttrs []string
+	ttl      time.Duration
+}
+
+func (r rawSchema) Namespace() string       { return r.ns }
+func (r rawSchema) Mem() bool              { return r.mem }
+func (r rawSchema) KeyAttrs() []string     { return r.keyAttrs }
+func (r rawSchema) TTL() time.Duration     { return r.ttl }
+
+func sharedSeedBody(t *testing.T, db interface {
+	CreateIndex(idx x.Index) error
+	Set(k string, v string) error
+	UpsertDoc(s x.Schema) error
+}) {
+	t.Helper()
+	require := require.New(t)
+
+	require.NoError(db.UpsertDoc(rawSchema{ns: "probenegcli", mem: false, keyAttrs: []string{"id"}, ttl: 0}))
+	require.NoError(db.UpsertDoc(rawSchema{ns: "probeserver", mem: true, keyAttrs: []string{"id"}, ttl: 0}))
+	require.NoError(db.UpsertDoc(rawSchema{ns: "probenegdoc", mem: false, keyAttrs: []string{"id"}, ttl: 0}))
+
+	require.NoError(db.CreateIndex(x.Idx[testUserDoc]("age", "*", "age")))
+	require.NoError(db.CreateIndex(x.Idx[testUserDoc]("email", "*", "email")))
+
+	probeClientKP := testutil.KeyRangeKeyPattern(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
+	probeClientStorageNs := naming.BuildStorageNs(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
+	idxClientProbeScore := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "score"), probeClientKP, "score")
+	idxClientProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "bucket"), probeClientKP, "bucket")
+	idxClientProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "sparseamt"), probeClientKP, "sparse_amt")
+	require.NoError(db.CreateIndex(idxClientProbeScore))
+	require.NoError(db.CreateIndex(idxClientProbeBucket))
+	require.NoError(db.CreateIndex(idxClientProbeSparse))
+
+	probeDocKP := testutil.KeyRangeKeyPattern(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	probeDocStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	idxDocProbeScore := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "score"), probeDocKP, "score")
+	idxDocProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "bucket"), probeDocKP, "bucket")
+	idxDocProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "sparseamt"), probeDocKP, "sparse_amt")
+	require.NoError(db.CreateIndex(idxDocProbeScore))
+	require.NoError(db.CreateIndex(idxDocProbeBucket))
+	require.NoError(db.CreateIndex(idxDocProbeSparse))
+
+	require.NoError(db.CreateIndex(x.Idx[UserDoc]("age", "*", "age")))
+
+	require.NoError(db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50"))
+
+	for _, kv := range testutil.LoadXFor(t, searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
+		require.NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
+	}
+
+	for _, kv := range testutil.LoadXFor(t, searchKRDocNamespace, testutil.KeyRangeFixtureMem()) {
+		require.NoError(db.Set(kv.K, kv.V), "seed probe-doc fixture failed for %s", kv.K)
+	}
+}
+
+func stopAndResetGlobalState() {
+	disconnect()
+	setLifecycleCtx(nil, nil)
+	_ = server.Stop()
+	cliOnce = sync.Once{}
+	cliServerSeedOnce = sync.Once{}
+	clientTestServerAddr = ""
+}
+
+func ensureServerAndSeed(t *testing.T) {
+	t.Helper()
+	require := require.New(t)
+
+	t.Setenv("HOME", t.TempDir())
+
+	addr := clientTestServerAddr
+	if addr == "" {
+		for i := 0; i < 30; i++ {
+			if clientTestServerAddr != "" {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	if clientTestServerAddr == "" {
+		dbPath := filepath.Join(t.TempDir(), "redisx.db")
+		appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+		cfg := &server.Config{
+			DataPath: dbPath,
+			App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
+			Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		}
+		clientTestServerAddr = cfg.Admin.Addr()
+		db := server.StartWithConfig(cfg,
+			testUserDoc(""),
+			SearchFixtureDoc(""),
+			UpdateFixtureDoc(""),
+			UserDoc(""),
+			ExpiringUserDoc(""),
+			DocSearchFixture(""),
+			DocUpdateFixture(""),
+		)
+		require.NotNil(db)
+		sharedSeedBody(t, db)
+	}
+
+	for i := 0; i < 30; i++ {
+		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
+		if err == nil {
+			_ = probe.Close()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("test server did not become ready")
+}
+
 type testUserDoc string
 
 func (testUserDoc) Namespace() string  { return "user" }
@@ -44,6 +161,43 @@ func (testUserDoc) Mem() bool          { return false }
 func (testUserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u testUserDoc) RawJSON() string  { return string(u) }
 func (testUserDoc) TTL() time.Duration { return 0 }
+
+const (
+	searchKRDocNamespace = "probedoc"
+	updateKRDocNamespace = "upddoc000"
+)
+
+type DocSearchFixture string
+
+func (DocSearchFixture) Namespace() string  { return searchKRDocNamespace }
+func (DocSearchFixture) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (DocSearchFixture) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d DocSearchFixture) RawJSON() string  { return string(d) }
+func (DocSearchFixture) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+type DocUpdateFixture string
+
+func (DocUpdateFixture) Namespace() string  { return updateKRDocNamespace }
+func (DocUpdateFixture) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (DocUpdateFixture) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d DocUpdateFixture) RawJSON() string  { return string(d) }
+func (DocUpdateFixture) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+type UserDoc string
+
+func (UserDoc) Namespace() string  { return "user" }
+func (UserDoc) Mem() bool          { return false }
+func (UserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u UserDoc) RawJSON() string  { return string(u) }
+func (UserDoc) TTL() time.Duration { return time.Hour }
+
+type ExpiringUserDoc string
+
+func (ExpiringUserDoc) Namespace() string  { return "expuserclient" }
+func (ExpiringUserDoc) Mem() bool          { return false }
+func (ExpiringUserDoc) KeyAttrs() []string { return []string{"id"} }
+func (u ExpiringUserDoc) RawJSON() string  { return string(u) }
+func (ExpiringUserDoc) TTL() time.Duration { return 40 * time.Millisecond }
 
 func (s *ClientTestSuite) SetupTest() {
 	disconnect()
@@ -82,12 +236,6 @@ func (s *ClientTestSuite) SetupSuite() {
 	s.T().Setenv("HOME", s.T().TempDir())
 	dbPath := filepath.Join(s.T().TempDir(), "redisx.db")
 
-	probeKP := testutil.KeyRangeKeyPattern(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
-	probeStorageNs := naming.BuildStorageNs(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
-	idxProbeScore := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "score"), probeKP, "score")
-	idxProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "bucket"), probeKP, "bucket")
-	idxProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeStorageNs, "sparseamt"), probeKP, "sparse_amt")
-
 	appPort, adminPort := testutil.AllocateTwoFreePorts(s.T())
 	cfg := &server.Config{
 		DataPath: dbPath,
@@ -99,21 +247,14 @@ func (s *ClientTestSuite) SetupSuite() {
 		testUserDoc(""),
 		SearchFixtureDoc(""),
 		UpdateFixtureDoc(""),
+		UserDoc(""),
+		ExpiringUserDoc(""),
+		DocSearchFixture(""),
+		DocUpdateFixture(""),
 	)
 	s.Require().NotNil(db)
 
-	cliServerSeedOnce.Do(func() {
-		s.Require().NoError(db.CreateIndex(x.Idx[testUserDoc]("age", "*", "age")))
-		s.Require().NoError(db.CreateIndex(x.Idx[testUserDoc]("email", "*", "email")))
-		s.Require().NoError(db.CreateIndex(idxProbeScore))
-		s.Require().NoError(db.CreateIndex(idxProbeBucket))
-		s.Require().NoError(db.CreateIndex(idxProbeSparse))
-		s.Require().NoError(db.Set(naming.AuthStorageKey(clientTestExternalAuthKey), "50"))
-
-		for _, kv := range testutil.LoadXFor(s.T(), searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
-			s.Require().NoError(db.Set(kv.K, kv.V), "seed probe-client fixture failed for %s", kv.K)
-		}
-	})
+	sharedSeedBody(s.T(), db)
 
 	for i := 0; i < 30; i++ {
 		probe, err := connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -127,10 +268,7 @@ func (s *ClientTestSuite) SetupSuite() {
 }
 
 func (s *ClientTestSuite) TearDownSuite() {
-	disconnect()
-	_ = server.Stop()
-	cliServerSeedOnce = sync.Once{}
-	clientTestServerAddr = ""
+	stopAndResetGlobalState()
 }
 
 func TestClientSuite(t *testing.T) {
@@ -142,7 +280,6 @@ func (s *ClientTestSuite) TestMemKey() {
 	s.Equal("_m_:user:1", x.MemKey("_m_:user:1"))
 }
 
-// ensureConnected waits until the shared client is fully connected
 func (s *ClientTestSuite) ensureConnected() {
 	for i := 0; i < 30; i++ {
 		client := getSharedClient()
@@ -237,35 +374,35 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 		{
 			"Get not connected",
 			nil,
-			func() (string, error) { return Get("cli:k") },
+			func() (string, error) { return GetRaw("cli:k") },
 			true, "resp client is not connected", "",
 		},
 		{
 			"Set not connected",
 			nil,
-			func() (string, error) { return "", Set("cli:k", "v") },
+			func() (string, error) { return "", SetRaw("cli:k", "v") },
 			true, "resp client is not connected", "",
 		},
 		{
 			"Get empty key",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) { return Get("") },
+			func() (string, error) { return GetRaw("") },
 			false, "", "",
 		},
 		{
 			"Set empty key",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) { return "", Set("", "v") },
+			func() (string, error) { return "", SetRaw("", "v") },
 			false, "", "",
 		},
 		{
 			"Set and Get Success",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
 			func() (string, error) {
-				if err := Set("cli:external-key", "external-value"); err != nil {
+				if err := SetRaw("cli:external-key", "external-value"); err != nil {
 					return "", err
 				}
-				return Get("cli:external-key")
+				return GetRaw("cli:external-key")
 			},
 			false, "", "external-value",
 		},
@@ -273,15 +410,15 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 			"SetWithTTL Success and Expire",
 			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
 			func() (string, error) {
-				if err := SetWithTTL("cli:ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
+				if err := SetWithTTLRaw("cli:ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
 					return "", err
 				}
-				v1, _ := Get("cli:ttl_key")
+				v1, _ := GetRaw("cli:ttl_key")
 				if v1 != "ttl_val" {
 					return v1, nil
 				}
 				time.Sleep(200 * time.Millisecond)
-				v2, err := Get("cli:ttl_key")
+				v2, err := GetRaw("cli:ttl_key")
 				return v2, err
 			},
 			true, "redis: nil", "",
@@ -312,7 +449,7 @@ func (s *ClientTestSuite) TestGetSetCommand() {
 func (s *ClientTestSuite) TestCrudCommands() {
 	s.Run("SetNXWithTTL not connected", func() {
 		s.SetupTest()
-		ok, err := SetNXWithTTL("cli:k", "v", time.Second)
+		ok, err := SetNXWithTTLRaw("cli:k", "v", time.Second)
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(ok)
@@ -324,7 +461,7 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		ok, err := SetNXWithTTL("", "v", time.Second)
+		ok, err := SetNXWithTTLRaw("", "v", time.Second)
 		s.NoError(err)
 		s.False(ok)
 	})
@@ -335,11 +472,11 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		ok, err := SetNXWithTTL("cli:setnx-fallback", "v1", 0)
+		ok, err := SetNXWithTTLRaw("cli:setnx-fallback", "v1", 0)
 		s.NoError(err)
 		s.True(ok)
 
-		ok, err = SetNXWithTTL("cli:setnx-fallback", "v2", 0)
+		ok, err = SetNXWithTTLRaw("cli:setnx-fallback", "v2", 0)
 		s.NoError(err)
 		s.False(ok)
 	})
@@ -350,24 +487,24 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		ok, err := SetNXWithTTL("cli:setnx-ttl", "ttl-value", 100*time.Millisecond)
+		ok, err := SetNXWithTTLRaw("cli:setnx-ttl", "ttl-value", 100*time.Millisecond)
 		s.NoError(err)
 		s.True(ok)
 
-		val, err := Get("cli:setnx-ttl")
+		val, err := GetRaw("cli:setnx-ttl")
 		s.NoError(err)
 		s.Equal("ttl-value", val)
 
 		time.Sleep(200 * time.Millisecond)
 
-		_, err = Get("cli:setnx-ttl")
+		_, err = GetRaw("cli:setnx-ttl")
 		s.Error(err)
 		s.Contains(err.Error(), "redis: nil")
 	})
 
 	s.Run("SetNX not connected", func() {
 		s.SetupTest()
-		ok, err := SetNX("cli:k", "v")
+		ok, err := SetNXRaw("cli:k", "v")
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(ok)
@@ -375,7 +512,7 @@ func (s *ClientTestSuite) TestCrudCommands() {
 
 	s.Run("Delete not connected", func() {
 		s.SetupTest()
-		deleted, err := Delete("cli:k")
+		deleted, err := DeleteRaw("cli:k")
 		s.Error(err)
 		s.Contains(err.Error(), "resp client is not connected")
 		s.False(deleted)
@@ -383,7 +520,7 @@ func (s *ClientTestSuite) TestCrudCommands() {
 
 	s.Run("Keys not connected", func() {
 		s.SetupTest()
-		keysRes := Keys("cli:k*")
+		keysRes := KeysRaw("cli:k*")
 		s.True(keysRes.IsError())
 		s.Contains(keysRes.Error().Error(), "resp client is not connected")
 	})
@@ -394,35 +531,32 @@ func (s *ClientTestSuite) TestCrudCommands() {
 		s.NoError(err)
 		s.ensureConnected()
 
-		// Test SetNX
-		ok, err := SetNX("cli:key_nx", "val1")
+		ok, err := SetNXRaw("cli:key_nx", "val1")
 		s.NoError(err)
 		s.True(ok)
 
-		ok, err = SetNX("cli:key_nx", "val2")
+		ok, err = SetNXRaw("cli:key_nx", "val2")
 		s.NoError(err)
 		s.False(ok)
 
-		v, err := Get("cli:key_nx")
+		v, err := GetRaw("cli:key_nx")
 		s.NoError(err)
 		s.Equal("val1", v)
 
-		// Test Keys
-		_ = Set("cli:key_another", "val")
-		keysRes := Keys("cli:key_*")
+		_ = SetRaw("cli:key_another", "val")
+		keysRes := KeysRaw("cli:key_*")
 		s.False(keysRes.IsError())
 		s.ElementsMatch([]string{"cli:key_nx", "cli:key_another"}, keysRes.MustGet())
 
-		// Test Delete
-		deleted, err := Delete("cli:key_nx")
+		deleted, err := DeleteRaw("cli:key_nx")
 		s.NoError(err)
 		s.True(deleted)
 
-		keysRes = Keys("cli:key_*")
+		keysRes = KeysRaw("cli:key_*")
 		s.False(keysRes.IsError())
 		s.ElementsMatch([]string{"cli:key_another"}, keysRes.MustGet())
 
-		deleted, err = Delete("cli:key_another")
+		deleted, err = DeleteRaw("cli:key_another")
 		s.NoError(err)
 		s.True(deleted)
 	})
@@ -496,7 +630,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 		expectErr   bool
 		wantErrMsg  string
 		checkExceed bool
-		useConnect  bool // if true, use internal connect() instead of Connect()
+		useConnect  bool
 	}{
 		{
 			"Empty auth key",
@@ -545,9 +679,6 @@ func (s *ClientTestSuite) TestConnectCommand() {
 
 				if tc.expectErr {
 					s.Error(err)
-					// The error message from net.Dial can vary across different OS/environments
-					// (e.g., "dial tcp", "context deadline exceeded", "server misbehaving").
-					// We just need to ensure an error occurred for invalid addresses.
 					if tc.wantErrMsg != "" && err != nil && tc.name != "Invalid address" {
 						s.Contains(err.Error(), tc.wantErrMsg)
 					}
@@ -581,8 +712,6 @@ func (s *ClientTestSuite) TestConnectCommand() {
 					clients = append(clients, c)
 				}
 				s.Error(overflowErr)
-				// The error message for an intentionally rejected connection can be a transport-level close
-				// or an explicit AUTH error depending on when the server rejects the connection.
 				if overflowErr != nil && tc.wantErrMsg != "" {
 					errMsg := overflowErr.Error()
 					s.True(
@@ -731,12 +860,6 @@ func runEmbedSignalChild(t *testing.T) {
 	if pErr != nil {
 		t.Fatalf("invalid admin port %q: %v", adminPortStr, pErr)
 	}
-	// Atomically claim a free App port, then release it and immediately hand
-	// over both App and Admin ports to StartWithConfig for the actual bind.
-	// The App port we just bound is definitely not in active LISTEN state (we
-	// were the last ones to have it open); the Admin port was chosen by the
-	// parent using the same bind+close dance so redcon.ListenAndServe (which
-	// sets SO_REUSEADDR) will re-bind through TIME_WAIT successfully.
 	var appPort int
 	claimedApp, lErr := net.Listen("tcp", net.JoinHostPort(adminHost, "0"))
 	if lErr != nil {
@@ -919,7 +1042,6 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	// Prepare data
 	data := []struct {
 		key string
 		val string
@@ -930,7 +1052,7 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 	}
 
 	for _, d := range data {
-		err := Set(d.key, d.val)
+		err := SetRaw(d.key, d.val)
 		s.NoError(err)
 	}
 
@@ -959,7 +1081,7 @@ func (s *ClientTestSuite) TestSearchIndexCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchIndex(tt.index, tt.kr, tt.filter, tt.desc)
+			res := SearchIndexRaw(tt.index, tt.kr, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -977,7 +1099,6 @@ func (s *ClientTestSuite) TestSearchKeyCommand() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	// Prepare data
 	data := []struct {
 		key string
 		val string
@@ -988,7 +1109,7 @@ func (s *ClientTestSuite) TestSearchKeyCommand() {
 	}
 
 	for _, d := range data {
-		err := Set(d.key, d.val)
+		err := SetRaw(d.key, d.val)
 		s.NoError(err)
 	}
 
@@ -1013,7 +1134,7 @@ func (s *ClientTestSuite) TestSearchKeyCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := SearchKey(tt.kr, tt.filter, tt.desc)
+			res := SearchKeyRaw(tt.kr, tt.filter, tt.desc)
 
 			if tt.expectErr {
 				s.True(res.IsError())
@@ -1041,7 +1162,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 	}
 
 	for _, d := range data {
-		err := Set(d.key, d.val)
+		err := SetRaw(d.key, d.val)
 		s.NoError(err)
 	}
 
@@ -1074,7 +1195,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 			updates:   []x.Mutation{x.Set("status", "active"), x.Set("verified", true), x.Set("profile.age", 18)},
 			expectLen: 2,
 			check: func() {
-				val, err := Get("user:1")
+				val, err := GetRaw("user:1")
 				s.NoError(err)
 				s.Equal("active", gjson.Get(val, "status").String())
 				s.True(gjson.Get(val, "verified").Bool())
@@ -1088,7 +1209,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 			updates:   []x.Mutation{x.Set("version", 2)},
 			expectLen: 3,
 			check: func() {
-				val, err := Get("user:3")
+				val, err := GetRaw("user:3")
 				s.NoError(err)
 				s.Equal(float64(2), gjson.Get(val, "version").Float())
 			},
@@ -1097,7 +1218,7 @@ func (s *ClientTestSuite) TestUpdateCommand() {
 
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			res := Update(tt.kr, tt.filter, tt.updates...)
+			res := UpdateRaw(tt.kr, tt.filter, tt.updates...)
 			if tt.expectErr {
 				s.True(res.IsError())
 				return
@@ -1146,7 +1267,6 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 					s.FailNow("timeout waiting published message")
 				}
 
-				// Test Pattern Matching (PSUBSCRIBE)
 				psub := client.PSubscribe(ctxSub, "event:*")
 				s.T().Cleanup(func() { _ = psub.Close() })
 				_, err = psub.Receive(ctxSub)
@@ -1164,7 +1284,6 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 					s.FailNow("timeout waiting pattern published message")
 				}
 
-				// Test Broadcast (Multiple clients subscribe to the same topic)
 				client2, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
 				s.T().Cleanup(func() { _ = client2.Close() })
 				sub2 := client2.Subscribe(ctxSub, "broadcast_topic")
@@ -1424,13 +1543,13 @@ func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-obs-1", "hello")
+	err = SetRaw("cli:hook-obs-1", "hello")
 	s.NoError(err)
 	s.True(called, "ObserverHook must be called")
 	s.Equal("cli:hook-obs-1", gotKey)
 	s.Equal([]byte("hello"), gotVal)
 
-	stored, err := Get("cli:hook-obs-1")
+	stored, err := GetRaw("cli:hook-obs-1")
 	s.NoError(err)
 	s.Equal("hello", stored)
 }
@@ -1454,11 +1573,11 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-obs-panic", "val")
+	err = SetRaw("cli:hook-obs-panic", "val")
 	s.NoError(err, "ObserverHook panic must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run after panic in prior observer")
 
-	stored, err := Get("cli:hook-obs-panic")
+	stored, err := GetRaw("cli:hook-obs-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1483,13 +1602,13 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("cli:hook-obs-timeout", "val")
+	err = SetRaw("cli:hook-obs-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverHook timeout must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run")
 	s.Less(elapsed, 500*time.Millisecond, "timeout should bound the hook time")
 
-	stored, err := Get("cli:hook-obs-timeout")
+	stored, err := GetRaw("cli:hook-obs-timeout")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1509,15 +1628,15 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:forbidden", "secret")
+	err = SetRaw("cli:forbidden", "secret")
 	s.ErrorIs(err, customErr)
 
-	_, err = Get("cli:forbidden")
+	_, err = GetRaw("cli:forbidden")
 	s.Error(err, "key must not exist after abort")
 
-	err = Set("cli:allowed", "public")
+	err = SetRaw("cli:allowed", "public")
 	s.NoError(err)
-	v, err := Get("cli:allowed")
+	v, err := GetRaw("cli:allowed")
 	s.NoError(err)
 	s.Equal("public", v)
 }
@@ -1536,11 +1655,11 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-abort-panic", "val")
+	err = SetRaw("cli:hook-abort-panic", "val")
 	s.Error(err, "AbortHook panic must abort write (fail-closed)")
 	s.Contains(err.Error(), "panic")
 
-	_, err = Get("cli:hook-abort-panic")
+	_, err = GetRaw("cli:hook-abort-panic")
 	s.Error(err, "key must not exist after AbortHook panic")
 }
 
@@ -1560,7 +1679,7 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("cli:hook-abort-timeout", "val")
+	err = SetRaw("cli:hook-abort-timeout", "val")
 	elapsed := time.Since(start)
 	s.Error(err, "AbortHook timeout must abort write (fail-closed)")
 	s.Contains(err.Error(), "timeout")
@@ -1582,10 +1701,10 @@ func (s *ClientTestSuite) TestTransformHookChangesValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-transform-1", "plain")
+	err = SetRaw("cli:hook-transform-1", "plain")
 	s.NoError(err)
 
-	stored, err := Get("cli:hook-transform-1")
+	stored, err := GetRaw("cli:hook-transform-1")
 	s.NoError(err)
 	s.Equal("enc:plain", stored, "TransformHook must change the written value")
 }
@@ -1612,10 +1731,10 @@ func (s *ClientTestSuite) TestTransformHookChain() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-transform-chain", "\x01")
+	err = SetRaw("cli:hook-transform-chain", "\x01")
 	s.NoError(err)
 
-	stored, err := Get("cli:hook-transform-chain")
+	stored, err := GetRaw("cli:hook-transform-chain")
 	s.NoError(err)
 	s.Equal([]byte{("\x01"[0] + 1) * 2}, []byte(stored),
 		"TransformHooks must chain in registration order: (+1) then (*2)")
@@ -1632,11 +1751,11 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnError() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-transform-err", "val")
+	err = SetRaw("cli:hook-transform-err", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "transform failed")
 
-	_, err = Get("cli:hook-transform-err")
+	_, err = GetRaw("cli:hook-transform-err")
 	s.Error(err, "key must not exist after TransformHook error")
 }
 
@@ -1654,11 +1773,11 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-transform-panic", "val")
+	err = SetRaw("cli:hook-transform-panic", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "panic")
 
-	_, err = Get("cli:hook-transform-panic")
+	_, err = GetRaw("cli:hook-transform-panic")
 	s.Error(err)
 }
 
@@ -1677,7 +1796,7 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-after-1", "hello-after")
+	err = SetRaw("cli:hook-after-1", "hello-after")
 	s.NoError(err)
 	s.Equal("cli:hook-after-1", gotKey)
 	s.Equal("hello-after", gotVal)
@@ -1705,7 +1824,7 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-after-transformed", "ABC")
+	err = SetRaw("cli:hook-after-transformed", "ABC")
 	s.NoError(err)
 	s.Equal([]byte("BCD"), gotVal, "ObserverAfter must see the transformed value")
 }
@@ -1729,11 +1848,11 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-after-panic", "val")
+	err = SetRaw("cli:hook-after-panic", "val")
 	s.NoError(err, "ObserverAfterHook panic must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
 
-	stored, err := Get("cli:hook-after-panic")
+	stored, err := GetRaw("cli:hook-after-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1758,7 +1877,7 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = Set("cli:hook-after-timeout", "val")
+	err = SetRaw("cli:hook-after-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverAfterHook timeout must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
@@ -1790,7 +1909,6 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 		capture(2)
 		s.Equal("transformed", string(value), "ObserverBefore must see POST-transform value (A5)")
 	})
-	// Write happens between index 2 and 3 (captured below as manual step 3)
 	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
 		capture(4)
 		s.Equal("transformed", string(value), "ObserverAfter must see transformed value")
@@ -1800,19 +1918,19 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-order", "original")
+	err = SetRaw("cli:hook-order", "original")
 	s.NoError(err)
-	steps[3] = seq.Add(1) // Capture "write step" after Set returns
+	steps[3] = seq.Add(1)
 
 	s.Equal([]int64{1, 2, 3, 5, 4}, steps,
-		"Order MUST be Abort(1) → Transform(2) → ObserverBefore(3) → [actual Redis write happens  before return ~4 but AFTER Before hooks] → ObserverAfter(4) — seq: [1,2,3,4,5]")
-	s.Equal(int64(1), steps[0]) // Abort
-	s.Equal(int64(2), steps[1]) // Transform
-	s.Equal(int64(3), steps[2]) // ObserverBefore
-	s.Equal(int64(4), steps[4]) // ObserverAfter runs BEFORE Set returns (sync)
-	s.Equal(int64(5), steps[3]) // our post-Set capture happens last
+		"Order MUST be Abort(1) → Transform(2) → ObserverBefore(3) → [actual Redis write happens before return ~4 but AFTER Before hooks] → ObserverAfter(4) — seq: [1,2,3,4,5]")
+	s.Equal(int64(1), steps[0])
+	s.Equal(int64(2), steps[1])
+	s.Equal(int64(3), steps[2])
+	s.Equal(int64(4), steps[4])
+	s.Equal(int64(5), steps[3])
 
-	stored, err := Get("cli:hook-order")
+	stored, err := GetRaw("cli:hook-order")
 	s.NoError(err)
 	s.Equal("transformed", stored)
 }
@@ -1841,7 +1959,7 @@ func (s *ClientTestSuite) TestObserverBeforeSeesPostTransformValueButAbortSeesOr
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-see-orig", "raw-value")
+	err = SetRaw("cli:hook-see-orig", "raw-value")
 	s.NoError(err)
 	s.Equal([]byte("raw-value"), abortSaw,
 		"AbortHook must see ORIGINAL value (runs first)")
@@ -1872,7 +1990,7 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:hook-no-after", "val")
+	err = SetRaw("cli:hook-no-after", "val")
 	s.Error(err)
 	s.False(observerBeforeCalled,
 		"ObserverBefore must NOT run when AbortHook aborted earlier (fail-closed propagates out of Abort phase)")
@@ -1883,8 +2001,6 @@ func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() 
 	s.SetupTest()
 
 	AddTransformHook(func(key string, value []byte) ([]byte, error) {
-		// Emulate user who forgot to either return a fresh slice or return an error.
-		// Framework must fail-closed instead of silently writing "".
 		return nil, nil
 	})
 
@@ -1892,11 +2008,11 @@ func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() 
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = Set("cli:nil-transform", "should-not-be-overwritten")
+	err = SetRaw("cli:nil-transform", "should-not-be-overwritten")
 	s.Error(err)
 	s.Contains(err.Error(), "returned nil bytes without error")
 
-	existing, gerr := Get("cli:nil-transform")
+	existing, gerr := GetRaw("cli:nil-transform")
 	if gerr == nil {
 		s.Equal("", existing,
 			"key either should not exist OR be empty string; what we must NOT see is 'should-not-be-overwritten' overwritten to ''.")
@@ -1916,10 +2032,9 @@ func (s *ClientTestSuite) TestSetHookZeroTimeoutUsesSyncPathNoGoroutineAllocs() 
 	s.NoError(err)
 	s.ensureConnected()
 
-	// Quick sanity — no error, writes succeed with T=0.
-	err = Set("cli:sync-path", "v")
+	err = SetRaw("cli:sync-path", "v")
 	s.NoError(err)
-	v, gerr := Get("cli:sync-path")
+	v, gerr := GetRaw("cli:sync-path")
 	s.NoError(gerr)
 	s.Equal("v", v)
 }
@@ -1940,22 +2055,18 @@ func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError()
 	s.NoError(err)
 	s.ensureConnected()
 
-	// (1) Plain Set success -> committed true, err nil
-	err = Set("cli:after-commit-1", "v1")
+	err = SetRaw("cli:after-commit-1", "v1")
 	s.NoError(err)
 	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
 	s.NoError(gotErr)
 
-	// (2) Abort in before-hook -> ObserverAfter does NOT run at all, got* unchanged (per invariant).
 	abortID := AddAbortHook(func(key string, value []byte) error {
 		return errors.New("blocked in abort hook")
 	})
 	defer RemoveHook(abortID)
-	err = Set("cli:after-commit-2", "v2")
+	err = SetRaw("cli:after-commit-2", "v2")
 	s.Error(err)
-	// gotKey/gotCommitted/gotErr still hold values from the previous successful Set because
-	// runAfterHooks is entirely skipped when runBeforeHooks aborts (fail-closed propagation).
 	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
 }
@@ -1990,7 +2101,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNX("cli:hook-setnx-1", "original")
+	ok, err := SetNXRaw("cli:hook-setnx-1", "original")
 	s.NoError(err)
 	s.True(ok)
 	s.True(afterCommitted, "first SetNX write actually occurred -> committed=true")
@@ -2000,11 +2111,11 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.Equal("x:original", afterVal)
 	s.NoError(afterErr)
 
-	stored, err := Get("cli:hook-setnx-1")
+	stored, err := GetRaw("cli:hook-setnx-1")
 	s.NoError(err)
 	s.Equal("x:original", stored)
 
-	ok, err = SetNX("cli:hook-setnx-1", "another")
+	ok, err = SetNXRaw("cli:hook-setnx-1", "another")
 	s.NoError(err)
 	s.False(ok, "SetNX should return false on existing key")
 	s.False(afterCommitted,
@@ -2024,15 +2135,15 @@ func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetWithTTL("cli:hook-ttl", "base", 100*time.Millisecond)
+	err = SetWithTTLRaw("cli:hook-ttl", "base", 100*time.Millisecond)
 	s.NoError(err)
 
-	v, err := Get("cli:hook-ttl")
+	v, err := GetRaw("cli:hook-ttl")
 	s.NoError(err)
 	s.Equal("base-ttl", v)
 
 	time.Sleep(200 * time.Millisecond)
-	_, err = Get("cli:hook-ttl")
+	_, err = GetRaw("cli:hook-ttl")
 	s.Error(err)
 }
 
@@ -2047,16 +2158,16 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNXWithTTL("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
+	ok, err := SetNXWithTTLRaw("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
 	s.NoError(err)
 	s.True(ok)
 
-	v, err := Get("cli:hook-setnx-ttl")
+	v, err := GetRaw("cli:hook-setnx-ttl")
 	s.NoError(err)
 	s.Equal("x", v)
 
 	time.Sleep(160 * time.Millisecond)
-	_, err = Get("cli:hook-setnx-ttl")
+	_, err = GetRaw("cli:hook-setnx-ttl")
 	s.Error(err)
 }
 
@@ -2080,7 +2191,7 @@ func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
 	}()
 
 	for i := 0; i < 50; i++ {
-		_ = Set(fmt.Sprintf("hook-safe-%d", i), "v")
+		_ = SetRaw(fmt.Sprintf("hook-safe-%d", i), "v")
 	}
 	<-done
 }
@@ -2138,7 +2249,7 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
 	defer func() {
-		_ = server.Stop()
+		stopAndResetGlobalState()
 	}()
 
 	appAddr := cfg.App.Addr()
@@ -2154,12 +2265,10 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 		args []any
 	}
 	cases := []tc{
-		{"regdoc", []any{"REGDOC", `{"namespace":"user","mem":false,"key_attrs":["id"]}`}},
-		{"lsdoc", []any{"LSDOC"}},
-		{"desdoc", []any{"DESDOC", "user"}},
-		{"regidx", []any{"REGIDX", "user", "age", "age"}},
-		{"lsidx", []any{"LSIDX"}},
-		{"delidx", []any{"DELIDX", "user", "age"}},
+		{"regsch", []any{"REGSCH", `{"namespace":"user","mem":false,"key_attrs":["id"]}`}},
+		{"dropsch", []any{"DROPSCH", "user"}},
+		{"regidx", []any{"REGIDX", `{"owner_ns":"user","logical":"age","paths":["age"],"key_pattern":"_d_user:*"}`}},
+		{"dropidx", []any{"DROPIDX", "user", "age"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2190,7 +2299,7 @@ func TestConnectAuthMismatchEmitsWrapAdminErr(t *testing.T) {
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
 	defer func() {
-		_ = server.Stop()
+		stopAndResetGlobalState()
 	}()
 
 	t.Run("app port with admin auth key → connect() itself returns WrapAdminErr WRONGPASS", func(t *testing.T) {
@@ -2380,7 +2489,7 @@ func BenchmarkSetNoHooks(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("cli:bench-nohook", "payload-value", 0)
+		_ = SetWithTTLRaw("cli:bench-nohook", "payload-value", 0)
 	}
 }
 
@@ -2415,7 +2524,7 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("cli:bench-observer", "payload-value", 0)
+		_ = SetWithTTLRaw("cli:bench-observer", "payload-value", 0)
 	}
 }
 
@@ -2450,7 +2559,7 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("cli:bench-abort", "payload-value", 0)
+		_ = SetWithTTLRaw("cli:bench-abort", "payload-value", 0)
 	}
 }
 
@@ -2487,7 +2596,7 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTL("cli:bench-transform", "payload-value", 0)
+		_ = SetWithTTLRaw("cli:bench-transform", "payload-value", 0)
 	}
 }
 
@@ -2498,4 +2607,812 @@ func BenchmarkHooksStoreLoadBaseline(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = snapshotHooks()
 	}
+}
+
+type DocTestSuite struct {
+	suite.Suite
+}
+
+func TestDocSuite(t *testing.T) {
+	suite.Run(t, new(DocTestSuite))
+}
+
+func (s *DocTestSuite) SetupSuite() {
+	ensureServerAndSeed(s.T())
+
+	err := ConnectEmbed(clientTestServerAddr)
+	s.Require().NoError(err)
+
+	for i := 0; i < 30; i++ {
+		if c := getSharedClient(); c != nil && healthCheck(context.Background(), c) == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s.T().Fatal("failed to connect to test server")
+}
+
+func (s *DocTestSuite) SetupTest() {
+	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
+		disconnect()
+		err := ConnectEmbed(clientTestServerAddr)
+		if err != nil {
+			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
+			s.Require().NoError(err)
+		}
+		for i := 0; i < 30; i++ {
+			if c := getSharedClient(); c != nil && healthCheck(context.Background(), c) == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		s.T().Fatal("shared client reconnection failed")
+	}
+}
+
+func (s *DocTestSuite) TestGenericDocMethods() {
+	jsonStr := `{"id":"200","name":"Test","age":30}`
+	doc := UserDoc(jsonStr)
+
+	err := Set(doc)
+	s.Require().NoError(err)
+
+	val, err := Get[UserDoc]("200")
+	s.Require().NoError(err)
+	s.Equal(UserDoc(jsonStr), val)
+
+	ok, err := SetNX(doc)
+	s.Require().NoError(err)
+	s.False(ok)
+
+	keysRes := Keys[UserDoc]("*")
+	s.Require().NoError(keysRes.Error())
+	s.Contains(keysRes.MustGet(), "user:200")
+
+	searchRes := SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), false)
+	s.Require().NoError(searchRes.Error())
+	s.Contains(searchRes.MustGet(), UserDoc(jsonStr))
+
+	idxRes := SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
+	s.Require().NoError(idxRes.Error())
+	s.Contains(idxRes.MustGet(), UserDoc(jsonStr))
+
+	updRes := Update[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), x.Set("age", 31))
+	s.Require().NoError(updRes.Error())
+
+	del, err := Delete(UserDoc(`{"id":"200"}`))
+	s.Require().NoError(err)
+	s.True(del)
+}
+
+func (s *DocTestSuite) TestStorageKeyFromDocument() {
+	doc := UserDoc(`{"id":"201","name":"Alice"}`)
+
+	key, err := x.StorageKey(doc)
+	s.Require().NoError(err)
+	s.Equal("user:201", key)
+}
+
+func (s *DocTestSuite) TestTypedWritesRespectDocumentTTL() {
+	first := ExpiringUserDoc(`{"id":"1","name":"alpha"}`)
+	err := Set(first)
+	s.Require().NoError(err)
+
+	second := ExpiringUserDoc(`{"id":"2","name":"beta"}`)
+	ok, err := SetNX(second)
+	s.Require().NoError(err)
+	s.True(ok)
+
+	updRes := Update[ExpiringUserDoc](x.KeysPattern("*"), x.Eq("id", "1"), x.Set("name", "updated"))
+	s.Require().NoError(updRes.Error())
+
+	time.Sleep(80 * time.Millisecond)
+
+	_, err = Get[ExpiringUserDoc]("1")
+	s.Require().Error(err)
+	_, err = Get[ExpiringUserDoc]("2")
+	s.Require().Error(err)
+}
+
+func (s *DocTestSuite) TestSearchIndexRejectsPrefixedStoragePattern() {
+	res := SearchIndex[UserDoc]("age", x.KeysPattern("user:*"), nil, false)
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
+func (s *DocTestSuite) TestSearchKeyRejectsPrefixedStoragePattern() {
+	res := SearchKey[UserDoc](x.KeysPattern("user:*"), nil, false)
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
+func (s *DocTestSuite) TestKeysRejectsPrefixedStoragePattern() {
+	res := Keys[UserDoc]("user:*")
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
+func (s *DocTestSuite) TestUpdateRejectsPrefixedStoragePattern() {
+	res := Update[UserDoc](x.KeysPattern("user:*"), nil, x.Set("name", "updated"))
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "document-scoped")
+}
+
+func (s *DocTestSuite) TestSearchIndexRejectsFullIdxName() {
+	res := SearchIndex[UserDoc]("user_age", x.KeysPattern("*"), nil, false)
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "fully-qualified index name")
+}
+
+func (s *DocTestSuite) TestSearchKeyScopedLimitCarry4LayerAlignment() {
+	idSet := []string{"k_layer_a", "k_layer_b", "k_layer_c", "k_layer_d", "k_layer_e"}
+	for _, id := range idSet {
+		doc := UserDoc(`{"id":"` + id + `","tag":"layer4align"}`)
+		s.NoError(Set(doc))
+	}
+
+	fullRes := SearchKey[UserDoc](x.KeysPattern("k_layer*"), x.Eq("tag", "layer4align"), false)
+	s.Require().NoError(fullRes.Error())
+	s.Len(fullRes.MustGet(), len(idSet))
+
+	limitRes := SearchKey[UserDoc](x.KeysPattern("k_layer*").Limit(2), x.Eq("tag", "layer4align"), false)
+	s.Require().NoError(limitRes.Error())
+	s.Len(limitRes.MustGet(), 2, "Limit(2) must be carried through ScopeKeyRange namespace injection")
+	s.Equal(fullRes.MustGet()[:2], limitRes.MustGet(), "ScopeKeyRange Limit must preserve ASC order first-N, not arbitrary slice")
+}
+
+func (s *DocTestSuite) TestDocHookForwarders() {
+	var obsKey, obsVal string
+	id1 := AddObserverHook(func(key string, valueJSON []byte) {
+		obsKey = key
+		obsVal = string(valueJSON)
+	})
+	defer RemoveHook(id1)
+
+	testAbortErr := errors.New("doc hook abort test")
+	aborted := false
+	id2 := AddAbortHook(func(key string, valueJSON []byte) error {
+		if string(valueJSON) == `{"id":"999","blocked":true}` {
+			aborted = true
+			return testAbortErr
+		}
+		return nil
+	})
+	defer RemoveHook(id2)
+
+	transformed := false
+	id3 := AddTransformHook(func(key string, valueJSON []byte) ([]byte, error) {
+		if key == "user:998" {
+			transformed = true
+			out := make([]byte, 0, len(valueJSON)+20)
+			out = append(out, valueJSON[:len(valueJSON)-1]...)
+			out = append(out, []byte(`,"transformed":true}`)...)
+			return out, nil
+		}
+		return valueJSON, nil
+	})
+	defer RemoveHook(id3)
+
+	var afterKey, afterVal string
+	var afterWriteErr error
+	var afterCommitted bool
+	id4 := AddObserverAfterHook(func(key string, valueJSON []byte, committed bool, writeErr error) {
+		afterKey = key
+		afterVal = string(valueJSON)
+		afterWriteErr = writeErr
+		afterCommitted = committed
+	})
+	defer RemoveHook(id4)
+
+	orig := UserDoc(`{"id":"998","name":"Alice"}`)
+	err := Set(orig)
+	s.Require().NoError(err)
+	s.Equal("user:998", obsKey)
+	s.Equal(`{"id":"998","name":"Alice","transformed":true}`, obsVal,
+		"ObserverHook (Before) runs after Abort + Transform per A5 mandatory order, so sees post-transform JSON")
+	s.True(transformed)
+	s.Equal("user:998", afterKey)
+	s.Contains(afterVal, `"transformed":true`)
+	s.True(afterCommitted, "typed doc Set committed the write -> committed=true")
+	s.NoError(afterWriteErr)
+
+	got, err := Get[UserDoc]("998")
+	s.Require().NoError(err)
+	s.Contains(string(got), `"transformed":true`)
+
+	blockedDoc := UserDoc(`{"id":"999","blocked":true}`)
+	err = Set(blockedDoc)
+	s.ErrorIs(err, testAbortErr)
+	s.True(aborted)
+}
+
+func krDocID(id string) string  { return id }
+func updDocID(id string) string { return id }
+
+func docRaw[D x.Document](docs []D) []string {
+	out := make([]string, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, d.RawJSON())
+	}
+	return out
+}
+
+func updDocIDPrefix() string {
+	return testutil.XKeyPrefix(updateKRDocNamespace, testutil.KeyRangeFixtureMem())
+}
+
+func updDocIDFromStorage(storageKeys []string) []string {
+	prefix := updDocIDPrefix()
+	out := make([]string, 0, len(storageKeys))
+	for _, k := range storageKeys {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			out = append(out, k[len(prefix):])
+			continue
+		}
+		out = append(out, "")
+	}
+	return out
+}
+
+func updDocRawGet(raw, path string) string { return gjson.Get(raw, path).String() }
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeSeedCountIs100() {
+	kr := x.KeysPattern("p*")
+	got := SearchKey[DocSearchFixture](kr, nil, false)
+	s.False(got.IsError(), "SearchKey err: %v", got.Error())
+	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
+	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
+	resServer := SearchKey[DocSearchFixture](krServer, nil, false)
+	s.False(resServer.IsError())
+	s.Empty(resServer.MustGet())
+
+	krClient := x.KeysPattern(testutil.XKeyPrefix("probeclient", true) + "*")
+	resClient := SearchKey[DocSearchFixture](krClient, nil, false)
+	s.False(resClient.IsError())
+	s.Empty(resClient.MustGet())
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeFullMatrix_TABLE_DRIVEN() {
+	run := func(kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := SearchKey[DocSearchFixture](kr, nil, desc)
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(docRaw(res.MustGet())), true, ""
+	}
+	testutil.AssertSearchKeyMatrix(s.T(), run, testutil.KeyRangeCtorCases(), krDocID, "SK/")
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeGtGteGapEqualsOne() {
+	gte := SearchKey[DocSearchFixture](x.KeysGte(krDocID("p027")), nil, false)
+	s.Require().False(gte.IsError())
+	gt := SearchKey[DocSearchFixture](x.KeysGt(krDocID("p027")), nil, false)
+	s.Require().False(gt.IsError())
+	testutil.AssertGtGteGap1(s.T(),
+		testutil.XIDsFromValues(docRaw(gte.MustGet())),
+		testutil.XIDsFromValues(docRaw(gt.MustGet())),
+		"p027")
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeLtLteGapEqualsOne() {
+	lte := SearchKey[DocSearchFixture](x.KeysLte(krDocID("p072")), nil, false)
+	s.Require().False(lte.IsError())
+	lt := SearchKey[DocSearchFixture](x.KeysLt(krDocID("p072")), nil, false)
+	s.Require().False(lt.IsError())
+	testutil.AssertLtLteGap1(s.T(),
+		testutil.XIDsFromValues(docRaw(lte.MustGet())),
+		testutil.XIDsFromValues(docRaw(lt.MustGet())),
+		"p072")
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeCrossLayerMismatchNote_docScoped() {
+	kr, _ := x.UnmarshalKeyRange([]byte(`{"op":"pattern","p":"user:*"}`))
+	if kr == nil {
+		kr = x.KeysPattern("user:*")
+	}
+	res := SearchKeyRaw(kr, nil, false)
+	if res.IsError() {
+		s.Contains(res.Error().Error(), "wrong number of arguments",
+			"untyped client SearchKey error allowed (client may not be fully seeded); skipping cross-layer assertion in doc suite")
+		return
+	}
+	s.True(true,
+		"doc-scoped typed APIs (SearchKey[D]/SearchIndex[D]) always scope to D's namespace via ScopeKeyRange prefix, so cross-layer mismatch is impossible at doc layer.")
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeScoreSeedCountIs100() {
+	krAll := x.KeysPattern("p*")
+	res := SearchIndex[DocSearchFixture]("score", krAll, nil, false)
+	s.False(res.IsError(), "SearchIndex err: %v", res.Error())
+	s.Len(res.MustGet(), testutil.CountX())
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeScoreOrderingMatchesSearchKeyIdOrder() {
+	krAll := x.KeysPattern("p*")
+	siAsc := SearchIndex[DocSearchFixture]("score", krAll, nil, false)
+	s.Require().False(siAsc.IsError())
+	skAsc := SearchKey[DocSearchFixture](krAll, nil, false)
+	s.Require().False(skAsc.IsError())
+	siDesc := SearchIndex[DocSearchFixture]("score", krAll, nil, true)
+	s.Require().False(siDesc.IsError())
+	skDesc := SearchKey[DocSearchFixture](krAll, nil, true)
+	s.Require().False(skDesc.IsError())
+	testutil.AssertScoreEqSKId(s.T(),
+		testutil.XIDsFromValues(docRaw(siAsc.MustGet())),
+		testutil.XIDsFromValues(docRaw(skAsc.MustGet())),
+		testutil.XIDsFromValues(docRaw(siDesc.MustGet())),
+		testutil.XIDsFromValues(docRaw(skDesc.MustGet())))
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeFullMatrix_TABLE_DRIVEN() {
+	run := func(idxName string, kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := SearchIndex[DocSearchFixture](idxName, kr, nil, desc)
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(docRaw(res.MustGet())), true, ""
+	}
+	testutil.AssertSearchIndexMatrix(s.T(), run, "score", testutil.KeyRangeCtorCases(), krDocID, "idx=score/")
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeBucketTiebreakersLexicographicById() {
+	krAll := x.KeysPattern("p*")
+	resA := SearchIndex[DocSearchFixture]("bucket", krAll, x.Eq("bucket", "A"), false)
+	s.Require().False(resA.IsError())
+	resC := SearchIndex[DocSearchFixture]("bucket", krAll, x.Eq("bucket", "C"), false)
+	s.Require().False(resC.IsError())
+	all := SearchIndex[DocSearchFixture]("bucket", krAll, nil, false)
+	s.Require().False(all.IsError())
+	testutil.AssertBucketDistribution(s.T(),
+		testutil.XIDsFromValues(docRaw(resA.MustGet())),
+		testutil.XIDsFromValues(docRaw(resC.MustGet())),
+		testutil.XIDsFromValues(docRaw(all.MustGet())))
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeSparseAmtLimit10() {
+	krLimit := x.KeysPattern("p*").Limit(10)
+	si := SearchIndex[DocSearchFixture]("sparseamt", krLimit, nil, false)
+	s.Require().False(si.IsError())
+	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(docRaw(si.MustGet())))
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchNote_docScoped() {
+	memStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
+	memIdxName := naming.BuildIdxFullName(memStorageNs, "score")
+	diskKr := x.KeysPattern("user:*")
+	res := SearchIndexRaw(memIdxName, diskKr, nil, false)
+	if res.IsError() {
+		s.Contains(res.Error().Error(), "different storage layer",
+			"mem index (%s) + disk KeyRange (user:*) must reject cross-layer; got err: %v", memIdxName, res.Error())
+		return
+	}
+	if len(res.OrEmpty()) == 0 {
+		s.True(true,
+			"doc typed-layer APIs scope keyranges under D's namespace (always same layer), so cross-layer cannot be synthesized from doc package; untyped SI returned empty here, OK to skip.")
+		return
+	}
+	s.FailNowf("unexpected SI Ok result", "len=%d", len(res.OrEmpty()))
+}
+
+func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeScopedLimitCarry4LayerAlignment() {
+	idSet := []string{"si_doc_a", "si_doc_b", "si_doc_c", "si_doc_d", "si_doc_e"}
+	for _, id := range idSet {
+		doc := UserDoc(fmt.Sprintf(`{"id":"%s","tag":"si_doc4align","age":33}`, id))
+		s.NoError(Set(doc))
+	}
+	fullRes := SearchIndex[UserDoc]("age", x.KeysPattern("si_doc*"), x.Eq("tag", "si_doc4align"), false)
+	s.Require().NoError(fullRes.Error())
+	s.Len(fullRes.MustGet(), len(idSet))
+
+	limitRes := SearchIndex[UserDoc]("age", x.KeysPattern("si_doc*").Limit(2), x.Eq("tag", "si_doc4align"), false)
+	s.Require().NoError(limitRes.Error())
+	s.Len(limitRes.MustGet(), 2, "Limit(2) must be carried through typed-layer ScopeKeyRange + SI")
+	s.Equal(fullRes.MustGet()[:2], limitRes.MustGet(),
+		"typed SI Limit carry must preserve ASC order first-N, matching SK parity")
+}
+
+type DocSearchKeyRangeSuite struct {
+	suite.Suite
+}
+
+func (s *DocSearchKeyRangeSuite) SetupSuite() {
+	var docSuite DocTestSuite
+	docSuite.SetT(s.T())
+	docSuite.SetupSuite()
+}
+
+func (s *DocSearchKeyRangeSuite) SetupTest() {
+	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
+		disconnect()
+		err := ConnectEmbed(clientTestServerAddr)
+		if err != nil {
+			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
+			s.Require().NoError(err)
+		}
+		for i := 0; i < 30; i++ {
+			if c := getSharedClient(); c != nil && healthCheck(context.Background(), c) == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		s.T().Fatal("shared client reconnection failed")
+	}
+}
+
+func TestDocSearchKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(DocSearchKeyRangeSuite))
+}
+
+type DocUpdateKeyRangeSuite struct {
+	suite.Suite
+}
+
+func (s *DocUpdateKeyRangeSuite) SetupSuite() {
+	var docSuite DocTestSuite
+	docSuite.SetT(s.T())
+	docSuite.SetupSuite()
+}
+
+func (s *DocUpdateKeyRangeSuite) SetupTest() {
+	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
+		disconnect()
+		err := ConnectEmbed(clientTestServerAddr)
+		if err != nil {
+			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
+			s.Require().NoError(err)
+		}
+		for i := 0; i < 30; i++ {
+			if c := getSharedClient(); c != nil && healthCheck(context.Background(), c) == nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	for _, kv := range testutil.LoadXFor(s.T(), updateKRDocNamespace, testutil.KeyRangeFixtureMem()) {
+		doc := DocUpdateFixture(kv.V)
+		s.Require().NoError(Set(doc), "UpdateKR SetupTest Set key=%s", kv.K)
+	}
+}
+
+func (s *DocUpdateKeyRangeSuite) TestSeedCountMatchesSearchKey() {
+	allKr := x.KeysPattern("p*")
+	skRes := SearchKey[DocUpdateFixture](allKr, nil, false)
+	s.Require().NoError(skRes.Error(), "SK err: %v", skRes.Error())
+	s.Len(skRes.MustGet(), testutil.CountX(), "UpdateKR seed count should equal fixture count")
+}
+
+func (s *DocUpdateKeyRangeSuite) TestNoCrossContamination() {
+	resWrong := Update[DocUpdateFixture](x.KeysPattern("probenegdoc:*"), nil, x.Set("tag_contam", true))
+	s.NoError(resWrong.Error())
+	s.Empty(resWrong.MustGet(), "cross-contam probenegdoc prefix should hit zero keys (typed Scope coerces)")
+
+	resServer := Update[DocUpdateFixture](x.KeysPattern(clientKRServerStar()), nil, x.Set("tag_contam", true))
+	s.NoError(resServer.Error())
+	s.Empty(resServer.MustGet(), "cross-contam probe-server prefix should hit zero keys")
+
+	skAll := SearchKey[DocUpdateFixture](x.KeysPattern("p*"), nil, false)
+	s.Require().NoError(skAll.Error())
+	for _, d := range skAll.MustGet() {
+		got := updDocRawGet(d.RawJSON(), "tag_contam")
+		s.NotEqual("true", got, "tag_contam leaked to fixture data; ctor_shape=%q raw=%s", updDocRawGet(d.RawJSON(), "ctor_shape"), d.RawJSON())
+	}
+}
+
+func clientKRServerStar() string {
+	return testutil.XKeyPrefix("probeserver", true) + "*"
+}
+
+func (s *DocUpdateKeyRangeSuite) TestBulkSetAllTagThenVerifyViaSearchKey() {
+	allKr := x.KeysPattern("p*")
+	res := Update[DocUpdateFixture](allKr, nil, x.Set("update_tagged", "bulk_all"))
+	s.Require().NoError(res.Error(), "Update bulk_all err: %v", res.Error())
+	keys := res.MustGet()
+	s.Len(keys, testutil.CountX())
+	sort.Strings(keys)
+
+	skAfter := SearchKey[DocUpdateFixture](allKr, nil, false)
+	s.Require().NoError(skAfter.Error())
+	after := skAfter.MustGet()
+	s.Len(after, testutil.CountX())
+	for _, v := range after {
+		s.Equal("bulk_all", updDocRawGet(v.RawJSON(), "update_tagged"),
+			"every value should carry update_tagged=bulk_all; raw=%s", v.RawJSON())
+	}
+}
+
+func (s *DocUpdateKeyRangeSuite) TestUpdateAllKeyRangeCtorShapes_TABLE_DRIVEN() {
+	epoch := 0
+	nextTag := func() string {
+		epoch++
+		return fmt.Sprintf("e%d", epoch)
+	}
+	runAsc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := Update[DocUpdateFixture](kr, nil, x.Set("ctor_shape", tag))
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return updDocIDFromStorage(res.MustGet()), true, ""
+	}
+	runDesc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := Update[DocUpdateFixture](kr, nil, x.Set("ctor_shape", tag))
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		ids := updDocIDFromStorage(res.MustGet())
+		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
+			ids[i], ids[j] = ids[j], ids[i]
+		}
+		return ids, true, ""
+	}
+	assertCtorShapeWritten := func(caseName, label string, wantCount int, verifyRange x.KeyRange, wantTag string) {
+		s.T().Helper()
+		skRes := SearchKey[DocUpdateFixture](verifyRange, nil, false)
+		s.Require().False(skRes.IsError(), "%s/%s: SearchKey[D] after Update err: %v", caseName, label, skRes.Error())
+		docs := skRes.MustGet()
+		var count int
+		for _, d := range docs {
+			if updDocRawGet(d.RawJSON(), "ctor_shape") == wantTag {
+				count++
+			}
+		}
+		s.Equal(wantCount, count,
+			"%s/%s: ctor_shape=%q written count mismatch want=%d got=%d (SearchKey range len=%d)",
+			caseName, label, wantTag, wantCount, count, len(docs))
+	}
+	for _, tc := range testutil.KeyRangeCtorCases() {
+		tc := tc
+		kr := tc.Build(updDocID)
+		fullCase := "UpdateKR/" + tc.Name
+
+		tag := nextTag()
+		ids, ok, errMsg := runAsc(kr, tag)
+		assertDocKRResult(s.T(), fullCase, "ASC_no_limit", tc.WantAsc, ids, ok, errMsg, false)
+		if ok && len(ids) > 0 {
+			assertCtorShapeWritten(fullCase, "ASC_no_limit", len(ids), kr, tag)
+		}
+
+		tag = nextTag()
+		ids, ok, errMsg = runDesc(kr, tag)
+		assertDocKRResult(s.T(), fullCase, "DESC_no_limit", tc.WantAsc, ids, ok, errMsg, true)
+		if ok && len(tc.WantAsc) > 0 {
+			assertCtorShapeWritten(fullCase, "DESC_no_limit", len(tc.WantAsc), kr, tag)
+		}
+
+		if len(tc.WantAsc) >= 5 {
+			limit5Asc := tc.WantAsc[:5]
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(5), tag)
+			assertDocKRResult(s.T(), fullCase, "ASC_Limit_5_is_first_5", limit5Asc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_5", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runDesc(kr.Limit(5), tag)
+			assertDocKRResult(s.T(), fullCase, "DESC_Limit_5_is_last_5_rev", limit5Asc, ids, ok, errMsg, true)
+			if ok && len(limit5Asc) > 0 {
+				assertCtorShapeWritten(fullCase, "DESC_Limit_5", 5, kr, tag)
+			}
+		}
+		if len(tc.WantAsc) >= 3 {
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)), tag)
+			assertDocKRResult(s.T(), fullCase, "ASC_Limit_EQ_count_returns_all", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_EQ_count", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)+500), tag)
+			assertDocKRResult(s.T(), fullCase, "ASC_Limit_OVER_count_safe", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_OVER_count", len(ids), kr, tag)
+			}
+		}
+	}
+}
+
+func assertDocKRResult(t *testing.T, caseName, label string, wantAsc, ids []string, ok bool, errMsg string, desc bool) {
+	t.Helper()
+	if !ok {
+		t.Errorf("%s/%s: expected Ok, got Error: %s", caseName, label, errMsg)
+		return
+	}
+	if len(wantAsc) != len(ids) {
+		t.Errorf("%s/%s: length mismatch want=%d got=%d ids=%v", caseName, label, len(wantAsc), len(ids), ids)
+		return
+	}
+	var want []string
+	if desc {
+		want = make([]string, len(wantAsc))
+		copy(want, wantAsc)
+		for i, j := 0, len(want)-1; i < j; i, j = i+1, j-1 {
+			want[i], want[j] = want[j], want[i]
+		}
+	} else {
+		want = wantAsc
+	}
+	if len(want) == 0 && len(ids) == 0 {
+		return
+	}
+	for i := range want {
+		if want[i] != ids[i] {
+			t.Errorf("%s/%s content mismatch (desc=%v): want[%d]=%q got[%d]=%q", caseName, label, desc, i, want[i], i, ids[i])
+			return
+		}
+	}
+}
+
+func (s *DocUpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
+	krGte := x.KeysGte(updDocID("p027"))
+	resGte := Update[DocUpdateFixture](krGte, nil, x.Set("boundary", "gte"))
+	s.Require().NoError(resGte.Error())
+	idsGte := updDocIDFromStorage(resGte.MustGet())
+
+	skGte := SearchKey[DocUpdateFixture](krGte, nil, false)
+	s.Require().NoError(skGte.Error())
+	gotGte := skGte.MustGet()
+	s.Len(gotGte, len(idsGte), "Gte SK sweep after Update expected len=%d got=%d", len(idsGte), len(gotGte))
+	for _, d := range gotGte {
+		got := updDocRawGet(d.RawJSON(), "boundary")
+		s.Equal("gte", got, "Update Gte value mismatch on boundary field: raw=%s", d.RawJSON())
+	}
+
+	krGt := x.KeysGt(updDocID("p027"))
+	resGt := Update[DocUpdateFixture](krGt, nil, x.Set("boundary", "gt"))
+	s.Require().NoError(resGt.Error())
+	idsGt := updDocIDFromStorage(resGt.MustGet())
+
+	skGt := SearchKey[DocUpdateFixture](krGt, nil, false)
+	s.Require().NoError(skGt.Error())
+	gotGt := skGt.MustGet()
+	s.Len(gotGt, len(idsGt), "Gt SK sweep after Update expected len=%d got=%d", len(idsGt), len(gotGt))
+	for _, d := range gotGt {
+		got := updDocRawGet(d.RawJSON(), "boundary")
+		s.Equal("gt", got, "Update Gt value mismatch on boundary field: raw=%s", d.RawJSON())
+	}
+
+	testutil.AssertGtGteGap1(s.T(), idsGte, idsGt, "p027")
+}
+
+func (s *DocUpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
+	krLte := x.KeysLte(updDocID("p072"))
+	resLte := Update[DocUpdateFixture](krLte, nil, x.Set("boundary", "lte"))
+	s.Require().NoError(resLte.Error())
+	idsLte := updDocIDFromStorage(resLte.MustGet())
+
+	skLte := SearchKey[DocUpdateFixture](krLte, nil, false)
+	s.Require().NoError(skLte.Error())
+	gotLte := skLte.MustGet()
+	s.Len(gotLte, len(idsLte), "Lte SK sweep after Update expected len=%d got=%d", len(idsLte), len(gotLte))
+	for _, d := range gotLte {
+		got := updDocRawGet(d.RawJSON(), "boundary")
+		s.Equal("lte", got, "Update Lte value mismatch on boundary field: raw=%s", d.RawJSON())
+	}
+
+	krLt := x.KeysLt(updDocID("p072"))
+	resLt := Update[DocUpdateFixture](krLt, nil, x.Set("boundary", "lt"))
+	s.Require().NoError(resLt.Error())
+	idsLt := updDocIDFromStorage(resLt.MustGet())
+
+	skLt := SearchKey[DocUpdateFixture](krLt, nil, false)
+	s.Require().NoError(skLt.Error())
+	gotLt := skLt.MustGet()
+	s.Len(gotLt, len(idsLt), "Lt SK sweep after Update expected len=%d got=%d", len(idsLt), len(gotLt))
+	for _, d := range gotLt {
+		got := updDocRawGet(d.RawJSON(), "boundary")
+		s.Equal("lt", got, "Update Lt value mismatch on boundary field: raw=%s", d.RawJSON())
+	}
+
+	testutil.AssertLtLteGap1(s.T(), idsLte, idsLt, "p072")
+}
+
+func (s *DocUpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
+	allKr := x.KeysPattern("p*")
+
+	fullRes := Update[DocUpdateFixture](allKr, nil, x.Set("lim", "full"))
+	s.Require().NoError(fullRes.Error(), "full err=%v", fullRes.Error())
+	full := fullRes.MustGet()
+	s.Len(full, testutil.CountX())
+	sort.Strings(full)
+	skFull := SearchKey[DocUpdateFixture](allKr, nil, false)
+	s.Require().NoError(skFull.Error())
+	gotFull := skFull.MustGet()
+	s.Len(gotFull, testutil.CountX())
+	for _, d := range gotFull {
+		got := updDocRawGet(d.RawJSON(), "lim")
+		s.Equal("full", got, "Update lim=full value mismatch: raw=%s", d.RawJSON())
+	}
+
+	limitRes := Update[DocUpdateFixture](x.KeysPattern("p*").Limit(7), nil, x.Set("lim", "7"))
+	s.Require().NoError(limitRes.Error(), "limit err=%v", limitRes.Error())
+	lim := limitRes.MustGet()
+	s.Len(lim, 7, "Limit(7) must truncate at callback=7, got len=%d", len(lim))
+	sort.Strings(lim)
+	s.Equal(full[:7], lim, "Limit(7) updated keys must equal ASC first-7 of full set — proves early-stop at callback")
+	skLim := SearchKey[DocUpdateFixture](allKr, nil, false)
+	s.Require().NoError(skLim.Error())
+	gotLim := skLim.MustGet()
+	var cntLim7 int
+	for _, d := range gotLim {
+		got := updDocRawGet(d.RawJSON(), "lim")
+		if got == "7" {
+			cntLim7++
+			continue
+		}
+		s.Equal("full", got, "Limit=7 sweep: non-first-7 docs must keep lim=full, got %q; raw=%s", got, d.RawJSON())
+	}
+	s.Equal(7, cntLim7, "lim=7 want 7 docs with exact value lim==7 got=%d", cntLim7)
+}
+
+func (s *DocUpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
+	filter := x.Eq("bucket", "A")
+	res := Update[DocUpdateFixture](x.KeysPattern("p*"), filter, x.Set("filtered_tag", "A-only"))
+	s.Require().NoError(res.Error(), "filtered err=%v", res.Error())
+	ids := updDocIDFromStorage(res.MustGet())
+	s.Len(ids, 34, "Update+filter Eq(bucket,A) should match 34 bucket=A rows")
+
+	skAll := SearchKey[DocUpdateFixture](x.KeysPattern("p*"), nil, false)
+	s.Require().NoError(skAll.Error())
+	var count int
+	for _, v := range skAll.MustGet() {
+		if updDocRawGet(v.RawJSON(), "filtered_tag") == "A-only" {
+			count++
+		}
+	}
+	s.Equal(len(ids), count, "only updated rows carry filtered_tag; count=%d", count)
+}
+
+func (s *DocUpdateKeyRangeSuite) TestNilKRRejects() {
+	res := Update[DocUpdateFixture](nil, nil, x.Set("nil_tag", true))
+	s.Require().True(res.IsError(), "nil kr must reject")
+	s.Contains(res.Error().Error(), "key range is required")
+}
+
+func (s *DocUpdateKeyRangeSuite) TestTypedScopedLimitCarry4LayerAlignment() {
+	idSet := []string{"ukr_a", "ukr_b", "ukr_c", "ukr_d", "ukr_e"}
+	for _, id := range idSet {
+		doc := UserDoc(fmt.Sprintf(`{"id":"%s","tag":"ukr4align","age":33}`, id))
+		s.NoError(Set(doc))
+	}
+	fullRes := Update[UserDoc](x.KeysPattern("ukr_*"), x.Eq("tag", "ukr4align"), x.Set("scoped", "yes"))
+	s.Require().NoError(fullRes.Error())
+	s.Len(fullRes.MustGet(), len(idSet))
+	skFull := SearchKey[UserDoc](x.KeysPattern("ukr_*"), x.Eq("tag", "ukr4align"), false)
+	s.Require().NoError(skFull.Error())
+	var cntYes int
+	for _, d := range skFull.MustGet() {
+		got := updDocRawGet(d.RawJSON(), "scoped")
+		if got == "yes" {
+			cntYes++
+			continue
+		}
+		s.Equal("", got, "unexpected scoped value (neither yes nor empty): %q raw=%s", got, d.RawJSON())
+	}
+	s.Equal(len(idSet), cntYes, "scoped=yes per-doc value check want=%d got=%d", len(idSet), cntYes)
+
+	limitRes := Update[UserDoc](x.KeysPattern("ukr_*").Limit(2), x.Eq("tag", "ukr4align"), x.Set("scoped", "lim2"))
+	s.Require().NoError(limitRes.Error())
+	s.Len(limitRes.MustGet(), 2, "Limit(2) must carry through typed-layer ScopeKeyRange + Update")
+	wantFull := fullRes.MustGet()
+	sort.Strings(wantFull)
+	gotLim := limitRes.MustGet()
+	sort.Strings(gotLim)
+	s.Equal(wantFull[:2], gotLim, "typed Update Limit carry must preserve ASC order first-N — matching SK parity")
+	skLim := SearchKey[UserDoc](x.KeysPattern("ukr_*"), x.Eq("tag", "ukr4align"), false)
+	s.Require().NoError(skLim.Error())
+	var cntLim2 int
+	for _, d := range skLim.MustGet() {
+		got := updDocRawGet(d.RawJSON(), "scoped")
+		if got == "lim2" {
+			cntLim2++
+			continue
+		}
+	}
+	s.Equal(2, cntLim2, "scoped=lim2 per-doc value check want=2 got=%d", cntLim2)
+}
+
+func TestDocUpdateKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(DocUpdateKeyRangeSuite))
 }

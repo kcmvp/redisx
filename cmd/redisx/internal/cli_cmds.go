@@ -361,8 +361,8 @@ With 0 args, redisx is equivalent to "redisx HELP".`,
 }
 
 func registerDocCmds(app *tui.CLIApp) {
-	regdoc := &tui.CLICommand{
-		Use:   "regdoc [spec_json]",
+	regsch := &tui.CLICommand{
+		Use:   "regsch [spec_json]",
 		Short: "register a Doc schema — no args = step-by-step wizard; 1 JSON arg = raw wire script mode",
 		Run: func(ctx tui.RunContext, args []string) error {
 			sess := sessFromCtx(ctx)
@@ -374,12 +374,12 @@ func registerDocCmds(app *tui.CLIApp) {
 				return wizard.RunCreateDocWizard(sess, cache)
 			}
 			if len(args) > 1 {
-				return fmt.Errorf("regdoc accepts 0 or 1 arg(s) (got %d)", len(args))
+				return fmt.Errorf("regsch accepts 0 or 1 arg(s) (got %d)", len(args))
 			}
 			if !json.Valid([]byte(args[0])) {
 				return errors.New("spec_json is not valid JSON")
 			}
-			v, err := sess.RawDo([]any{"regdoc", args[0]}).Result()
+			v, err := sess.RawDo([]any{"regsch", args[0]}).Result()
 			if err != nil {
 				return err
 			}
@@ -389,102 +389,34 @@ func registerDocCmds(app *tui.CLIApp) {
 		},
 		MinArgs: 0, MaxArgs: 1,
 	}
-	app.Register(regdoc)
-	trackCmd("regdoc", regdoc)
+	app.Register(regsch)
+	trackCmd("regsch", regsch)
 
-	lsdoc := &tui.CLICommand{
-		Use:     "lsdoc [pattern]",
-		Short:   "list registered Doc namespaces (optionally filtered by GLOB pattern)",
-		MinArgs: 0, MaxArgs: 1,
-		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if err := requireRedisxDoc(sess); err != nil {
-				return err
-			}
-			callArgs := []any{"lsdoc"}
-			for _, arg := range args {
-				callArgs = append(callArgs, arg)
-			}
-			v, err := sess.RawDo(callArgs).Result()
-			if err != nil {
-				return err
-			}
-			wizard.PrintAny(os.Stdout, v)
-			return nil
-		},
-	}
-	app.Register(lsdoc)
-	trackCmd("lsdoc", lsdoc)
-
-	desdoc := &tui.CLICommand{
-		Use:     "desdoc <namespace>",
-		Short:   "describe a single registered Doc schema (fields, KeyAttrs, schemaVersion)",
+	dropsch := &tui.CLICommand{
+		Use:     "dropsch <namespace>",
+		Short:   "drop a Doc schema (auto removes disk+mem versions; refuses if any attached indexes remain)",
 		MinArgs: 1, MaxArgs: 1,
 		Run: func(ctx tui.RunContext, args []string) error {
 			sess := sessFromCtx(ctx)
+			cache := cacheFromCtx(ctx)
 			if err := requireRedisxDoc(sess); err != nil {
 				return err
 			}
-			v, err := sess.RawDo([]any{"desdoc", args[0]}).Result()
+			v, err := sess.RawDo([]any{"dropsch", args[0]}).Result()
 			if err != nil {
 				return err
 			}
+			cache.Invalidate()
 			wizard.PrintAny(os.Stdout, v)
 			return nil
 		},
 	}
-	app.Register(desdoc)
-	trackCmd("desdoc", desdoc)
+	app.Register(dropsch)
+	trackCmd("dropsch", dropsch)
 
-	listdocs := &tui.CLICommand{
-		Use:     "!listdocs [pattern]",
-		Aliases: []string{"listdocs"},
-		Short:   "alias for lsdoc",
-		MinArgs: 0, MaxArgs: 1,
-		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if err := requireRedisxDoc(sess); err != nil {
-				return err
-			}
-			callArgs := []any{"lsdoc"}
-			for _, arg := range args {
-				callArgs = append(callArgs, arg)
-			}
-			v, err := sess.RawDo(callArgs).Result()
-			if err != nil {
-				return err
-			}
-			wizard.PrintAny(os.Stdout, v)
-			return nil
-		},
-	}
-	app.Register(listdocs)
-	trackCmd("!listdocs", listdocs)
-
-	describeddoc := &tui.CLICommand{
-		Use:     "!describedoc <namespace>",
-		Aliases: []string{"describedoc"},
-		Short:   "alias for desdoc",
-		MinArgs: 1, MaxArgs: 1,
-		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if err := requireRedisxDoc(sess); err != nil {
-				return err
-			}
-			v, err := sess.RawDo([]any{"desdoc", args[0]}).Result()
-			if err != nil {
-				return err
-			}
-			wizard.PrintAny(os.Stdout, v)
-			return nil
-		},
-	}
-	app.Register(describeddoc)
-	trackCmd("!describedoc", describeddoc)
-
-	createdoc := &tui.CLICommand{
-		Use:     "!createdoc",
-		Aliases: []string{"createdoc"},
+	createsch := &tui.CLICommand{
+		Use:     "!createsch",
+		Aliases: []string{"createsch"},
 		Short:   "(REPL sugar) 5-step wizard to register a new Doc schema — avoids one-shot JSON typos",
 		MinArgs: 0, MaxArgs: 0,
 		Run: func(ctx tui.RunContext, _ []string) error {
@@ -496,14 +428,14 @@ func registerDocCmds(app *tui.CLIApp) {
 			return wizard.RunCreateDocWizard(sess, cache)
 		},
 	}
-	app.Register(createdoc)
-	trackCmd("!createdoc", createdoc)
+	app.Register(createsch)
+	trackCmd("!createsch", createsch)
 }
 
 func registerIdxCmds(app *tui.CLIApp) {
 	regidx := &tui.CLICommand{
-		Use:   "regidx [owner_ns logical_name json_path [UNIQUE] [TYPE <type>]]",
-		Short: "register a secondary index — no args = step-by-step wizard; 3..6 args = raw wire script mode",
+		Use:   "regidx [spec_json]",
+		Short: "register a secondary index — no args = step-by-step wizard; 1 arg = raw wire JSON-only spec (single argument form)",
 		Run: func(ctx tui.RunContext, args []string) error {
 			sess := sessFromCtx(ctx)
 			cache := cacheFromCtx(ctx)
@@ -513,15 +445,13 @@ func registerIdxCmds(app *tui.CLIApp) {
 			if len(args) == 0 {
 				return wizard.RunCreateIdxWizard(sess, cache)
 			}
-			if len(args) < 3 || len(args) > 6 {
-				return fmt.Errorf("regidx accepts 0 args (wizard) or 3..6 args (owner_ns logical_name json_path [UNIQUE] [TYPE <type>]); received %d", len(args))
+			if len(args) != 1 {
+				return fmt.Errorf("regidx accepts 0 args (wizard) or 1 arg (spec_json); received %d", len(args))
 			}
-			callArgs := make([]any, 0, 1+len(args))
-			callArgs = append(callArgs, "regidx")
-			for _, arg := range args {
-				callArgs = append(callArgs, arg)
+			if !json.Valid([]byte(args[0])) {
+				return errors.New("regidx spec_json arg is not valid JSON")
 			}
-			v, err := sess.RawDo(callArgs).Result()
+			v, err := sess.RawDo([]any{"regidx", args[0]}).Result()
 			if err != nil {
 				return err
 			}
@@ -529,71 +459,27 @@ func registerIdxCmds(app *tui.CLIApp) {
 			wizard.PrintAny(os.Stdout, v)
 			return nil
 		},
-		MinArgs: -1, MaxArgs: -1,
+		MinArgs: 0, MaxArgs: 1,
 	}
 	app.Register(regidx)
 	trackCmd("regidx", regidx)
 
-	lsidx := &tui.CLICommand{
-		Use:     "lsidx [owner_ns]",
-		Short:   "list registered indexes (optionally filtered by owner namespace)",
-		MinArgs: 0, MaxArgs: 1,
-		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if err := requireRedisxIndex(sess); err != nil {
-				return err
-			}
-			callArgs := []any{"lsidx"}
-			for _, arg := range args {
-				callArgs = append(callArgs, arg)
-			}
-			v, err := sess.RawDo(callArgs).Result()
-			if err != nil {
-				return err
-			}
-			wizard.PrintAny(os.Stdout, v)
-			return nil
-		},
-	}
-	app.Register(lsidx)
-	trackCmd("lsidx", lsidx)
-
-	listidx := &tui.CLICommand{
-		Use:     "!listindexes [owner_ns]",
-		Aliases: []string{"listindexes"},
-		Short:   "alias for lsidx",
-		MinArgs: 0, MaxArgs: 1,
-		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if err := requireRedisxIndex(sess); err != nil {
-				return err
-			}
-			callArgs := []any{"lsidx"}
-			for _, arg := range args {
-				callArgs = append(callArgs, arg)
-			}
-			v, err := sess.RawDo(callArgs).Result()
-			if err != nil {
-				return err
-			}
-			wizard.PrintAny(os.Stdout, v)
-			return nil
-		},
-	}
-	app.Register(listidx)
-	trackCmd("!listindexes", listidx)
-
-	delidx := &tui.CLICommand{
-		Use:     "delidx <owner_ns> <logical_name>",
-		Short:   "(raw wire, script-only) delete an index — prefer `!dropindex` for the 2-phase confirm",
-		MinArgs: 2, MaxArgs: 2,
+	dropidx := &tui.CLICommand{
+		Use:     "dropidx <owner_ns> <logical_name>  |  dropidx <full_name>",
+		Short:   "(raw wire, script-only) drop an index — prefer `!dropidx` for the 2-phase confirm",
+		MinArgs: 1, MaxArgs: 2,
 		Run: func(ctx tui.RunContext, args []string) error {
 			sess := sessFromCtx(ctx)
 			cache := cacheFromCtx(ctx)
 			if err := requireRedisxIndex(sess); err != nil {
 				return err
 			}
-			v, err := sess.RawDo([]any{"delidx", args[0], args[1]}).Result()
+			callArgs := make([]any, 0, 1+len(args))
+			callArgs = append(callArgs, "dropidx")
+			for _, arg := range args {
+				callArgs = append(callArgs, arg)
+			}
+			v, err := sess.RawDo(callArgs).Result()
 			if err != nil {
 				return err
 			}
@@ -602,12 +488,12 @@ func registerIdxCmds(app *tui.CLIApp) {
 			return nil
 		},
 	}
-	app.Register(delidx)
-	trackCmd("delidx", delidx)
+	app.Register(dropidx)
+	trackCmd("dropidx", dropidx)
 
 	createidx := &tui.CLICommand{
-		Use:     "!createindex",
-		Aliases: []string{"createindex"},
+		Use:     "!createidx",
+		Aliases: []string{"createidx"},
 		Short:   "(REPL sugar) 4-step wizard to create a secondary index — avoids one-shot arg mistakes",
 		MinArgs: 0, MaxArgs: 0,
 		Run: func(ctx tui.RunContext, _ []string) error {
@@ -620,11 +506,11 @@ func registerIdxCmds(app *tui.CLIApp) {
 		},
 	}
 	app.Register(createidx)
-	trackCmd("!createindex", createidx)
+	trackCmd("!createidx", createidx)
 
-	dropidx := &tui.CLICommand{
-		Use:     "!dropindex",
-		Aliases: []string{"dropindex"},
+	dropidxw := &tui.CLICommand{
+		Use:     "!dropidx",
+		Aliases: []string{"dropidxw"},
 		Short:   "(REPL sugar) 2-phase destroy confirm: type exact full-name, then type DESTROY — irreversible",
 		MinArgs: 0, MaxArgs: 0,
 		Run: func(ctx tui.RunContext, _ []string) error {
@@ -636,8 +522,8 @@ func registerIdxCmds(app *tui.CLIApp) {
 			return wizard.RunDropIdxWizard(sess, cache)
 		},
 	}
-	app.Register(dropidx)
-	trackCmd("!dropindex", dropidx)
+	app.Register(dropidxw)
+	trackCmd("!dropidx", dropidxw)
 }
 
 func registerExtendedCmds(app *tui.CLIApp) {
@@ -678,7 +564,7 @@ Examples:
 		Use:     "searchindex <namespace.index_name> <keyrange> [filter_json] [desc]",
 		Aliases: []string{"si"},
 		Short:   "(Extended) SEARCHINDEX — secondary-index ordered scan with JSON field filter",
-		Long: `SEARCHINDEX looks up a typed secondary index registered via regidx/!createindex
+		Long: `SEARCHINDEX looks up a typed secondary index registered via regidx/!createidx
 and returns document keys ordered by the index score.
 Examples:
   searchindex user.score '{"prefix":"user:""}'

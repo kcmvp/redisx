@@ -21,9 +21,9 @@ func TestShlexSplitBasic(t *testing.T) {
 		wantOK bool
 	}{
 		{"empty", "  \t ", nil, true},
-		{"simple", "regdoc foo", []string{"regdoc", "foo"}, true},
-		{"doubleQuotes", `regdoc "hello world" foo`, []string{"regdoc", "hello world", "foo"}, true},
-		{"singleQuotes", `lsdoc 'a:b:c'`, []string{"lsdoc", "a:b:c"}, true},
+		{"simple", "regsch foo", []string{"regsch", "foo"}, true},
+		{"doubleQuotes", `regsch "hello world" foo`, []string{"regsch", "hello world", "foo"}, true},
+		{"singleQuotes", `dropsch 'a:b:c'`, []string{"dropsch", "a:b:c"}, true},
 		{"escapeInDouble", `"a\"b"`, []string{`a"b`}, true},
 		{"escapeOutDouble", `a\ b c`, []string{"a b", "c"}, true},
 		{"unterminatedDouble", `"abc`, nil, false},
@@ -369,8 +369,8 @@ func TestGlobalHelpPlainRedisShowsOnlyBasic(t *testing.T) {
 	if !strings.Contains(out, "connected peer is not a redisx server") {
 		t.Fatalf("plain-redis should show peer-not-redisx notice: %q", out)
 	}
-	if strings.Contains(out, "  regdoc ") || strings.Contains(out, "  searchkey ") || strings.Contains(out, "  update ") || strings.Contains(out, "  regidx ") {
-		t.Fatalf("plain-redis help must not list redisx-only command rows (regdoc/searchkey/update/regidx): %q", out)
+	if strings.Contains(out, "  regsch ") || strings.Contains(out, "  searchkey ") || strings.Contains(out, "  update ") || strings.Contains(out, "  regidx ") {
+		t.Fatalf("plain-redis help must not list redisx-only command rows (regsch/searchkey/update/regidx): %q", out)
 	}
 }
 
@@ -403,10 +403,10 @@ func TestGlobalHelpTypedDocsAndIndexesDrilldown(t *testing.T) {
 		SearchIndex:  true,
 	}
 	out := runGlobalHelpFor(t, docsOnly)
-	if !strings.Contains(out, "  regdoc ") || !strings.Contains(out, "  lsdoc ") || !strings.Contains(out, "  desdoc ") {
-		t.Fatalf("docs=true must list Doc management entry rows (regdoc/lsdoc/desdoc): %q", out)
+	if !strings.Contains(out, "  regsch ") || !strings.Contains(out, "  dropsch ") {
+		t.Fatalf("docs=true must list Doc management entry rows (regsch/dropsch): %q", out)
 	}
-	if strings.Contains(out, "  regidx ") || strings.Contains(out, "  lsidx ") || strings.Contains(out, "  delidx ") || strings.Contains(out, "  !createindex ") {
+	if strings.Contains(out, "  regidx ") || strings.Contains(out, "  dropidx ") || strings.Contains(out, "  !createidx ") {
 		t.Fatalf("indexes=false must NOT list Index management entry rows: %q", out)
 	}
 	if !strings.Contains(out, cBold("Extended Commands")+":") {
@@ -424,11 +424,11 @@ func TestGlobalHelpTypedDocsAndIndexesDrilldown(t *testing.T) {
 		SearchIndex:  true,
 	}
 	out = runGlobalHelpFor(t, idxOnly)
-	if strings.Contains(out, "  regdoc ") || strings.Contains(out, "  lsdoc ") || strings.Contains(out, "  desdoc ") || strings.Contains(out, "  !createdoc ") {
+	if strings.Contains(out, "  regsch ") || strings.Contains(out, "  dropsch ") || strings.Contains(out, "  !createsch ") {
 		t.Fatalf("docs=false must NOT list Doc management entry rows: %q", out)
 	}
-	if !strings.Contains(out, "  regidx ") || !strings.Contains(out, "  lsidx ") || !strings.Contains(out, "  delidx ") {
-		t.Fatalf("indexes=true must list Index management entry rows (regidx/lsidx/delidx): %q", out)
+	if !strings.Contains(out, "  regidx ") || !strings.Contains(out, "  dropidx ") {
+		t.Fatalf("indexes=true must list Index management entry rows (regidx/dropidx): %q", out)
 	}
 }
 
@@ -444,7 +444,7 @@ func TestGlobalHelpAppRoleShowsMetaCommands(t *testing.T) {
 	if !strings.Contains(out, cBold("Meta Management")+":") {
 		t.Fatalf("AdminRole=false should still show Meta Management in help (No Privilege handled server-side): %q", out)
 	}
-	if !strings.Contains(out, "  regdoc ") || !strings.Contains(out, "  regidx ") {
+	if !strings.Contains(out, "  regsch ") || !strings.Contains(out, "  regidx ") {
 		t.Fatalf("AdminRole=false help entries for Meta should still list command rows: %q", out)
 	}
 	if !strings.Contains(out, cBold("Extended Commands")+":") {
@@ -507,8 +507,8 @@ func TestBannerForThreeStates(t *testing.T) {
 		if !strings.Contains(out, "not a redisx server — only raw RESP forwarding available") {
 			t.Fatalf("plain-redis banner should show yellow 'not a redisx server' notice: %q", out)
 		}
-		if strings.Contains(out, "regdoc") || strings.Contains(out, "searchkey") {
-			t.Fatalf("plain-redis banner should NOT list any redisx-only command names (regdoc/searchkey/...): %q", out)
+		if strings.Contains(out, "regsch") || strings.Contains(out, "searchkey") {
+			t.Fatalf("plain-redis banner should NOT list any redisx-only command names (regsch/searchkey/...): %q", out)
 		}
 	})
 	t.Run("RedisxAdminFullFeatures", func(t *testing.T) {
@@ -522,10 +522,10 @@ func TestBannerForThreeStates(t *testing.T) {
 		if !strings.Contains(out, "connected: admin 127.0.0.1:7381") {
 			t.Fatalf("admin banner role label + host:port missing: %q", out)
 		}
-		if !strings.Contains(out, "docs:  regdoc / lsdoc / desdoc / !createdoc / !describedoc") {
+		if !strings.Contains(out, "docs:  regsch / dropsch / !createsch") {
 			t.Fatalf("with TypedDocs=true docs list missing: %q", out)
 		}
-		if !strings.Contains(out, "idx:   regidx / lsidx / delidx / !createindex / !dropindex / !listindexes") {
+		if !strings.Contains(out, "idx:   regidx / dropidx / !createidx / !dropidx") {
 			t.Fatalf("with TypedIndexes=true idx list missing: %q", out)
 		}
 		if !strings.Contains(out, "searchkey(sk)  /  searchindex(si)  /  update(upd)") {
@@ -558,7 +558,7 @@ func TestBannerForThreeStates(t *testing.T) {
 			IsRedisx: true, AdminRole: true, TypedDocs: true, TypedIndexes: false, SearchIndex: false,
 		}
 		out := BannerFor(caps, "127.0.0.1", "7381")
-		if !strings.Contains(out, "docs:  regdoc / lsdoc / desdoc / !createdoc / !describedoc") {
+		if !strings.Contains(out, "docs:  regsch / dropsch / !createsch") {
 			t.Fatalf("with TypedDocs=true docs list must be present: %q", out)
 		}
 		if strings.Contains(out, "idx:") {
@@ -691,7 +691,7 @@ func TestCommandsListMatchesAdminShellCaps(t *testing.T) {
 	outPlain := stripANSIStrict(out)
 	mustContain := []string{
 		"Basic:", "Extended:", "Meta Management:",
-		"regdoc", "regidx", "searchkey",
+		"regsch", "regidx", "searchkey",
 		"admin 127.0.0.1:7381",
 	}
 	for _, m := range mustContain {

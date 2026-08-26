@@ -44,12 +44,10 @@ var (
 	cmdUpdate      = strings.ToLower(proto.CmdUpdate)
 	cmdSearchIndex = strings.ToLower(proto.CmdSearchIndex)
 	cmdSearchKey   = strings.ToLower(proto.CmdSearchKey)
-	cmdRegDoc      = strings.ToLower(proto.CmdRegisterDoc)
-	cmdLsDoc       = strings.ToLower(proto.CmdListDocs)
-	cmdDesDoc      = strings.ToLower(proto.CmdDescribeDoc)
-	cmdLsIdx       = strings.ToLower(proto.CmdListIndexes)
+	cmdRegSch      = strings.ToLower(proto.CmdRegisterSchema)
+	cmdDropSch     = strings.ToLower(proto.CmdDropSchema)
 	cmdRegIdx      = strings.ToLower(proto.CmdRegisterIndex)
-	cmdDelIdx      = strings.ToLower(proto.CmdDropIndex)
+	cmdDropIdx     = strings.ToLower(proto.CmdDropIndex)
 )
 
 type commandHandler func(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
@@ -72,12 +70,10 @@ var commandRegistry = map[string]commandHandler{
 	cmdUpdate:      updateCommand,
 	cmdSearchIndex: searchIndexCommand,
 	cmdSearchKey:   searchKeyCommand,
-	cmdRegDoc:      regDocCommand,
-	cmdLsDoc:       lsDocCommand,
-	cmdDesDoc:      desDocCommand,
-	cmdLsIdx:       lsIdxCommand,
+	cmdRegSch:      regSchemaCommand,
+	cmdDropSch:     dropSchemaCommand,
 	cmdRegIdx:      regIdxCommand,
-	cmdDelIdx:      delIdxCommand,
+	cmdDropIdx:     dropIndexCommand,
 }
 
 var (
@@ -497,9 +493,9 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	if gate2MTLSAndSourceIP(conn, cmdName) {
 		return
 	}
-	if gate3ArgcShape(conn, cmd) {
-		return
-	}
+	// Note: per-command argc validation lives inside each handler. Registry
+	// commands (REGSCH/REGIDX/DROPSCH/DROPIDX) are ordinary commands with
+	// exactly the same argc discipline as SET/GET/DEL.
 
 	if cmdName != cmdAuth && cmdName != cmdClient {
 		connAuthKey, _ := conn.Context().(string)

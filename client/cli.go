@@ -18,6 +18,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,12 +27,14 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
+	naming "github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/x"
@@ -605,8 +608,202 @@ func disconnect() {
 	resetHandlers()
 }
 
+// ———  Typesafe API (top-most as user requested)  ———
+
+func Get[D x.Document](key string) (D, error) {
+	var zero D
+	raw, err := GetRaw(x.StorageKeyValue[D](key))
+	if err != nil {
+		return zero, err
+	}
+	return D(raw), nil
+}
+
+func Set[D x.Document](d D) error {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return err
+	}
+	return SetWithTTLRaw(key, d.RawJSON(), d.TTL())
+}
+
+func SetNX[D x.Document](d D) (bool, error) {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return SetNXWithTTLRaw(key, d.RawJSON(), d.TTL())
+}
+
+func Delete[D x.Document](d D) (bool, error) {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return DeleteRaw(key)
+}
+
+func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
+	fullKeyPattern, err := x.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return KeysRaw(fullKeyPattern)
+}
+
+func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
+	fullIdxName, err := x.ValidateIdxName[D](idxName)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := SearchIndexRaw(fullIdxName, fullKR, filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := SearchKeyRaw(fullKR, filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if scopedKR == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
+	}
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return UpdateRaw(fullKR, filter, values...)
+}
+
+func RegisterSchema[T x.Schema]() error {
+	var zero T
+	type raw struct {
+		Namespace string        `json:"namespace"`
+		Mem       bool          `json:"mem"`
+		KeyAttrs  []string      `json:"key_attrs"`
+		TTL       time.Duration `json:"ttl_ns"`
+	}
+	r := raw{
+		Namespace: zero.Namespace(),
+		Mem:       zero.Mem(),
+		KeyAttrs:  append([]string(nil), zero.KeyAttrs()...),
+		TTL:       zero.TTL(),
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return RegisterSchemaFromJSON(string(b))
+}
+
+func RegisterIndex[D x.Document](logical string, keyPattern string, jsonPaths ...string) error {
+	if logical == "" {
+		return errors.New("logical index name is empty")
+	}
+	if keyPattern == "" {
+		return errors.New("key pattern is empty")
+	}
+	if len(jsonPaths) == 0 {
+		return errors.New("at least one jsonPath is required")
+	}
+	var zero D
+	ns := zero.Namespace()
+	mem := zero.Mem()
+	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
+		return err
+	}
+	storageNs := naming.BuildStorageNs(ns, mem)
+	paths := make([]string, 0, len(jsonPaths))
+	for _, p := range jsonPaths {
+		if p == "" {
+			return errors.New("jsonPaths contains empty path")
+		}
+		paths = append(paths, strings.ReplaceAll(p, ".", "_"))
+	}
+	type raw struct {
+		OwnerNs    string   `json:"owner_ns"`
+		OwnerMem   bool     `json:"owner_mem,omitempty"`
+		Logical    string   `json:"logical"`
+		Paths      []string `json:"paths"`
+		KeyPattern string   `json:"key_pattern"`
+	}
+	spec := raw{
+		OwnerNs:    storageNs,
+		OwnerMem:   mem,
+		Logical:    strings.ToLower(logical),
+		Paths:      paths,
+		KeyPattern: keyPattern,
+	}
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("RegisterIndex build JSON: %w", err)
+	}
+	return RegisterIndexFromJSON(string(b))
+}
+
+func DropSchema[T x.Schema]() error {
+	var zero T
+	ns := zero.Namespace()
+	if ns == "" {
+		return errors.New("schema returned empty namespace")
+	}
+	return DropSchemaRaw(ns)
+}
+
+func DropIndex[D x.Document](logical string) error {
+	if logical == "" {
+		return errors.New("logical index name is empty")
+	}
+	var zero D
+	ns := zero.Namespace()
+	mem := zero.Mem()
+	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
+		return err
+	}
+	storageNs := naming.BuildStorageNs(ns, mem)
+	return DropIndexRaw(storageNs, strings.ToLower(logical))
+}
+
+// ———  Raw API  ———
+
 // Get retrieves the value for the given key using the shared resp client.
-func Get(key string) (string, error) {
+func GetRaw(key string) (string, error) {
 	if key == "" {
 		return "", nil
 	}
@@ -625,8 +822,8 @@ func Get(key string) (string, error) {
 	return val, nil
 }
 
-// Set stores a value for the given key using the shared resp client.
-func SetWithTTL(key, value string, ttl time.Duration) error {
+// SetWithTTLRaw stores a value for the given key using the shared resp client, applying a positive TTL.
+func SetWithTTLRaw(key, value string, ttl time.Duration) error {
 	if key == "" {
 		return nil
 	}
@@ -661,13 +858,13 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 	return werr
 }
 
-// Set stores a value for the given key using the shared resp client.
-func Set(key, value string) error {
-	return SetWithTTL(key, value, 0)
+// SetRaw stores a value for the given key using the shared resp client with no TTL.
+func SetRaw(key, value string) error {
+	return SetWithTTLRaw(key, value, 0)
 }
 
-// SetNX stores a value for the given key only if the key does not exist.
-func SetNX(key, value string) (bool, error) {
+// SetNXRaw stores a value for the given key only if the key does not exist.
+func SetNXRaw(key, value string) (bool, error) {
 	if key == "" {
 		return false, nil
 	}
@@ -703,11 +900,11 @@ func SetNX(key, value string) (bool, error) {
 	return ok, werr
 }
 
-// SetNXWithTTL stores a value for the given key only if the key does not
+// SetNXWithTTLRaw stores a value for the given key only if the key does not
 // exist, and applies the provided TTL when it is positive.
-func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
+func SetNXWithTTLRaw(key, value string, ttl time.Duration) (bool, error) {
 	if ttl <= 0 {
-		return SetNX(key, value)
+		return SetNXRaw(key, value)
 	}
 
 	if key == "" {
@@ -744,8 +941,8 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 	return ok, werr
 }
 
-// Delete removes the specified key using the shared resp client.
-func Delete(key string) (bool, error) {
+// DeleteRaw removes the specified key using the shared resp client.
+func DeleteRaw(key string) (bool, error) {
 	if key == "" {
 		return false, nil
 	}
@@ -762,8 +959,8 @@ func Delete(key string) (bool, error) {
 	return res > 0, err
 }
 
-// Keys returns all keys matching the given key pattern.
-func Keys(keyPattern string) mo.Result[[]string] {
+// KeysRaw returns all keys matching the given key pattern.
+func KeysRaw(keyPattern string) mo.Result[[]string] {
 	if keyPattern == "" {
 		return mo.Ok([]string{})
 	}
@@ -794,7 +991,7 @@ func Keys(keyPattern string) mo.Result[[]string] {
 //
 // Example:
 //
-//	res := client.SearchIndex(
+//	res := client.SearchIndexRaw(
 //		"idx_age",
 //		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
 //		x.And(
@@ -804,7 +1001,7 @@ func Keys(keyPattern string) mo.Result[[]string] {
 //		false,
 //	)
 //	users := res.MustGet()
-func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
+func SearchIndexRaw(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
 	}
@@ -874,13 +1071,13 @@ func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo
 //
 // Example:
 //
-//	res := client.SearchKey(
+//	res := client.SearchKeyRaw(
 //		x.KeysGte("user:engineering:0100").Limit(50),
 //		x.Eq("region", "us"),
 //		true,
 //	)
 //	users := res.MustGet()
-func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
+func SearchKeyRaw(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
@@ -939,14 +1136,14 @@ func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 //
 // Example:
 //
-//	res := client.Update(
+//	res := client.UpdateRaw(
 //		x.KeysPattern("user:*"),
 //		x.Eq("status", "pending"),
 //		x.Set("status", "active"),
 //		x.Set("verified", true),
 //	)
 //	updatedKeys := res.MustGet()
-func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+func UpdateRaw(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
@@ -1195,5 +1392,111 @@ func consume(ctx context.Context, client *redis.Client) error {
 				slog.Warn("message handler channel full, message dropped", "topic", msg.Channel)
 			}
 		}
+	}
+}
+
+func RegisterSchemaFromJSON(specJSON string) error {
+	if specJSON == "" {
+		return errors.New("schema spec json is empty")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterSchema, specJSON).Err()
+}
+
+func RegisterIndexShort(ownerNs, logical string, paths ...string) error {
+	if ownerNs == "" {
+		return errors.New("owner_ns is empty")
+	}
+	if logical == "" {
+		return errors.New("logical is empty")
+	}
+	if len(paths) == 0 {
+		return errors.New("at least one path is required")
+	}
+	clean := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			return errors.New("paths contains an empty entry")
+		}
+		clean = append(clean, strings.ReplaceAll(p, ".", "_"))
+	}
+	type raw struct {
+		OwnerNs    string   `json:"owner_ns"`
+		Logical    string   `json:"logical"`
+		Paths      []string `json:"paths"`
+		KeyPattern string   `json:"key_pattern,omitempty"`
+	}
+	ownerMem := strings.HasPrefix(ownerNs, "_m_")
+	nsScope := ownerNs
+	if !ownerMem {
+		nsScope = "_d_" + ownerNs
+	}
+	spec := raw{
+		OwnerNs:    ownerNs,
+		Logical:    strings.ToLower(logical),
+		Paths:      clean,
+		KeyPattern: nsScope + ":*",
+	}
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("RegisterIndexShort build JSON: %w", err)
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterIndex, string(b)).Err()
+}
+
+func RegisterIndexFromJSON(specJSON string) error {
+	if specJSON == "" {
+		return errors.New("index spec json is empty")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterIndex, specJSON).Err()
+}
+
+func DropSchemaRaw(logicalNs string) error {
+	if logicalNs == "" {
+		return errors.New("logical ns is empty")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdDropSchema, logicalNs).Err()
+}
+
+func DropIndexRaw(ownerNsOrFull string, logical ...string) error {
+	if ownerNsOrFull == "" {
+		return errors.New("owner ns or full name is required")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	switch len(logical) {
+	case 0:
+		return client.Do(ctx, proto.CmdDropIndex, ownerNsOrFull).Err()
+	case 1:
+		return client.Do(ctx, proto.CmdDropIndex, ownerNsOrFull, logical[0]).Err()
+	default:
+		return errors.New("DropIndexRaw takes at most 2 args: (fullName)  or  (ownerNs, logical)")
 	}
 }

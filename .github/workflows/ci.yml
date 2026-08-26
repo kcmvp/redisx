@@ -96,9 +96,9 @@ jobs:
       run: |
         set -euo pipefail
 
-        echo "--- (1) Direct source import audit: no redisx/server, buntdb, or client→server in core SDK packages (x, client, client/doc); excluding *_test.go ---"
+        echo "--- (1) Direct source import audit: no redisx/server, buntdb, or client→server in core SDK packages (x, client); excluding *_test.go ---"
         DIRECT_FORBIDDEN=$(
-          ( grep -RIlsE '"github.com/kcmvp/redisx/server"|"github.com/tidwall/buntdb"' x/ client/ client/doc/ 2>/dev/null || true ) \
+          ( grep -RIlsE '"github.com/kcmvp/redisx/server"|"github.com/tidwall/buntdb"' x/ client/ 2>/dev/null || true ) \
             | grep -v '_test.go$' || true
         )
         if [ -n "$DIRECT_FORBIDDEN" ]; then
@@ -108,8 +108,8 @@ jobs:
         fi
         echo "OK: no direct import of redisx/server or buntdb in x/client/client-doc non-test files."
 
-        echo "--- (2) Transitive dep audit: ./x ./client ./client/doc non-test graphs must NOT pull server or buntdb ---"
-        for pkg in ./x ./client ./client/doc; do
+        echo "--- (2) Transitive dep audit: ./x ./client non-test graphs must NOT pull server or buntdb ---"
+        for pkg in ./x ./client; do
           echo "Checking transitive deps of $pkg (non-test)..."
           SERVER_DEPS=$(go list -tags testonly -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/kcmvp/redisx/server($|/)' || true; })
           if [ -n "$SERVER_DEPS" ]; then

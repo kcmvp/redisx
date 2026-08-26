@@ -1,7 +1,6 @@
 package server
 
 import (
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -161,45 +160,22 @@ func gate2MTLSAndSourceIP(conn redcon.Conn, cmdName string) (reject bool) {
 	return false
 }
 
-// gate3ArgcShape uses proto.Registry (D2 Step0's SSoT CommandSpec) to validate
-// argument count / shape for commands that have a proto.Registry entry.
-// Commands not registered in proto.Registry skip argc shape check (legacy
-// commands like SET/GET still have inline argc checks and those remain the
-// authority for those).
-func gate3ArgcShape(conn redcon.Conn, cmd redcon.Command) (reject bool) {
-	cmdWord := strings.ToLower(string(cmd.Args[0]))
-	spec, ok := proto.Registry[cmdWord]
-	if !ok {
-		return false // no spec → legacy command; skip Gate 3 pre-check
-	}
-	argc := len(cmd.Args) - 1 // -1 because proto.MinArgs/MaxArgs count args EXCLUDING the command word itself.
-	if spec.Argc.MinArgs >= 0 && argc < spec.Argc.MinArgs {
-		conn.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command: expected >=%d args (got %d). Usage: %s",
-			string(cmd.Args[0]), spec.Argc.MinArgs, argc, spec.Usage))
-		return true
-	}
-	if spec.Argc.MaxArgs >= 0 && argc > spec.Argc.MaxArgs {
-		conn.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command: expected <=%d args (got %d). Usage: %s",
-			string(cmd.Args[0]), spec.Argc.MaxArgs, argc, spec.Usage))
-		return true
-	}
-	return false
-}
-
 // appPortCmdAllowlist is the set of command words (lowercase) allowed through
-// Gate 1 when a connection's role == portRoleApp. Built from the proto SSoT
-// lists once at init() time. Admin-only cmds are intentionally not in this map
-// → fail-closed reject on app-port.
+// Gate 1 when a connection's role == portRoleApp. Built once at init().
+// Commands intentionally omitted from here are rejected on the app port
+// (fail-closed security).
 var appPortCmdAllowlist = map[string]bool{}
 
 func init() {
-	baseHandshake := proto.BaseHandshakeCommands
-	sharedBiz := proto.SharedBizCommands
-	combined := make([]string, 0, len(baseHandshake)+len(sharedBiz))
-	combined = append(combined, baseHandshake...)
-	combined = append(combined, sharedBiz...)
+	combined := []string{
+		// Handshake & base transport commands
+		proto.CmdAuth, proto.CmdHello, proto.CmdClient, proto.CmdPing, proto.CmdQuit, proto.CmdSelect, proto.CmdCommand, proto.CmdReset,
+		proto.CmdSubscribe, proto.CmdUnsubscribe, proto.CmdPSubscribe, proto.CmdPUnsubscribe, proto.CmdPublish,
+		// Shared business commands: KV, KV-extensions
+		proto.CmdSet, proto.CmdSetEx, proto.CmdSetNX, proto.CmdGet, proto.CmdDel, proto.CmdExists,
+		proto.CmdSearchKey, proto.CmdSearchIndex, proto.CmdUpdate,
+	}
 	for _, c := range combined {
-		l := strings.ToLower(c)
-		appPortCmdAllowlist[l] = true
+		appPortCmdAllowlist[strings.ToLower(c)] = true
 	}
 }

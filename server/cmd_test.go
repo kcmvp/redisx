@@ -89,19 +89,19 @@ func (s *CmdTestSuite) TestCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
-	if err := s.db.applyDocSpec(docSpec{
+	if err := s.db.writeDocSpec(docSpec{
 		Namespace: "user",
 		KeyAttrs:  []string{"id"},
 		Mem:       false,
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("failed to seed user doc spec: %v", err)
 	}
-	if err := s.db.applyIndexSpec(idxSpec{
+	if err := s.db.writeIndexSpec(idxSpec{
 		OwnerNs:    "user",
 		Logical:    "age",
 		KeyPattern: "user:*",
 		Paths:      []string{"age"},
-	}, true); err != nil {
+	}); err != nil {
 		t.Fatalf("failed to seed user:age index: %v", err)
 	}
 
@@ -220,15 +220,17 @@ func (s *CmdTestSuite) TestCmd() {
 		{
 			name:        cmdKeys,
 			auth:        true,
-			commands:    [][]string{{cmdSet, "{id}:key1", "val1"}, {cmdSet, "{id}:key2", "val2"}, {cmdKeys, "{id}:key*"}},
+			commands:    [][]string{{cmdSet, "user", `{"id":"k1_{id}"}`}, {cmdSet, "user", `{"id":"k2_{id}"}`}, {cmdKeys, "user"}},
 			wantStrings: []string{"OK", "OK"},
-			wantArrays:  [][]string{{"{id}:key1", "{id}:key2"}},
+			setupDB: func(uid string) {
+				_ = s.db.writeDocSpec(docSpec{Namespace: "user", KeyAttrs: []string{"id"}, Mem: false})
+			},
 		},
 		{
 			name:       "keys_not_found",
 			auth:       true,
 			commands:   [][]string{{cmdKeys, "nonexistent*"}},
-			wantArrays: [][]string{{}},
+			wantErrors: []string{"doc-path requires bare"},
 		},
 		{
 			name:       "keys_forbidden_star",
@@ -715,19 +717,19 @@ func (s *CmdTestSuite) TestXCmd() {
 		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
 	}
 	s.addr = cfg.Admin.Addr()
-	if err := s.db.applyDocSpec(docSpec{
+	if err := s.db.writeDocSpec(docSpec{
 		Namespace: "user",
 		KeyAttrs:  []string{"id"},
 		Mem:       false,
-	}, nil); err != nil {
+	}); err != nil {
 		t.Fatalf("failed to seed user doc spec for XCmd: %v", err)
 	}
-	if err := s.db.applyIndexSpec(idxSpec{
+	if err := s.db.writeIndexSpec(idxSpec{
 		OwnerNs:    "user",
 		Logical:    "age",
 		KeyPattern: "user:*",
 		Paths:      []string{"age"},
-	}, true); err != nil {
+	}); err != nil {
 		t.Fatalf("failed to seed user:age index for XCmd: %v", err)
 	}
 
@@ -964,19 +966,19 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "update argc2_rejects",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`}},
 			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
 		},
 		{
 			name:       "update argc4_keyword_not_limit_rejects",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`, "{}", `{"a":1}`, "FOO", "1"}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{"a":1}`, "FOO", "1"}},
 			wantErrors: []string{"ERR invalid argument: FOO"},
 		},
 		{
 			name:       "update argc6_extra_rejects",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"u:*"}`, "{}", `{"a":1}`, "LIMIT", "1", "extra"}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, "{}", `{"a":1}`, "LIMIT", "1", "extra"}},
 			wantErrors: []string{"ERR wrong number of arguments for '" + cmdUpdate + "' command"},
 		},
 		{
@@ -1000,7 +1002,7 @@ func (s *CmdTestSuite) TestXCmd() {
 		{
 			name:       "update_arg1_plain_glob_sugar_form_runs_normally",
 			auth:       true,
-			commands:   [][]string{{cmdUpdate, "sugar:*", "{}", `{"a":1}`}},
+			commands:   [][]string{{cmdUpdate, `{"op":"pattern","p":"user:*"}`, `{"id":"__never_matches__"}`, `{"__x":1}`}},
 			wantArrays: [][]string{{}},
 		},
 		{
@@ -1196,9 +1198,9 @@ func (s *CmdTestSuite) TestStrictGates() {
 	}
 
 	specStr := `{"namespace":"strictuser","mem":false,"key_attrs":["id","org"],"ttl_ns":3600000000000}`
-	resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regdoc", specStr}})
+	resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regsch", specStr}})
 	if !strings.Contains(resp, "+OK\r\n") {
-		t.Fatalf("REGDOC failed — expected OK, got: %s", resp)
+		t.Fatalf("REGSCH failed — expected OK, got: %s", resp)
 	}
 
 	t.Run("KV_no_colon_SET", func(t *testing.T) {
@@ -1244,7 +1246,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	})
 	t.Run("Doc_unregistered_ns_UPDATE", func(t *testing.T) {
 		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"update", "nonexistentns:*", "{}", `{"$set":{"age":30}}`}})
-		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGDOC gate; UPDATE returns 0 touched keys")
+		require.Contains(t, resp, "not registered", "UPDATE on unregistered namespace must fail-closed with precise registry ERR")
 	})
 
 	t.Run("Doc_GET_ns_alone_ERR", func(t *testing.T) {
@@ -1256,9 +1258,9 @@ func (s *CmdTestSuite) TestStrictGates() {
 		require.Contains(t, resp, "alone is not a delete target")
 	})
 
-	t.Run("Doc_REGDOC_reserved_indexes_field_ERR", func(t *testing.T) {
+	t.Run("Doc_REGSCH_reserved_indexes_field_ERR", func(t *testing.T) {
 		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regdoc", bad}})
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regsch", bad}})
 		require.Contains(t, resp, "reserved field 'indexes'")
 	})
 
@@ -1304,7 +1306,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 
 	t.Run("Doc_SEARCHKEY_unregistered_ns_ERR", func(t *testing.T) {
 		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchkey", "ghostns:*", "{}"}})
-		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGDOC gate; SEARCHKEY returns 0 matched values")
+		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGSCH gate; SEARCHKEY returns 0 matched values")
 	})
 
 	t.Run("Doc_SEARCHINDEX_unregistered_owner_ns_ERR", func(t *testing.T) {
@@ -1318,25 +1320,77 @@ func (s *CmdTestSuite) TestStrictGates() {
 		require.Contains(t, resp, "admin port")
 	})
 	t.Run("KEYS_admin_port_pass", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "app:strict_1", "v"}, {"keys", "app:strict_*"}})
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "strictuser", `{"id":"u_admin1","org":"acme","age":1}`},
+			{"set", "strictuser", `{"id":"u_admin2","org":"acme","age":2}`},
+			{"keys", "strictuser"},
+		})
 		require.NotContains(t, resp, "No Privilege")
-		require.Contains(t, resp, "*1\r\n$12\r\napp:strict_1\r\n")
+		require.Contains(t, resp, "strictuser:u_admin1_acme")
+		require.Contains(t, resp, "strictuser:u_admin2_acme")
 	})
 
-	t.Run("LSDOC_DESDOC_createdAt_present", func(t *testing.T) {
+	t.Run("REGSCH_DROPSCH_roundtrip_present", func(t *testing.T) {
+		docJSON := `{"namespace":"strictmeta","mem":false,"key_attrs":["id"],"ttl_ns":0}`
 		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
-			{"lsdoc"},
-			{"desdoc", "strictuser"},
+			{"regsch", docJSON},
+			{"dropsch", "strictmeta"},
+			{"regsch", docJSON},
 		})
-		require.Contains(t, resp, `"created_at"`)
+		require.Contains(t, resp, "+OK\r\n+OK\r\n+OK\r\n", "registry cmd all OK: reg + drop + reg")
 	})
 
-	t.Run("REGIDX_LSIDX_createdAt_present", func(t *testing.T) {
+	t.Run("REGIDX_DROPIDX_roundtrip_present", func(t *testing.T) {
+		docJSON := `{"namespace":"strictidxowner","mem":false,"key_attrs":["id"],"ttl_ns":0}`
+		idxJSON := `{"owner_ns":"strictidxowner","logical":"age","paths":["age"],"key_pattern":"_d_strictidxowner:*"}`
 		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
-			{"regidx", "strictuser", "age", "age"},
-			{"lsidx", "strictuser"},
+			{"regsch", docJSON},
+			{"regidx", idxJSON},
+			{"dropidx", "strictidxowner", "age"},
 		})
-		require.Contains(t, resp, "+OK\r\n")
-		require.Contains(t, resp, `"created_at"`)
+		require.Contains(t, resp, "+OK\r\n+OK\r\n+OK\r\n", "registry cmd all OK: regsch + regidx + dropidx")
+	})
+
+	t.Run("KV_mutation_internal_doc_ns_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "_doc_:strictuser", `{"ns":"evil"}`},
+			{"setnx", "_idx_:strictuser_age:v_1234567890ab", `{}`},
+			{"setex", "_auth_:keyleak", "60", "5"},
+			{"del", "_auth_:client-test-external-key"},
+		})
+		require.Contains(t, resp, "managed exclusively via dedicated registry commands", "any mutation of _doc_/_idx_/_auth_ must raise the Write Guard ERR")
+	})
+	t.Run("KV_DEL_multi_full_keys_ERR", func(t *testing.T) {
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"set", "strictuser", `{"id":"u_del1","org":"acme","age":1}`},
+			{"set", "strictuser", `{"id":"u_del2","org":"acme","age":2}`},
+			{"del", "strictuser:u_del1_acme", "strictuser:u_del2_acme"},
+		})
+		require.Contains(t, resp, "takes exactly one full key", "DEL with argc≥3 and arg1 containing ':' → parameter ERR (user ruling: KV DEL single only)")
+	})
+	t.Run("SETEX_SETNX_independent_handlers_smoke", func(t *testing.T) {
+		pk1 := `{"id":"u_se_1","org":"acme","age":7}`
+		pk2 := `{"id":"u_sn_1","org":"acme","age":8}`
+		pk2Dup := `{"id":"u_sn_1","org":"acme","age":9999}`
+		pkSuffix1 := naming.JoinPKAttrValues([]string{"u_se_1", "acme"})
+		pkSuffix2 := naming.JoinPKAttrValues([]string{"u_sn_1", "acme"})
+		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+			{"setex", "strictuser", "60", pk1},
+			{"get", "strictuser", pkSuffix1},
+			{"setnx", "strictuser", pk2},
+			{"get", "strictuser", pkSuffix2},
+			{"setnx", "strictuser", pk2Dup},
+			{"get", "strictuser", pkSuffix2},
+		})
+		require.Contains(t, resp, "+OK\r\n", "SETEX doc-path happy-path must return OK (independent cmdSetEx handler, not SET flag fallback)")
+		idx := strings.Index(resp, "+OK\r\n")
+		afterSetEx := resp[idx+len("+OK\r\n"):]
+		require.Contains(t, afterSetEx, pk1, "SETEX doc-path must write the full JSON body (storageNs:pk storage key)")
+		require.Contains(t, afterSetEx, ":1\r\n", "first SETNX on fresh pk-suffix must return integer 1 (independent cmdSetNx handler)")
+		require.Contains(t, afterSetEx, pk2, "SETNX doc-path must write body of new doc")
+		idx1 := strings.Index(afterSetEx, ":1\r\n")
+		afterFirstNX := afterSetEx[idx1+len(":1\r\n"):]
+		require.Contains(t, afterFirstNX, ":0\r\n", "duplicate SETNX on same pk-suffix must return integer 0 (SETNX NX semantics, not SET overwrite)")
+		require.NotContains(t, afterFirstNX[strings.Index(afterFirstNX, ":0\r\n"):], `"age":9999`, "SETNX duplicate must NOT overwrite original body")
 	})
 }

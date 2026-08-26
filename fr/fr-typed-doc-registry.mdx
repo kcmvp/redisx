@@ -543,41 +543,68 @@ Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Muta
 - [ ] `DROP INDEX user.age` → `DescribeDoc("user")` no longer lists `age` index. `SEARCHINDEX user_age ...` → ERR `index belongs to unregistered namespace or index was dropped`
 - [ ] RawIndex conflict: UserDoc registered, then someone passes `x.RawIndex("user_age", "user:*", "contact.email")` (same full name but DIFFERENT path) → Start aborts during option processing with clear error.
 
-### 7.4 Strict Command Matrix (Q1/Q2/Q3/C2/C4 — MVP Fail-Closed Gate Level)
+### 7.4 Strict Command Matrix (Colon-Routing SSoT)
 
-#### 7.4.1 Parameter-Level Gate (handleCommand 统一入口层 — 业务 handler 之前执行，零数据变更)
+**Trust-User Principle (user ruling 2026-08-25):** "For every Redis-native command, if the key/pattern arg contains `:`, execute it with pure Redis semantics — zero registry gates, zero schema validation, zero implicit key derivation, caller owns correctness 100%. Doc-path gates only apply to args that have no `:` at all."
 
-- [ ] **Q2 — SET/SETEX/SETNX 第 1 参数含 `:` → 立即 ERR**：`SET user:0100 '{"id":"0100"}'`（第 1 参数含冒号，无论 ns 是否注册） → 返回精确错误文案：`ERR first argument must be storageNs only, got 'user:0100' (contains ':'). Correct form: SET <storageNs> <full_json_doc>, full_key=<storageNs>:<pk_suffix>`. 零行写入，`KEYS user` 返回空。
-- [ ] **Q2 — GET 第 1 参数含 `:` → 立即 ERR**：`GET user:0100` → 返回与上面 SET 完全相同的 ERR 文案。`KEYS user` 返回空。
-- [ ] **Q2 — DEL 第 1 参数含 `:` → 立即 ERR**：`DEL user:0001` → 返回与上面完全相同的 ERR 文案。`KEYS user` 返回空。
-- [ ] **Q3 — KEYS 传 glob pattern → 立即 ERR**：`KEYS user:*` → 精确错误：`ERR KEYS only accepts a single storageNs argument (no glob patterns allowed). Got 'user:*' detected a glob pattern.` `KEYS abc*` → 同样 ERR 精确错误。`KEYS user` 成功（合法正确用法）。
-- [ ] **Q1 — SEARCHKEY 单参数旧形式 → 立即 ERR**：`SEARCHKEY '{"op":"gte","pivot":"0100"}'`（只有 1 个参数） → 精确错误：`ERR SEARCHKEY requires exactly 2 arguments: SEARCHKEY <storageNs> <pk-range_json>. Old single-argument full-KeyRange form is NOT supported.` pivot 里带 storageNs 前缀 → ERR：`SEARCHKEY user '{"$gte":"user:0100"}'`（pivot 字段含 `:` 前缀） → 精确错误：`ERR SEARCHKEY pk-range_json pivot must be pk-suffix only, must not contain storageNs prefix ':'. Got 'user:0100'. scopeGuard auto-injects '<storageNs>:' prefix internally.`
-- [ ] **C2 — SEARCHINDEX index_full_name 解析失败 → 立即 ERR**：`SEARCHINDEX badname '{}'`（badname 不含 `_` 分隔符，ParseIndexFullName 失败） → 精确错误：`ERR SEARCHINDEX cannot parse index full_name 'badname': must match pattern '[_m_:]<ns>_<logical>' (first '_' after optional '_m_:' prefix splits ns vs logical).`
-- [ ] **C4 — UPDATE full_storageKey 无法用 last-colon 拆分 → 立即 ERR**：`UPDATE no_colon_key '{"$set":{}}'`（第 1 参数不含任何 `:`，SplitStorageKey 失败） → 精确错误：`ERR UPDATE requires first argument as full_storageKey = '<storageNs>:<pk-suffix>' (last ':' separates ns vs suffix). Got 'no_colon_key' which contains no colon.`
+**Internal-Namespace Write Guard Exception (user ruling 2026-08-25):** The Trust-User principle does NOT apply to mutation of the three dedicated admin namespaces `_doc_`, `_idx_`, `_auth_`. Any SET/SETEX/SETNX/DEL whose resolved storageNs equals one of these three → precise ERR advising the dedicated command (REGSCH / DROPSCH / REGIDX / DROPIDX / AUTH). Read-class operations (GET / KEYS) on these three internal storageNs ARE allowed via KV-path (colon present) — e.g. `KEYS _doc_:*` remains free for admin introspection. `_m_:…` (mem layer) and any other underscore-prefixed forms → rejected uniformly by HasUnderscorePrefix regardless of read/write (reserved for future protocol expansion).
 
-#### 7.4.2 Registry-Level Gate (参数级 Gate 之后，Registry 校验)
+**Rationale:** "single structural discriminator = does arg1 contain `:`?"
 
-- [ ] **Q2 — SET ns 未注册 → ERR**：`SET orphan_ns '{"id":"0100"}'`（orphan_ns 未 REGISTERDOC） → 精确错误：`ERR table 'orphan_ns' does not exist`. 零行写入。
-- [ ] **Q2 — SETNX ns 未注册 → ERR**：`SETNX orphan_ns '{"id":"0100"}'` → 同上 ERR。
-- [ ] **Q2 — GET ns 未注册 → ERR**：`GET orphan_ns`（集合糖形式，无第 2 参数） → 同上 ERR。`GET orphan_ns 0100`（带 pk-suffix 形式） → 同上 ERR（不允许读未注册的表，即使单条）。
-- [ ] **Q2 — DEL ns 未注册 → ERR**：`DEL orphan_ns 0001` → 同上 ERR，零行删除（所有预检查全过才执行删除，原子性保证零半写）。
-- [ ] **Q3 — KEYS ns 未注册 → ERR**：`KEYS orphan_ns` → 同上 ERR（除 `_doc_`/`_idx_`/`_auth_`/`_m_:<mem_ns>` 白名单放行外一律拦）。
-- [ ] **C2 — SEARCHINDEX index 属于未注册 ns → ERR**：即使 buntdb 物理存在 `user_age` 索引，但 `user` ns 不在 registry → `SEARCHINDEX user_age '{}'` → 精确错误：`ERR index 'user_age' belongs to unregistered namespace 'user' (registry is SSoT, physical index presence alone is NOT sufficient).`
-- [ ] **C4 — UPDATE full_key 属于未注册 ns → ERR**：`UPDATE evil:0001 '{"$set":{"x":1}}'`（SplitStorageKey 拆出 ns=`evil` 未注册） → `ERR table 'evil' does not exist`。0 行更新。
+- **KV-path (arg1 contains `:`)**: Redis-compatible passthrough. No registry, no schema validation, no `DocSpec.TTL` auto-apply. Caller owns correctness.
+- **Doc-path (arg1 has no `:`)**: Typed-document gates apply in order (parameter → registry → business). Any gate fails → precise `ERR`; zero data mutation.
 
-#### 7.4.3 Business-Level Gate (Registry Gate 之后，业务逻辑级 Fail-Closed)
+Note: Client SDK generic surface `Get[D]`, `Set[D]`, `Keys[D]`, `SearchIndex[D]`, `SearchKey[D]`, `Update[D]` always emit **Doc-path** (no `:` in arg1). The `*Raw` methods emit literal args (can drive KV-path by passing full keys with `:`).
 
-- [ ] **Q2 — SET 单文档 KeyAttrs mismatch → 0 行 ERR**：`SET user '{"id":"9999","age":20}'`（UserDoc.KeyAttrs=["id"]），server 侧派生 pk=`9999`，后续写 `_` 之后写 `user:9999` OK。现在 KeyAttrs 一致性校验没问题 — 改为校验 KeyAttrs 缺失 ERR：`SET user '{"age":20}'`（JSON 无 `id` 字段，KeyAttrs 值提取失败） → 精确错误：`ERR SET aborted: cannot extract KeyAttrs '["id"]' from JSON doc. KeyAttrs fields are REQUIRED and MUST be present at top-level of every document.` 0 行写入；`GET user` 集合糖返回空数组。
-- [ ] **Q2 — SET 批量 JSON Array 原子性（任一失败 → 0 行）**：`SET user '[{"id":"0100"},{"id":"0101"},{"age":99},{"id":"0103"}]'`（数组 #2 缺 id 字段） → ERR 精确错误：`ERR batch SET aborted at array index #2: cannot extract KeyAttrs '["id"]' from JSON doc — 0 rows were written`. 之后 `KEYS user` 返回与调用前完全相同的基数（0100/0101/0103 全部不存在，原子性保证）。
-- [ ] **Q2 — SET 批量同批 pk 冲突 → 0 行 ERR**：`SET user '[{"id":"0100","x":1},{"id":"0100","x":2}]'`（同批两文档 pk 相同） → 精确错误：`ERR batch SET aborted at array index #1: duplicate pk 'user:0100' derived from different documents in same batch call — 0 rows written`（防止同批 silent overwrite）。
-- [ ] **Q2 — SETNX 批量语义：任一 pk 已存在 → 整体 0 行 ERR**：先 `SET user '[{"id":"0100"},{"id":"0101"}]'` 成功写入，然后 `SETNX user '[{"id":"0102"},{"id":"0100"}]'` → ERR 精确错误：`ERR batch SETNX aborted: pk 'user:0100' already exists (SETNX requires ALL-or-NOTHING batch semantic — 0 rows written, including 'user:0102' which did not exist before).` 之后检查 `GET user 0102` → nil（证明原子性）。
-- [ ] **Q2 — SET 单 JSON / 批量 JSON 非 JSON 输入 → ERR**：`SET user 'plain-string-not-json'` → 精确错误：`ERR SET second argument must be valid JSON (single object OR array of objects). Got plain string (no leading '{' or '[').` `SET user '123'`（number） → 同样 ERR。
-- [ ] **Q2 — DEL 0 个 pk-suffix → ERR**：`DEL user`（只有 ns，无后续参数） → 精确错误：`ERR DEL requires at least one pk-suffix argument after <storageNs>. To delete ALL documents in a namespace, use client typed API (DANGEROUS operation not available via raw RESP for safety).`（严禁 DEL 整个集合糖，防止误操作删表）。
-- [ ] **Q2 — GET 集合糖 max_rows 防 OOM**：先灌 15000 条 user 文档（通过 SET 批量 + pipeline）。`GET user`（缺省 max_rows=10000） → ERR 精确错误：`ERR GET <storageNs> (collection form) exceeded max_rows=10000 (actual=15000). Use SEARCHKEY for pagination or set via typed API.` 0 行返回。之后调用 `db.SugarGetMaxRows(20000)`（或等价 RESP CONFIG 命令）重设后重试 → 返回 JSON 数组 len=15000。
-- [ ] **C4 — UPDATE mutation 后 KeyAttrs 新值 != 原 pk → 0 行 ERR**：先写入 `SET user '{"id":"0100","age":20}'` → 成功（pk=user:0100）。然后 `UPDATE user:0100 '{"$set":{"id":"9999"}}'`（把 KeyAttrs id 从 0100 改成 9999） → 精确错误：`ERR UPDATE aborted: KeyAttrs mismatch after mutation applied. Original pk derived from storageKey='user:0100'`, new pk re-derived from mutated JSON='{"id":"9999",...}='user:9999'. Mutation MUST NOT change KeyAttrs field values. 0 rows updated`。后续 `GET user 0100` 返回原始 JSON（id=0100 age=20），证明 0 行变更。
-- [ ] **TTL 注入规则（Server 侧 SSoT，不信任客户端输入）**：UserDoc.TTL=168h，调用 `SET user '{"id":"0100"}'`（无 EX/PX 参数）→ 写 buntdb key `user:0100` 的 TTL = 168h（通过 TTL 命令验证）。再调 `SET user '{"id":"0101"}' EX 1`（显式 EX 1 秒）→ TTL = 1s（显式覆盖默认）。SETEX 等价于 SET + EX（SETEX user 1 '{"id":"0102"}' → TTL=1s）。
-- [ ] **Q1 — SEARCHKEY 两参数正常工作 + scopeGuard 正确注入**：写入 user:0098 / user:0099 / user:0100 / order:0100 → `SEARCHKEY user '{"op":"gte","pivot":"0100"}'` → 返回仅 `[user:0100]（只有 user 命名空间，order:0100 被 scopeGuard 过滤，证明 pivot 只接受 pk-suffix，内部自动拼 `<ns>:`前缀）。
-- [ ] **C2 — SEARCHINDEX ParseIndexFullName 反推 ns + registry 双重校验**：`REGISTER INDEX ON user(age, age)` → `SEARCHINDEX user_age '{"op":"gte","value":18}'` → ParseIndexFullName 剥 _m_:（无）→ 取第一个 `_` 前=`user` 后=`age` → 通过。对 Mem 层 HotDoc：`REGISTER INDEX ON _m_:hot(temp, temperature)` → IdxFullName=`_m_:hot_temp`，SEARCHINDEX 剥 `_m_:` → 剩 `hot_temp` → 第一个 `_` 前=`hot` 后=`temp` → 通过。
+#### 7.4.1 Parameter-Level Gates
+
+- [x] **`SET` / `SETEX` / `SETNX` arg1 = KV → pure passthrough**. Example: `SET user:abc 'plain-bytes' EX 3600` → buntdb writes literal `user:abc` with no registry/JSON/KeyAttrs gate. Semantics are upsert-if-exists / Redis-style.
+- [x] **`SET` / `SETEX` / `SETNX` arg1 = Doc (no `:`)**.
+  - `SET`: argc ≥ 3. JSON = single object or non-empty array of objects. `EX/PX/NX` optional tail.
+  - `SETEX`: argc = 4 exactly. Fixed `ttl_seconds` before value.
+  - `SETNX`: argc = 3 exactly. Value JSON shape rules same as SET.
+- [x] **`GET` arg1 = KV (contains `:`, argc = 2 total) → raw buntdb Get**. Key missing → null.
+- [x] **`GET` arg1 = Doc (no `:)`. argc must be exactly 3 (`<ns> <pk-suffix>` total = 2 beyond CMD)**. Bare ns (`GET user` alone) → ERR ("namespace alone is not a query"). Suffix must not contain `:` (it's appended after BuildStorageKey).
+- [x] **`DEL` arg1 = KV**. `argc == 2 → single kv delete` (user ruling 2026-08-25: KV-path DEL is **always single-key only** on this server; multi-key KV-path deletion like `DEL a:1 b:2 c:3` is intentionally not exposed and callers should issue multiple DEL commands). `argc ≥ 3 AND arg1 contains `:` → parameter ERR ("DEL kv-pattern takes one full key; issue separate DELs for multiple keys or use doc-path form"). `argc ≥ 3 AND arg1 has NO `:` → doc-path ns + ≥ 1 pk-suffix below.
+- [x] **`DEL` arg1 = Doc (no `:)`. argc ≥ 3 total → ns + ≥ 1 pk-suffix**. Bare ns (`DEL user` alone) → ERR ("forbid drop-whole-collection sugar"). Every pk-suffix must NOT contain `:`.
+- [x] **`KEYS`**. Single argument. Colon-routing discriminator applied to the pattern itself:
+  - [x] `HasMemPrefix(pattern) || IsInternalStorageNs(pattern)` → passthrough unchanged. Covers `_doc_`, `_idx_`, `_auth_` bare storageNs and any `_m_:<ns>:*` style mem-layer globs (admin introspection via raw KV).
+  - [x] Pattern **contains `:`** → treated as raw KV-path glob, allowed freely (wildcards + colons OK, no registry/doc gates, no auto-transform). Examples: `KEYS app:prefix*` / `KEYS user:*` / `KEYS cli:key_*` — all resolve exactly as written on the KV store.
+  - [x] Pattern **has NO `:` AND contains wildcards (`*?[`)** → parameter ERR ("doc-path KEYS requires bare <storageNs> without wildcards; fragment globs like `abc*` are ambiguous because they could span namespaces").
+  - [x] Pattern **has NO `:` AND no wildcards** → bare doc storageNs: (a) non-internal → **registry gate MUST be registered** (else ERR with hint to append `:*` for KV-style raw), (b) auto-scoped internally to `<ns>:*` for the actual buntdb scan.
+- [x] **`SEARCHKEY`**. First arg is always a KeyRange JSON (current implementation retained). Two routing branches from `x.LayerRoutingAnchor(kr)`:
+  - Anchor **contains `:`** (e.g. `"user:p1|user:p9"`) → KV-style range. No registry gate.
+  - Anchor **does NOT contain `:`** → Doc-style range. Resolve storageNs from anchor; **registry gate: ns MUST be registered** (internal ns excepted).
+- [x] **`SEARCHINDEX`** `indexName` always structural: `[_m_:]<ownerNs>_<logical>` → ParseIdxFullName → **owner ns MUST be registered** (internal excepted) → `_idx_:<full>:v_*` metadata must exist (registry is SSoT, buntdb-physical-only index is rejected with precise ERR citing missing metadata). ORDER / LIMIT flags retained as today.
+- [x] **`UPDATE` → strict typed-doc only (explicit user rule: UPDATE must go through ns, because it uses KeyRange and assumes typed doc semantics). NO KV-style bypass branch (unlike SEARCHKEY)**. First, `storageNsFromKRAnchor(x.LayerRoutingAnchor(kr))` MUST resolve cleanly to a single storageNs (failure → parameter ERR: "operates on typed documents only; key-range must be anchored to a registered storage namespace prefix (format: '<storageNs>:<range-suffixes>'). Use SET on the KV-path (arg1 contains ':' for full-key writes) to mutate arbitrary raw keys, or use doc-path UPDATE with a KeyRange scoped to a single registered namespace."). Resolved internal storageNs (`_doc_`, `_idx_`, `_auth_`) are short-circuited as always-valid. Any other resolved storageNs → **registry gate: ns MUST be registered** (ERR with exact resolved storageNs + anchor). Then run mutations inside a tx with KeyAttrs pk-immutable check.
+
+#### 7.4.2 Registry-Level Gates (no `:` on arg1 or explicit ns-resolved branch)
+
+- [x] **SET-family ns-not-registered → ERR**. Hint JSON if value body looks-JSON: `ERR SET namespace %q not registered — doc-pattern requires REGSCH first`. Hint KV otherwise: `ERR SET kv-pattern key must contain namespace separator ':'`.
+- [x] **GET doc-path ns-not-registered → ERR**.
+- [x] **DEL doc-path ns-not-registered → ERR**.
+- [x] **SEARCHKEY/SI/UPDATE resolved-ns not-registered → ERR** (with specific naming of the command).
+- [x] Requirement of SSoT: no `requireRegistered[D]` lazy path exists on either server handlers or client SDK. Strict mode is fail-closed on registry existence, not auto-register.
+
+#### 7.4.3 Business-Level Gates (doc-path SET-family / UPDATE / DEL)
+
+- [x] **`SET/SETEX/SETNX` doc-path JSON validity**. Value MUST parse as a JSON object or a non-empty array of objects. Plain strings/numbers → ERR.
+- [x] **SET-family KeyAttrs extraction required**. For every object, `deriveDocKey(spec, storageNs, obj)` MUST succeed. Missing top-level required `KeyAttrs` → ERR with positional `object[%d]: missing key attr: <path>` (0 rows written).
+- [x] **SET-family batch atomic (all-or-nothing)**. Single `tx.Update` wraps every derived write. Any parse / KeyAttrs / duplicate-pk / NX-precondition error in the batch → 0 rows written and the command ERR with the exact reason.
+- [x] **SET-family intra-batch pk collision** (two distinct objects derive the same `FullStorageKey`) → ERR at the offending array index: `duplicate key %q in single SET` (0 rows written).
+- [x] **SETNX batch all-or-nothing**: before any `tx.Set`, a pre-pass runs `tx.Get` for every derived key. Any key already present → **abort with `errNxPreconditionFailed`** (reported as `0` rows for SETNX int return, not ERR).
+- [x] **`DocSpec.TTL` auto-route on doc-path SET-family**. If no explicit `EX/PX` / `SETEX` ttl is 0 and `DocSpec.TTL > 0` → server side injects TTL as buntdb option. Client explicit TTLs win.
+- [x] **DEL doc-path suffixes with `:` are individually rejected** by `validatePKSuffixNoColon` before any `tx.Delete` executes (Phase1 pre-check = 0 mutations).
+- [x] **UPDATE KeyAttrs-PK immutable check**: for every matched row within the `tx.Update`, re-derive `oldDK` vs `newDK`. If `FullStorageKey` differs → tx aborts, 0 rows updated, ERR reports the old/new keys.
+- [x] **UPDATE `LIMIT n` flag** (`n>0`, positive integer). Illegal tail tokens → parameter ERR.
+- [x] **No half-written cross-layer batches**: `setBatchAtomic` and `deleteBatchAtomic` reject `len(layers)!=1` ("cannot span storage layers"). This prevents user-defined Mem flag mismatches across a doc-path batch from silently splitting writes.
+
+#### 7.4.4 Wire Registry Commands (REGSCH/DROPSCH/REGIDX/DROPIDX)
+
+- [x] REGSCH: exactly 1 arg = JSON. `DisallowUnknownFields` decoder. Top-level `"indexes"` key present → ERR ("indexes registered via REGIDX, not inside REGSCH payload").
+- [x] DROPSCH: attached-index guard. If any `_idx_:<ns>_*` meta key still exists for this schema ns → ERR (explicitly list count; require DROPIDX first).
+- [x] REGIDX: exactly 1 arg = JSON (`{owner_ns, logical, paths:[…], key_pattern, …}`). Latest-wins MD5 fingerprint; mismatch → atomically drop then recreate buntdb native index + delete old meta key version + persist new `:v_<md5>` version.
+- [x] DROPIDX: 1 or 2 args. Full name alone OR owner + logical. No guard (orphan indexes allowed to drop freely).
 
 ### 7.5 `_doc_:*` / `_idx_:*` Persistence + Crash Recovery
 
@@ -604,11 +631,13 @@ Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Muta
 - [ ] **TTL 注入 happy path**：UserDoc.TTL=168h，`SET user '{"id":"0100"}'` → TTL 命令 `TTL user:0100` 返回 ≈168h 秒数（通过 buntdb 原生 TTL 能力）。`SETEX user 3600 '{"id":"0101"}'` → `TTL user:0101` 返回 ≈3600。`SET user '{"id":"0102"}' PX 1000` → `PTTL user:0102` 返回 ≈1000 毫秒。
 - [ ] **REGISTER/DROP INDEX happy path**：`REGISTER INDEX ON user(email, contact.email)`（logical 名 `email`，JSON path `contact.email`，logical 名禁止含 `_` / `:`（尝试 REGISTER INDEX ON user(my_age, age)` → 参数级 Gate ERR：`logical name 'my_age' contains '_' which is reserved separator for IdxFullName, not allowed`。`DROP INDEX user.email` → `DescribeDoc("user").indexes 不再列 email；`SEARCHINDEX user_email` → registry 级 ERR。
 
-### 7.6 Client P1-A Conformance
+### 7.6 Client P1-A Conformance (Plan B — Raw Suffix Public)
 
-- [ ] `grep -E '^func (Get|Set|SetNX|Delete|Keys|SearchIndex|SearchKey|Update)\b' client/*.go` — all 10 raw CRUD are lowercase/private (`*Raw` naming). No public raw CRUD functions remain.
-- [ ] User-facing example code in README / howto.md / typed-document.md exclusively uses typed APIs: `client.Get[UserDoc]("0100")` etc. Zero references to `client.Get(key)`.
-- [ ] KeyRange parity tests still pass in both tiers: typed `[]D` assertions and raw wire `[]string` gjson assertions are covered in the merged whitebox key_range_test.go.
+User ruling 2026-08-25: Raw CRUD surface is **public** with mandatory `Raw` suffix on the short name. The bare short names (`Get`, `Set`, `SetNX`, `Delete`, `Keys`, `SearchIndex`, `SearchKey`, `Update`) are reserved for the **typesafe (generics) surface**, which always emits Doc-path (no `:` in arg1).
+
+- [x] `grep -E '^func (Get|Set|SetNX|Delete|Keys|SearchIndex|SearchKey|Update)\b' client/*.go` → all 8 short-name signatures carry a `[D any]` generic receiver (typesafe API). The underlying non-generic wire-callers carry the `Raw` suffix (`GetRaw`, `SetRaw`, `SetNXRaw`, `DeleteRaw`, `KeysRaw`, `SearchIndexRaw`, `SearchKeyRaw`, `UpdateRaw`). No bare public non-generic `Get(key string)` short form remains.
+- [x] `*Raw` methods emit literal args byte-for-byte; callers wishing to drive KV-path (arg1 with `:`) use `SetRaw("user:abc", v)` etc. directly and forego all registry/JSON/KeyAttrs gates on the server.
+- [x] KeyRange parity tests live in the single merged `cli_test.go` under the `Doc` prefix, asserting typed `[]D` and raw wire `[]string` gjson slices side by side.
 
 ### 7.7 Architecture SSoT Alignment
 
@@ -628,17 +657,22 @@ Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Muta
 
 ---
 
-## 8. Milestones (for Issue breakdown)
+## 8. Milestones (Colon-Routing SSoT)
 
-| M | 名称 | 主要交付 | 对应验收项 |
-|---|---|---|---|
-| M1 | **Infra: 3 Structs + StartOptions + Registry** | `x.PersistentDocSpec` / `x.IndexSpec` / `x.DescribeDocResult` 三套 struct 定义与类型级隔离（reflect 门禁）；`Start(..., opts...)` 签名；`RegisterDoc[D]` / `RegisterDocFromSpec`；registryMutex + documentRegistry 升级（移除 lazy path）| §3.2 分离表, §7.2, 三门, §7.5 最后 4 条断言 |
-| M2 | **Strict Gates 1: SET/UPDATE/DEL + KeyAttrs** | RESP cmd.go 改造：SET/UPDATE/DEL 的预检查与错误信息；KeyAttrs 一致性校验（含 UPDATE mutation 后门） | §7.4 (前 6 条), §5.2 |
-| M3 | **Strict Gates 2: SEARCHINDEX/SEARCHKEY + TTL auto-apply** | SEARCHINDEX registry-first, SEARCHKEY broad pattern filter, TTL 自动路由 | §7.4 (最后 3 条), §5.4 |
-| M4 | **Index: Register/Drop/Dynamic + REGISTER INDEX cmd** | `RegisterIndex[D]`, `DropIndex[D]`, RESP `REGISTER INDEX`/`DROP INDEX`; 复用 buntdb CreateIndex backfill | §7.3 |
-| M5 | **_doc_* / _idx_* Persistence + Recovery** | 持久化两套分离 schema + `loadSchemaRegistryFromDB()` 在 Start 里的正确顺序；三套 struct 严格分离门禁 | §7.5, §4.1 执行顺序, §3.2 struct 分离表 |
-| M6 | **Client P1-A Refactor** | 合并包、raw → `*Raw` private、测试合并、deprecated shim、README/howto 示例全量替换 | §7.6, §6.3 |
-| M7 | **Docs** | architecture.md SSoT 更新；typed-document.md 示例修正；index.md 导航；index SSoT 说明 | §7.7 |
+Replaces the pre-colon-routing M1–M7 table (old single-path strict model superseded by §7.4 dual-path).
+
+| M | Name | Scope | Status (2026-08-25) | Acceptance references |
+|---|---|---|---|---|
+| M1 | Infra: 3 Structs + Start + Registry Layer | `x.PersistentDocSpec` / `x.IndexSpec` / `x.DescribeDocResult` isolation (reflect); `Start(..., opts...)` signature; MD5-12 `Version`, `CreatedAt` fixed, `UpdatedAt` refreshed on MD5 delta; loadSchemaRegistryFromDB recovery | ✅ Done | §3.2, §7.5 struct-split last 4 checks |
+| M2 | Colon-Routing Gates: SET/SETEX/SETNX/GET/DEL | classifyArg1 (`:`?); Doc-path Parameter / Registry / Business 3-gates (JSON+KeyAttrs+batch-atomic+intra-batch pk dup + SETNX prepass); KV-path pure passthrough; DEL bare-ns ERR; DEL suffix-no-colon ERR | ✅ Done (P0 verified) | §7.4.1 first 6 bullets, §7.4.3 all SET/DEL bullets |
+| M3 | Colon-Routing Gates: KEYS/SEARCHKEY/SEARCHINDEX/UPDATE + TTL auto | KEYS business-ns wildcard-anywhere + colon ERR + `<ns>→<ns>:*` internal scope; SK anchor-colon bypass registry / no-colon registry gate; SI ParseIdxFullName + owner-ns registry + meta-exists gate; UPDATE anchor-colon parameter-ERR (no KV-style); DocPath `DocSpec.TTL` default-applied when no explicit ttl; UPDATE KeyAttrs-PK immutable tx-abort | ✅ Done (P0 2026-08-25 fixed) | §7.4.1 KEYS / SK / SI / UPDATE bullets; §7.4.3 UPDATE immutability + TTL bullets |
+| M4 | Registry CMD (4) + Latest-Wins MD5 + DROPSCH attach-guard | REGSCH/DROPSCH/REGIDX/DROPIDX (UPPERCASE wire, admin-only at both ports via auth); REGSCH/REGIDX exactly 1 JSON arg; DROPSCH rejects if `_idx_:<ns>_*` count > 0; MD5 delta → drop-then-recreate native index + delete old `:v_*` version | ✅ Done | §7.4.4 all 4 bullets |
+| M5 | `_doc_:*` / `_idx_:*` Persistence (Symmetric Layer) + Crash Recovery | meta writes follow `DocSpec.Mem` (symmetric metadata storage); on-disk recovery rebuilds pure registry without re-running writeDocSpec/writeIndexSpec (write paths only for REGSCH/REGIDX) | ✅ Done | §4.1 boot order, §7.5 recovery bullets |
+| M6 | Client SDK: Flatten + Raw Suffix + Tests Consolidated | `client/doc/` → `client/` single package; clix.go merged into cli.go with two banners: Typesafe API (generics, short names) first, then Raw API (`*Raw` suffix); all tests merged into `cli_test.go` with `Doc` prefixes; srvOnce/lifecycleCtx/cliOnce/cliSeedOnce/addr reset helper `stopAndResetGlobalState()`; sharedSeedBody runs unconditionally on new boot | ✅ Done | §7.6 Plan B 3 bullets |
+| — | **P0 Gaps remaining (DoD matrix all [x] — None)** | — | ✅ Cleared 2026-08-25 | §7.4 [x] inventory |
+| M7 | Docs: Architecture SSoT migration + README samples | `architecture.md` to own §11 System-Level Naming SSoT; README/howto samples swap to typed generics surface; remove stale references to deprecated `client/doc/` subpackage and proto `Registry` map | 🔜 Open (non-P0) | §7.7 |
+
+Note: the explicit UPDATE anchor-colon ERR and KEYS business-ns wildcard/colon ERR were retro-fitted after the P0 inventory on 2026-08-25. They are the last two parameter-level gates required for the colon-routing SSoT to be fail-closed.
 
 ---
 
