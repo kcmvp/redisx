@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
@@ -135,20 +135,20 @@ func canonicalIdxMD5(spec idxSpec) (string, error) {
 	})
 }
 
-// loadLatestDocMeta reads the single persisted doc meta key for storageNs.
+// loadDocSpec reads the single persisted doc meta key for storageNs.
 // Uses the per-ns glob invariant (at most one v_* key exists after any
 // write path; multiple stale ones are cleaned inside writeDocSpec Tx).
 // Returns exists=false if no versioned meta is currently on disk.
-func (db *DB) loadLatestDocMeta(storageNs string) (spec docSpec, exists bool, err error) {
+func (db *DB) loadDocSpec(storageNs string) (spec docSpec, exists bool, err error) {
 	if storageNs == "" {
-		return spec, false, errors.New("loadLatestDocMeta: storageNs is required")
+		return spec, false, errors.New("loadDocSpec: storageNs is required")
 	}
 	layer := layerForStorageNs(storageNs)
 	glob := naming.DocMetaGlobFor(storageNs)
 	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
 		_ = tx.AscendKeys(glob, func(k, raw string) bool {
 			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
-				err = fmt.Errorf("loadLatestDocMeta: %s unmarshal: %w", k, e)
+				err = fmt.Errorf("loadDocSpec: %s unmarshal: %w", k, e)
 				return false
 			}
 			exists = true
@@ -159,21 +159,21 @@ func (db *DB) loadLatestDocMeta(storageNs string) (spec docSpec, exists bool, er
 	return spec, exists, err
 }
 
-// loadLatestIdxMeta mirrors loadLatestDocMeta for index metadata.
-func (db *DB) loadLatestIdxMeta(idxFullName string) (spec idxSpec, exists bool, err error) {
+// loadIdxSpec mirrors loadDocSpec for index metadata.
+func (db *DB) loadIdxSpec(idxFullName string) (spec idxSpec, exists bool, err error) {
 	if idxFullName == "" {
-		return spec, false, errors.New("loadLatestIdxMeta: idxFullName is required")
+		return spec, false, errors.New("loadIdxSpec: idxFullName is required")
 	}
 	ownerNs, _, perr := naming.ParseIdxFullName(idxFullName)
 	if perr != nil {
-		return spec, false, fmt.Errorf("loadLatestIdxMeta: %w", perr)
+		return spec, false, fmt.Errorf("loadIdxSpec: %w", perr)
 	}
 	layer := layerForStorageNs(ownerNs)
 	glob := naming.IdxMetaGlobFor(idxFullName)
 	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
 		_ = tx.AscendKeys(glob, func(k, raw string) bool {
 			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
-				err = fmt.Errorf("loadLatestIdxMeta: %s unmarshal: %w", k, e)
+				err = fmt.Errorf("loadIdxSpec: %s unmarshal: %w", k, e)
 				return false
 			}
 			exists = true
@@ -184,10 +184,10 @@ func (db *DB) loadLatestIdxMeta(idxFullName string) (spec idxSpec, exists bool, 
 	return spec, exists, err
 }
 
-// deleteStaleDocMeta deletes all versioned doc meta keys for storageNs whose
+// deleteStaleDocSpecVersions deletes all versioned doc meta keys for storageNs whose
 // version fingerprint does NOT match keepVersion. Used inside writeDocSpec Tx
 // to enforce the "exactly one latest version on disk" invariant.
-func deleteStaleDocMeta(tx *buntdb.Tx, storageNs, keepVersion string) error {
+func deleteStaleDocSpecVersions(tx *buntdb.Tx, storageNs, keepVersion string) error {
 	var stale []string
 	_ = tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, _ string) bool {
 		ver := versionFromKey(k)
@@ -198,14 +198,14 @@ func deleteStaleDocMeta(tx *buntdb.Tx, storageNs, keepVersion string) error {
 	})
 	for _, k := range stale {
 		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteStaleDocMeta: %s: %w", k, e)
+			return fmt.Errorf("deleteStaleDocSpecVersions: %s: %w", k, e)
 		}
 	}
 	return nil
 }
 
-// deleteStaleIdxMeta mirrors deleteStaleDocMeta for index meta keys.
-func deleteStaleIdxMeta(tx *buntdb.Tx, idxFullName, keepVersion string) error {
+// deleteStaleIdxSpecVersions mirrors deleteStaleDocSpecVersions for index meta keys.
+func deleteStaleIdxSpecVersions(tx *buntdb.Tx, idxFullName, keepVersion string) error {
 	var stale []string
 	_ = tx.AscendKeys(naming.IdxMetaGlobFor(idxFullName), func(k, _ string) bool {
 		ver := versionFromKey(k)
@@ -216,7 +216,7 @@ func deleteStaleIdxMeta(tx *buntdb.Tx, idxFullName, keepVersion string) error {
 	})
 	for _, k := range stale {
 		if _, e := tx.Delete(k); e != nil && !errors.Is(e, buntdb.ErrNotFound) {
-			return fmt.Errorf("deleteStaleIdxMeta: %s: %w", k, e)
+			return fmt.Errorf("deleteStaleIdxSpecVersions: %s: %w", k, e)
 		}
 	}
 	return nil
@@ -270,7 +270,7 @@ func (db *DB) writeDocSpec(spec docSpec) error {
 	if err != nil {
 		return fmt.Errorf("writeDocSpec %q: md5: %w", storageNs, err)
 	}
-	oldSpec, hadOld, err := db.loadLatestDocMeta(storageNs)
+	oldSpec, hadOld, err := db.loadDocSpec(storageNs)
 	if err != nil {
 		return err
 	}
@@ -298,7 +298,7 @@ func (db *DB) writeDocSpec(spec docSpec) error {
 	targetKey := naming.DocMetaKey(storageNs, versionHex)
 
 	if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
-		if err := deleteStaleDocMeta(tx, storageNs, versionHex); err != nil {
+		if err := deleteStaleDocSpecVersions(tx, storageNs, versionHex); err != nil {
 			return err
 		}
 		_, _, setErr := tx.Set(targetKey, string(raw), nil)
@@ -361,7 +361,7 @@ func (db *DB) writeIndexSpec(spec idxSpec) error {
 	if err != nil {
 		return fmt.Errorf("writeIndexSpec %q: md5: %w", fullName, err)
 	}
-	oldSpec, hadOld, err := db.loadLatestIdxMeta(fullName)
+	oldSpec, hadOld, err := db.loadIdxSpec(fullName)
 	if err != nil {
 		return err
 	}
@@ -398,7 +398,7 @@ func (db *DB) writeIndexSpec(spec idxSpec) error {
 	targetKey := naming.IdxMetaKey(fullName, versionHex)
 
 	if err := db.store(metaLayer).Update(func(tx *buntdb.Tx) error {
-		if err := deleteStaleIdxMeta(tx, fullName, versionHex); err != nil {
+		if err := deleteStaleIdxSpecVersions(tx, fullName, versionHex); err != nil {
 			return err
 		}
 		_, _, setErr := tx.Set(targetKey, string(raw), nil)

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/x"
 	"github.com/tidwall/buntdb"

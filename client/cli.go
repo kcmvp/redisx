@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/x"

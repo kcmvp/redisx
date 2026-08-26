@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 )

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/require"
 	"github.com/tailscale/hujson"

@@ -10,7 +10,7 @@ import (
 
 	"sync"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/require"

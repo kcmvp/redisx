@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	naming "github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
