@@ -260,31 +260,6 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		return
 	}
 
-	appAuth, ctrlAuth, configured := getAuthConfig()
-	if configured && providedKey != internalAuthKey {
-		role := connPortRole(conn)
-		switch role {
-		case portRoleApp:
-			if ctrlAuth != "" && providedKey == ctrlAuth {
-				msg := "WRONGPASS invalid password for app port. AUTH with the --auth key, not the --ctrl-auth key, then retry."
-				conn.WriteError(msg)
-				slog.Warn("auth rejected: app-port used ctrl-auth key",
-					"remote", conn.RemoteAddr())
-				_ = conn.Close()
-				return
-			}
-		case portRoleCtrl:
-			if appAuth != "" && providedKey == appAuth {
-				msg := "WRONGPASS invalid password for ctrl port. AUTH with the --ctrl-auth key, not the --auth key, then retry."
-				conn.WriteError(msg)
-				slog.Warn("auth rejected: ctrl-port used app-auth key",
-					"remote", conn.RemoteAddr())
-				_ = conn.Close()
-				return
-			}
-		}
-	}
-
 	if err := acquireAuthConn(db, providedKey); err == nil {
 		conn.SetContext(providedKey)
 		conn.WriteString("OK")

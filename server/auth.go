@@ -5,7 +5,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
@@ -30,11 +32,6 @@ func (p portRole) String() string {
 var (
 	connRoleMu  sync.RWMutex
 	connRoleMap = map[redcon.Conn]portRole{}
-
-	authCfgMu      sync.RWMutex
-	activeAppAuth  = ""
-	activeCtrlAuth = ""
-	authConfigured = false
 )
 
 func setConnPortRole(conn redcon.Conn, role portRole) {
@@ -68,78 +65,195 @@ func connPortRole(conn redcon.Conn) portRole {
 	return r
 }
 
-func configureAuthKeys(appAuth, ctrlAuth string) {
-	authCfgMu.Lock()
-	activeAppAuth = appAuth
-	activeCtrlAuth = ctrlAuth
-	authConfigured = (appAuth != "") || (ctrlAuth != "")
-	authCfgMu.Unlock()
+// loadAllAuthPortKeys scans the _auth_ namespace for all account slots that
+// follow the `_auth_:app_N` / `_auth_:ctrl_N` naming convention (N zero or
+// more decimal digits — account sequence IDs). It returns:
+//
+//   - `appValues`: all VALUES stored under `_auth_:app_*` slots → AUTH keys
+//     allowed on the app data port.
+//   - `ctrlValues`: same for `_auth_:ctrl_*` slots → AUTH keys allowed on the
+//     ctrl admin port.
+//   - `defaultApp` / `defaultCtrl`: the values specifically under the default
+//     account-0 keys (`_auth_:app_0` / `_auth_:ctrl_0`) — used for the startup
+//     banner and the WRONGPASS diagnostic hint.
+//
+// `_auth_:ext-<name>` keys (external per-key connection limits) are NOT part
+// of either set; they continue to flow through the separate refreshAuthLimit
+// path with per-key conn counting.
+func loadAllAuthPortKeys(db *DB) (appValues, ctrlValues map[string]struct{}, defaultApp, defaultCtrl string, err error) {
+	if db == nil || db.disk == nil {
+		return nil, nil, "", "", nil
+	}
+	appPrefix := naming.AuthStorageKey("app_")
+	ctrlPrefix := naming.AuthStorageKey("ctrl_")
+	app0 := naming.AuthStorageKey("app_0")
+	ctrl0 := naming.AuthStorageKey("ctrl_0")
+	appValues = map[string]struct{}{}
+	ctrlValues = map[string]struct{}{}
+	terr := db.disk.View(func(tx *buntdb.Tx) error {
+		return tx.Ascend("", func(key, value string) bool {
+			switch {
+			case strings.HasPrefix(key, appPrefix):
+				appValues[value] = struct{}{}
+				if key == app0 {
+					defaultApp = value
+				}
+			case strings.HasPrefix(key, ctrlPrefix):
+				ctrlValues[value] = struct{}{}
+				if key == ctrl0 {
+					defaultCtrl = value
+				}
+			}
+			return true
+		})
+	})
+	if terr != nil {
+		return nil, nil, "", "", terr
+	}
+	return appValues, ctrlValues, defaultApp, defaultCtrl, nil
 }
 
-func getAuthConfig() (appAuth, ctrlAuth string, configured bool) {
-	authCfgMu.RLock()
-	defer authCfgMu.RUnlock()
-	return activeAppAuth, activeCtrlAuth, authConfigured
-}
-
-func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
-	cmdLower := strings.ToLower(cmdName)
+// gate2_AuthKeyMatch rejects connections that have already issued a successful
+// AUTH (gate #1 lets the AUTH command pass) but whose provided key is NOT
+// valid for the port they connected to.
+//
+// Rules:
+//   - IPC internal key: always pass, any port.
+//   - app port: only AUTH keys whose value was stored under ANY `_auth_:app_N`
+//     slot are accepted. Even if the key IS a valid ctrl key, further cmds
+//     on the app port are rejected with WRONGPASS.
+//   - ctrl port: symmetric — only values under `_auth_:ctrl_N` slots accepted.
+func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) {
+	cmdLower := cmdName
+	if len(cmdName) > 0 {
+		cmdLower = toLowerInPlace(cmdName)
+	}
 	switch cmdLower {
 	case proto.LowerCmdAuth, proto.LowerCmdHello, proto.LowerCmdClient:
 		return false
 	}
-	appAuth, ctrlAuth, configured := getAuthConfig()
+	appValues, ctrlValues, defaultApp, defaultCtrl, err := loadAllAuthPortKeys(db)
+	if err != nil {
+		slog.Warn("Gate2 reject: failed to read _auth_ port-role keys from storage",
+			"port_role", connPortRole(conn).String(), "remote", conn.RemoteAddr(), "cmd", cmdName, "error", err)
+		conn.WriteError("ERR internal auth state unavailable")
+		return true
+	}
+	configured := len(appValues) > 0 || len(ctrlValues) > 0
 	if !configured {
 		return false
 	}
-	role := connPortRole(conn)
 	ctx := conn.Context()
 	var authedKey string
 	if ctx != nil {
 		authedKey, _ = ctx.(string)
 	}
-	// Internal per-process bootstrap auth key (used exclusively by embedded
-	// client ↔ embedded server traffic) bypasses the port-role vs. configured
-	// user-key match entirely. It is accepted on both App and Ctrl ports
-	// unconditionally regardless of whether app/ctrl user keys are set.
 	if authedKey != "" && authedKey == internalAuthKey {
 		return false
 	}
-	anyConfigured := (appAuth != "") || (ctrlAuth != "")
-	if !anyConfigured || authedKey == "" {
+	if authedKey == "" {
 		return false
 	}
+	role := connPortRole(conn)
 	switch role {
 	case portRoleApp:
-		if appAuth == "" {
+		if len(appValues) == 0 {
 			return false
 		}
-		if authedKey != appAuth {
-			slog.Warn("Gate0 reject: app-port conn authenticated with wrong key",
+		if _, ok := appValues[authedKey]; !ok {
+			slog.Warn("Gate2 reject: app-port conn authenticated with wrong-role key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
-			conn.WriteError("WRONGPASS invalid password for app port. AUTH with the --auth key, not the --ctrl-auth key, then retry.")
+			msg := "WRONGPASS invalid or wrong auth key for app port"
+			if defaultCtrl != "" && authedKey == defaultCtrl {
+				msg += " (looks like you supplied the ctrl_0 key to the app port)"
+			}
+			conn.WriteError(msg)
 			return true
 		}
 	case portRoleCtrl:
-		if ctrlAuth == "" {
+		if len(ctrlValues) == 0 {
 			return false
 		}
-		if authedKey != ctrlAuth {
-			slog.Warn("Gate0 reject: ctrl-port conn authenticated with wrong key",
+		if _, ok := ctrlValues[authedKey]; !ok {
+			slog.Warn("Gate2 reject: ctrl-port conn authenticated with wrong-role key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
-			conn.WriteError("WRONGPASS invalid password for ctrl port. AUTH with the --ctrl-auth key, not the --auth key, then retry.")
+			msg := "WRONGPASS invalid or wrong auth key for ctrl port"
+			if defaultApp != "" && authedKey == defaultApp {
+				msg += " (looks like you supplied the app_0 key to the ctrl port)"
+			}
+			conn.WriteError(msg)
 			return true
 		}
 	}
 	return false
 }
 
-// gate1CommandWordByPortRole blocks CTRL-only command words from reaching the
+// gate1_NoAuthNsAccessOnAppPort is the #1 filter in the command pipeline.
+// If the connection is the app port and the command touches any `_auth_:*`
+// key — either as a literal key (Arg1 has the _auth_: prefix) OR via a
+// sweeping KEYS/SCAN glob pattern that contains wildcards — the request is
+// immediately rejected with "No Privilege".
+func gate1_NoAuthNsAccessOnAppPort(conn redcon.Conn, cmd redcon.Command) bool {
+	if connPortRole(conn) != portRoleApp {
+		return false
+	}
+	// Case A: literal key command with at least one key argument (GET/SET/DEL/...)
+	if len(cmd.Args) >= 2 && strings.HasPrefix(string(cmd.Args[1]), naming.AuthNsPrefix()+naming.StorageKeySeparator()) {
+		conn.WriteError("No Privilege")
+		return true
+	}
+	// Case B: KEYS or SCAN pattern commands that could sweep the _auth_
+	// namespace (any glob wildcards). App port is data-only, not admin-scan.
+	switch len(cmd.Args) {
+	case 0, 1:
+		return false
+	}
+	switch toLowerInPlace(string(cmd.Args[0])) {
+	case "keys":
+		if len(cmd.Args) < 2 {
+			return false
+		}
+		if strings.ContainsAny(string(cmd.Args[1]), "*?[") {
+			conn.WriteError("No Privilege")
+			return true
+		}
+	case "scan":
+		if len(cmd.Args) < 4 || toLowerInPlace(string(cmd.Args[2])) != "match" {
+			return false
+		}
+		if strings.ContainsAny(string(cmd.Args[3]), "*?[") {
+			conn.WriteError("No Privilege")
+			return true
+		}
+	}
+	return false
+}
+
+func toLowerInPlace(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			out := make([]byte, len(s))
+			copy(out, s)
+			out[i] = c + 32
+			for j := i + 1; j < len(s); j++ {
+				c2 := out[j]
+				if c2 >= 'A' && c2 <= 'Z' {
+					out[j] = c2 + 32
+				}
+			}
+			return string(out)
+		}
+	}
+	return s
+}
+
+// gate3_CommandByPortRole blocks CTRL-only command words from reaching the
 // app-port listener. Fail-closed: allowlist map for app-port (13 handshake +
 // shared biz cmds), ctrl-port = pass everything.
 //
 // MVP before D3 dual-port: default conn role = ctrl-port → every cmd passes.
-func gate1CommandWordByPortRole(conn redcon.Conn, cmdName string) (reject bool) {
+func gate3_CommandByPortRole(conn redcon.Conn, cmdName string) (reject bool) {
 	role := connPortRole(conn) // ctrl/app; MVP defaults to "ctrl"
 	if role == portRoleCtrl {
 		return false
@@ -154,9 +268,9 @@ func gate1CommandWordByPortRole(conn redcon.Conn, cmdName string) (reject bool) 
 	return false
 }
 
-// gate2MTLSAndSourceIP validates Caddy forward PROXY v2 real source IP +
+// gate4_SourceAndMTLS validates Caddy forward PROXY v2 real source IP +
 // cert OU/CN. MVP structure only: always returns reject=false until D3+mTLS is wired.
-func gate2MTLSAndSourceIP(conn redcon.Conn, cmdName string) (reject bool) {
+func gate4_SourceAndMTLS(conn redcon.Conn, cmdName string) (reject bool) {
 	return false
 }
 

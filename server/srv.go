@@ -23,6 +23,65 @@ import (
 	"github.com/tidwall/redcon"
 )
 
+func printBootstrapAuthBanner(appAuth, ctrlAuth string) {
+	appPort := defaultAppPort
+	ctrlPort := defaultCtrlPort
+	if _, configured, curr := getEffectivePort(portRoleApp); configured {
+		appPort = curr
+	}
+	if _, configured, curr := getEffectivePort(portRoleCtrl); configured {
+		ctrlPort = curr
+	}
+	width := 80
+	bar := strings.Repeat("═", width)
+	head := "REDISX AUTO-GENERATED CREDENTIALS  (BOOTSTRAP — FIRST RUN ONLY)"
+	headPadL := (width - len(head)) / 2
+	if headPadL < 0 {
+		headPadL = 0
+	}
+	headPadR := width - len(head) - headPadL
+	if headPadR < 0 {
+		headPadR = 0
+	}
+	save1 := "SAVE THESE NOW."
+	save2 := "They are stored ONLY under the _auth_ namespace"
+	save3 := "and will NOT be reprinted on subsequent restarts."
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n%s\n", bar)
+	fmt.Fprintf(&sb, "%s%s%s\n", strings.Repeat(" ", headPadL), head, strings.Repeat(" ", headPadR))
+	fmt.Fprintf(&sb, "  app   : %s    # redisx -p %d -a %s\n", appAuth, appPort, appAuth)
+	fmt.Fprintf(&sb, "  ctrl  : %s    # redisx -p %d -a %s\n", ctrlAuth, ctrlPort, ctrlAuth)
+	fmt.Fprintf(&sb, "  %s\n", save1)
+	fmt.Fprintf(&sb, "  %s\n", save2)
+	fmt.Fprintf(&sb, "  %s\n", save3)
+	fmt.Fprintf(&sb, "%s\n", bar)
+	fmt.Fprint(os.Stdout, sb.String())
+}
+
+var (
+	effPortMu   sync.RWMutex
+	effPorts    = map[portRole]int{}
+	effPortsSet = map[portRole]bool{}
+)
+
+func recordEffectivePort(role portRole, port int) {
+	effPortMu.Lock()
+	defer effPortMu.Unlock()
+	effPorts[role] = port
+	effPortsSet[role] = true
+}
+
+func getEffectivePort(role portRole) (int, bool, int) {
+	effPortMu.RLock()
+	defer effPortMu.RUnlock()
+	v, ok := effPorts[role]
+	defaultV := defaultAppPort
+	if role == portRoleCtrl {
+		defaultV = defaultCtrlPort
+	}
+	return defaultV, ok, v
+}
+
 const (
 	unlimitedAuthConns = -1
 )
@@ -116,6 +175,27 @@ var (
 // for writability before any listeners open. Passing nil is equivalent to
 // the empty Config{} (pure system defaults).
 //
+// AUTH bootstrap flow — SSoT lives ONLY inside `_auth_:app` + `_auth_:ctrl`
+// two KV entries on the disk layer of the DB itself. There is NO per-process
+// duplicate state: every AUTH gate round-trips to the storage layer via a
+// buntdb View tx (BuntDB is mmap-backed; read cost is O(log n) in memory):
+//
+//   - cfg.App.Auth / cfg.Ctrl.Auth EMPTY (zero-value default)
+//     → BootstrapAuth(seedApp="", seedCtrl="") is called.
+//     · Both slots MISSING → generate 2× crypto/rand 128-bit hex pair, write
+//     them atomically inside a single BuntDB Update tx using SETNX-style
+//     presence-check. firstBoot=true ONLY when our write actually went
+//     through; if another caller won the race, reload winner's values and
+//     continue silently. Banner is printed ONCE.
+//     · Both slots PRESENT → silent load, zero logs.
+//     · Exactly ONE slot present → hard FATAL "_auth_ namespace corrupted"
+//     requiring operator intervention (delete partial key or wipe db file).
+//   - cfg.App.Auth / cfg.Ctrl.Auth set explicitly (yaml or StartWithConfig)
+//     → BootstrapAuth's seed parameters ALWAYS win. Non-empty seeds are
+//     written unconditionally to their respective storage slots, with a
+//     slog.Info when an existing DB value is being overwritten. If the
+//     resolved pair would end up equal after merge → hard error.
+//
 // On boot, redisx automatically rebuilds its BuntDB index registry by
 // scanning all "_idx_:*" meta keys stored on disk and in the volatile
 // mem-layer. Indexes are NO LONGER declared as Go parameters passed to any
@@ -145,17 +225,8 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 
 	appAddr := cfg.App.Addr()
 	ctrlAddr := cfg.Ctrl.Addr()
-	appAuthLabel := lo.Ternary(cfg.App.Auth != "", "set", "unset")
-	ctrlAuthLabel := lo.Ternary(cfg.Ctrl.Auth != "", "set", "unset")
-	slog.Info("redisx dual-port config",
-		"app_addr", appAddr,
-		"ctrl_addr", ctrlAddr,
-		"app_auth", appAuthLabel,
-		"ctrl_auth", ctrlAuthLabel,
-		"doc_schemas", len(schemas),
-	)
-
-	internal.SetAddr(ctrlAddr, appAddr)
+	recordEffectivePort(portRoleApp, cfg.App.Port)
+	recordEffectivePort(portRoleCtrl, cfg.Ctrl.Port)
 
 	watchShutdownSignals()
 	var db *DB
@@ -166,14 +237,41 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 		}
 		db = opened
 	})
-
-	configureAuthKeys(cfg.App.Auth, cfg.Ctrl.Auth)
 	if db == nil {
 		globalMu.RLock()
 		db = currentDB
 		globalMu.RUnlock()
 	}
 	if db != nil {
+		finalApp, finalCtrl, anyGenerated, berr := db.bootstrapAuth(cfg.App.Auth, cfg.Ctrl.Auth)
+		if berr != nil {
+			slog.Error("redisx startup failed", "phase", "bootstrap_auth", "error", berr)
+			if exitFn := getOsExitFn(); exitFn != nil {
+				exitFn(1)
+			}
+			return nil
+		}
+		if finalApp == "" || finalCtrl == "" {
+			slog.Error("redisx startup failed", "phase", "bootstrap_auth_final",
+				"error", "resolved AUTH pair contains empty string; refusing to start")
+			if exitFn := getOsExitFn(); exitFn != nil {
+				exitFn(1)
+			}
+			return nil
+		}
+		appAuthLabel := lo.Ternary(cfg.App.Auth != "", "explicit", lo.Ternary(anyGenerated && cfg.App.Auth == "", "generated", "persisted"))
+		ctrlAuthLabel := lo.Ternary(cfg.Ctrl.Auth != "", "explicit", lo.Ternary(anyGenerated && cfg.Ctrl.Auth == "", "generated", "persisted"))
+		slog.Info("redisx dual-port config",
+			"app_addr", appAddr,
+			"ctrl_addr", ctrlAddr,
+			"app_auth", appAuthLabel,
+			"ctrl_auth", ctrlAuthLabel,
+			"doc_schemas", len(schemas),
+		)
+		if anyGenerated {
+			printBootstrapAuthBanner(finalApp, finalCtrl)
+		}
+		internal.SetAddr(ctrlAddr, appAddr)
 		var ps redcon.PubSub
 		go bootListener(portRoleApp, appAddr, db, &ps)
 		go bootListener(portRoleCtrl, ctrlAddr, db, &ps)
@@ -267,6 +365,11 @@ func Stop() error {
 	authKeyConnCounts = map[string]int{}
 	authStateMu.Unlock()
 
+	effPortMu.Lock()
+	clear(effPorts)
+	clear(effPortsSet)
+	effPortMu.Unlock()
+
 	srvOnce = sync.Once{}
 	internal.ResetAddrs()
 	return err
@@ -353,14 +456,19 @@ func refreshAuthLimit(db *DB, key string) (int, bool, error) {
 	return limit, true, nil
 }
 
-func releaseAuthConn(key string) {
+func releaseAuthConn(key string, db *DB) {
 	if key == "" || key == internalAuthKey {
 		return
 	}
-	appAuth, ctrlAuth, configured := getAuthConfig()
-	if configured {
-		if (appAuth != "" && key == appAuth) || (ctrlAuth != "" && key == ctrlAuth) {
-			return
+	appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
+	if err == nil {
+		if len(appValues) > 0 || len(ctrlValues) > 0 {
+			if _, isApp := appValues[key]; isApp {
+				return
+			}
+			if _, isCtrl := ctrlValues[key]; isCtrl {
+				return
+			}
 		}
 	}
 
@@ -378,9 +486,15 @@ func acquireAuthConn(db *DB, key string) error {
 	if key == internalAuthKey {
 		return nil
 	}
-	appAuth, ctrlAuth, configured := getAuthConfig()
-	if configured {
-		if (appAuth != "" && key == appAuth) || (ctrlAuth != "" && key == ctrlAuth) {
+	appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
+	if err != nil {
+		return err
+	}
+	if len(appValues) > 0 || len(ctrlValues) > 0 {
+		if _, isApp := appValues[key]; isApp {
+			return nil
+		}
+		if _, isCtrl := ctrlValues[key]; isCtrl {
 			return nil
 		}
 	}
@@ -406,7 +520,7 @@ func acquireAuthConn(db *DB, key string) error {
 	return nil
 }
 
-func closeCon(conn redcon.Conn, err error) {
+func closeCon(conn redcon.Conn, err error, db *DB) {
 	clearConnPortRole(conn)
 
 	ctx := conn.Context()
@@ -415,7 +529,7 @@ func closeCon(conn redcon.Conn, err error) {
 		prevAuth, _ = ctx.(string)
 	}
 
-	releaseAuthConn(prevAuth)
+	releaseAuthConn(prevAuth, db)
 
 	authStateMu.Lock()
 	current := authKeyConnCounts[prevAuth]
@@ -494,13 +608,16 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 
 	cmdName := strings.ToLower(string(cmd.Args[0]))
 
-	if gate0Auth(conn, cmdName) {
+	if gate1_NoAuthNsAccessOnAppPort(conn, cmd) {
 		return
 	}
-	if gate1CommandWordByPortRole(conn, cmdName) {
+	if gate2_AuthKeyMatch(conn, cmdName, db) {
 		return
 	}
-	if gate2MTLSAndSourceIP(conn, cmdName) {
+	if gate3_CommandByPortRole(conn, cmdName) {
+		return
+	}
+	if gate4_SourceAndMTLS(conn, cmdName) {
 		return
 	}
 	// Note: per-command argc validation lives inside each handler. Registry
@@ -510,27 +627,32 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	if cmdName != cmdAuth && cmdName != cmdClient {
 		connAuthKey, _ := conn.Context().(string)
 		if conn.Context() == nil || connAuthKey == "" {
-			appAuth, ctrlAuth, _ := getAuthConfig()
+			appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
 			role := connPortRole(conn)
 			var authRequired bool
-			switch role {
-			case portRoleCtrl:
-				authRequired = ctrlAuth != ""
-			case portRoleApp:
-				authRequired = appAuth != ""
+			switch {
+			case err != nil:
+				// If storage read fails we fail-closed (require AUTH) so
+				// unauthenticated clients can't slip through on transient
+				// storage I/O hiccups.
+				authRequired = true
+			case role == portRoleCtrl:
+				authRequired = len(ctrlValues) > 0
+			case role == portRoleApp:
+				authRequired = len(appValues) > 0
 			default:
-				authRequired = (appAuth != "") || (ctrlAuth != "")
+				authRequired = len(appValues) > 0 || len(ctrlValues) > 0
 			}
 			if authRequired {
 				if cmdName == cmdHello || cmdName == cmdPing || cmdName == cmdQuit {
 					conn.WriteError("NOAUTH authentication required")
 					slog.Warn("unauthenticated handshake/status command on port that requires AUTH",
-						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String())
+						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String(), "storage_error", err)
 					return
 				}
 				conn.WriteError("NOAUTH authentication required")
 				slog.Warn("unauthenticated command attempt on port that requires AUTH",
-					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String())
+					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String(), "storage_error", err)
 				_ = conn.Close()
 				return
 			}
@@ -608,7 +730,9 @@ func bootListener(role portRole, address string, db *DB, ps *redcon.PubSub) {
 			handleCommand(conn, cmd, db, ps)
 		},
 		acceptFn,
-		closeCon,
+		func(conn redcon.Conn, closeErr error) {
+			closeCon(conn, closeErr, db)
+		},
 	)
 	if err != nil && !isServerShutdownErr(err) {
 		slog.Error("redisx listener stopped", "port_role", role.String(), "error", err)

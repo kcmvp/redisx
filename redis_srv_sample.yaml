@@ -1,0 +1,60 @@
+# redisx server sample configuration
+# Copy this file to redisx.yaml and tweak as needed. Any unset field falls back
+# to the default value documented alongside it.
+#
+# Loading rules:
+#   · redisx.yaml present  → config is read from disk
+#   · redisx.yaml absent   → slog.Warn is emitted and system defaults apply
+#   · a relative data_path is resolved against the DIR CONTAINING THIS YAML,
+#     NOT the process working directory
+
+app:
+  # Business RESP port. Default: 7379
+  port: 7379
+  # Bind address for the business listener. Empty = auto-detect the first
+  # RFC1918 private IP, or fall back to 127.0.0.1. Default: (auto-detect)
+  bind: ""
+  # AUTH key for the business port. Empty = generated on FIRST startup and stored
+  # under the reserved "_auth_:app" namespace.
+  #   · First run (brand-new DB) → generated once + banner printed to stdout ONCE
+  #   · Subsequent runs → loaded silently from the DB
+  #   · Set explicitly here only when you need a DETERMINISTIC key (tests, CI,
+  #     key-roll pre-shared secret injection); an explicit value ALWAYS overwrites the DB
+  #     slot on collision).
+  auth: ""
+
+ctrl:
+  # Control-plane RESP port. Default: 7381
+  port: 7381
+  # Bind address for the control-plane listener. Loopback-only by default for
+  # safety; binding directly to 0.0.0.0 requires explicit opt-in below.
+  # Default: "127.0.0.1"
+  bind: "127.0.0.1"
+  # AUTH key for the control-plane port. Same semantics as app.auth above; persisted
+  # under "_auth_:ctrl". See comments there.
+  auth: ""
+  # Set to true when running behind a trusted L7 PROXY v2 + mTLS reverse proxy;
+  # allows a non-loopback ctrl.bind without the danger flag.
+  trust_proxy: false
+  # Explicit acknowledgement for binding ctrl to 0.0.0.0. UNSAFE; use only on
+  # fully isolated / air-gapped networks.
+  danger_bind_any: false
+
+# Persistence file path. Empty → $HOME/.redisx/redisx.db
+# Absolute paths are recommended. Relative paths are anchored at the directory
+# that contains this yaml file (not the process CWD).
+data_path: ""
+
+logging:
+  # debug / info / warn / error. Default: info
+  level: "info"
+  # text / json. Default: text
+  format: "text"
+
+# —— Hard startup constraints (STARTUP FATAL when violated) ——
+#  · app.port and ctrl.port MUST be distinct
+#  · port range MUST be 7001..65535
+#  · a non-loopback ctrl.bind is refused unless trust_proxy=true OR
+#    danger_bind_any=true
+#  · when both app.auth and ctrl.auth are set, they MUST be different strings
+#    (dual-port model requires separate credentials)

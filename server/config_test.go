@@ -91,9 +91,9 @@ func TestLoadNoConfigFileDefaults(t *testing.T) {
 	t.Logf("no-config case produced DataPath=%q; dir exists=%v", cfg.DataPath, true)
 }
 
-func TestConfigFailsEqualAuth(t *testing.T) {
+func TestConfigAllowsEqualAuth(t *testing.T) {
 	dir := t.TempDir()
-	y := filepath.Join(dir, "bad.yaml")
+	y := filepath.Join(dir, "ok.yaml")
 	if err := os.WriteFile(y, []byte(`
 app:
   bind: ""
@@ -103,15 +103,17 @@ ctrl:
   bind: "127.0.0.1"
   port: 7381
   auth: "same"
-data_path: "./bad.db"
+data_path: "./ok.db"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := LoadConfig(y)
-	if err == nil {
-		t.Fatalf("want FATAL equal auth; got nil error")
+	cfg, err := LoadConfig(y)
+	if err != nil {
+		t.Fatalf("equal auth is now allowed per simplified rules; got err %v", err)
 	}
-	t.Logf("got expected err: %v", err)
+	if cfg.App.Auth != "same" || cfg.Ctrl.Auth != "same" {
+		t.Fatalf("expected auth to round-trip equal values; got app=%q ctrl=%q", cfg.App.Auth, cfg.Ctrl.Auth)
+	}
 }
 
 func TestConfigFailsNonLoopbackCtrlNoAck(t *testing.T) {

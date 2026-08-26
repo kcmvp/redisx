@@ -190,12 +190,6 @@ func (c *Config) validate() error {
 			)
 		}
 	}
-	if c.App.Auth != "" && c.Ctrl.Auth != "" && c.App.Auth == c.Ctrl.Auth {
-		return errors.New(
-			"STARTUP FATAL: AppAuth equals CtrlAuth; dual-port model requires distinct passwords; refusing",
-		)
-	}
-
 	dbPath := c.DataPath
 	if !filepath.IsAbs(dbPath) {
 		wd, wdErr := os.Getwd()

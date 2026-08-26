@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/privateip"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
@@ -743,4 +745,344 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	// because StartForTest was removed. The equivalent modern path is
 	// StartWithConfig with Ctrl.Port explicitly set to 16380 — exercised by
 	// TestStartInvokesListener above.
+}
+
+func rawCmd(t *testing.T, conn net.Conn, timeout time.Duration, args ...string) string {
+	t.Helper()
+	parts := make([]string, 0, len(args)*3+2)
+	parts = append(parts, fmt.Sprintf("*%d\r\n", len(args)))
+	for _, a := range args {
+		parts = append(parts, fmt.Sprintf("$%d\r\n%s\r\n", len(a), a))
+	}
+	raw := strings.Join(parts, "")
+	if _, err := conn.Write([]byte(raw)); err != nil {
+		t.Fatalf("raw write failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("raw read failed: %v", err)
+	}
+	return string(buf[:n])
+}
+
+// App port must never allow any read/write against _auth_:* SSoT namespace.
+// This is gate1_NoAuthNsAccessOnAppPort (#1 filter, before gate2/gate3/gate4),
+// so even when AUTH is satisfied and the command passes every other gate we
+// still reply with literal "No Privilege".
+func (s *ServerTestSuite) TestAppPortHasNoAuthNsPrivilege() {
+	t := s.T()
+
+	dbPath := testutil.DBPath(t)
+	appP, ctrlP := testutil.AllocateTwoFreePorts(t)
+
+	// Seed explicit auth values so gate2_AuthKeyMatch + gate3_CommandByPortRole
+	// pass cleanly — the test is about privilege, not AUTH failures.
+	const (
+		appAuth  = "s.app-auth-778"
+		ctrlAuth = "s.ctrl-auth-778"
+	)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: appAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrlAuth},
+	}
+	db := StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig nil; appP=%d ctrlP=%d", appP, ctrlP)
+	}
+	defer func() { _ = Stop() }()
+	time.Sleep(15 * time.Millisecond)
+
+	// ————— App-port client, AUTHed with app AUTH key —————
+	appConn, err := net.Dial("tcp", cfg.App.Addr())
+	if err != nil {
+		t.Fatalf("dial app: %v", err)
+	}
+	defer func() { _ = appConn.Close() }()
+	if resp := rawCmd(t, appConn, 250*time.Millisecond, "AUTH", appAuth); !strings.Contains(resp, "+OK") {
+		t.Fatalf("AUTH app port failed: %q", resp)
+	}
+
+	for _, tc := range [][]string{
+		{"GET", naming.AuthStorageKey("app_0")},
+		{"GET", naming.AuthStorageKey("ctrl_0")},
+		{"SET", naming.AuthStorageKey("app_0"), "newval"},
+		{"SET", naming.AuthStorageKey("ctrl_0"), "newval"},
+		{"DEL", naming.AuthStorageKey("app_0")},
+		{"DEL", naming.AuthStorageKey("ctrl_0")},
+		{"EXISTS", naming.AuthStorageKey("app_0")},
+		{"TTL", naming.AuthStorageKey("app_0")},
+		{"PERSIST", naming.AuthStorageKey("app_0")},
+		{"TYPE", naming.AuthStorageKey("app_0")},
+		{"KEYS", naming.AuthNsPrefix() + naming.StorageKeySeparator() + "*"},
+		{"KEYS", "*"},
+		{"SCAN", "0", "MATCH", "*"},
+		{"SCAN", "0", "MATCH", naming.AuthNsPrefix() + naming.StorageKeySeparator() + "*"},
+	} {
+		resp := rawCmd(t, appConn, 250*time.Millisecond, tc...)
+		if !strings.Contains(resp, "No Privilege") {
+			t.Fatalf("app-port cmd=%v resp=%q want substring \"No Privilege\"", tc, resp)
+		}
+	}
+
+	// Spot check: non-_auth_ key still works normally on app port (sanity
+	// guard: we didn't accidentally block every GET/SET).
+	_ = rawCmd(t, appConn, 250*time.Millisecond, "SET", "user-k", "hello")
+	getResp := rawCmd(t, appConn, 250*time.Millisecond, "GET", "user-k")
+	if !strings.Contains(getResp, "hello") {
+		t.Fatalf("expected app-port plain GET/SET to work normally, got %q", getResp)
+	}
+
+	// ————— Ctrl-port client, AUTHed with ctrl AUTH key —————
+	ctrlConn, err := net.Dial("tcp", cfg.Ctrl.Addr())
+	if err != nil {
+		t.Fatalf("dial ctrl: %v", err)
+	}
+	defer func() { _ = ctrlConn.Close() }()
+	if resp := rawCmd(t, ctrlConn, 250*time.Millisecond, "AUTH", ctrlAuth); !strings.Contains(resp, "+OK") {
+		t.Fatalf("AUTH ctrl port failed: %q", resp)
+	}
+
+	// 1. Ctrl-port GET of _auth_:app_0 / _auth_:ctrl_0 must work (no privilege
+	//    error; the values themselves are the SSoT and ctrl is admin-facing).
+	appVal := readKeyOrEmptyCtrl(t, db, "app_0")
+	ctrlVal := readKeyOrEmptyCtrl(t, db, "ctrl_0")
+	if appVal != appAuth || ctrlVal != ctrlAuth {
+		t.Fatalf("SSoT mismatch after start: want app=%q ctrl=%q stored app_0=%q ctrl_0=%q",
+			appAuth, ctrlAuth, appVal, ctrlVal)
+	}
+	resp := rawCmd(t, ctrlConn, 250*time.Millisecond, "GET", naming.AuthStorageKey("app_0"))
+	if !strings.Contains(resp, appAuth) {
+		t.Fatalf("ctrl GET %q want app AUTH in response; got %q", naming.AuthStorageKey("app_0"), resp)
+	}
+	if strings.Contains(resp, "No Privilege") {
+		t.Fatalf("ctrl GET %q must not hit No Privilege gate; got %q", naming.AuthStorageKey("app_0"), resp)
+	}
+
+	// 2. Ctrl-port WRITE against _auth_ must still be blocked by the EXISTING
+	//    internal-ns WriteGuard (IsInternalKey/ERR internal namespace). It
+	//    should NOT be "No Privilege" because the ctrl port passed privilege
+	//    gate — the second-stage guard catches it.
+	respSet := rawCmd(t, ctrlConn, 250*time.Millisecond, "SET", naming.AuthStorageKey("app_0"), "stolen")
+	if strings.Contains(respSet, "+OK") {
+		t.Fatalf("ctrl SET %q must not succeed (existing internal WriteGuard); got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+	if strings.Contains(respSet, "No Privilege") {
+		t.Fatalf("ctrl SET %q rejected by WriteGuard not privilege gate; got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+	if !strings.Contains(strings.ToUpper(respSet), "ERR") {
+		t.Fatalf("ctrl SET %q want some ERR (internal ns); got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+}
+
+func seedBootstrapAuthKV(t *testing.T, db *DB, slot, value string) {
+	t.Helper()
+	if db == nil || db.disk == nil {
+		t.Fatal("seedBootstrapAuthKV: db not open")
+	}
+	if werr := db.disk.Update(func(tx *buntdb.Tx) error {
+		_, _, serr := tx.Set(naming.AuthStorageKey(slot), value, nil)
+		return serr
+	}); werr != nil {
+		t.Fatalf("seedBootstrapAuthKV(slot=%s,value=%s): %v", slot, value, werr)
+	}
+}
+
+// TestAuthPortRoleKeyBinding verifies:
+//
+//  1. AUTH on app port with the ctrl_0 key → AUTH succeeds (the key is a
+//     legitimate auth key, so AUTH returns +OK), but the NEXT non-handshake
+//     command returns WRONGPASS because the key is wrong for the port role.
+//  2. AUTH on ctrl port with the app_0 key → symmetric: AUTH succeeds, but
+//     subsequent commands return WRONGPASS.
+//  3. AUTH on app port with the correct app_0 key → everything passes.
+//  4. AUTH on ctrl port with the correct ctrl_0 key → everything passes.
+//  5. Extra account slots (app_1, ctrl_1) seeded manually via Raw().Update
+//     behave symmetrically to the _0 defaults — their VALUES are accepted
+//     strictly on the matching port role.
+func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
+	t := s.T()
+
+	dbPath := testutil.DBPath(t)
+	appP, ctrlP := testutil.AllocateTwoFreePorts(t)
+
+	// Use explicit seeds so the banner does not fire (banner is tested via
+	// the db unit tests; this test is about wire-protocol WRONGPASS).
+	const (
+		app0Auth  = "s.app0-auth-3a1f"
+		ctrl0Auth = "s.ctrl0-auth-7c2b"
+	)
+
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: app0Auth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrl0Auth},
+	}
+	db, ok := setupDB(cfg.DataPath, cfg.Schemas)
+	s.Require().True(ok)
+
+	// —— Seed extra account-1 slots directly via Raw disk layer.
+	//    (Ctrl-only operational operation; the app port would hit No
+	//    Privilege gate instead.)
+	const (
+		app1Slot  = "app_1"
+		ctrl1Slot = "ctrl_1"
+		app1Auth  = "s.app1-auth-bb55"
+		ctrl1Auth = "s.ctrl1-auth-ee99"
+	)
+	seedBootstrapAuthKV(t, db, app1Slot, app1Auth)
+	seedBootstrapAuthKV(t, db, ctrl1Slot, ctrl1Auth)
+
+	svc, err := StartWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("StartWithConfig: %v", err)
+	}
+	defer func() { _ = svc.Stop() }()
+
+	// Helper: raw AUTH + immediately run a single plain PING and return the
+	// concatenated AUTH + PING raw RESP output. We split + inspect them.
+	authThenPing := func(net *net.TCPConn, auth string) (authResp, pingResp string) {
+		t.Helper()
+		raw := ""
+		if strings.ToUpper(auth) != "<empty>" {
+			raw += rawCmd(t, net, 300*time.Millisecond, "AUTH", auth)
+		}
+		return raw, rawCmd(t, net, 300*time.Millisecond, "PING")
+	}
+
+	appDial := func() *net.TCPConn {
+		n, derr := net.Dial("tcp", cfg.App.Addr())
+		s.Require().NoError(derr)
+		return n.(*net.TCPConn)
+	}
+	ctrlDial := func() *net.TCPConn {
+		n, derr := net.Dial("tcp", cfg.Ctrl.Addr())
+		s.Require().NoError(derr)
+		return n.(*net.TCPConn)
+	}
+
+	// Case 1a — app port, AUTH with ctrl0 → WRONGPASS on next PING
+	{
+		c := appDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, ctrl0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/ctrl0-auth] AUTH response = %q want +OK (AUTH itself doesn't gate role)", authR)
+		}
+		if !strings.Contains(pingR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl0-auth] next PING = %q want substring WRONGPASS", pingR)
+		}
+	}
+	// Case 1b — ctrl port, AUTH with app0 → WRONGPASS on next PING
+	{
+		c := ctrlDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, app0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/app0-auth] AUTH response = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app0-auth] next PING = %q want substring WRONGPASS", pingR)
+		}
+	}
+
+	// Case 2a — app port with correct app0 AUTH → PING returns PONG
+	{
+		c := appDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, app0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/app0-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[app/app0-auth] PING = %q want +PONG", pingR)
+		}
+	}
+	// Case 2b — ctrl port with correct ctrl0 AUTH → PING returns PONG
+	{
+		c := ctrlDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, ctrl0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/ctrl0-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[ctrl/ctrl0-auth] PING = %q want +PONG", pingR)
+		}
+	}
+
+	// Case 3a — account 1 app key on app port → PONG good; same key on ctrl
+	// port → next PING = WRONGPASS
+	{
+		c := appDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, app1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/app1-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[app/app1-auth] PING = %q want +PONG (app_1 slot must be app-port accept list)", pingR)
+		}
+	}
+	{
+		c := ctrlDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, app1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/app1-auth] AUTH = %q want +OK (acquireAuthConn should match _auth_:app_*)", authR)
+		}
+		if !strings.Contains(pingR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app1-auth] PING = %q want WRONGPASS — app1 slot only valid on app port", pingR)
+		}
+	}
+	// Case 3b — account 1 ctrl key on ctrl port → PONG good; same key on app
+	// port → next PING = WRONGPASS
+	{
+		c := ctrlDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, ctrl1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/ctrl1-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[ctrl/ctrl1-auth] PING = %q want +PONG (ctrl_1 slot must be ctrl-port accept list)", pingR)
+		}
+	}
+	{
+		c := appDial()
+		defer func() { _ = c.Close() }()
+		authR, pingR := authThenPing(c, ctrl1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/ctrl1-auth] AUTH = %q want +OK (acquireAuthConn should match _auth_:ctrl_*)", authR)
+		}
+		if !strings.Contains(pingR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl1-auth] PING = %q want WRONGPASS — ctrl1 slot only valid on ctrl port", pingR)
+		}
+	}
+}
+
+// thin wrapper that avoids test name collision with server/auth_test.go helpers.
+func readKeyOrEmptyCtrl(t *testing.T, db *DB, slot string) string {
+	t.Helper()
+	return readKeyOrEmptyInternal(t, db, slot)
+}
+
+func readKeyOrEmptyInternal(t *testing.T, db *DB, slot string) string {
+	t.Helper()
+	var v string
+	if db == nil || db.disk == nil {
+		return ""
+	}
+	_ = db.disk.View(func(tx *buntdb.Tx) error {
+		key := naming.AuthStorageKey(slot)
+		gv, gerr := tx.Get(key)
+		if gerr != nil && gerr != buntdb.ErrNotFound {
+			return gerr
+		}
+		v = gv
+		return nil
+	})
+	return v
 }

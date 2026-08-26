@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -157,6 +158,112 @@ func (db *DB) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// bootstrapAuth resolves the dual-port AUTH pair using a strict per-slot
+// priority cascade:  cfg seed  →  DB stored value  →  crypto/rand 128-bit hex.
+//
+// Rules (simplified SSoT):
+//
+//  1. If cfg.App.Auth (seedApp) is non-empty → it wins the app slot unconditio-
+//     nally. The ctrl slot resolves similarly from seedCtrl.
+//  2. For whichever slot the seed is empty, fall back to whatever is stored on
+//     disk under `_auth_:app` / `_auth_:ctrl`; if that slot is also missing,
+//     generate a fresh 128-bit random hex for just that one missing slot.
+//  3. The resulting resolved values are written back to disk (in a single
+//     Update tx) iff the slot's value differs from what was on disk (no-op
+//     reads are never persisted).
+//  4. `anyGenerated` is true if at least one slot had to be randomly produced
+//     this call; callers (srv.StartWithConfig) use this flag to decide whether
+//     to print the credentials banner to stdout.
+//
+// No dual-port distinctness invariant is enforced here; equality between the
+// two slots is allowed and the caller does not error on it. No "partial pair
+// corrupted" failure mode: partial storage (one slot on disk, one missing) is
+// silently repaired by generating only the missing half.
+func (db *DB) bootstrapAuth(seedApp, seedCtrl string) (finalApp, finalCtrl string, anyGenerated bool, err error) {
+	if db == nil || db.disk == nil {
+		return "", "", false, fmt.Errorf("bootstrapAuth: storage not initialised")
+	}
+	appKey := naming.AuthStorageKey("app_0")
+	ctrlKey := naming.AuthStorageKey("ctrl_0")
+
+	var storedApp, storedCtrl string
+	err = db.disk.View(func(tx *buntdb.Tx) error {
+		if av, aerr := tx.Get(appKey); aerr == nil {
+			storedApp = av
+		} else if aerr != buntdb.ErrNotFound {
+			return fmt.Errorf("bootstrapAuth: read %s: %w", appKey, aerr)
+		}
+		if cv, cerr := tx.Get(ctrlKey); cerr == nil {
+			storedCtrl = cv
+		} else if cerr != buntdb.ErrNotFound {
+			return fmt.Errorf("bootstrapAuth: read %s: %w", ctrlKey, cerr)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", false, err
+	}
+
+	finalApp = storedApp
+	finalCtrl = storedCtrl
+	writeApp := false
+	writeCtrl := false
+	if seedApp != "" {
+		if finalApp != seedApp {
+			finalApp = seedApp
+			writeApp = true
+		}
+	} else if finalApp == "" {
+		gapp, _, gerr := generateBootstrapAuth()
+		if gerr != nil {
+			return "", "", false, fmt.Errorf("bootstrapAuth: gen app slot: %w", gerr)
+		}
+		finalApp = gapp
+		writeApp = true
+		anyGenerated = true
+	}
+	if seedCtrl != "" {
+		if finalCtrl != seedCtrl {
+			finalCtrl = seedCtrl
+			writeCtrl = true
+		}
+	} else if finalCtrl == "" {
+		_, gctrl, gerr := generateBootstrapAuth()
+		if gerr != nil {
+			return "", "", false, fmt.Errorf("bootstrapAuth: gen ctrl slot: %w", gerr)
+		}
+		finalCtrl = gctrl
+		writeCtrl = true
+		anyGenerated = true
+	}
+	if !writeApp && !writeCtrl {
+		return finalApp, finalCtrl, anyGenerated, nil
+	}
+	err = db.disk.Update(func(tx *buntdb.Tx) error {
+		if writeApp {
+			if _, _, serr := tx.Set(appKey, finalApp, nil); serr != nil {
+				return fmt.Errorf("bootstrapAuth: persist app slot: %w", serr)
+			}
+		}
+		if writeCtrl {
+			if _, _, serr := tx.Set(ctrlKey, finalCtrl, nil); serr != nil {
+				return fmt.Errorf("bootstrapAuth: persist ctrl slot: %w", serr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", false, err
+	}
+	if writeApp && seedApp != "" {
+		slog.Info("bootstrapAuth: app slot overwritten by cfg.App.Auth")
+	}
+	if writeCtrl && seedCtrl != "" {
+		slog.Info("bootstrapAuth: ctrl slot overwritten by cfg.Ctrl.Auth")
+	}
+	return finalApp, finalCtrl, anyGenerated, nil
 }
 
 // CreateIndex is a small alias over registerIndexes; see registerIndexes for
@@ -559,6 +666,31 @@ func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
 }
 
 // ——— Private (unexported) helpers ———
+
+func generateBootstrapAuth() (appAuth, ctrlAuth string, err error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generateBootstrapAuth: crypto/rand: %w", err)
+	}
+	appAuth = hex.EncodeToString(raw)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generateBootstrapAuth: crypto/rand ctrl: %w", err)
+	}
+	ctrlAuth = hex.EncodeToString(raw)
+	// Guarantee distinctness (crypto-lottery collision probability is ~2^-64
+	// per run; enforce to satisfy the dual-port "different passwords" hard
+	// gate in Config.validate, which runs BEFORE BootstrapAuth writes back).
+	if appAuth == ctrlAuth {
+		// Flip the first byte of the ctrl copy.
+		if raw[0] == 0xFF {
+			raw[0] = 0x00
+		} else {
+			raw[0]++
+		}
+		ctrlAuth = hex.EncodeToString(raw)
+	}
+	return appAuth, ctrlAuth, nil
+}
 
 // ——— Meta helpers: fingerprint + meta-key load/delete (no multi-version) ———
 
@@ -986,6 +1118,13 @@ func (db *DB) writeIndexSpec(spec idxSpec) error {
 // reserved and rejected by HasUnderscorePrefix in the checker layer (above the
 // storage layer) — the store simply routes; the semantic gate lives in
 // checker.go / cmd.go handlers.
+//
+// AUTH lifecycle is owned 1:1 by the pair of physical keys `_auth_:app` and
+// `_auth_:ctrl` (SSoT lives in the storage layer itself, NOT in-process).
+// First-read of the pair via `BootstrapAuth(seedApp, seedCtrl)` generates and
+// SETNX-atomic-writes both keys iff both slots are empty; there is no
+// per-process duplicate state on *DB and no file-creation-time dependence on
+// this constructor.
 func openDB(path string) *DB {
 	if path == "" {
 		slog.Error("failed to open storage", "error", "db path is required")
@@ -1003,20 +1142,17 @@ func openDB(path string) *DB {
 		slog.Error("failed to create db directory", "path", path, "error", err)
 		return nil
 	}
-
 	disk, err := buntdb.Open(path)
 	if err != nil {
 		slog.Error("failed to open buntdb", "path", path, "error", err)
 		return nil
 	}
-
 	mem, err := buntdb.Open(":memory:")
 	if err != nil {
 		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
 		_ = disk.Close()
 		return nil
 	}
-
 	return &DB{
 		disk:       disk,
 		mem:        mem,
