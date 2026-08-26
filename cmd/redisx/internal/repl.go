@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kcmvp/redisx/cmd/_shared/session"
 	"github.com/kcmvp/redisx/cmd/_shared/tui"
 )
 

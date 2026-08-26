@@ -225,20 +225,20 @@ func normalizeIndexPathFields(rawMap map[string]any) ([]string, error) {
 // ——— ——— 握手 / 元命令 / Auth & Hello & Client & Ping & Quit ——— ———
 
 // authCommand implements the AUTH wire command for RedisX's dual-port
-// (app + admin) model.
+// (app + ctrl) model.
 //
 // Flow:
 //  1. If the connection is already authenticated and the caller repeats
 //     the same key we answer OK; if they send a DIFFERENT key we close
 //     the connection (security: no silent re-auth downgrade).
-//  2. If --admin-auth is configured on the admin port we REFUSE the
+//  2. If --ctrl-auth is configured on the ctrl port we REFUSE the
 //     app-auth key (and vice versa on the app port) to prevent leaking
 //     the wrong role.
 //  3. acquireAuthConn() checks the global per-key connection limit and
 //     validates existence of the key via `_auth_:<key>` storage lookup
 //     (or the bootstrap internalAuthKey literal). Internal-NS Write
 //     Guard forbids wire clients from mutating `_auth_:` keys directly
-//     through SET / DEL; AUTH key rotation is an admin-only operation.
+//     through SET / DEL; AUTH key rotation is a ctrl-only operation.
 func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
 	if len(cmd.Args) != 2 {
 		conn.WriteError("ERR authentication failed")
@@ -260,24 +260,24 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		return
 	}
 
-	appAuth, adminAuth, configured := getAuthConfig()
+	appAuth, ctrlAuth, configured := getAuthConfig()
 	if configured && providedKey != internalAuthKey {
 		role := connPortRole(conn)
 		switch role {
 		case portRoleApp:
-			if adminAuth != "" && providedKey == adminAuth {
-				msg := "WRONGPASS invalid password for app port. AUTH with the --auth key, not the --admin-auth key, then retry."
+			if ctrlAuth != "" && providedKey == ctrlAuth {
+				msg := "WRONGPASS invalid password for app port. AUTH with the --auth key, not the --ctrl-auth key, then retry."
 				conn.WriteError(msg)
-				slog.Warn("auth rejected: app-port used admin-auth key",
+				slog.Warn("auth rejected: app-port used ctrl-auth key",
 					"remote", conn.RemoteAddr())
 				_ = conn.Close()
 				return
 			}
-		case portRoleAdmin:
+		case portRoleCtrl:
 			if appAuth != "" && providedKey == appAuth {
-				msg := "WRONGPASS invalid password for admin port. AUTH with the --admin-auth key, not the --auth key, then retry."
+				msg := "WRONGPASS invalid password for ctrl port. AUTH with the --ctrl-auth key, not the --auth key, then retry."
 				conn.WriteError(msg)
-				slog.Warn("auth rejected: admin-port used app-auth key",
+				slog.Warn("auth rejected: ctrl-port used app-auth key",
 					"remote", conn.RemoteAddr())
 				_ = conn.Close()
 				return
@@ -312,7 +312,7 @@ func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 // SSoT: Minimal identity response — intentionally returns ONLY the server
 // string "redisx". This follows the "backend command upgrade, frontend App
 // no update needed" decoupling principle: the client owns its command
-// catalogue, feature flags, and admin/app UI distinctions. The server's
+// catalogue, feature flags, and ctrl/app UI distinctions. The server's
 // only job during HELLO is to prove it's a RedisX peer so the client
 // SDK can enable typed-doc / colon-mode routing internally.
 //
@@ -729,7 +729,7 @@ func getCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 	case argShapeDoc:
 		if len(cmd.Args) != 3 {
 			if _, docRegistered := db.lookupDocByLogicalOrStorageNs(arg1); docRegistered {
-				conn.WriteError(fmt.Sprintf("ERR GET doc-pattern requires <ns> <pk-suffix>; namespace %q alone is not a query (use SEARCHKEY or KEYS on admin port)", arg1))
+				conn.WriteError(fmt.Sprintf("ERR GET doc-pattern requires <ns> <pk-suffix>; namespace %q alone is not a query (use SEARCHKEY or KEYS on ctrl port)", arg1))
 			} else {
 				conn.WriteError(fmt.Sprintf("ERR GET kv-pattern key must contain namespace separator %q", naming.StorageKeySeparator()))
 			}
@@ -851,7 +851,7 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 //     BuntDB ordered index usefulness)
 //   - no leading underscore (forbids enumerating `_doc_:` / `_idx_:` /
 //     `_auth_:` meta keys — wire-level enumeration of registry data is
-//     an admin-only exposure and goes via REGSCH/REGIDX introspection,
+//     a ctrl-only exposure and goes via REGSCH/REGIDX introspection,
 //     not raw KEYS).
 //
 // Routing via SSoTs:
@@ -863,7 +863,7 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 //     straight through to db.Keys (which itself calls applyKeyRange and
 //     isLeadingWildcard guarded again).
 //   - otherwise (doc-path shape):
-//   - if pattern contains ANY glob: forbidden (admin must pass bare
+//   - if pattern contains ANY glob: forbidden (ctrl must pass bare
 //     namespace only). Enumeration within a doc-ns with filters goes
 //     via SEARCHKEY, not KEYS.
 //   - otherwise the pattern is a bare storageNs: look it up via
@@ -1309,7 +1309,7 @@ func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 // JSON-shape + unknown-field guard.
 //
 // Internal-NS Write Guard doesn't apply here because REGSCH itself IS
-// the designated admin write path for `_doc_:` meta keys — wire
+// the designated ctrl write path for `_doc_:` meta keys — wire
 // clients cannot SET _doc_:abc directly, they must go through this
 // command.
 func regSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {

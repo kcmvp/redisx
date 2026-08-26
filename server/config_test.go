@@ -28,14 +28,14 @@ func TestLoadSampleYaml(t *testing.T) {
 	if cfg.App.Port != 7379 {
 		t.Fatalf("sample default app.port = %d want 7379", cfg.App.Port)
 	}
-	if cfg.Admin.Port != 7381 {
-		t.Fatalf("sample default admin.port = %d want 7381", cfg.Admin.Port)
+	if cfg.Ctrl.Port != 7381 {
+		t.Fatalf("sample default ctrl.port = %d want 7381", cfg.Ctrl.Port)
 	}
-	if cfg.Admin.Bind != "127.0.0.1" {
-		t.Fatalf("sample default admin.bind = %q want 127.0.0.1", cfg.Admin.Bind)
+	if cfg.Ctrl.Bind != "127.0.0.1" {
+		t.Fatalf("sample default ctrl.bind = %q want 127.0.0.1", cfg.Ctrl.Bind)
 	}
-	if cfg.App.Auth != "" || cfg.Admin.Auth != "" {
-		t.Fatalf("sample defaults both auth empty; got app=%q admin=%q", cfg.App.Auth, cfg.Admin.Auth)
+	if cfg.App.Auth != "" || cfg.Ctrl.Auth != "" {
+		t.Fatalf("sample defaults both auth empty; got app=%q ctrl=%q", cfg.App.Auth, cfg.Ctrl.Auth)
 	}
 	if cfg.DataPath == "" {
 		t.Fatalf("DataPath must be set (falls back to ~/.redisx/redisx.db when yaml data_path is empty)")
@@ -47,8 +47,8 @@ func TestLoadSampleYaml(t *testing.T) {
 			t.Fatalf("yaml omits storage.data_path => expected user-scoped default %q, got %q (sample yaml must not assign empty data_path)", want, cfg.DataPath)
 		}
 	}
-	t.Logf("loaded cfg: app=%s:%d admin=%s:%d db=%s",
-		cfg.App.Bind, cfg.App.Port, cfg.Admin.Bind, cfg.Admin.Port, cfg.DataPath)
+	t.Logf("loaded cfg: app=%s:%d ctrl=%s:%d db=%s",
+		cfg.App.Bind, cfg.App.Port, cfg.Ctrl.Bind, cfg.Ctrl.Port, cfg.DataPath)
 }
 
 func TestLoadNoConfigFileDefaults(t *testing.T) {
@@ -66,14 +66,14 @@ func TestLoadNoConfigFileDefaults(t *testing.T) {
 	if cfg.App.Port != 7379 {
 		t.Fatalf("want app.port default %d, got %d", 7379, cfg.App.Port)
 	}
-	if cfg.Admin.Port != 7381 {
-		t.Fatalf("want admin.port default %d, got %d", 7381, cfg.Admin.Port)
+	if cfg.Ctrl.Port != 7381 {
+		t.Fatalf("want ctrl.port default %d, got %d", 7381, cfg.Ctrl.Port)
 	}
-	if cfg.Admin.Bind != "127.0.0.1" {
-		t.Fatalf("want admin.bind default 127.0.0.1, got %q", cfg.Admin.Bind)
+	if cfg.Ctrl.Bind != "127.0.0.1" {
+		t.Fatalf("want ctrl.bind default 127.0.0.1, got %q", cfg.Ctrl.Bind)
 	}
-	if cfg.App.Auth != "" || cfg.Admin.Auth != "" {
-		t.Fatalf("want no-auth defaults; got app=%q admin=%q", cfg.App.Auth, cfg.Admin.Auth)
+	if cfg.App.Auth != "" || cfg.Ctrl.Auth != "" {
+		t.Fatalf("want no-auth defaults; got app=%q ctrl=%q", cfg.App.Auth, cfg.Ctrl.Auth)
 	}
 	home, hErr := os.UserHomeDir()
 	if hErr == nil {
@@ -99,7 +99,7 @@ app:
   bind: ""
   port: 7379
   auth: "same"
-admin:
+ctrl:
   bind: "127.0.0.1"
   port: 7381
   auth: "same"
@@ -114,14 +114,14 @@ data_path: "./bad.db"
 	t.Logf("got expected err: %v", err)
 }
 
-func TestConfigFailsNonLoopbackAdminNoAck(t *testing.T) {
+func TestConfigFailsNonLoopbackCtrlNoAck(t *testing.T) {
 	dir := t.TempDir()
 	y := filepath.Join(dir, "bad2.yaml")
 	if err := os.WriteFile(y, []byte(`
 app:
   bind: ""
   port: 7379
-admin:
+ctrl:
   bind: "0.0.0.0"
   port: 7381
 data_path: "./b2.db"
@@ -130,7 +130,7 @@ data_path: "./b2.db"
 	}
 	_, err := LoadConfig(y)
 	if err == nil {
-		t.Fatalf("want FATAL admin non-loopback no ack; got nil error")
+		t.Fatalf("want FATAL ctrl non-loopback no ack; got nil error")
 	}
 	t.Logf("got expected err: %v", err)
 }
@@ -141,7 +141,7 @@ func TestConfigAllowsDangerBindAny(t *testing.T) {
 	if err := os.WriteFile(y, []byte(`
 app:
   port: 7390
-admin:
+ctrl:
   bind: "0.0.0.0"
   port: 7391
   danger_bind_any: true
@@ -153,7 +153,7 @@ data_path: "./ok.db"
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Admin.Bind != "0.0.0.0" || cfg.Admin.Port != 7391 || !cfg.Admin.DangerBindAny {
+	if cfg.Ctrl.Bind != "0.0.0.0" || cfg.Ctrl.Port != 7391 || !cfg.Ctrl.DangerBindAny {
 		t.Fatalf("cfg mismatch: %+v", cfg)
 	}
 }

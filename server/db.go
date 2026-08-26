@@ -786,7 +786,7 @@ func deleteIdxSpecMeta(tx *buntdb.Tx, idxFullName string) error {
 // ——— Core writers: writeDocSpec / writeIndexSpec ———
 
 // writeDocSpec is the single entry point for doc-spec writes (REGSCH command,
-// boot registerSchemas, admin seed fixtures). Input spec carries only the
+// boot registerSchemas, ctrl seed fixtures). Input spec carries only the
 // four user-visible x.Schema fields; Version/CreatedAt/UpdatedAt are computed
 // & stamped here internally.
 //
@@ -1413,7 +1413,7 @@ func applyKeyRange(tx *buntdb.Tx, kr x.KeyRange, dir x.RangeDirection, fn func(k
 // dropIndexByFullName is the DROPIDX command implementation (1 arg = fullName
 // or 2 args = ownerNs + logical, resolved in cmd.go dropIdxCommand). idxRegMu
 // is held for the entire op (spec read → btree DropIndex → meta probe/delete
-// → map delete). Admin ops are low frequency so coarse lock scope keeps the
+// → map delete). Ctrl ops are low frequency so coarse lock scope keeps the
 // reasoning symmetric with DROPSCH.
 func (db *DB) dropIndexByFullName(fullName string) error {
 	if db == nil {
@@ -1432,7 +1432,7 @@ func (db *DB) dropIndexByFullName(fullName string) error {
 	}
 	// Symmetric with dropSchemaByLogicalNs: acquire the registry write-lock up
 	// front for the entire operation (spec lookup → btree DropIndex → meta
-	// probe/delete → map delete). Admin registry ops are low frequency so the
+	// probe/delete → map delete). Ctrl registry ops are low frequency so the
 	// coarse lock scope keeps reasoning simple and symmetric with DROPSCH.
 	db.idxRegMu.Lock()
 	defer db.idxRegMu.Unlock()

@@ -48,7 +48,7 @@ redisx 目前的 typed document 体系（`x.Document` [x.go#L261-L292](file:///U
 - 不做跨 Doc 的事务 / ACID rollback
 - 不做 per-Doc Hook 路由（只在 `server.Doc[D](hooks ...DocHook[D])` 的签名上卡位）
 - 不做 `DROP DOC <ns>` / `DROPTABLE` RESP 命令（只在 Strict 矩阵里假设不存在，所有删表只能靠直接删 key + 后续补命令）
-- **不做 `OrphanNamespaces() → []string` admin helper（用户 2026-08-22 决策：先不考虑）**。现有用户升级时的临时 workaround：运维用原生 `KEYS *` 全扫后，脚本里按 §11 `SplitStorageKey` 拆 storageNs → dedupe → 与 `db.RegisteredDocs()` storageNs 列表 diff，找出 orphan 手工处理。MVP 交付后如果升级体验反馈差，再下一个 patch 版本补 OrphanNamespaces。
+- **不做 `OrphanNamespaces() → []string` ctrl helper（用户 2026-08-22 决策：先不考虑）**。现有用户升级时的临时 workaround：运维用原生 `KEYS *` 全扫后，脚本里按 §11 `SplitStorageKey` 拆 storageNs → dedupe → 与 `db.RegisteredDocs()` storageNs 列表 diff，找出 orphan 手工处理。MVP 交付后如果升级体验反馈差，再下一个 patch 版本补 OrphanNamespaces。
 - 不做 `REINDEX` / 索引一致性校验工具（后续版本）
 
 ---
@@ -200,7 +200,7 @@ func (db *DB) RegisterIndex[D x.Document](logicalName string, jsonPath string) e
 func (db *DB) DropIndex[D x.Document](logicalName string) error
 ```
 
-以及 admin 可观测性：
+以及 ctrl 可观测性：
 
 ```go
 func (db *DB) RegisteredDocs() []x.PersistentDocSpec                    // SHOW TABLES NAMES+SCHEMA（仅持久化 schema，不含 indexes）
@@ -249,7 +249,7 @@ RegisterIndex[D](name, path)
 
 ### 4.3 RESP wire 的 REGISTER / DROP 命令（MVP 对齐 Index）+ 传统 Redis SET/GET 语义糖扩展
 
-MVP 就落地 2 条 RESP 扩展命令（对应 Channel 2 的 Index 家族）。注意：**REGISTER/DROP 官方命令词是 UI 糖（人类 Shell 输入读），RESP 线上实际命令字统一为 ADM 前缀 regidx / delidx**（见 Admin Shell Child FR §7）。原因：① 和 Doc 管理命令（regdoc 等）风格统一 ② Server 端 Gate1 App-port 构建显式白名单：遍历 proto.Registry Role==AdminOnly 的全部命令字（regdoc/lsdoc/desdoc/lsidx/regidx/delidx）— Fail-Closed，不会漏判以后加的 Admin 命令。③ 未来业务命令如果要加 CREATE 动词不会和管理命令命名空间冲突。
+MVP 就落地 2 条 RESP 扩展命令（对应 Channel 2 的 Index 家族）。注意：**REGISTER/DROP 官方命令词是 UI 糖（人类 Shell 输入读），RESP 线上实际命令字统一为 ADM 前缀 regidx / delidx**（见 Ctrl Shell Child FR §7）。原因：① 和 Doc 管理命令（regdoc 等）风格统一 ② Server 端 Gate1 App-port 构建显式白名单：遍历 proto.Registry Role==CtrlOnly 的全部命令字（regdoc/lsdoc/desdoc/lsidx/regidx/delidx）— Fail-Closed，不会漏判以后加的 Ctrl 命令。③ 未来业务命令如果要加 CREATE 动词不会和管理命令命名空间冲突。
 
 **人类 UI 糖（Shell / 文档阅读友好）：**
 ```
@@ -488,7 +488,7 @@ Else (no TTL in SET)
 ```
 // Infrastructure (no-D, forever public)
 Connect(respAddr, authKey string) error
-ConnectEmbed(respAddr string) error
+ConnectEmbedded() error
 Auth(authKey string) error
 Publish(topic, msg string) bool
 Subscribe(topic string) mo.Result[<-chan *ReceivedMessage]
@@ -547,7 +547,7 @@ Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Muta
 
 **Trust-User Principle (user ruling 2026-08-25):** "For every Redis-native command, if the key/pattern arg contains `:`, execute it with pure Redis semantics — zero registry gates, zero schema validation, zero implicit key derivation, caller owns correctness 100%. Doc-path gates only apply to args that have no `:` at all."
 
-**Internal-Namespace Write Guard Exception (user ruling 2026-08-25):** The Trust-User principle does NOT apply to mutation of the three dedicated admin namespaces `_doc_`, `_idx_`, `_auth_`. Any SET/SETEX/SETNX/DEL whose resolved storageNs equals one of these three → precise ERR advising the dedicated command (REGSCH / DROPSCH / REGIDX / DROPIDX / AUTH). Read-class operations (GET / KEYS) on these three internal storageNs ARE allowed via KV-path (colon present) — e.g. `KEYS _doc_:*` remains free for admin introspection. `_m_:…` (mem layer) and any other underscore-prefixed forms → rejected uniformly by HasUnderscorePrefix regardless of read/write (reserved for future protocol expansion).
+**Internal-Namespace Write Guard Exception (user ruling 2026-08-25):** The Trust-User principle does NOT apply to mutation of the three dedicated ctrl namespaces `_doc_`, `_idx_`, `_auth_`. Any SET/SETEX/SETNX/DEL whose resolved storageNs equals one of these three → precise ERR advising the dedicated command (REGSCH / DROPSCH / REGIDX / DROPIDX / AUTH). Read-class operations (GET / KEYS) on these three internal storageNs ARE allowed via KV-path (colon present) — e.g. `KEYS _doc_:*` remains free for ctrl introspection. `_m_:…` (mem layer) and any other underscore-prefixed forms → rejected uniformly by HasUnderscorePrefix regardless of read/write (reserved for future protocol expansion).
 
 **Rationale:** "single structural discriminator = does arg1 contain `:`?"
 
@@ -568,7 +568,7 @@ Note: Client SDK generic surface `Get[D]`, `Set[D]`, `Keys[D]`, `SearchIndex[D]`
 - [x] **`DEL` arg1 = KV**. `argc == 2 → single kv delete` (user ruling 2026-08-25: KV-path DEL is **always single-key only** on this server; multi-key KV-path deletion like `DEL a:1 b:2 c:3` is intentionally not exposed and callers should issue multiple DEL commands). `argc ≥ 3 AND arg1 contains `:` → parameter ERR ("DEL kv-pattern takes one full key; issue separate DELs for multiple keys or use doc-path form"). `argc ≥ 3 AND arg1 has NO `:` → doc-path ns + ≥ 1 pk-suffix below.
 - [x] **`DEL` arg1 = Doc (no `:)`. argc ≥ 3 total → ns + ≥ 1 pk-suffix**. Bare ns (`DEL user` alone) → ERR ("forbid drop-whole-collection sugar"). Every pk-suffix must NOT contain `:`.
 - [x] **`KEYS`**. Single argument. Colon-routing discriminator applied to the pattern itself:
-  - [x] `HasMemPrefix(pattern) || IsInternalStorageNs(pattern)` → passthrough unchanged. Covers `_doc_`, `_idx_`, `_auth_` bare storageNs and any `_m_:<ns>:*` style mem-layer globs (admin introspection via raw KV).
+  - [x] `HasMemPrefix(pattern) || IsInternalStorageNs(pattern)` → passthrough unchanged. Covers `_doc_`, `_idx_`, `_auth_` bare storageNs and any `_m_:<ns>:*` style mem-layer globs (ctrl introspection via raw KV).
   - [x] Pattern **contains `:`** → treated as raw KV-path glob, allowed freely (wildcards + colons OK, no registry/doc gates, no auto-transform). Examples: `KEYS app:prefix*` / `KEYS user:*` / `KEYS cli:key_*` — all resolve exactly as written on the KV store.
   - [x] Pattern **has NO `:` AND contains wildcards (`*?[`)** → parameter ERR ("doc-path KEYS requires bare <storageNs> without wildcards; fragment globs like `abc*` are ambiguous because they could span namespaces").
   - [x] Pattern **has NO `:` AND no wildcards** → bare doc storageNs: (a) non-internal → **registry gate MUST be registered** (else ERR with hint to append `:*` for KV-style raw), (b) auto-scoped internally to `<ns>:*` for the actual buntdb scan.
@@ -666,7 +666,7 @@ Replaces the pre-colon-routing M1–M7 table (old single-path strict model super
 | M1 | Infra: 3 Structs + Start + Registry Layer | `x.PersistentDocSpec` / `x.IndexSpec` / `x.DescribeDocResult` isolation (reflect); `Start(..., opts...)` signature; MD5-12 `Version`, `CreatedAt` fixed, `UpdatedAt` refreshed on MD5 delta; loadSchemaRegistryFromDB recovery | ✅ Done | §3.2, §7.5 struct-split last 4 checks |
 | M2 | Colon-Routing Gates: SET/SETEX/SETNX/GET/DEL | classifyArg1 (`:`?); Doc-path Parameter / Registry / Business 3-gates (JSON+KeyAttrs+batch-atomic+intra-batch pk dup + SETNX prepass); KV-path pure passthrough; DEL bare-ns ERR; DEL suffix-no-colon ERR | ✅ Done (P0 verified) | §7.4.1 first 6 bullets, §7.4.3 all SET/DEL bullets |
 | M3 | Colon-Routing Gates: KEYS/SEARCHKEY/SEARCHINDEX/UPDATE + TTL auto | KEYS business-ns wildcard-anywhere + colon ERR + `<ns>→<ns>:*` internal scope; SK anchor-colon bypass registry / no-colon registry gate; SI ParseIdxFullName + owner-ns registry + meta-exists gate; UPDATE anchor-colon parameter-ERR (no KV-style); DocPath `DocSpec.TTL` default-applied when no explicit ttl; UPDATE KeyAttrs-PK immutable tx-abort | ✅ Done (P0 2026-08-25 fixed) | §7.4.1 KEYS / SK / SI / UPDATE bullets; §7.4.3 UPDATE immutability + TTL bullets |
-| M4 | Registry CMD (4) + Latest-Wins MD5 + DROPSCH attach-guard | REGSCH/DROPSCH/REGIDX/DROPIDX (UPPERCASE wire, admin-only at both ports via auth); REGSCH/REGIDX exactly 1 JSON arg; DROPSCH rejects if `_idx_:<ns>_*` count > 0; MD5 delta → drop-then-recreate native index + delete old `:v_*` version | ✅ Done | §7.4.4 all 4 bullets |
+| M4 | Registry CMD (4) + Latest-Wins MD5 + DROPSCH attach-guard | REGSCH/DROPSCH/REGIDX/DROPIDX (UPPERCASE wire, ctrl-only at both ports via auth); REGSCH/REGIDX exactly 1 JSON arg; DROPSCH rejects if `_idx_:<ns>_*` count > 0; MD5 delta → drop-then-recreate native index + delete old `:v_*` version | ✅ Done | §7.4.4 all 4 bullets |
 | M5 | `_doc_:*` / `_idx_:*` Persistence (Symmetric Layer) + Crash Recovery | meta writes follow `DocSpec.Mem` (symmetric metadata storage); on-disk recovery rebuilds pure registry without re-running writeDocSpec/writeIndexSpec (write paths only for REGSCH/REGIDX) | ✅ Done | §4.1 boot order, §7.5 recovery bullets |
 | M6 | Client SDK: Flatten + Raw Suffix + Tests Consolidated | `client/doc/` → `client/` single package; clix.go merged into cli.go with two banners: Typesafe API (generics, short names) first, then Raw API (`*Raw` suffix); all tests merged into `cli_test.go` with `Doc` prefixes; srvOnce/lifecycleCtx/cliOnce/cliSeedOnce/addr reset helper `stopAndResetGlobalState()`; sharedSeedBody runs unconditionally on new boot | ✅ Done | §7.6 Plan B 3 bullets |
 | — | **P0 Gaps remaining (DoD matrix all [x] — None)** | — | ✅ Cleared 2026-08-25 | §7.4 [x] inventory |
@@ -683,7 +683,7 @@ Note: the explicit UPDATE anchor-colon ERR and KEYS business-ns wildcard/colon E
 | **buntdb `CreateIndex` 对已有 100k+ 行回填阻塞写操作** | 中 | 生产动态 CREATE INDEX 期间抖动 | MVP 文档警告："REGISTER INDEX 会同步扫描已有 `<ns>:*` 行，建议低峰期执行"；未来补异步 `CREATE INDEX CONCURRENTLY` cmd（非 MVP） |
 | **DEL 预检查存在 TOCTOU**：预检查通过后、真正执行 tx.Delete 前，另一协程 DropIndex / DropDoc 把 registry 清空了 | 低 | registry 没了 → strict gate 在 tx 内的实际 Set/Del 入口再 gate 一次（双保险）| `registerMutex` 保护所有 registry 变更；tx 内部在实际写操作前再走一次 LookupDocByKey；极端情况下即使 registry 变了，仍然 ERR，不写脏数据 |
 | **KeyAttrs 多段解析与 StorageKeyValue 生成算法漂移** | 低 | storage key 生成的 pk-segment 与 strict gate 解析不一致 → 合法写入被误拒 / 非法写入漏过 | StorageKeyValue、KeyAttrs 一致性校验、ScopeGuard 三处全部共享同一个 internal helper `ExtractPKSuffixes(storageKey, segCount)`；单测 matrix 覆盖 2-segment PK 下的所有边界 |
-| **旧客户存储了 10GB 未注册 ns 的裸 KV 数据，升级后 Strict Mode 下 KEYS 仍然可见，用户要清理「幽灵数据」很痛苦** | 中 | 技术债体验差 | 提供 admin helper：`db.OrphanNamespaces() → []string`（用 KEYS `*` 扫所有 ns，和 registry 对比，列出未注册的 ns 列表）；用户可以据此手动 DROP 或 `REGISTER DOC` 认领 |
+| **旧客户存储了 10GB 未注册 ns 的裸 KV 数据，升级后 Strict Mode 下 KEYS 仍然可见，用户要清理「幽灵数据」很痛苦** | 中 | 技术债体验差 | 提供 ctrl helper：`db.OrphanNamespaces() → []string`（用 KEYS `*` 扫所有 ns，和 registry 对比，列出未注册的 ns 列表）；用户可以据此手动 DROP 或 `REGISTER DOC` 认领 |
 
 ---
 
@@ -762,7 +762,7 @@ Note: the explicit UPDATE anchor-colon ERR and KEYS business-ns wildcard/colon E
        "row_count":  < 此时刻 <storageNs>:* 下的行数（可选，运维用） >
      }
      ```
-3. **✅ 已标记 OUT OF SCOPE: `OrphanNamespaces()` admin helper（用户 2026-08-22 决策：先不考虑）**
+3. **✅ 已标记 OUT OF SCOPE: `OrphanNamespaces()` ctrl helper（用户 2026-08-22 决策：先不考虑）**
    - **不进 MVP**。原因：运维/升级体验问题可通过临时 workaround 解决（`KEYS *` 全扫后按 §11 `SplitStorageKey` 拆 storageNs → dedupe → 与 `db.RegisteredDocs()` storageNs 列表 diff → 手工 REGISTER 或 DROP 清理）。
    - **后续补入的触发条件**（任一满足即可在下个 patch 版本加）：
      ① 发布后 ≥2 个独立用户反馈「升级 Strict 模式后找不到哪些是 orphan key」；

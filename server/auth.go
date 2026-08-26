@@ -14,15 +14,15 @@ type portRole uint8
 const (
 	portRoleUnknown portRole = iota
 	portRoleApp
-	portRoleAdmin
+	portRoleCtrl
 )
 
 func (p portRole) String() string {
 	switch p {
 	case portRoleApp:
 		return "app"
-	case portRoleAdmin:
-		return "admin"
+	case portRoleCtrl:
+		return "ctrl"
 	}
 	return "unknown"
 }
@@ -31,10 +31,10 @@ var (
 	connRoleMu  sync.RWMutex
 	connRoleMap = map[redcon.Conn]portRole{}
 
-	authCfgMu       sync.RWMutex
-	activeAppAuth   = ""
-	activeAdminAuth = ""
-	authConfigured  = false
+	authCfgMu      sync.RWMutex
+	activeAppAuth  = ""
+	activeCtrlAuth = ""
+	authConfigured = false
 )
 
 func setConnPortRole(conn redcon.Conn, role portRole) {
@@ -57,29 +57,29 @@ func clearConnPortRole(conn redcon.Conn) {
 
 func connPortRole(conn redcon.Conn) portRole {
 	if conn == nil {
-		return portRoleAdmin
+		return portRoleCtrl
 	}
 	connRoleMu.RLock()
 	r, ok := connRoleMap[conn]
 	connRoleMu.RUnlock()
 	if !ok || r == portRoleUnknown {
-		return portRoleAdmin
+		return portRoleCtrl
 	}
 	return r
 }
 
-func configureAuthKeys(appAuth, adminAuth string) {
+func configureAuthKeys(appAuth, ctrlAuth string) {
 	authCfgMu.Lock()
 	activeAppAuth = appAuth
-	activeAdminAuth = adminAuth
-	authConfigured = (appAuth != "") || (adminAuth != "")
+	activeCtrlAuth = ctrlAuth
+	authConfigured = (appAuth != "") || (ctrlAuth != "")
 	authCfgMu.Unlock()
 }
 
-func getAuthConfig() (appAuth, adminAuth string, configured bool) {
+func getAuthConfig() (appAuth, ctrlAuth string, configured bool) {
 	authCfgMu.RLock()
 	defer authCfgMu.RUnlock()
-	return activeAppAuth, activeAdminAuth, authConfigured
+	return activeAppAuth, activeCtrlAuth, authConfigured
 }
 
 func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
@@ -88,7 +88,7 @@ func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
 	case proto.LowerCmdAuth, proto.LowerCmdHello, proto.LowerCmdClient:
 		return false
 	}
-	appAuth, adminAuth, configured := getAuthConfig()
+	appAuth, ctrlAuth, configured := getAuthConfig()
 	if !configured {
 		return false
 	}
@@ -100,12 +100,12 @@ func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
 	}
 	// Internal per-process bootstrap auth key (used exclusively by embedded
 	// client ↔ embedded server traffic) bypasses the port-role vs. configured
-	// user-key match entirely. It is accepted on both App and Admin ports
-	// unconditionally regardless of whether app/admin user keys are set.
+	// user-key match entirely. It is accepted on both App and Ctrl ports
+	// unconditionally regardless of whether app/ctrl user keys are set.
 	if authedKey != "" && authedKey == internalAuthKey {
 		return false
 	}
-	anyConfigured := (appAuth != "") || (adminAuth != "")
+	anyConfigured := (appAuth != "") || (ctrlAuth != "")
 	if !anyConfigured || authedKey == "" {
 		return false
 	}
@@ -117,38 +117,38 @@ func gate0Auth(conn redcon.Conn, cmdName string) (reject bool) {
 		if authedKey != appAuth {
 			slog.Warn("Gate0 reject: app-port conn authenticated with wrong key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
-			conn.WriteError("WRONGPASS invalid password for app port. AUTH with the --auth key, not the --admin-auth key, then retry.")
+			conn.WriteError("WRONGPASS invalid password for app port. AUTH with the --auth key, not the --ctrl-auth key, then retry.")
 			return true
 		}
-	case portRoleAdmin:
-		if adminAuth == "" {
+	case portRoleCtrl:
+		if ctrlAuth == "" {
 			return false
 		}
-		if authedKey != adminAuth {
-			slog.Warn("Gate0 reject: admin-port conn authenticated with wrong key",
+		if authedKey != ctrlAuth {
+			slog.Warn("Gate0 reject: ctrl-port conn authenticated with wrong key",
 				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
-			conn.WriteError("WRONGPASS invalid password for admin port. AUTH with the --admin-auth key, not the --auth key, then retry.")
+			conn.WriteError("WRONGPASS invalid password for ctrl port. AUTH with the --ctrl-auth key, not the --auth key, then retry.")
 			return true
 		}
 	}
 	return false
 }
 
-// gate1CommandWordByPortRole blocks ADMIN-only command words from reaching the
+// gate1CommandWordByPortRole blocks CTRL-only command words from reaching the
 // app-port listener. Fail-closed: allowlist map for app-port (13 handshake +
-// shared biz cmds), admin-port = pass everything.
+// shared biz cmds), ctrl-port = pass everything.
 //
-// MVP before D3 dual-port: default conn role = admin-port → every cmd passes.
+// MVP before D3 dual-port: default conn role = ctrl-port → every cmd passes.
 func gate1CommandWordByPortRole(conn redcon.Conn, cmdName string) (reject bool) {
-	role := connPortRole(conn) // admin/app; MVP defaults to "admin"
-	if role == portRoleAdmin {
+	role := connPortRole(conn) // ctrl/app; MVP defaults to "ctrl"
+	if role == portRoleCtrl {
 		return false
 	}
 	// app-port → only allow allowlist. Build once at init time from proto.
 	if !appPortCmdAllowlist[cmdName] {
-		slog.Warn("app-port attempted admin-only command (Gate1 reject)",
+		slog.Warn("app-port attempted ctrl-only command (Gate1 reject)",
 			"remote", conn.RemoteAddr(), "cmd", cmdName)
-		conn.WriteError("ERR No Privilege: '" + cmdName + "' is a Meta Management command, only allowed on the admin port. Connect via the admin port and use --admin-auth, or run equivalent data operations on this app port.")
+		conn.WriteError("ERR No Privilege: '" + cmdName + "' is a Meta Management command, only allowed on the ctrl port. Connect via the ctrl port and use --ctrl-auth, or run equivalent data operations on this app port.")
 		return true
 	}
 	return false

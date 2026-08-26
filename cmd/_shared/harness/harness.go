@@ -80,7 +80,7 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 			Port: appPort,
 			Auth: opt.AppAuth,
 		},
-		Admin: server.AdminConfig{
+		Ctrl: server.CtrlConfig{
 			Bind:          opt.CtrlBindIP,
 			Port:          ctrlPort,
 			Auth:          opt.CtrlAuth,

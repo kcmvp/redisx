@@ -20,8 +20,8 @@ const (
 	defaultLoggingLevel  = "info"
 	defaultLoggingFormat = "text"
 
-	defaultAppPort   = 7379
-	defaultAdminPort = 7381
+	defaultAppPort  = 7379
+	defaultCtrlPort = 7381
 
 	minAllowedPort = 7001
 	maxAllowedPort = 65535
@@ -37,7 +37,7 @@ func (a AppConfig) Addr() string {
 	return net.JoinHostPort(a.Bind, strconv.Itoa(a.Port))
 }
 
-type AdminConfig struct {
+type CtrlConfig struct {
 	Bind          string `yaml:"bind"`
 	Port          int    `yaml:"port"`
 	Auth          string `yaml:"auth"`
@@ -45,8 +45,8 @@ type AdminConfig struct {
 	DangerBindAny bool   `yaml:"danger_bind_any"`
 }
 
-func (a AdminConfig) Addr() string {
-	return net.JoinHostPort(a.Bind, strconv.Itoa(a.Port))
+func (c CtrlConfig) Addr() string {
+	return net.JoinHostPort(c.Bind, strconv.Itoa(c.Port))
 }
 
 type LoggingConfig struct {
@@ -56,7 +56,7 @@ type LoggingConfig struct {
 
 type Config struct {
 	App      AppConfig     `yaml:"app"`
-	Admin    AdminConfig   `yaml:"admin"`
+	Ctrl     CtrlConfig    `yaml:"ctrl"`
 	DataPath string        `yaml:"data_path"`
 	Logging  LoggingConfig `yaml:"logging"`
 }
@@ -65,11 +65,11 @@ func (c *Config) applyDefaults() {
 	if c.App.Port == 0 {
 		c.App.Port = defaultAppPort
 	}
-	if c.Admin.Port == 0 {
-		c.Admin.Port = defaultAdminPort
+	if c.Ctrl.Port == 0 {
+		c.Ctrl.Port = defaultCtrlPort
 	}
-	if c.Admin.Bind == "" {
-		c.Admin.Bind = "127.0.0.1"
+	if c.Ctrl.Bind == "" {
+		c.Ctrl.Bind = "127.0.0.1"
 	}
 	if c.App.Bind == "" {
 		detect := privateip.DetectAppBind(nil)
@@ -135,7 +135,7 @@ func normalizeLogFormat(raw string) (string, error) {
 
 func validatePort(port int, field string) error {
 	if port < minAllowedPort || port > maxAllowedPort {
-		return fmt.Errorf("invalid %s=%d: must be %d..%d (ports below %d are reserved; avoid collisions with stock Redis 6379 / default admin 6381)",
+		return fmt.Errorf("invalid %s=%d: must be %d..%d (ports below %d are reserved; avoid collisions with stock Redis 6379 / default ctrl 6381)",
 			field, port, minAllowedPort, maxAllowedPort, minAllowedPort)
 	}
 	return nil
@@ -161,38 +161,38 @@ func (c *Config) validate() error {
 	if err := validatePort(c.App.Port, "app.port"); err != nil {
 		return errors.New("STARTUP FATAL: " + err.Error())
 	}
-	if err := validatePort(c.Admin.Port, "admin.port"); err != nil {
+	if err := validatePort(c.Ctrl.Port, "ctrl.port"); err != nil {
 		return errors.New("STARTUP FATAL: " + err.Error())
 	}
-	if c.App.Port == c.Admin.Port {
+	if c.App.Port == c.Ctrl.Port {
 		return fmt.Errorf(
-			"STARTUP FATAL: app.port=%d must not equal admin.port=%d; assign distinct TCP ports",
-			c.App.Port, c.Admin.Port,
+			"STARTUP FATAL: app.port=%d must not equal ctrl.port=%d; assign distinct TCP ports",
+			c.App.Port, c.Ctrl.Port,
 		)
 	}
-	adminBind, err := resolveOne(c.Admin.Bind, "admin")
+	ctrlBind, err := resolveOne(c.Ctrl.Bind, "ctrl")
 	if err != nil {
 		return errors.New("STARTUP FATAL: " + err.Error())
 	}
 	if _, aerr := resolveOne(c.App.Bind, "app"); aerr != nil {
 		return errors.New("STARTUP FATAL: " + aerr.Error())
 	}
-	if adminBind != "" && adminBind != "127.0.0.1" {
-		parsed := net.ParseIP(adminBind)
+	if ctrlBind != "" && ctrlBind != "127.0.0.1" {
+		parsed := net.ParseIP(ctrlBind)
 		isLoopback := parsed != nil && parsed.IsLoopback()
-		if !isLoopback && !c.Admin.TrustProxy && !c.Admin.DangerBindAny {
+		if !isLoopback && !c.Ctrl.TrustProxy && !c.Ctrl.DangerBindAny {
 			return fmt.Errorf(
-				"STARTUP FATAL: admin.bind=%q (resolved) is not loopback; refusing. "+
-					"Bind admin to 127.0.0.1 (recommended; expose via Caddy+mTLS reverse-proxy), "+
-					"or set admin.trust_proxy (running behind trusted L7 PROXY v2 + mTLS verifier), "+
-					"or set admin.danger_bind_any (ACKNOWLEDGED unsafe, for isolated air-gapped nets only)",
-				adminBind,
+				"STARTUP FATAL: ctrl.bind=%q (resolved) is not loopback; refusing. "+
+					"Bind ctrl to 127.0.0.1 (recommended; expose via Caddy+mTLS reverse-proxy), "+
+					"or set ctrl.trust_proxy (running behind trusted L7 PROXY v2 + mTLS verifier), "+
+					"or set ctrl.danger_bind_any (ACKNOWLEDGED unsafe, for isolated air-gapped nets only)",
+				ctrlBind,
 			)
 		}
 	}
-	if c.App.Auth != "" && c.Admin.Auth != "" && c.App.Auth == c.Admin.Auth {
+	if c.App.Auth != "" && c.Ctrl.Auth != "" && c.App.Auth == c.Ctrl.Auth {
 		return errors.New(
-			"STARTUP FATAL: AppAuth equals AdminAuth; dual-port model requires distinct passwords; refusing",
+			"STARTUP FATAL: AppAuth equals CtrlAuth; dual-port model requires distinct passwords; refusing",
 		)
 	}
 
@@ -235,8 +235,8 @@ func (c *Config) validate() error {
 			"app", map[string]string{
 				"bind": c.App.Bind, "port": strconv.Itoa(c.App.Port), "auth_set": strconv.FormatBool(c.App.Auth != ""),
 			},
-			"admin", map[string]string{
-				"bind": c.Admin.Bind, "port": strconv.Itoa(c.Admin.Port), "auth_set": strconv.FormatBool(c.Admin.Auth != ""),
+			"ctrl", map[string]string{
+				"bind": c.Ctrl.Bind, "port": strconv.Itoa(c.Ctrl.Port), "auth_set": strconv.FormatBool(c.Ctrl.Auth != ""),
 			},
 			"storage_data_path", c.DataPath,
 			"logging_level", c.Logging.Level,

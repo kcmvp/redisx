@@ -78,17 +78,17 @@ func TestCmdSuite(t *testing.T) {
 func (s *CmdTestSuite) TestCmd() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
-	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
 	cfg := &Config{
 		DataPath: dbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	s.db = StartWithConfig(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
-	s.addr = cfg.Admin.Addr()
+	s.addr = cfg.Ctrl.Addr()
 	if err := s.db.writeDocSpec(docSpec{
 		Namespace: "user",
 		KeyAttrs:  []string{"id"},
@@ -560,17 +560,17 @@ func (s *CmdTestSuite) TestCmd() {
 func (s *CmdTestSuite) TestPubSub() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
-	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
 	cfg := &Config{
 		DataPath: dbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	db := StartWithConfig(cfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
-	addr := cfg.Admin.Addr()
+	addr := cfg.Ctrl.Addr()
 	defer func() { _ = Stop() }()
 
 	// Need a small sleep to ensure server is ready
@@ -706,17 +706,17 @@ func (s *CmdTestSuite) TestParseFilter() {
 func (s *CmdTestSuite) TestXCmd() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
-	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
 	cfg := &Config{
 		DataPath: dbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	s.db = StartWithConfig(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", appPort, adminPort)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
-	s.addr = cfg.Admin.Addr()
+	s.addr = cfg.Ctrl.Addr()
 	if err := s.db.writeDocSpec(docSpec{
 		Namespace: "user",
 		KeyAttrs:  []string{"id"},
@@ -1140,20 +1140,20 @@ func (s *CmdTestSuite) TestXCmd() {
 func (s *CmdTestSuite) TestStrictGates() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
-	appPort, adminPort := testutil.AllocateTwoFreePorts(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
 	appAuth := "app-secret-strict"
-	adminAuth := "admin-secret-strict"
+	ctrlAuth := "ctrl-secret-strict"
 	cfg := &Config{
 		DataPath: dbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort, Auth: adminAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
 	s.db = StartWithConfig(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil for strict gates; appPort=%d adminPort=%d", appPort, adminPort)
+		t.Fatalf("StartWithConfig returned nil for strict gates; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	appAddr := cfg.App.Addr()
-	adminAddr := cfg.Admin.Addr()
+	ctrlAddr := cfg.Ctrl.Addr()
 
 	runRESP := func(addr string, auth string, cmds [][]string) (string, bool) {
 		conn, err := net.Dial("tcp", addr)
@@ -1198,75 +1198,75 @@ func (s *CmdTestSuite) TestStrictGates() {
 	}
 
 	specStr := `{"namespace":"strictuser","mem":false,"key_attrs":["id","org"],"ttl_ns":3600000000000}`
-	resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regsch", specStr}})
+	resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", specStr}})
 	if !strings.Contains(resp, "+OK\r\n") {
 		t.Fatalf("REGSCH failed — expected OK, got: %s", resp)
 	}
 
 	t.Run("KV_no_colon_SET", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "noblekey", "v"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"set", "noblekey", "v"}})
 		require.Contains(t, resp, "namespace separator")
 	})
 	t.Run("KV_no_colon_SETEX", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setex", "noblekey", "10", "v"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"setex", "noblekey", "10", "v"}})
 		require.Contains(t, resp, "namespace separator")
 	})
 	t.Run("KV_no_colon_SETNX", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setnx", "noblekey", "v"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"setnx", "noblekey", "v"}})
 		require.Contains(t, resp, "namespace separator")
 	})
 	t.Run("KV_no_colon_GET", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "noblekey"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"get", "noblekey"}})
 		require.Contains(t, resp, "namespace separator")
 	})
 	t.Run("KV_no_colon_DEL", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "noblekey"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"del", "noblekey"}})
 		require.Contains(t, resp, "namespace separator")
 	})
 
 	t.Run("Doc_unregistered_ns_SET", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"set", "nonexistentns", `{"id":"1","org":"acme"}`}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"set", "nonexistentns", `{"id":"1","org":"acme"}`}})
 		require.Contains(t, resp, "not registered")
 	})
 	t.Run("Doc_unregistered_ns_SETEX", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setex", "nonexistentns", "60", `{"id":"1","org":"acme"}`}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"setex", "nonexistentns", "60", `{"id":"1","org":"acme"}`}})
 		require.Contains(t, resp, "not registered")
 	})
 	t.Run("Doc_unregistered_ns_SETNX", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"setnx", "nonexistentns", `{"id":"1","org":"acme"}`}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"setnx", "nonexistentns", `{"id":"1","org":"acme"}`}})
 		require.Contains(t, resp, "not registered")
 	})
 	t.Run("Doc_unregistered_ns_GET", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "nonexistentns", "1"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"get", "nonexistentns", "1"}})
 		require.Contains(t, resp, "not registered")
 	})
 	t.Run("Doc_unregistered_ns_DEL", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "nonexistentns", "1"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"del", "nonexistentns", "1"}})
 		require.Contains(t, resp, "not registered")
 	})
 	t.Run("Doc_unregistered_ns_UPDATE", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"update", "nonexistentns:*", "{}", `{"$set":{"age":30}}`}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"update", "nonexistentns:*", "{}", `{"$set":{"age":30}}`}})
 		require.Contains(t, resp, "not registered", "UPDATE on unregistered namespace must fail-closed with precise registry ERR")
 	})
 
 	t.Run("Doc_GET_ns_alone_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"get", "strictuser"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"get", "strictuser"}})
 		require.Contains(t, resp, "alone is not a query")
 	})
 	t.Run("Doc_DEL_ns_alone_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"del", "strictuser"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"del", "strictuser"}})
 		require.Contains(t, resp, "alone is not a delete target")
 	})
 
 	t.Run("Doc_REGSCH_reserved_indexes_field_ERR", func(t *testing.T) {
 		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"regsch", bad}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", bad}})
 		require.Contains(t, resp, "reserved field 'indexes'")
 	})
 
 	t.Run("Doc_SET_object_ok", func(t *testing.T) {
 		doc := `{"id":"u1","org":"acme","age":30}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "strictuser", doc},
 			{"get", "strictuser", naming.JoinPKAttrValues([]string{"u1", "acme"})},
 		})
@@ -1278,7 +1278,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 		a := `{"id":"u_coll","org":"acme","n":1}`
 		b := `{"id":"u_coll","org":"acme","n":2}`
 		c := `{"id":"u_second","org":"acme","n":3}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "strictuser", a},
 			{"setnx", "strictuser", "[" + b + "," + c + "]"},
 			{"get", "strictuser", naming.JoinPKAttrValues([]string{"u_coll", "acme"})},
@@ -1292,7 +1292,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	})
 
 	t.Run("Doc_UPDATE_pk_mutation_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "strictuser", `{"id":"pk1","org":"acme","age":1}`},
 			{"update", "strictuser:*", `{"id":"pk1"}`, `{"id":"PK_CHANGED"}`},
 		})
@@ -1300,27 +1300,27 @@ func (s *CmdTestSuite) TestStrictGates() {
 	})
 
 	t.Run("Doc_SEARCHKEY_bare_pivot_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchkey", "*", "{}"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"searchkey", "*", "{}"}})
 		require.Contains(t, resp, "must be anchored to a namespace")
 	})
 
 	t.Run("Doc_SEARCHKEY_unregistered_ns_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchkey", "ghostns:*", "{}"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"searchkey", "ghostns:*", "{}"}})
 		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGSCH gate; SEARCHKEY returns 0 matched values")
 	})
 
 	t.Run("Doc_SEARCHINDEX_unregistered_owner_ns_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{{"searchindex", "ghostdoc:zzz", `{"op":"pattern","p":"*"}`, "{}"}})
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"searchindex", "ghostdoc:zzz", `{"op":"pattern","p":"*"}`, "{}"}})
 		require.Contains(t, resp, "not registered")
 	})
 
 	t.Run("KEYS_app_port_Gate1_reject", func(t *testing.T) {
 		resp, _ := runRESP(appAddr, appAuth, [][]string{{"keys", "*"}})
 		require.Contains(t, resp, "No Privilege")
-		require.Contains(t, resp, "admin port")
+		require.Contains(t, resp, "ctrl port")
 	})
-	t.Run("KEYS_admin_port_pass", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+	t.Run("KEYS_ctrl_port_pass", func(t *testing.T) {
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "strictuser", `{"id":"u_admin1","org":"acme","age":1}`},
 			{"set", "strictuser", `{"id":"u_admin2","org":"acme","age":2}`},
 			{"keys", "strictuser"},
@@ -1332,7 +1332,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 
 	t.Run("REGSCH_DROPSCH_roundtrip_present", func(t *testing.T) {
 		docJSON := `{"namespace":"strictmeta","mem":false,"key_attrs":["id"],"ttl_ns":0}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"regsch", docJSON},
 			{"dropsch", "strictmeta"},
 			{"regsch", docJSON},
@@ -1343,7 +1343,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	t.Run("REGIDX_DROPIDX_roundtrip_present", func(t *testing.T) {
 		docJSON := `{"namespace":"strictidxowner","mem":false,"key_attrs":["id"],"ttl_ns":0}`
 		idxJSON := `{"owner_ns":"strictidxowner","logical":"age","paths":["age"],"key_pattern":"_d_strictidxowner:*"}`
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"regsch", docJSON},
 			{"regidx", idxJSON},
 			{"dropidx", "strictidxowner", "age"},
@@ -1352,7 +1352,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	})
 
 	t.Run("KV_mutation_internal_doc_ns_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "_doc_:strictuser", `{"ns":"evil"}`},
 			{"setnx", "_idx_:strictuser_age:v_1234567890ab", `{}`},
 			{"setex", "_auth_:keyleak", "60", "5"},
@@ -1361,7 +1361,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 		require.Contains(t, resp, "managed exclusively via dedicated registry commands", "any mutation of _doc_/_idx_/_auth_ must raise the Write Guard ERR")
 	})
 	t.Run("KV_DEL_multi_full_keys_ERR", func(t *testing.T) {
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "strictuser", `{"id":"u_del1","org":"acme","age":1}`},
 			{"set", "strictuser", `{"id":"u_del2","org":"acme","age":2}`},
 			{"del", "strictuser:u_del1_acme", "strictuser:u_del2_acme"},
@@ -1374,7 +1374,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 		pk2Dup := `{"id":"u_sn_1","org":"acme","age":9999}`
 		pkSuffix1 := naming.JoinPKAttrValues([]string{"u_se_1", "acme"})
 		pkSuffix2 := naming.JoinPKAttrValues([]string{"u_sn_1", "acme"})
-		resp, _ := runRESP(adminAddr, adminAuth, [][]string{
+		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"setex", "strictuser", "60", pk1},
 			{"get", "strictuser", pkSuffix1},
 			{"setnx", "strictuser", pk2},

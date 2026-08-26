@@ -23,7 +23,7 @@ func main() {
 	slog.Info("demo booting redisx via yaml config",
 		"config", defaultConfigName, "db", cfg.DataPath,
 		"app", cfg.App.Addr(),
-		"ctrl", cfg.Admin.Addr(),
+		"ctrl", cfg.Ctrl.Addr(),
 	)
 	db := server.StartWithConfig(cfg)
 	if db == nil {
@@ -33,10 +33,10 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("demo: redisx connect ->")
-	if cfg.Admin.Auth == "" {
-		fmt.Printf("  redisx -H 127.0.0.1 -p %d\n", cfg.Admin.Port)
+	if cfg.Ctrl.Auth == "" {
+		fmt.Printf("  redisx -H 127.0.0.1 -p %d\n", cfg.Ctrl.Port)
 	} else {
-		fmt.Printf("  redisx -H 127.0.0.1 -p %d -a %s\n", cfg.Admin.Port, cfg.Admin.Auth)
+		fmt.Printf("  redisx -H 127.0.0.1 -p %d -a %s\n", cfg.Ctrl.Port, cfg.Ctrl.Auth)
 	}
 	fmt.Println("  (Ctrl-C / SIGTERM / SIGINT to shutdown cleanly)")
 	fmt.Println()

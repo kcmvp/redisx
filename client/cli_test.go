@@ -151,9 +151,9 @@ func ensureServerAndSeed(t *testing.T) {
 		cfg := &server.Config{
 			DataPath: dbPath,
 			App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
-			Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort},
+			Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 		}
-		clientTestServerAddr = cfg.Admin.Addr()
+		clientTestServerAddr = cfg.Ctrl.Addr()
 		db := server.StartWithConfig(cfg,
 			testUserDoc(""),
 			SearchFixtureDoc(""),
@@ -264,9 +264,9 @@ func (s *ClientTestSuite) SetupSuite() {
 	cfg := &server.Config{
 		DataPath: dbPath,
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	clientTestServerAddr = cfg.Admin.Addr()
+	clientTestServerAddr = cfg.Ctrl.Addr()
 	db := server.StartWithConfig(cfg,
 		testUserDoc(""),
 		SearchFixtureDoc(""),
@@ -753,15 +753,15 @@ func (s *ClientTestSuite) TestConnectCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestConnectEmbed() {
+func (s *ClientTestSuite) TestConnectEmbedded() {
 	s.SetupTest()
 
-	err := ConnectEmbed(clientTestServerAddr)
+	err := ConnectEmbedded()
 	s.NoError(err)
 	s.ensureConnected()
 }
 
-func (s *ClientTestSuite) TestConnectEmbedStopsOnProcessSignal() {
+func (s *ClientTestSuite) TestConnectEmbeddedStopsOnProcessSignal() {
 	s.SetupTest()
 
 	var capturedSigCh chan<- os.Signal
@@ -769,7 +769,7 @@ func (s *ClientTestSuite) TestConnectEmbedStopsOnProcessSignal() {
 		capturedSigCh = c
 	}
 
-	err := ConnectEmbed(clientTestServerAddr)
+	err := ConnectEmbedded()
 	s.NoError(err)
 	s.ensureConnected()
 
@@ -903,15 +903,15 @@ func runEmbedSignalChild(t *testing.T) {
 	cfg := &server.Config{
 		DataPath: dbPath,
 		App:      server.AppConfig{Bind: ctrlHost, Port: appPort},
-		Admin:    server.AdminConfig{Bind: ctrlHost, Port: ctrlPort},
+		Ctrl:     server.CtrlConfig{Bind: ctrlHost, Port: ctrlPort},
 	}
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		t.Fatalf("server.StartWithConfig() returned nil; appPort=%d ctrlPort=%d — likely a bind race, retry", appPort, ctrlPort)
 	}
 
-	if err := ConnectEmbed(addr); err != nil {
-		t.Fatalf("ConnectEmbed() failed: %v", err)
+	if err := ConnectEmbedded(); err != nil {
+		t.Fatalf("ConnectEmbedded() failed: %v", err)
 	}
 
 	waitForSharedClient(t)
@@ -2268,7 +2268,7 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 	cfg := &server.Config{
 		DataPath: testutil.DBPath(t),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
@@ -2318,7 +2318,7 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 	cfg := &server.Config{
 		DataPath: testutil.DBPath(t),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
 	db := server.StartWithConfig(cfg)
 	require.NotNil(t, db)
@@ -2333,18 +2333,18 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 		require.Contains(t, dialErr.Error(), "invalid password for app port")
 	})
 	t.Run("ctrl port with app auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
-		_, dialErr := connect(cfg.Admin.Addr(), appAuth)
+		_, dialErr := connect(cfg.Ctrl.Addr(), appAuth)
 		require.Error(t, dialErr)
 		require.Contains(t, dialErr.Error(), "WRONGPASS")
 		require.Contains(t, dialErr.Error(), "invalid password")
 	})
 	t.Run("ctrl port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
-		err := Connect(cfg.Admin.Addr(), "")
+		err := Connect(cfg.Ctrl.Addr(), "")
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "auth key is empty")
 	})
 	t.Run("ctrl port with invalid non-empty auth key → connect() returns raw ERR authentication failed", func(t *testing.T) {
-		_, dialErr := connect(cfg.Admin.Addr(), "wrong-wrong-wrong")
+		_, dialErr := connect(cfg.Ctrl.Addr(), "wrong-wrong-wrong")
 		require.Error(t, dialErr)
 		require.Contains(t, dialErr.Error(), "ERR authentication failed")
 	})
@@ -2490,9 +2490,9 @@ func BenchmarkSetNoHooks(b *testing.B) {
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
-	clientTestServerAddr = cfg.Admin.Addr()
+	clientTestServerAddr = cfg.Ctrl.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
@@ -2530,9 +2530,9 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
-	clientTestServerAddr = cfg.Admin.Addr()
+	clientTestServerAddr = cfg.Ctrl.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
@@ -2570,9 +2570,9 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
-	clientTestServerAddr = cfg.Admin.Addr()
+	clientTestServerAddr = cfg.Ctrl.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
@@ -2612,9 +2612,9 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
-		Admin:    server.AdminConfig{Bind: "127.0.0.1", Port: 36380},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
-	clientTestServerAddr = cfg.Admin.Addr()
+	clientTestServerAddr = cfg.Ctrl.Addr()
 	db := server.StartWithConfig(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
@@ -2661,7 +2661,7 @@ func TestDocSuite(t *testing.T) {
 func (s *DocTestSuite) SetupSuite() {
 	ensureServerAndSeed(s.T())
 
-	err := ConnectEmbed(clientTestServerAddr)
+	err := ConnectEmbedded()
 	s.Require().NoError(err)
 
 	for i := 0; i < 30; i++ {
@@ -2676,7 +2676,7 @@ func (s *DocTestSuite) SetupSuite() {
 func (s *DocTestSuite) SetupTest() {
 	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
 		disconnect()
-		err := ConnectEmbed(clientTestServerAddr)
+		err := ConnectEmbedded()
 		if err != nil {
 			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
 			s.Require().NoError(err)
@@ -3068,7 +3068,7 @@ func (s *DocSearchKeyRangeSuite) SetupSuite() {
 func (s *DocSearchKeyRangeSuite) SetupTest() {
 	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
 		disconnect()
-		err := ConnectEmbed(clientTestServerAddr)
+		err := ConnectEmbedded()
 		if err != nil {
 			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
 			s.Require().NoError(err)
@@ -3100,7 +3100,7 @@ func (s *DocUpdateKeyRangeSuite) SetupSuite() {
 func (s *DocUpdateKeyRangeSuite) SetupTest() {
 	if c := getSharedClient(); c == nil || healthCheck(context.Background(), c) != nil {
 		disconnect()
-		err := ConnectEmbed(clientTestServerAddr)
+		err := ConnectEmbedded()
 		if err != nil {
 			err = Connect(clientTestServerAddr, clientTestExternalAuthKey)
 			s.Require().NoError(err)

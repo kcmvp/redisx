@@ -194,17 +194,17 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 
 	// Start server with default external auth key limit = 1
 	authLimitDbPath := testutil.DBPath(t)
-	alp, admP := testutil.AllocateTwoFreePorts(t)
+	alp, ctlP := testutil.AllocateTwoFreePorts(t)
 	acfg := &Config{
 		DataPath: authLimitDbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: alp},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: admP},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctlP},
 	}
 	db := StartWithConfig(acfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", alp, admP)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", alp, ctlP)
 	}
-	addr := acfg.Admin.Addr()
+	addr := acfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
 	defer func() { _ = Stop() }()
 
@@ -289,17 +289,17 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 	t := s.T()
 	dynDbPath := testutil.DBPath(t)
-	dynApp, dynAdm := testutil.AllocateTwoFreePorts(t)
+	dynApp, dynCtl := testutil.AllocateTwoFreePorts(t)
 	dynCfg := &Config{
 		DataPath: dynDbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: dynApp},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: dynAdm},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: dynCtl},
 	}
 	db := StartWithConfig(dynCfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", dynApp, dynAdm)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", dynApp, dynCtl)
 	}
-	addr := dynCfg.Admin.Addr()
+	addr := dynCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
 	defer func() { _ = Stop() }()
 
@@ -361,17 +361,17 @@ func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 	t := s.T()
 	sameDbPath := testutil.DBPath(t)
-	sameApp, sameAdm := testutil.AllocateTwoFreePorts(t)
+	sameApp, sameCtl := testutil.AllocateTwoFreePorts(t)
 	sameCfg := &Config{
 		DataPath: sameDbPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: sameApp},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: sameAdm},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: sameCtl},
 	}
 	db := StartWithConfig(sameCfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d adminPort=%d", sameApp, sameAdm)
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", sameApp, sameCtl)
 	}
-	addr := sameCfg.Admin.Addr()
+	addr := sameCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
 	defer func() { _ = Stop() }()
 
@@ -501,12 +501,12 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	badDataPath := filepath.Join(parentFile, "kv.db")
 	appPort, pErr := testutil.AllocateFreePort()
 	s.Require().NoError(pErr)
-	adminPort, pErr := testutil.AllocateFreePort()
+	ctrlPort, pErr := testutil.AllocateFreePort()
 	s.Require().NoError(pErr)
 	cfg := &Config{
 		DataPath: badDataPath,
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	db := StartWithConfig(cfg)
 	s.Nil(db)
@@ -535,12 +535,12 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 
 	appPort, pErr := testutil.AllocateFreePort()
 	s.Require().NoError(pErr)
-	adminPort, pErr := testutil.AllocateFreePort()
+	ctrlPort, pErr := testutil.AllocateFreePort()
 	s.Require().NoError(pErr)
 	cfg := &Config{
 		DataPath: testutil.DBPath(s.T()),
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	db := StartWithConfig(cfg)
 	s.NotNil(db) // DB opens successfully, but background listen fails
@@ -665,7 +665,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 		lcfg := &Config{
 			DataPath: testutil.DBPath(t),
 			App:      AppConfig{Bind: "127.0.0.1", Port: lp1},
-			Admin:    AdminConfig{Bind: "127.0.0.1", Port: lp2},
+			Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: lp2},
 		}
 		_ = StartWithConfig(lcfg)
 		close(doneCh)
@@ -674,7 +674,7 @@ func (s *ServerTestSuite) TestStartListenError() {
 	select {
 	case <-listenCalledCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("StartWithConfig should invoke listenAndServeFn for either App or Admin listener")
+		t.Fatal("StartWithConfig should invoke listenAndServeFn for either App or Ctrl listener")
 	}
 
 	// Wait for goroutine to fully finish and call osExitFn
@@ -706,14 +706,14 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 
 	appPort, pErr := testutil.AllocateFreePort()
 	s.Require().NoError(pErr)
-	adminPort := 16380
+	ctrlPort := 16380
 
 	cfg := &Config{
 		DataPath: testutil.DBPath(t),
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
-		Admin:    AdminConfig{Bind: "127.0.0.1", Port: adminPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	startAdminAddr := cfg.Admin.Addr()
+	startCtrlAddr := cfg.Ctrl.Addr()
 	_ = StartWithConfig(cfg)
 
 	gotAddrs := map[string]struct{}{}
@@ -727,12 +727,12 @@ loop:
 			break loop
 		}
 	}
-	if _, ok := gotAddrs[startAdminAddr]; !ok {
+	if _, ok := gotAddrs[startCtrlAddr]; !ok {
 		keys := make([]string, 0, len(gotAddrs))
 		for k := range gotAddrs {
 			keys = append(keys, k)
 		}
-		t.Fatalf("StartWithConfig() listener called with %v; want admin addr %q present among them", keys, startAdminAddr)
+		t.Fatalf("StartWithConfig() listener called with %v; want ctrl addr %q present among them", keys, startCtrlAddr)
 	}
 }
 
@@ -741,6 +741,6 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	_ = t
 	// Legacy behavior "StartForTest("") → default to privateAddr" is obsolete
 	// because StartForTest was removed. The equivalent modern path is
-	// StartWithConfig with Admin.Port explicitly set to 16380 — exercised by
+	// StartWithConfig with Ctrl.Port explicitly set to 16380 — exercised by
 	// TestStartInvokesListener above.
 }

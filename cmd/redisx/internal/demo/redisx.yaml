@@ -7,7 +7,7 @@ app:
   # bind defaults to the first private IP detected (or 127.0.0.1 as fallback)
   # auth is intentionally empty for the demo
 
-admin:
+ctrl:
   bind: "127.0.0.1"
   port: 7381
   # auth is intentionally empty for the demo

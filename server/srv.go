@@ -111,7 +111,7 @@ var (
 // redisx.yaml from disk).
 //
 // Config is always run through Config.validate: defaults are populated,
-// security gates (equal auth / non-loopback admin / port range / duplicate
+// security gates (equal auth / non-loopback ctrl / port range / duplicate
 // ports) trigger a hard exit, and the database path is created and probed
 // for writability before any listeners open. Passing nil is equivalent to
 // the empty Config{} (pure system defaults).
@@ -119,13 +119,13 @@ var (
 // On boot, redisx automatically rebuilds its BuntDB index registry by
 // scanning all "_idx_:*" meta keys stored on disk and in the volatile
 // mem-layer. Indexes are NO LONGER declared as Go parameters passed to any
-// Start variant; they must be created via the admin CLI (regidx command).
+// Start variant; they must be created via the ctrl CLI (regidx command).
 //
 // Example (harness-style direct embed):
 //
 //	cfg := &server.Config{
 //	    App: server.AppConfig{Bind: "127.0.0.1", Port: 7379},
-//	    Admin: server.AdminConfig{Bind: "127.0.0.1", Port: 7381, DangerBindAny: true},
+//	    Ctrl: server.CtrlConfig{Bind: "127.0.0.1", Port: 7381, DangerBindAny: true},
 //	    DataPath: "/tmp/redisx.test.db",
 //	}
 //	db := server.StartWithConfig(cfg, UserDoc(""))
@@ -144,16 +144,18 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 	}
 
 	appAddr := cfg.App.Addr()
-	adminAddr := cfg.Admin.Addr()
+	ctrlAddr := cfg.Ctrl.Addr()
 	appAuthLabel := lo.Ternary(cfg.App.Auth != "", "set", "unset")
-	adminAuthLabel := lo.Ternary(cfg.Admin.Auth != "", "set", "unset")
+	ctrlAuthLabel := lo.Ternary(cfg.Ctrl.Auth != "", "set", "unset")
 	slog.Info("redisx dual-port config",
 		"app_addr", appAddr,
-		"admin_addr", adminAddr,
+		"ctrl_addr", ctrlAddr,
 		"app_auth", appAuthLabel,
-		"admin_auth", adminAuthLabel,
+		"ctrl_auth", ctrlAuthLabel,
 		"doc_schemas", len(schemas),
 	)
+
+	internal.SetAddr(ctrlAddr, appAddr)
 
 	watchShutdownSignals()
 	var db *DB
@@ -165,7 +167,7 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 		db = opened
 	})
 
-	configureAuthKeys(cfg.App.Auth, cfg.Admin.Auth)
+	configureAuthKeys(cfg.App.Auth, cfg.Ctrl.Auth)
 	if db == nil {
 		globalMu.RLock()
 		db = currentDB
@@ -174,7 +176,7 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 	if db != nil {
 		var ps redcon.PubSub
 		go bootListener(portRoleApp, appAddr, db, &ps)
-		go bootListener(portRoleAdmin, adminAddr, db, &ps)
+		go bootListener(portRoleCtrl, ctrlAddr, db, &ps)
 		time.Sleep(10 * time.Millisecond)
 	}
 	return db
@@ -198,7 +200,7 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 //
 // When redisx.yaml is missing or unreadable (except YAML syntax errors) the
 // zero-config defaults kick in: App 7379 on auto-selected RFC1918 bind,
-// Admin 7381 on 127.0.0.1, and database file at ~/.redisx/redisx.db.
+// Ctrl 7381 on 127.0.0.1, and database file at ~/.redisx/redisx.db.
 //
 // To supply a Config struct directly (e.g. from tests or harnesses) instead
 // of loading a file, use StartWithConfig.
@@ -266,6 +268,7 @@ func Stop() error {
 	authStateMu.Unlock()
 
 	srvOnce = sync.Once{}
+	internal.ResetAddrs()
 	return err
 }
 
@@ -354,9 +357,9 @@ func releaseAuthConn(key string) {
 	if key == "" || key == internalAuthKey {
 		return
 	}
-	appAuth, adminAuth, configured := getAuthConfig()
+	appAuth, ctrlAuth, configured := getAuthConfig()
 	if configured {
-		if (appAuth != "" && key == appAuth) || (adminAuth != "" && key == adminAuth) {
+		if (appAuth != "" && key == appAuth) || (ctrlAuth != "" && key == ctrlAuth) {
 			return
 		}
 	}
@@ -375,9 +378,9 @@ func acquireAuthConn(db *DB, key string) error {
 	if key == internalAuthKey {
 		return nil
 	}
-	appAuth, adminAuth, configured := getAuthConfig()
+	appAuth, ctrlAuth, configured := getAuthConfig()
 	if configured {
-		if (appAuth != "" && key == appAuth) || (adminAuth != "" && key == adminAuth) {
+		if (appAuth != "" && key == appAuth) || (ctrlAuth != "" && key == ctrlAuth) {
 			return nil
 		}
 	}
@@ -507,16 +510,16 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	if cmdName != cmdAuth && cmdName != cmdClient {
 		connAuthKey, _ := conn.Context().(string)
 		if conn.Context() == nil || connAuthKey == "" {
-			appAuth, adminAuth, _ := getAuthConfig()
+			appAuth, ctrlAuth, _ := getAuthConfig()
 			role := connPortRole(conn)
 			var authRequired bool
 			switch role {
-			case portRoleAdmin:
-				authRequired = adminAuth != ""
+			case portRoleCtrl:
+				authRequired = ctrlAuth != ""
 			case portRoleApp:
 				authRequired = appAuth != ""
 			default:
-				authRequired = (appAuth != "") || (adminAuth != "")
+				authRequired = (appAuth != "") || (ctrlAuth != "")
 			}
 			if authRequired {
 				if cmdName == cmdHello || cmdName == cmdPing || cmdName == cmdQuit {

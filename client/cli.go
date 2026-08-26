@@ -581,9 +581,18 @@ func Connect(respAddr, authKey string) error {
 	return nil
 }
 
-// ConnectEmbed starts the bridge lifecycle with the shared in-process auth key.
-func ConnectEmbed(respAddr string) error {
-	return Connect(respAddr, internal.AuthKey())
+// ConnectEmbedded starts the bridge lifecycle against the in-process embedded
+// server. It reads the ctrl-port address set by server.StartWithConfig via
+// internal.CtrlAddr() and authenticates with the shared per-process
+// internal.AuthKey(). Callers that have not booted an in-process server (or
+// that want to dial a remote cross-process server) should use Connect() with
+// an explicit address and auth key.
+func ConnectEmbedded() error {
+	addr := internal.CtrlAddr()
+	if addr == "" {
+		return errors.New("ConnectEmbedded: no in-process ctrl address registered; call server.StartWithConfig first, or use Connect(addr, auth) for remote servers")
+	}
+	return Connect(addr, internal.AuthKey())
 }
 
 // disconnect stops the current bridge lifecycle and closes the shared client.
