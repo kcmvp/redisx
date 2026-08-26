@@ -47,7 +47,6 @@ func cYellow(s string) string  { return tui.Yellow(s) }
 func cRed(s string) string     { return tui.Red(s) }
 func cMagenta(s string) string { return tui.Magenta(s) }
 func cDim(s string) string     { return tui.Dim(s) }
-func cPurple(s string) string  { return tui.Magenta(s) }
 
 func bannerLinesFor(host, port string) []string {
 	headPure := "Redisx  RESP Shell  — Raw RESP passthrough; support & privilege enforcement handled server-side"

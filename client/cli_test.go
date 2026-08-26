@@ -122,7 +122,7 @@ func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 
 func stopAndResetGlobalState() {
 	disconnect()
-	setLifecycleCtx(nil, nil)
+	setLifecycleCtx(context.TODO(), nil)
 	_ = server.Stop()
 	cliOnce = sync.Once{}
 	cliServerSeedOnce = sync.Once{}

@@ -96,14 +96,6 @@ func runRedisxDiagnose(ctx tui.RunContext, sess *session.Session, data *AppData,
 	return nil
 }
 
-func cacheFromCtx(ctx tui.RunContext) *session.Cache {
-	data, _ := ctx.UserData.(*AppData)
-	if data == nil {
-		return nil
-	}
-	return data.Cache
-}
-
 var examples = map[string][]string{
 	"example": {
 		"example (no args)   — list example targets",
