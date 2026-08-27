@@ -13,10 +13,49 @@ import (
 
 func noShellCmds(name string) bool {
 	switch name {
-	case "clear", "!clear", "cls", "version", "!version":
+	case "clear", "!clear", "cls", "version", "!version", "con", "connect":
 		return true
 	}
 	return false
+}
+
+// notConnectedErr is the error every connection-needing command returns when
+// the shell has no session yet.
+func notConnectedErr(data *AppData) error {
+	hint := "not connected — connect with `con -h <host> -p <port> [-a <auth>]` or `con <host> <port> [auth]`"
+	if data != nil && len(data.Endpoints) > 0 {
+		hint += " or " + ShortcutNames(data.Endpoints) + " (from ./" + LocalConfigFile + ")"
+	}
+	return fmt.Errorf("%s", hint)
+}
+
+// connectSession dials a new session and swaps it in as the shell's current
+// session, closing the previous one when present.
+func connectSession(data *AppData, host string, port int, auth string) error {
+	if data == nil {
+		return fmt.Errorf("no app data")
+	}
+	timeoutMs := data.Opts.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 3000
+	}
+	created, err := session.New(session.Options{
+		Host:      host,
+		Port:      port,
+		Auth:      auth,
+		TimeoutMs: timeoutMs,
+	})
+	if err != nil {
+		return err
+	}
+	if old := *data.Session; old != nil {
+		_ = old.Close()
+	}
+	*data.Session = created
+	data.ConnHost = host
+	data.ConnPort = port
+	data.Cache.Invalidate()
+	return nil
 }
 
 func BuildApp(sessPtr **session.Session) *tui.CLIApp {
@@ -28,12 +67,22 @@ func BuildApp(sessPtr **session.Session) *tui.CLIApp {
 			if data == nil {
 				return nil
 			}
+			// Entering the REPL (name == "") never auto-dials; the user
+			// connects explicitly via con / !app / !ctrl.
+			if name == "" {
+				return nil
+			}
 			if noShellCmds(name) {
 				return nil
 			}
 			if *data.Session != nil {
 				return nil
 			}
+			if data.InREPL {
+				return notConnectedErr(data)
+			}
+			// One-shot mode (subcommand on the command line) keeps the lazy
+			// dial from the -h/-p/-a flags for script usage.
 			created, err := session.New(session.Options{
 				Host:      data.Opts.Host,
 				Port:      data.Opts.Port,
@@ -44,11 +93,13 @@ func BuildApp(sessPtr **session.Session) *tui.CLIApp {
 				return err
 			}
 			*data.Session = created
+			data.ConnHost = data.Opts.Host
+			data.ConnPort = data.Opts.Port
 			return nil
 		},
 		OnUnknown: func(ctx tui.RunContext, args []string) (handled bool, err error) {
 			data, _ := ctx.UserData.(*AppData)
-			if data == nil || *data.Session == nil {
+			if data == nil {
 				return false, nil
 			}
 			if len(args) == 0 {
@@ -56,15 +107,23 @@ func BuildApp(sessPtr **session.Session) *tui.CLIApp {
 			}
 			w := args[0]
 			if strings.HasPrefix(w, "!") {
+				if ep := FindEndpoint(data.Endpoints, strings.TrimPrefix(w, "!")); ep != nil {
+					if err := connectSession(data, ep.Host, ep.Port, ep.Auth); err != nil {
+						return true, err
+					}
+					fmt.Printf("connected to %s (%s)\n", cCyan(ep.Addr()), ep.Name)
+					return true, nil
+				}
 				return false, fmt.Errorf("unknown sugar command %q — run !help to list available wizards", w)
 			}
-			sess := *data.Session
+			if *data.Session == nil {
+				return true, notConnectedErr(data)
+			}
 			call := make([]any, 0, len(args))
 			for _, a := range args {
 				call = append(call, a)
 			}
-			fmt.Fprintln(os.Stderr, cYellow("forwarding as raw RESP command (not a registered sub-command)"))
-			v, err := sess.RawDo(call).Result()
+			v, err := (*data.Session).RawDo(call).Result()
 			if err != nil {
 				return true, err
 			}
@@ -76,11 +135,14 @@ func BuildApp(sessPtr **session.Session) *tui.CLIApp {
 		},
 		Banner: func(ctx tui.RunContext) string {
 			data, _ := ctx.UserData.(*AppData)
-			host, port := "127.0.0.1", "7381"
-			if data != nil {
-				host, port = data.HostPort()
+			if data != nil && *data.Session != nil {
+				return BannerFor(data.ConnHost, fmt.Sprintf("%d", data.ConnPort))
 			}
-			return BannerFor(host, port)
+			var eps []LocalEndpoint
+			if data != nil {
+				eps = data.Endpoints
+			}
+			return BannerDisconnectedFor(eps)
 		},
 		EnterREPL: func(ctx tui.RunContext) error {
 			data, _ := ctx.UserData.(*AppData)
@@ -90,8 +152,13 @@ func BuildApp(sessPtr **session.Session) *tui.CLIApp {
 			if app == nil {
 				return fmt.Errorf("app not ready")
 			}
-			host, port := data.HostPort()
-			fmt.Print(BannerFor(host, port))
+			var eps []LocalEndpoint
+			if *data.Session != nil {
+				fmt.Print(BannerFor(data.ConnHost, fmt.Sprintf("%d", data.ConnPort)))
+			} else {
+				eps = data.Endpoints
+				fmt.Print(BannerDisconnectedFor(eps))
+			}
 			return RunREPL(app, data)
 		},
 		GlobalHelp: func(ctx tui.RunContext, groups map[string][]tui.GroupEntry, flagHelpText string) string {
@@ -163,6 +230,11 @@ to execute a single action and exit (e.g. "redisx regsch").
 				sb.WriteString("\n")
 			}
 			fmt.Fprintf(&sb, "REPL-only shortcuts (type these inside the redisx> prompt):\n")
+			sb.WriteString("  con [-h host] [-p port] [-a auth] | con [host] [port] [auth] — connect to a server, redis-cli style (no args reuses the -h/-p/-a startup values)\n")
+			ud2, _ := ctx.UserData.(*AppData)
+			if ud2 != nil && len(ud2.Endpoints) > 0 {
+				fmt.Fprintf(&sb, "  %s — connect to the matching ./%s endpoint\n", ShortcutNames(ud2.Endpoints), LocalConfigFile)
+			}
 			sb.WriteString("  <enter> with empty = no-op; quit / exit / logout / !quit = exit REPL\n")
 			sb.WriteString("  unrecognised non-! words are forwarded verbatim as raw RESP commands (e.g. SET, GET, KEYS)\n")
 			sb.WriteString("  unrecognised !words error out and hint at !help\n")
@@ -175,7 +247,13 @@ to execute a single action and exit (e.g. "redisx regsch").
 	}
 	app = tui.NewCLIApp("redisx", Version, hooks)
 	app.SetUserData(ud)
-	app.Flags().StringVar(&ud.Opts.Host, "host", "H", "127.0.0.1", "server host (never expose publicly; cross-machine access via Caddy+mTLS)")
+	// Discover ./redisx.yaml endpoint shortcuts (top-level keys → !app/!ctrl/...).
+	if eps, err := LoadLocalConfig("."); err != nil {
+		fmt.Fprintln(os.Stderr, cYellow("warning: "+err.Error()))
+	} else if len(eps) > 0 {
+		ud.Endpoints = eps
+	}
+	app.Flags().StringVar(&ud.Opts.Host, "host", "h", "127.0.0.1", "server host (never expose publicly; cross-machine access via Caddy+mTLS)")
 	app.Flags().IntVar(&ud.Opts.Port, "port", "p", 7381, "server port")
 	app.Flags().StringVar(&ud.Opts.Auth, "auth", "a", "", "AUTH key (required only if the target server was started with --auth enabled)")
 	app.Flags().IntVar(&ud.Opts.TimeoutMs, "timeout-ms", "", 3000, "dial / read / write timeout in milliseconds")

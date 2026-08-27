@@ -863,10 +863,11 @@ func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
 // Guardrails (applied BEFORE touching storage):
 //   - no leading glob wildcard (would force full DB scan + defeat
 //     BuntDB ordered index usefulness)
-//   - no leading underscore (forbids enumerating `_doc_:` / `_idx_:` /
-//     `_auth_:` meta keys — wire-level enumeration of registry data is
-//     a ctrl-only exposure and goes via REGSCH/REGIDX introspection,
-//     not raw KEYS).
+//   - `_doc_:` / `_idx_:` meta namespaces are READ-enumerable so
+//     operators can list registered doc/idx specs and GET their
+//     definitions (writes to them stay rejected via
+//     validateKVMutationKey). `_auth_:` (credentials) and any other
+//     underscore-prefixed shape remain forbidden.
 //
 // Routing via SSoTs:
 //   - resolveLayer(keyPattern) — storage-layer decision is delegated to
@@ -899,9 +900,21 @@ func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub
 		conn.WriteError("ERR forbidden key pattern")
 		return
 	}
-	if naming.HasUnderscorePrefix(keyPattern) {
-		conn.WriteError("ERR forbidden key pattern")
-		return
+	// Registry introspection: bare `_doc_` / `_idx_` expand to their
+	// `:*` glob; explicit `_doc_:` / `_idx_:` prefixed patterns pass.
+	// `_auth_:` and unknown underscore shapes stay forbidden.
+	switch {
+	case keyPattern == naming.DocMetaNsPrefix():
+		keyPattern = naming.DocMetaNsPrefix() + ":*"
+	case keyPattern == naming.IdxMetaNsPrefix():
+		keyPattern = naming.IdxMetaNsPrefix() + ":*"
+	default:
+		if naming.HasUnderscorePrefix(keyPattern) &&
+			!strings.HasPrefix(keyPattern, naming.DocMetaNsPrefix()+":") &&
+			!strings.HasPrefix(keyPattern, naming.IdxMetaNsPrefix()+":") {
+			conn.WriteError("ERR forbidden key pattern")
+			return
+		}
 	}
 
 	layer, constrained, rlErr := resolveLayer(keyPattern)

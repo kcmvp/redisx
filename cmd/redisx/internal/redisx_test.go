@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -82,8 +83,8 @@ func TestHistoryFileNotEmptyWhenHomePresent(t *testing.T) {
 
 func TestBannerStartsWithBox(t *testing.T) {
 	b := BannerFor("127.0.0.1", "7381")
-	if !strings.Contains(b, "Redisx  RESP Shell") {
-		t.Fatalf("Banner should include Redisx RESP Shell head: %q", b)
+	if !strings.Contains(stripANSIStrict(b), "Redisx (Compatible with Redis Shell)") {
+		t.Fatalf("Banner should include Redisx (Compatible with Redis Shell) head: %q", b)
 	}
 	if !strings.Contains(b, "connected: 127.0.0.1:7381") {
 		t.Fatalf("Banner should include connected host:port line: %q", b)
@@ -277,11 +278,11 @@ func TestRootCmdHasExpectedFlags(t *testing.T) {
 	}
 	app2, _ := buildStubRoot(t)
 	ud2, _ := app2.UserData().(*AppData)
-	if err := app2.Execute([]string{"-H", "0.0.0.0", "-p", "9999", "-a", "sekret", "!version"}); err != nil {
+	if err := app2.Execute([]string{"-h", "0.0.0.0", "-p", "9999", "-a", "sekret", "!version"}); err != nil {
 		t.Fatalf("execute with shorthands failed: %v", err)
 	}
 	if ud2.Opts.Host != "0.0.0.0" {
-		t.Fatalf("-H shorthand write want 0.0.0.0 got %q", ud2.Opts.Host)
+		t.Fatalf("-h shorthand write want 0.0.0.0 got %q", ud2.Opts.Host)
 	}
 	if ud2.Opts.Port != 9999 {
 		t.Fatalf("-p shorthand write want 9999 got %d", ud2.Opts.Port)
@@ -339,22 +340,20 @@ func TestGlobalHelpShowsAllGroupsStatic(t *testing.T) {
 	}
 }
 
-func TestBeforeRunEmptyNameTriggersBuildSession(t *testing.T) {
-	wantHost, wantPort, wantAuth, wantTimeoutMs := "10.0.0.1", 9999, "k", 2000
-	prev := session.SetNewForTest(func(opts session.Options) (*session.Session, error) {
-		if opts.Host != wantHost || opts.Port != wantPort || opts.Auth != wantAuth || opts.TimeoutMs != wantTimeoutMs {
-			t.Fatalf("session.New opts mismatch got=%+v want host=%s port=%d auth=%s ms=%d", opts, wantHost, wantPort, wantAuth, wantTimeoutMs)
-		}
+func TestBeforeRunEmptyNameDoesNotDial(t *testing.T) {
+	dialed := false
+	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
+		dialed = true
 		return &session.Session{}, nil
 	})
 	defer func() { session.SetNewForTest(prev) }()
 
 	app, sessPtr := buildStubRoot(t)
 	ud, _ := app.UserData().(*AppData)
-	ud.Opts.Host = wantHost
-	ud.Opts.Port = wantPort
-	ud.Opts.Auth = wantAuth
-	ud.Opts.TimeoutMs = wantTimeoutMs
+	ud.Opts.Host = "10.0.0.1"
+	ud.Opts.Port = 9999
+	ud.Opts.Auth = "k"
+	ud.Opts.TimeoutMs = 2000
 	ctx := tui.RunContext{UserData: app.UserData()}
 	hooks := app.Hooks()
 	if hooks.BeforeRun == nil {
@@ -366,8 +365,86 @@ func TestBeforeRunEmptyNameTriggersBuildSession(t *testing.T) {
 	if err := hooks.BeforeRun(ctx, "", nil); err != nil {
 		t.Fatalf("BeforeRun(empty REPL name) should not error: %v", err)
 	}
+	if *sessPtr != nil || dialed {
+		t.Fatal("entering the REPL must NOT auto-dial; the user connects explicitly via con / !app / !ctrl")
+	}
+	// In-REPL commands before connecting return the not-connected error.
+	ud.InREPL = true
+	err := hooks.BeforeRun(ctx, "ping", nil)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("in-REPL unconnected command should error 'not connected ...': %v", err)
+	}
+	if !strings.Contains(err.Error(), "con <host> <port> [auth]") {
+		t.Fatalf("not-connected error should advertise the con command: %v", err)
+	}
+	ud.Endpoints = []LocalEndpoint{{Name: "app", Host: "127.0.0.1", Port: 7379}}
+	err = hooks.BeforeRun(ctx, "ping", nil)
+	if err == nil || !strings.Contains(err.Error(), "!app") {
+		t.Fatalf("not-connected error should advertise local shortcuts: %v", err)
+	}
+	// One-shot mode still lazy-dials from flags.
+	ud.InREPL = false
+	if err := hooks.BeforeRun(ctx, "ping", nil); err != nil {
+		t.Fatalf("one-shot mode should lazy-dial from flags: %v", err)
+	}
 	if *sessPtr == nil {
-		t.Fatal("BeforeRun(empty REPL name) must build session; it's nil — the 'noShellCmds(\"\")==true' regression is back")
+		t.Fatal("one-shot mode should have built the session")
+	}
+}
+
+func TestConRedisCliStyleFlags(t *testing.T) {
+	var got session.Options
+	prev := session.SetNewForTest(func(o session.Options) (*session.Session, error) {
+		got = o
+		return &session.Session{}, nil
+	})
+	defer func() { session.SetNewForTest(prev) }()
+
+	app, _ := buildStubRoot(t)
+	ud, _ := app.UserData().(*AppData)
+	ud.Opts.Host = "127.0.0.1"
+	ud.Opts.Port = 7381
+	ud.Opts.Auth = ""
+	ud.InREPL = true
+	*ud.Session = nil
+
+	// Short flags, dispatched like a REPL line (guards against the
+	// "unexpected flag after subcommand" rejection).
+	quit, err := app.DispatchREPLLine([]string{"con", "-h", "127.0.0.1", "-p", "7397", "-a", "123"})
+	if quit {
+		t.Fatal("con must not quit the REPL")
+	}
+	if err != nil {
+		t.Fatalf("con with redis-cli style flags should connect: %v", err)
+	}
+	if got.Host != "127.0.0.1" || got.Port != 7397 || got.Auth != "123" {
+		t.Fatalf("short flags not applied: %+v", got)
+	}
+
+	// Long forms.
+	_, err = app.DispatchREPLLine([]string{"con", "--host", "10.1.2.3", "--port", "6380", "--auth", "s3cret"})
+	if err != nil {
+		t.Fatalf("con with long flags should connect: %v", err)
+	}
+	if got.Host != "10.1.2.3" || got.Port != 6380 || got.Auth != "s3cret" {
+		t.Fatalf("long flags not applied: %+v", got)
+	}
+
+	// Positional form still works.
+	_, err = app.DispatchREPLLine([]string{"con", "10.2.3.4", "6381", "pw"})
+	if err != nil {
+		t.Fatalf("con with positional args should connect: %v", err)
+	}
+	if got.Host != "10.2.3.4" || got.Port != 6381 || got.Auth != "pw" {
+		t.Fatalf("positional args not applied: %+v", got)
+	}
+
+	// Unknown flags produce a usage error instead of a dial (the REPL
+	// DispatchError hook consumes the error, so call Run directly).
+	conCmd, _ := app.Resolve("con")
+	err = conCmd.Run(tui.RunContext{UserData: app.UserData()}, []string{"-x"})
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("unknown flag should return a usage error: %v", err)
 	}
 }
 
@@ -376,20 +453,18 @@ func TestBannerStaticContent(t *testing.T) {
 		out := BannerFor("1.2.3.4", "6379")
 		// Banner must be single-mode per client zero-assumption (no role branching).
 		// Static content is enforced by the positive assertion below.
-		if !strings.Contains(out, "Redisx  RESP Shell") {
-			t.Fatalf("banner must say 'Redisx  RESP Shell': %q", out)
+		if !strings.Contains(stripANSIStrict(out), "Redisx (Compatible with Redis Shell)") {
+			t.Fatalf("banner must say 'Redisx (Compatible with Redis Shell)': %q", out)
 		}
 		if !strings.Contains(out, "connected: 1.2.3.4:6379") {
 			t.Fatalf("banner should include host:port connected line: %q", out)
 		}
-		if !strings.Contains(out, "docs:  regsch / dropsch") {
-			t.Fatalf("Meta docs list missing: %q", out)
+		stripped := stripANSIStrict(out)
+		if !strings.Contains(stripped, "Extended: sk, si, upd, regsch, dropsch, regidx, dropidx") {
+			t.Fatalf("Extended command list missing: %q", out)
 		}
-		if !strings.Contains(out, "idx:   regidx / dropidx") {
-			t.Fatalf("Meta idx list missing: %q", out)
-		}
-		if !strings.Contains(out, "searchkey(sk)  /  searchindex(si)  /  update(upd)") {
-			t.Fatalf("Extended search/update list missing: %q", out)
+		if !strings.Contains(stripped, `Type "help <command>" for help`) {
+			t.Fatalf("help hint line missing: %q", out)
 		}
 		if strings.Contains(out, "generic-redis") || strings.Contains(out, "not a redisx server") {
 			t.Fatalf("banner should NOT mention generic-redis / not-redisx fallback (client zero assumptions): %q", out)
@@ -400,12 +475,7 @@ func TestBannerStaticContent(t *testing.T) {
 	})
 }
 
-func TestEnterREPLBannerUsesHostPortFromAppData(t *testing.T) {
-	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
-		return &session.Session{}, nil
-	})
-	defer func() { session.SetNewForTest(prev) }()
-
+func TestEnterREPLBannerDisconnectedAndConnected(t *testing.T) {
 	var buf bytes.Buffer
 	app, sessPtr := buildStubRoot(t)
 	ud, _ := app.UserData().(*AppData)
@@ -413,6 +483,10 @@ func TestEnterREPLBannerUsesHostPortFromAppData(t *testing.T) {
 	ud.Opts.Port = 7381
 	ud.Opts.Auth = "X"
 	ud.Opts.TimeoutMs = 100
+	ud.Endpoints = []LocalEndpoint{
+		{Name: "app", Host: "127.0.0.1", Port: 7379},
+		{Name: "ctrl", Host: "127.0.0.1", Port: 7381},
+	}
 	ctx := tui.RunContext{UserData: app.UserData()}
 	ctx.IO = tui.IO{In: os.Stdin, Out: &buf, Err: os.Stderr, FSOut: os.Stderr}
 	h := app.Hooks()
@@ -422,21 +496,35 @@ func TestEnterREPLBannerUsesHostPortFromAppData(t *testing.T) {
 	if err := h.BeforeRun(ctx, "", nil); err != nil {
 		t.Fatalf("BeforeRun err: %v", err)
 	}
-	if *sessPtr == nil {
-		t.Fatal("session not built")
+	if *sessPtr != nil {
+		t.Fatal("REPL entry must not build a session")
 	}
 	if h.Banner == nil {
 		t.Fatal("Banner hook not installed")
 	}
+	// Disconnected startup banner: con hint + !app/!ctrl shortcuts from ./redisx.yaml.
 	txt := h.Banner(ctx)
+	if !strings.Contains(txt, "con <host> <port> [auth]") {
+		t.Fatalf("disconnected banner should advertise the con command: %q", txt)
+	}
+	if !strings.Contains(txt, "!app") || !strings.Contains(txt, "!ctrl") {
+		t.Fatalf("disconnected banner should list !app / !ctrl shortcuts from redisx.yaml: %q", txt)
+	}
+	if !strings.Contains(txt, "127.0.0.1:7379") {
+		t.Fatalf("disconnected banner should show the !app endpoint addr: %q", txt)
+	}
+	if ok, diag := bannerIsPerfectRect(txt); !ok {
+		t.Fatalf("disconnected banner box is NOT a perfect rect: %s\nraw=%q", diag, txt)
+	}
+	// Connected banner (after con): shows the dialled endpoint.
+	*ud.Session = &session.Session{}
+	ud.ConnHost, ud.ConnPort = "9.9.9.9", 7381
+	txt = h.Banner(ctx)
 	if !strings.Contains(txt, "connected: 9.9.9.9:7381") {
-		t.Fatalf("Banner(ctx) should pick host/port from AppData after BuildApp; got: %q", txt)
+		t.Fatalf("Banner(ctx) should show the dialled host:port: %q", txt)
 	}
-	if strings.Contains(txt, "generic-redis") || strings.Contains(txt, "not a redisx server") {
-		t.Fatalf("Banner(ctx) should NOT fall back to generic-redis — client zero assumptions: %q", txt)
-	}
-	if !strings.Contains(txt, "Redisx  RESP Shell") {
-		t.Fatalf("Banner(ctx) should print 'Redisx  RESP Shell' head: %q", txt)
+	if !strings.Contains(stripANSIStrict(txt), "Redisx (Compatible with Redis Shell)") {
+		t.Fatalf("Banner(ctx) should print 'Redisx (Compatible with Redis Shell)' head: %q", txt)
 	}
 	if ok, diag := bannerIsPerfectRect(txt); !ok {
 		t.Fatalf("Banner(ctx) box is NOT a perfect rect (user-visible right-side zigzag): %s\nraw=%q", diag, txt)
@@ -476,20 +564,18 @@ func TestBannerForBoxPerfectRect(t *testing.T) {
 }
 
 func TestCommandsListStaticAllGroups(t *testing.T) {
-	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
-		return &session.Session{}, nil
-	})
-	defer func() { session.SetNewForTest(prev) }()
 	app, sessPtr := buildStubRoot(t)
 	ud, _ := app.UserData().(*AppData)
 	ud.Opts.Host = "127.0.0.1"
 	ud.Opts.Port = 7381
+	// commands is a local catalogue; it works without a connection, but the
+	// header shows the flag host:port, so give it a stub session-free path.
 	ctx := tui.RunContext{UserData: app.UserData()}
 	if err := app.Hooks().BeforeRun(ctx, "", nil); err != nil {
 		t.Fatalf("BeforeRun err: %v", err)
 	}
-	if *sessPtr == nil {
-		t.Fatal("session nil after BeforeRun")
+	if *sessPtr != nil {
+		t.Fatal("REPL entry must not dial")
 	}
 	var buf bytes.Buffer
 	oldOut := os.Stdout
@@ -511,14 +597,13 @@ func TestCommandsListStaticAllGroups(t *testing.T) {
 		"Extended:", "Meta Management:",
 		"regsch", "regidx", "searchkey",
 		"127.0.0.1:7381",
+		"Not connected:",
+		"con [host] [port] [auth]",
 	}
 	for _, m := range mustContain {
 		if !strings.Contains(outPlain, m) {
 			t.Fatalf("commands output missing %q — plain output:\n%s", m, outPlain)
 		}
-	}
-	if strings.Contains(outPlain, "Basic:") {
-		t.Fatalf("commands output should NO LONGER include 'Basic:' group (generic Redis commands are universally known) — plain output:\n%s", outPlain)
 	}
 	if strings.Contains(outPlain, "generic-redis") || strings.Contains(outPlain, "not a redisx server") {
 		t.Fatalf("commands header should never use generic-redis fallback / client zero assumptions:\n%s", outPlain)
@@ -526,23 +611,17 @@ func TestCommandsListStaticAllGroups(t *testing.T) {
 }
 
 func TestBannerVsCommandsConsistentHeader(t *testing.T) {
-	var realSess *session.Session
-	prev := session.SetNewForTest(func(_ session.Options) (*session.Session, error) {
-		realSess = &session.Session{}
-		return realSess, nil
-	})
-	defer func() { session.SetNewForTest(prev) }()
 	app, _ := buildStubRoot(t)
 	ud, _ := app.UserData().(*AppData)
 	ud.Opts.Host = "127.0.0.1"
 	ud.Opts.Port = 7381
 	ud.Opts.Auth = "X"
+	// Simulate the connected state (post-`con`) for banner/commands checks.
+	*ud.Session = &session.Session{}
+	ud.ConnHost, ud.ConnPort = "127.0.0.1", 7381
 	ctx := tui.RunContext{UserData: app.UserData()}
 	if err := app.Hooks().BeforeRun(ctx, "", nil); err != nil {
 		t.Fatalf("BeforeRun err: %v", err)
-	}
-	if realSess == nil {
-		t.Fatal("realSess nil; seam not triggered")
 	}
 	var combo bytes.Buffer
 	if app.Hooks().Banner != nil {
@@ -575,6 +654,54 @@ func TestBannerVsCommandsConsistentHeader(t *testing.T) {
 	}
 	if !bodyRedisx {
 		t.Fatalf("Expected body Connected line to contain '127.0.0.1:7381', got %q", bodyConnLine)
+	}
+}
+
+func TestLoadLocalConfig(t *testing.T) {
+	dir := t.TempDir()
+	// Missing file → nil, nil.
+	eps, err := LoadLocalConfig(dir)
+	if err != nil || eps != nil {
+		t.Fatalf("missing file: eps=%v err=%v", eps, err)
+	}
+	// Sample-shaped yaml → endpoints in file order, empty bind → localhost.
+	content := `app:
+  port: 7379
+  bind: ""
+  auth: ""
+ctrl:
+  port: 7381
+  bind: "127.0.0.1"
+  auth: sekret
+  trust_proxy: false
+notanendpoint:
+  description: no port here
+`
+	if err := os.WriteFile(filepath.Join(dir, LocalConfigFile), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eps, err = LoadLocalConfig(dir)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("want 2 endpoints, got %d: %+v", len(eps), eps)
+	}
+	if eps[0].Name != "app" || eps[0].Host != "127.0.0.1" || eps[0].Port != 7379 || eps[0].Auth != "" {
+		t.Fatalf("app endpoint mismatch: %+v", eps[0])
+	}
+	if eps[1].Name != "ctrl" || eps[1].Host != "127.0.0.1" || eps[1].Port != 7381 || eps[1].Auth != "sekret" {
+		t.Fatalf("ctrl endpoint mismatch: %+v", eps[1])
+	}
+	// FindEndpoint case-insensitive.
+	if ep := FindEndpoint(eps, "APP"); ep == nil || ep.Name != "app" {
+		t.Fatalf("FindEndpoint(APP) mismatch: %+v", ep)
+	}
+	if FindEndpoint(eps, "nope") != nil {
+		t.Fatal("FindEndpoint(nope) should be nil")
+	}
+	if got := ShortcutNames(eps); got != "!app / !ctrl" {
+		t.Fatalf("ShortcutNames=%q", got)
 	}
 }
 

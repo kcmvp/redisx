@@ -105,6 +105,15 @@ func (s *CmdTestSuite) TestCmd() {
 		t.Fatalf("failed to seed user:age index: %v", err)
 	}
 
+	seedDocVer, err := canonicalDocMD5(docSpec{Namespace: "user", KeyAttrs: []string{"id"}, Mem: false})
+	if err != nil {
+		t.Fatalf("canonicalDocMD5: %v", err)
+	}
+	seedIdxVer, err := canonicalIdxMD5(idxSpec{OwnerNs: "user", Logical: "age", KeyPattern: "user:*", Paths: []string{"age"}})
+	if err != nil {
+		t.Fatalf("canonicalIdxMD5: %v", err)
+	}
+
 	tests := []struct {
 		name        string
 		auth        bool
@@ -258,6 +267,30 @@ func (s *CmdTestSuite) TestCmd() {
 				"OK",
 			},
 			wantArrays: [][]string{{naming.BuildStorageKey(naming.BuildStorageNs("k", true), "{id}")}},
+		},
+		{
+			name:       "keys_doc_meta_introspection",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "_doc_:*"}},
+			wantArrays: [][]string{{naming.DocMetaKey("user", seedDocVer)}},
+		},
+		{
+			name:       "keys_doc_meta_bare_ns",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "_doc_"}},
+			wantArrays: [][]string{{naming.DocMetaKey("user", seedDocVer)}},
+		},
+		{
+			name:       "keys_idx_meta_introspection",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "_idx_:*"}},
+			wantArrays: [][]string{{naming.IdxMetaKey(naming.BuildIdxFullName("user", "age"), seedIdxVer)}},
+		},
+		{
+			name:       "keys_auth_meta_still_forbidden",
+			auth:       true,
+			commands:   [][]string{{cmdKeys, "_auth_:*"}},
+			wantErrors: []string{"ERR forbidden key pattern"},
 		},
 		{
 			name:     "del non-existent",

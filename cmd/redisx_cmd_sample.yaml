@@ -8,7 +8,7 @@
 #
 # Loading convention:
 #   · the `redisx` binary consumes these values via FLAGS, not by parsing
-#     this YAML (flags: -H/--host, -p/--port, -a/--auth, --timeout-ms)
+#     this YAML (flags: -h/--host, -p/--port, -a/--auth, --timeout-ms)
 #   · this file is a human-readable reference mirroring the server-side
 #     `app` / `ctrl` shape; use it to hand off the right -p/-a pair to the
 #     operator or to your deployment config system
@@ -19,7 +19,7 @@ app:
   # Default server-side value: 7379
   port: 7379
   # Bind-address hint — informational only. The CLI always uses its own
-  # explicit --host/-H flag (default 127.0.0.1); listed here purely to keep
+  # explicit --host/-h flag (default 127.0.0.1); listed here purely to keep
   # shape parity with redis_srv_sample.yaml.
   bind: ""
   # AUTH key for the business port. Pass with -a when CLI is pointed at the

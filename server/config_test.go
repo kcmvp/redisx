@@ -34,8 +34,8 @@ func TestLoadSampleYaml(t *testing.T) {
 	if cfg.Ctrl.Bind != "127.0.0.1" {
 		t.Fatalf("sample default ctrl.bind = %q want 127.0.0.1", cfg.Ctrl.Bind)
 	}
-	if cfg.App.Auth != "" || cfg.Ctrl.Auth != "" {
-		t.Fatalf("sample defaults both auth empty; got app=%q ctrl=%q", cfg.App.Auth, cfg.Ctrl.Auth)
+	if cfg.App.Auth != "123" || cfg.Ctrl.Auth != "234" {
+		t.Fatalf("sample pins demo credentials app=123 ctrl=234; got app=%q ctrl=%q", cfg.App.Auth, cfg.Ctrl.Auth)
 	}
 	if cfg.DataPath == "" {
 		t.Fatalf("DataPath must be set (falls back to ~/.redisx/redisx.db when yaml data_path is empty)")

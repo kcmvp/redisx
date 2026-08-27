@@ -34,9 +34,9 @@ func main() {
 	fmt.Println()
 	fmt.Println("demo: redisx connect ->")
 	if cfg.Ctrl.Auth == "" {
-		fmt.Printf("  redisx -H 127.0.0.1 -p %d\n", cfg.Ctrl.Port)
+		fmt.Printf("  redisx -h 127.0.0.1 -p %d\n", cfg.Ctrl.Port)
 	} else {
-		fmt.Printf("  redisx -H 127.0.0.1 -p %d -a %s\n", cfg.Ctrl.Port, cfg.Ctrl.Auth)
+		fmt.Printf("  redisx -h 127.0.0.1 -p %d -a %s\n", cfg.Ctrl.Port, cfg.Ctrl.Auth)
 	}
 	fmt.Println("  (Ctrl-C / SIGTERM / SIGINT to shutdown cleanly)")
 	fmt.Println()

@@ -35,6 +35,10 @@ type CLICommand struct {
 	MinArgs int
 	MaxArgs int
 	Hidden  bool
+	// AllowFlags permits "-x"-style tokens after the subcommand name so the
+	// command can parse its own flag set (redis-cli style). Without it, dash
+	// tokens after a subcommand are rejected as misplaced global flags.
+	AllowFlags bool
 }
 
 type FlagSet struct {
@@ -113,7 +117,9 @@ func NewCLIApp(name, version string, hooks AppHooks) *CLIApp {
 func (a *CLIApp) Flags() *FlagSet { return &a.flags }
 
 func (a *CLIApp) InstallHelpVersionFlags() {
-	a.flags.BoolVar(&a.helpFlag, "help", "h", false, "print help")
+	// redis-cli parity: -h belongs to the host flag, so help only gets the
+	// long form (like redis-cli's --help).
+	a.flags.BoolVar(&a.helpFlag, "help", "", false, "print help")
 	a.flags.BoolVar(&a.versionFlag, "version", "v", false, "print version")
 	a.flags.fs.Usage = func() {
 		text := a.renderGlobalHelp()
@@ -255,7 +261,7 @@ func (a *CLIApp) dispatch(name string, args []string, repl bool) error {
 	}
 	if c.Use != "" {
 		first := strings.SplitN(c.Use, " ", 2)[0]
-		if first != "raw" {
+		if first != "raw" && !c.AllowFlags {
 			for _, r := range args {
 				if strings.HasPrefix(r, "-") && len(r) > 1 {
 					return fmt.Errorf("unexpected flag %q after subcommand %q (global flags must come before subcommand name)", r, canonical)

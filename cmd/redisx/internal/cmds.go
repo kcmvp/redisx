@@ -2,10 +2,13 @@ package internal
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/kcmvp/redisx/cmd/_shared/session"
@@ -29,9 +32,9 @@ func defaultCommandGroups() *commandGroups {
 		GroupOrder: []string{"Extended", "Meta Management"},
 		Groups: map[string][]commandEntry{
 			"Extended": {
-				{Name: proto.LowerCmdUpdate, Usage: "UPDATE key <json_patch>  — merge-UPDATE a JSON value (typed doc enabled: writes validated)"},
-				{Name: proto.LowerCmdSearchKey, Usage: "SEARCHKEY <predicate_json>  — typed doc+index search: filter → pick key"},
-				{Name: proto.LowerCmdSearchIndex, Usage: "SEARCHINDEX <ns> <idx_name> <query>  — query a named typed index"},
+				{Name: proto.LowerCmdUpdate, Usage: "UPDATE <keyRange> <filter> <updateJSON> [LIMIT N]  — RFC6902-style patch on typed docs matching the filter"},
+				{Name: proto.LowerCmdSearchKey, Usage: "SEARCHKEY <keyRange> <filter> [ASC|DESC] [LIMIT N]  — filter → pick keys"},
+				{Name: proto.LowerCmdSearchIndex, Usage: "SEARCHINDEX <fullIndexName> <keyRange> <filter> [ASC|DESC] [LIMIT N]  — query a named typed index"},
 			},
 			"Meta Management": {
 				{Name: proto.LowerCmdRegisterSchema, Usage: proto.UsageRegisterSchema},
@@ -111,39 +114,29 @@ var examples = map[string][]string{
 		"# JSON tips: pass the blob as one argument — a single-quoted string in the CLI works.",
 		"",
 		"REGSCH '{" +
-			`"name":"user"` +
-			"," +
-			`"ttl_ms":0` +
+			`"namespace":"user"` +
 			"," +
 			`"mem":false` +
 			"," +
-			`"pk":{"path":"id","auto":false}` +
+			`"key_attrs":["id","age","profile.email"]` +
 			"," +
-			`"paths":[` +
-			`{"path":"id","type":"string"}` +
-			"," +
-			`{"path":"age","type":"int"}` +
-			"," +
-			`{"path":"profile.email","type":"string"}` +
-			"]}",
+			`"ttl_ns":0` +
+			"}'",
 		"",
-		"# Fields:",
-		"#   name       — required, logical namespace (ValidateDocLogicalNamespace rules)",
-		"#   ttl_ms     — 0 = no expiry; >0 = every key of this schema expires after N ms",
-		"#   mem        — false = disk-backed storage (default); true = _m_: memory-only layer",
-		"#   pk.path    — required, primary key field path inside JSON (where to extract id)",
-		"#   pk.auto    — true = let server assign a UUID string; false = caller writes pk explicitly",
-		"#   paths      — required, array of {path, type}: all typed fields of the document",
-		"#                  type ∈ {string, int, float, bool, time, json}",
-		"#                  paths with dots (profile.email) are automatically flattened to profile_email internally",
+		"# Fields (unknown fields are REJECTED — strict decoding):",
+		"#   namespace — required, logical namespace (ValidateDocLogicalNamespace rules)",
+		"#   mem       — false = disk-backed storage (default); true = _m_: memory-only layer",
+		"#   key_attrs — JSON paths of the document; dot paths (profile.email) are flattened to profile_email internally",
+		"#   ttl_ns    — 0 = no expiry; >0 = every key of this schema expires after N nanoseconds",
 		"# Notes:",
+		"#   - field types are NOT declared here — they are carried by the JSON values themselves at write time (SET/UPDATE)",
 		"#   - server disallows the reserved key \"indexes\" inside REGSCH payload — put indexes in REGIDX, not here",
 		"#   - identical MD5(canonical JSON) → no-op OK (idempotent upgrade guard)",
 		"#   - different MD5 vs existing schema → live upgrade (see DROPSCH for attached-index guard before dropping)",
 	},
 	"regidx": {
 		"# REGIDX accepts a SINGLE JSON argument. Three owner addressing forms — pick ONE:",
-		"#   A) { full_name: \"<ownerNs>!_!<logical>\" }  ← canonical full name",
+		"#   A) { full_name: \"<ownerNs>:<logical>\" }  ← canonical full name",
 		"#   B) { owner_ns: \"<storageNs>\", logical: \"age_idx\", paths: [...] }",
 		"#   C) { owner_doc_logical_ns: \"user\", owner_mem: false, logical: \"age_idx\", paths: [...] }",
 		"# paths come as a single string \"age\" OR an array [\"age\",\"profile.email\"] OR [{path:\"age\"}].",
@@ -157,13 +150,11 @@ var examples = map[string][]string{
 			`"logical":"age_email_idx"` +
 			"," +
 			`"paths":["age","profile.email"]` +
-			"," +
-			`"case_sensitive":true` +
 			"}",
 		"",
 		"# Full form A — reusing a full_name you already got from a diagnostic/listing:",
 		"REGIDX '{" +
-			`"full_name":"user!_!age_idx"` +
+			`"full_name":"user:age_idx"` +
 			"," +
 			`"paths":["age"]` +
 			"}",
@@ -174,8 +165,6 @@ var examples = map[string][]string{
 		"#   full_name            — takes precedence over owner_ns + logical",
 		"#   logical              — required (index handle, ValidateLogicalIndexName rules)",
 		"#   paths                — required, one or more doc paths to index",
-		"#   case_sensitive       — optional bool; true = string comparison is byte-exact (default false = case-insensitive)",
-		"#   comparator           — optional string for custom ordering on typed values; usually not needed",
 		"#   key_pattern          — optional, defaults to owner_ns:* (entire namespace)",
 		"# Notes:",
 		"#   - identical canonical MD5 → no-op OK (idempotent); different MD5 vs existing → live swap",
@@ -193,11 +182,11 @@ var examples = map[string][]string{
 	},
 	"dropidx": {
 		"# DROPIDX is a plain key-style command, two call forms:",
-		"#   (A) DROPIDX <fullName>              — canonical name, e.g. \"user!_!age_idx\" or \"_m_:user!_!age_idx\"",
+		"#   (A) DROPIDX <fullName>              — canonical name, e.g. \"user:age_idx\" or \"_m_:user:age_idx\"",
 		"#   (B) DROPIDX <logicalNs> <idxName>   — shortcut; server tries BOTH disk and _m_: variants automatically",
 		"# The (B) shortcut lets operators type without knowing the fullName.",
 		"",
-		"DROPIDX user!_!age_email_idx",
+		"DROPIDX user:age_email_idx",
 		"",
 		"DROPIDX user age_email_idx",
 		"",
@@ -206,56 +195,46 @@ var examples = map[string][]string{
 		"#   - irreversible — drops the btree handle + meta key + composite store",
 	},
 	"update": {
-		"# UPDATE: key + JSON patch object. The patch is MERGED into the existing document.",
-		"# For typed-doc namespaces, server validates field types against REGSCH schema before writing.",
-		"# key pattern rules are the same as SET/GET — for typed docs the key's anchor selects the ns.",
+		"# UPDATE works on typed documents ONLY (namespace must be REGSCH-registered).",
+		"# Wire form: UPDATE <keyRange> <filter> <updateJSON> [LIMIT N]",
+		"#   keyRange   — JSON object or bare pattern shorthand (\"user:*\"), anchored to one namespace",
+		"#   filter     — Mongo-style JSON ({} = all docs in range)",
+		"#   updateJSON — array of {op, path, value} patch ops (RFC6902-style, SSoT: x.ParseUpdate)",
 		"",
-		"UPDATE user:leto '{\"age\":46, \"profile\":{\"email\":\"leto@atreides.frf\"}}'",
+		"UPDATE 'user:*' '{\"name\":{\"$eq\":\"leto\"}}' '[{\"op\":\"replace\",\"path\":\"/age\",\"value\":46}]'",
 		"",
-		"# Behavior:",
-		"#   - top-level keys in the patch OVERWRITE existing doc keys of the same name",
-		"#   - nested objects are merged recursively (\"profile.email\" = patch replaces whole profile.value if both present, nested value is the one on patch)",
-		"#   - for non-typed plain KV keys: JSON still parsed, SET replaces the whole value (no schema verification)",
+		"# Ops:",
+		"#   replace — set the value at path (creates it if missing)",
+		"#   remove  — delete the value at path",
+		"#   path uses JSON-pointer form: /age, /profile/email",
 	},
 	"searchkey": {
-		"# SEARCHKEY: single JSON predicate argument. Returns matching PRIMARY KEYS (anchors) from the filtered range.",
-		"# Works on any registered typed-doc namespace.",
+		"# SEARCHKEY: <keyRange> <filter> [ASC|DESC] [LIMIT N]. Returns matching keys from the filtered range.",
+		"# Works on any registered typed-doc namespace (and raw KV paths with a ':').",
 		"",
-		"SEARCHKEY '{" +
-			`"ns":"user"` +
-			"," +
-			`"mem":false` +
-			"," +
-			`"filter":{"age":{"gte":18},"profile.email":{"ends_with":"@atreides.frf"}}` +
-			"," +
-			`"limit":100` +
-			"," +
-			`"offset":0` +
-			"}",
+		"SEARCHKEY 'user:*' '{\"age\":{\"$gte\":18},\"profile.email\":{\"$contains\":\"@atreides\"}}'",
 		"",
-		"# Top-level keys:",
-		"#   ns/mem          — optional namespace selector; if omitted, filter's first-level anchor(s) drive it",
-		"#   filter          — required, object of {path: {OP: value}} pairs",
-		"#   filter.OPs      — eq / ne / gt / gte / lt / lte / between / in / like / starts_with / ends_with / contains / regex",
-		"#   order           — optional [{path:\"age\", dir:\"asc|desc\"}, ...]",
-		"#   limit / offset  — pagination (server default caps apply)",
+		"# keyRange forms (JSON object or bare pattern shorthand):",
+		"#   user:*                                        — shorthand for {\"op\":\"pattern\",\"p\":\"user:*\"}",
+		"#   {\"op\":\"bt\",\"ge\":\"user:a\",\"lt\":\"user:n\"}   — ops: bt gt gte lt lte pattern",
+		"# Filter operators (multiple keys AND implicitly; $and/$or arrays combine):",
+		"#   $eq $neq $gt $gte $lt $lte $contains $in — \"field\": <scalar> is shorthand for implicit $eq",
+		"#   {} = empty filter passes everything",
+		"# Notes:",
+		"#   - key-range must be anchored (no leading wildcard); doc namespace must be REGSCH-registered",
+		"#   - LIMIT is a trailing arg: SEARCHKEY 'user:*' '{}' DESC LIMIT 10",
 	},
 	"searchindex": {
-		"# SEARCHINDEX: 3 plain-key args — <storageNs OR logical_ns> <idx_logical_name> <raw_lower_bound>",
-		"# The third arg is the raw scan start key inside the chosen index — exact semantics depend on comparator/case flags of the REGIDX.",
+		"# SEARCHINDEX: <fullIndexName> <keyRange> <filter> [ASC|DESC] [LIMIT N] — query a named typed index.",
+		"# fullIndexName format: <ownerNs>:<logical> (SSoT: naming.ParseIdxFullName), owner ns must be REGSCH-registered.",
 		"",
-		"SEARCHINDEX user age_email_idx 18",
-		"",
-		"# For a 2-path index (age, profile.email), query prefix works too — give enough args in lower_bound to",
-		"# encode the first path, then server walks the btree, e.g. for strings:",
-		"SEARCHINDEX user age_email_idx '18::leto'",
+		"SEARCHINDEX 'user:age_email_idx' '{\"op\":\"pattern\",\"p\":\"user:*\"}' '{\"age\":{\"$gte\":18}}'",
 		"",
 		"# Arguments:",
-		"#   arg1 = ns or storageNs — \"user\"  or \"_m_:user\" (no prefix = disk)",
-		"#   arg2 = logical index name — the REGIDX \"logical\" handle",
-		"#   arg3 = start value — scalar or composite joined with the index's native joiner",
+		"#   keyRange — MUST be a JSON object here (no shorthand): {\"op\":\"pattern\",\"p\":\"user:*\"} or bt/gt/gte/lt/lte forms",
+		"#   filter   — same Mongo-style grammar as SEARCHKEY ({} = everything)",
 		"# Notes:",
-		"#   - if the index's namespace + logical combo doesn't exist → ERR \"index not found\"",
+		"#   - if the index doesn't exist → ERR \"index not found\"",
 		"#   - result is a flat list of PKs matching the index scan (not doc rows themselves — follow up with GET/MGET)",
 	},
 }
@@ -331,6 +310,57 @@ func registerAllCommands(app *tui.CLIApp) {
 	app.Register(clr)
 	trackCmd("clear", clr)
 
+	con := &tui.CLICommand{
+		Use:        "con [-h host] [-p port] [-a auth] | con [host] [port] [auth]",
+		Aliases:    []string{"connect"},
+		Short:      "connect to a server (redis-cli style flags or positional; no args reuses the -h/-p/-a startup values)",
+		MinArgs:    0,
+		MaxArgs:    -1,
+		AllowFlags: true,
+		Run: func(ctx tui.RunContext, args []string) error {
+			data, _ := ctx.UserData.(*AppData)
+			if data == nil {
+				return fmt.Errorf("no app data")
+			}
+			host, port, auth := data.Opts.Host, data.Opts.Port, data.Opts.Auth
+			fs := flag.NewFlagSet("con", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			fs.StringVar(&host, "h", host, "server host")
+			fs.StringVar(&host, "host", host, "server host")
+			fs.IntVar(&port, "p", port, "server port")
+			fs.IntVar(&port, "port", port, "server port")
+			fs.StringVar(&auth, "a", auth, "AUTH key")
+			fs.StringVar(&auth, "auth", auth, "AUTH key")
+			if err := fs.Parse(args); err != nil {
+				return fmt.Errorf("con: %v (usage: con [-h host] [-p port] [-a auth] | con [host] [port] [auth])", err)
+			}
+			// Positional fallback on top of the parsed flags.
+			switch rest := fs.Args(); len(rest) {
+			case 0:
+			case 1:
+				host = rest[0]
+			case 2, 3:
+				p, err := strconv.Atoi(rest[1])
+				if err != nil {
+					return fmt.Errorf("invalid port %q: %v", rest[1], err)
+				}
+				host, port = rest[0], p
+				if len(rest) == 3 {
+					auth = rest[2]
+				}
+			default:
+				return fmt.Errorf("con accepts at most 3 positional arg(s) (got %d)", len(rest))
+			}
+			if err := connectSession(data, host, port, auth); err != nil {
+				return err
+			}
+			fmt.Printf("connected to %s\n", cCyan(fmt.Sprintf("%s:%d", host, port)))
+			return nil
+		},
+	}
+	app.Register(con)
+	trackCmd("con", con)
+
 	redisxCmd := &tui.CLICommand{
 		Use:   "redisx [subcommand [args...]]",
 		Short: "Local shell introspection. Subcommands: HELP | VERSION | CAPS | COMMANDS; DIAGNOSE = local probe debug; no args → HELP",
@@ -351,10 +381,6 @@ client rebuild. Support, availability and privilege enforcement are entirely
 server-side — the CLI never pre-judges whether a command is "allowed".`,
 		MinArgs: 0, MaxArgs: -1,
 		Run: func(ctx tui.RunContext, args []string) error {
-			sess := sessFromCtx(ctx)
-			if sess == nil {
-				return fmt.Errorf("shell not connected")
-			}
 			data, _ := ctx.UserData.(*AppData)
 			useArgs := args
 			if len(useArgs) == 0 {
@@ -363,6 +389,10 @@ server-side — the CLI never pre-judges whether a command is "allowed".`,
 			sub := strings.ToUpper(useArgs[0])
 			switch sub {
 			case "DIAGNOSE":
+				sess := sessFromCtx(ctx)
+				if sess == nil {
+					return fmt.Errorf("shell not connected")
+				}
 				return runRedisxDiagnose(ctx, sess, data, useArgs[1:])
 			case "HELP":
 				fmt.Println(cBold("redisx HELP (client-builtin SSoT; decoupled from server)"))
@@ -389,21 +419,7 @@ server-side — the CLI never pre-judges whether a command is "allowed".`,
 				wizardPrintAny(os.Stdout, out)
 				return nil
 			case "COMMANDS", "CMDS", "COMMAND":
-				cmdGroups := defaultCommandGroups()
-				groups := map[string][][2]string{}
-				for g, entries := range cmdGroups.Groups {
-					rows := make([][2]string, 0, len(entries))
-					for _, e := range entries {
-						rows = append(rows, [2]string{e.Name, e.Usage})
-					}
-					groups[g] = rows
-				}
-				h, p := "127.0.0.1", "7381"
-				if data != nil {
-					h, p = data.HostPort()
-				}
-				roleLine := cBold("Connected: ") + cCyan(h+":"+p) + "  (raw RESP passthrough — support & privilege enforcement handled server-side)"
-				printServerCommandsList(data, groups, cmdGroups.GroupOrder, roleLine)
+				printCatalogue(data)
 				return nil
 			default:
 				return fmt.Errorf("unknown redisx subcommand %q; try `redisx HELP`", useArgs[0])

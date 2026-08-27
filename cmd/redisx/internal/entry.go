@@ -27,6 +27,14 @@ type AppData struct {
 	Cache   *session.Cache
 	Help    bool
 	ShowVer bool
+	// Endpoints are the connect shortcuts discovered in ./redisx.yaml.
+	Endpoints []LocalEndpoint
+	// InREPL is true while the interactive REPL loop runs (drives the
+	// not-connected error instead of the one-shot lazy dial).
+	InREPL bool
+	// ConnHost/ConnPort record the endpoint the current session dialed.
+	ConnHost string
+	ConnPort int
 }
 
 func (a *AppData) HostPort() (string, string) {
@@ -48,21 +56,30 @@ func cRed(s string) string     { return tui.Red(s) }
 func cMagenta(s string) string { return tui.Magenta(s) }
 func cDim(s string) string     { return tui.Dim(s) }
 
-func bannerLinesFor(host, port string) []string {
-	headPure := "Redisx  RESP Shell  — Raw RESP passthrough; support & privilege enforcement handled server-side"
-	basicPure := []string{"ping", "!version / !clear", "!help", "quit / exit (Ctrl-C)"}
-	metaPure := []string{
-		"docs:  regsch / dropsch",
-		"idx:   regidx / dropidx",
+// sepSentinel marks the position of the mid-banner separator line; it is
+// replaced with the rendered "- - " separator after the banner width is known.
+const sepSentinel = "\x00sep"
+
+func bannerLines(connected string, endpoints []LocalEndpoint) []string {
+	headPure := "Redisx (Compatible with Redis Shell)"
+	extPure := []string{"sk", "si", "upd", "regsch", "dropsch", "regidx", "dropidx"}
+	hintPure := `Type "help <command>" for help — "quit" / Ctrl-C to exit.`
+	body := []string{"connect: con [-h host] [-p port] [-a auth] | con <host> <port> [auth]"}
+	body = append(body, "")
+	body = append(body, "Extended: "+strings.Join(extPure, ", "))
+	body = append(body, "")
+	body = append(body, hintPure)
+	if connected != "" {
+		body = append(body, "")
+		body = append(body, connected)
 	}
-	extPure := []string{"searchkey(sk)  /  searchindex(si)  /  update(upd)"}
-	body := []string{"Basic: " + strings.Join(basicPure, "  ·  ")}
-	body = append(body, "Extended: "+strings.Join(extPure, "    "))
-	body = append(body, "Meta:")
-	for _, m := range metaPure {
-		body = append(body, "  "+m)
+	if len(endpoints) > 0 {
+		body = append(body, sepSentinel)
+		body = append(body, LocalConfigFile+" found — endpoint shortcuts:")
+		for _, e := range endpoints {
+			body = append(body, "  !"+e.Name+"  →  "+e.Addr())
+		}
 	}
-	body = append(body, "connected: "+host+":"+port+"  (raw RESP passthrough)")
 	bodyMaxW := 0
 	for _, l := range body {
 		if rw := len([]rune(l)); rw > bodyMaxW {
@@ -83,35 +100,47 @@ func bannerLinesFor(host, port string) []string {
 		sepSb.WriteByte(pattern[r%len(pattern)])
 	}
 	sepPure := sepSb.String()
-	pure := make([]string, 0, 2+len(body))
+	pure := make([]string, 0, 3+len(body))
 	pure = append(pure, headPure)
+	pure = append(pure, "")
 	pure = append(pure, sepPure)
 	pure = append(pure, body...)
 	out := make([]string, len(pure))
 	for i, p := range pure {
 		switch i {
 		case 0:
-			idx := strings.Index(p, "—")
-			if idx > 0 {
-				out[i] = cBold(p[:idx] + "—" + cMagenta(p[idx+len("—"):]))
-			} else {
-				out[i] = cBold(cMagenta(p))
-			}
+			out[i] = cMagenta(p)
 		case 1:
 			out[i] = p
 		default:
 			line := p
-			if strings.HasPrefix(line, "Basic:") {
-				line = cBold("Basic") + line[len("Basic"):]
+			if line == sepSentinel {
+				out[i] = sepPure
+				continue
+			}
+			if line == hintPure {
+				line = cDim(line)
 			} else if strings.HasPrefix(line, "Extended:") {
 				line = cBold("Extended") + line[len("Extended"):]
-			} else if strings.HasPrefix(line, "Meta:") {
-				line = cBold("Meta") + line[len("Meta"):]
+			} else if strings.HasPrefix(line, "connect:") {
+				line = cBold("connect") + line[len("connect"):]
+			} else if strings.HasPrefix(line, LocalConfigFile+" found") {
+				line = cYellow(line)
+			} else if strings.HasPrefix(line, "  !") {
+				line = cYellow(line)
 			}
 			out[i] = line
 		}
 	}
 	return out
+}
+
+func bannerLinesFor(host, port string) []string {
+	return bannerLines("connected: "+host+":"+port+"  (raw RESP passthrough)", nil)
+}
+
+func bannerLinesDisconnected(endpoints []LocalEndpoint) []string {
+	return bannerLines("", endpoints)
 }
 
 func stripANSIStrict(s string) string {
@@ -134,6 +163,18 @@ func stripANSIStrict(s string) string {
 
 func BannerFor(host, port string) string {
 	lines := bannerLinesFor(host, port)
+	return renderBannerBox(lines)
+}
+
+// BannerDisconnectedFor renders the startup banner shown before the user has
+// connected: it advertises the `con` command and, when ./redisx.yaml was
+// found, the `!<name>` endpoint shortcuts derived from its top-level keys.
+func BannerDisconnectedFor(endpoints []LocalEndpoint) string {
+	lines := bannerLinesDisconnected(endpoints)
+	return renderBannerBox(lines)
+}
+
+func renderBannerBox(lines []string) string {
 	stripped := make([]string, len(lines))
 	for i, l := range lines {
 		stripped[i] = stripANSIStrict(l)
