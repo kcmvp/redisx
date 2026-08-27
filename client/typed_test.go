@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/client/internal/hook"
+	"github.com/kcmvp/redisx/client/raw"
 	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/internal/testutil"
@@ -37,6 +39,8 @@ var clientTestServerAddr string
 
 const clientTestExternalAuthKey = "client-test-external-key"
 const clientTestAuthLimit = 50
+
+const defaultHookTimeout = 100 * time.Millisecond
 
 var cliServerSeedOnce sync.Once
 
@@ -236,12 +240,9 @@ func (s *ClientTestSuite) SetupTest() {
 	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
 	handlersMu.Unlock()
 
-	kvClientMu.Lock()
-	if kvClient != nil {
-		_ = kvClient.Close()
+	if prev := setSharedClient(nil); prev != nil {
+		_ = prev.Close()
 	}
-	kvClient = nil
-	kvClientMu.Unlock()
 
 	cliOnce = sync.Once{}
 	signalNotifyFn = signal.Notify
@@ -255,7 +256,7 @@ func (s *ClientTestSuite) SetupTest() {
 	}
 	atomic.StoreUint64(&pipeDrops, 0)
 
-	resetHooks()
+	hook.Reset()
 }
 
 type ClientTestSuite struct {
@@ -395,206 +396,6 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 			}
 		})
 	}
-}
-
-func (s *ClientTestSuite) TestGetSetCommand() {
-	tests := []struct {
-		name       string
-		setup      func()
-		action     func() (string, error)
-		expectErr  bool
-		wantErrMsg string
-		expectVal  string
-	}{
-		{
-			"Get not connected",
-			nil,
-			func() (string, error) { return GetRaw("cli:k") },
-			true, "resp client is not connected", "",
-		},
-		{
-			"Set not connected",
-			nil,
-			func() (string, error) { return "", SetRaw("cli:k", "v") },
-			true, "resp client is not connected", "",
-		},
-		{
-			"Get empty key",
-			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) { return GetRaw("") },
-			false, "", "",
-		},
-		{
-			"Set empty key",
-			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) { return "", SetRaw("", "v") },
-			false, "", "",
-		},
-		{
-			"Set and Get Success",
-			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) {
-				if err := SetRaw("cli:external-key", "external-value"); err != nil {
-					return "", err
-				}
-				return GetRaw("cli:external-key")
-			},
-			false, "", "external-value",
-		},
-		{
-			"SetWithTTL Success and Expire",
-			func() { _ = Connect(clientTestServerAddr, clientTestExternalAuthKey); s.ensureConnected() },
-			func() (string, error) {
-				if err := SetWithTTLRaw("cli:ttl_key", "ttl_val", 100*time.Millisecond); err != nil {
-					return "", err
-				}
-				v1, _ := GetRaw("cli:ttl_key")
-				if v1 != "ttl_val" {
-					return v1, nil
-				}
-				time.Sleep(200 * time.Millisecond)
-				v2, err := GetRaw("cli:ttl_key")
-				return v2, err
-			},
-			true, "redis: nil", "",
-		},
-	}
-
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			s.SetupTest()
-			if tc.setup != nil {
-				tc.setup()
-			}
-
-			val, err := tc.action()
-			if tc.expectErr {
-				s.Error(err)
-				if tc.wantErrMsg != "" && err != nil {
-					s.Contains(err.Error(), tc.wantErrMsg)
-				}
-			} else {
-				s.NoError(err)
-				s.Equal(tc.expectVal, val)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestCrudCommands() {
-	s.Run("SetNXWithTTL not connected", func() {
-		s.SetupTest()
-		ok, err := SetNXWithTTLRaw("cli:k", "v", time.Second)
-		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
-		s.False(ok)
-	})
-
-	s.Run("SetNXWithTTL empty key", func() {
-		s.SetupTest()
-		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-		s.NoError(err)
-		s.ensureConnected()
-
-		ok, err := SetNXWithTTLRaw("", "v", time.Second)
-		s.NoError(err)
-		s.False(ok)
-	})
-
-	s.Run("SetNXWithTTL falls back when ttl is non-positive", func() {
-		s.SetupTest()
-		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-		s.NoError(err)
-		s.ensureConnected()
-
-		ok, err := SetNXWithTTLRaw("cli:setnx-fallback", "v1", 0)
-		s.NoError(err)
-		s.True(ok)
-
-		ok, err = SetNXWithTTLRaw("cli:setnx-fallback", "v2", 0)
-		s.NoError(err)
-		s.False(ok)
-	})
-
-	s.Run("SetNXWithTTL success and expire", func() {
-		s.SetupTest()
-		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-		s.NoError(err)
-		s.ensureConnected()
-
-		ok, err := SetNXWithTTLRaw("cli:setnx-ttl", "ttl-value", 100*time.Millisecond)
-		s.NoError(err)
-		s.True(ok)
-
-		val, err := GetRaw("cli:setnx-ttl")
-		s.NoError(err)
-		s.Equal("ttl-value", val)
-
-		time.Sleep(200 * time.Millisecond)
-
-		_, err = GetRaw("cli:setnx-ttl")
-		s.Error(err)
-		s.Contains(err.Error(), "redis: nil")
-	})
-
-	s.Run("SetNX not connected", func() {
-		s.SetupTest()
-		ok, err := SetNXRaw("cli:k", "v")
-		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
-		s.False(ok)
-	})
-
-	s.Run("Delete not connected", func() {
-		s.SetupTest()
-		deleted, err := DeleteRaw("cli:k")
-		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
-		s.False(deleted)
-	})
-
-	s.Run("Keys not connected", func() {
-		s.SetupTest()
-		keysRes := KeysRaw("cli:k*")
-		s.True(keysRes.IsError())
-		s.Contains(keysRes.Error().Error(), "resp client is not connected")
-	})
-
-	s.Run("SetNX Delete Keys Success", func() {
-		s.SetupTest()
-		err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-		s.NoError(err)
-		s.ensureConnected()
-
-		ok, err := SetNXRaw("cli:key_nx", "val1")
-		s.NoError(err)
-		s.True(ok)
-
-		ok, err = SetNXRaw("cli:key_nx", "val2")
-		s.NoError(err)
-		s.False(ok)
-
-		v, err := GetRaw("cli:key_nx")
-		s.NoError(err)
-		s.Equal("val1", v)
-
-		_ = SetRaw("cli:key_another", "val")
-		keysRes := KeysRaw("cli:key_*")
-		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"cli:key_nx", "cli:key_another"}, keysRes.MustGet())
-
-		deleted, err := DeleteRaw("cli:key_nx")
-		s.NoError(err)
-		s.True(deleted)
-
-		keysRes = KeysRaw("cli:key_*")
-		s.False(keysRes.IsError())
-		s.ElementsMatch([]string{"cli:key_another"}, keysRes.MustGet())
-
-		deleted, err = DeleteRaw("cli:key_another")
-		s.NoError(err)
-		s.True(deleted)
-	})
 }
 
 func (s *ClientTestSuite) TestAuthCommand() {
@@ -1072,201 +873,6 @@ func (s *ClientTestSuite) TestPublishCommand() {
 	}
 }
 
-func (s *ClientTestSuite) TestSearchIndexCommand() {
-	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-	s.NoError(err)
-	s.ensureConnected()
-
-	data := []struct {
-		key string
-		val string
-	}{
-		{"user:1", `{"id": "1", "email": "ken@example.com", "age": 30, "status": "active"}`},
-		{"user:2", `{"id": "2", "email": "john@example.com", "age": 20, "status": "pending"}`},
-		{"user:3", `{"id": "3", "email": "admin@example.com", "age": 40, "status": "active"}`},
-	}
-
-	for _, d := range data {
-		err := SetRaw(d.key, d.val)
-		s.NoError(err)
-	}
-
-	tests := []struct {
-		name      string
-		index     string
-		kr        x.KeyRange
-		filter    x.Filter
-		desc      bool
-		expectErr bool
-		expectLen int
-	}{
-		{"Missing index", "", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Unknown index", "unknown", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Eq string", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, false, 1},
-		{"Eq false", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "nobody@example.com"), false, false, 0},
-		{"Gt number", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 25), false, false, 2},
-		{"Lt number", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Lt("age", 35), false, false, 2},
-		{"And true", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.And(x.Gt("age", 25), x.Eq("status", "active")), false, false, 2},
-		{"And false", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, false, 0},
-		{"Or", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Or(x.Lt("age", 25), x.Eq("status", "active")), false, false, 3},
-		{"Empty filter", x.Idx[testUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), nil, false, false, 3},
-		{"Key pattern narrows index scan", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:2"), nil, false, false, 1},
-		{"Descend test", x.Idx[testUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 10), true, false, 3},
-	}
-
-	for _, tt := range tests {
-		s.Run(tt.name, func() {
-			res := SearchIndexRaw(tt.index, tt.kr, tt.filter, tt.desc)
-
-			if tt.expectErr {
-				s.True(res.IsError())
-			} else {
-				s.False(res.IsError())
-				results := res.MustGet()
-				s.Len(results, tt.expectLen)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestSearchKeyCommand() {
-	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-	s.NoError(err)
-	s.ensureConnected()
-
-	data := []struct {
-		key string
-		val string
-	}{
-		{"product:1", `{"id": "1", "name": "Apple", "price": 10, "stock": 100}`},
-		{"product:2", `{"id": "2", "name": "Banana", "price": 5, "stock": 50}`},
-		{"product:3", `{"id": "3", "name": "Orange", "price": 8, "stock": 200}`},
-	}
-
-	for _, d := range data {
-		err := SetRaw(d.key, d.val)
-		s.NoError(err)
-	}
-
-	tests := []struct {
-		name      string
-		kr        x.KeyRange
-		filter    x.Filter
-		desc      bool
-		expectErr bool
-		expectLen int
-	}{
-		{"Missing pattern", nil, x.Eq("name", "Apple"), false, true, 0},
-		{"Match one", x.KeysPattern("product:*"), x.Eq("name", "Apple"), false, false, 1},
-		{"Match none by filter", x.KeysPattern("product:*"), x.Eq("name", "Grape"), false, false, 0},
-		{"Match none by pattern", x.KeysPattern("99*"), x.Eq("name", "Apple"), false, false, 0},
-		{"Gt number", x.KeysPattern("product:*"), x.Gt("price", 6), false, false, 2},
-		{"Lt number", x.KeysPattern("product:*"), x.Lt("stock", 150), false, false, 2},
-		{"And true", x.KeysPattern("product:*"), x.And(x.Gt("price", 6), x.Lt("stock", 150)), false, false, 1},
-		{"Empty filter", x.KeysPattern("product:*"), nil, false, false, 3},
-		{"Descend test", x.KeysPattern("product:*"), x.Gt("price", 4), true, false, 3},
-	}
-
-	for _, tt := range tests {
-		s.Run(tt.name, func() {
-			res := SearchKeyRaw(tt.kr, tt.filter, tt.desc)
-
-			if tt.expectErr {
-				s.True(res.IsError())
-			} else {
-				s.False(res.IsError())
-				results := res.MustGet()
-				s.Len(results, tt.expectLen)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestUpdateCommand() {
-	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
-	s.NoError(err)
-	s.ensureConnected()
-
-	data := []struct {
-		key string
-		val string
-	}{
-		{"user:1", `{"id":"1","status":"pending","age":17}`},
-		{"user:2", `{"id":"2","status":"pending","age":22}`},
-		{"user:3", `{"id":"3","status":"active","age":30}`},
-	}
-
-	for _, d := range data {
-		err := SetRaw(d.key, d.val)
-		s.NoError(err)
-	}
-
-	tests := []struct {
-		name      string
-		kr        x.KeyRange
-		filter    x.Filter
-		updates   []x.Mutation
-		expectErr bool
-		expectLen int
-		check     func()
-	}{
-		{
-			name:      "missing keyrange",
-			kr:        nil,
-			filter:    x.Eq("status", "pending"),
-			updates:   []x.Mutation{x.Set("status", "active")},
-			expectErr: true,
-		},
-		{
-			name:      "missing update values",
-			kr:        x.KeysPattern("user:*"),
-			filter:    x.Eq("status", "pending"),
-			expectErr: true,
-		},
-		{
-			name:      "update filtered documents",
-			kr:        x.KeysPattern("user:*"),
-			filter:    x.Eq("status", "pending"),
-			updates:   []x.Mutation{x.Set("status", "active"), x.Set("verified", true), x.Set("profile.age", 18)},
-			expectLen: 2,
-			check: func() {
-				val, err := GetRaw("user:1")
-				s.NoError(err)
-				s.Equal("active", gjson.Get(val, "status").String())
-				s.True(gjson.Get(val, "verified").Bool())
-				s.Equal(float64(18), gjson.Get(val, "profile.age").Float())
-			},
-		},
-		{
-			name:      "update with nil filter",
-			kr:        x.KeysPattern("user:*"),
-			filter:    nil,
-			updates:   []x.Mutation{x.Set("version", 2)},
-			expectLen: 3,
-			check: func() {
-				val, err := GetRaw("user:3")
-				s.NoError(err)
-				s.Equal(float64(2), gjson.Get(val, "version").Float())
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		s.Run(tt.name, func() {
-			res := UpdateRaw(tt.kr, tt.filter, tt.updates...)
-			if tt.expectErr {
-				s.True(res.IsError())
-				return
-			}
-			s.False(res.IsError())
-			s.Len(res.MustGet(), tt.expectLen)
-			if tt.check != nil {
-				tt.check()
-			}
-		})
-	}
-}
-
 func (s *ClientTestSuite) TestPubSubLifecycle() {
 	tests := []struct {
 		name string
@@ -1527,39 +1133,39 @@ func (s *ClientTestSuite) TestSetAndClearSharedClientHelpers() {
 func (s *ClientTestSuite) TestHookRegistrationAndRemoval() {
 	s.SetupTest()
 
-	s.Nil(snapshotHooks(), "no hooks initially")
+	s.Nil(hook.Snapshot(), "no hooks initially")
 
-	id1 := AddObserverHook(func(key string, value []byte) {})
-	s.NotEqual(HookID(0), id1, "HookID should be non-zero")
-	s.NotNil(snapshotHooks())
-	s.Len(snapshotHooks().observers, 1)
+	id1 := hook.AddObserver(func(key string, value []byte) {})
+	s.NotEqual(hook.ID(0), id1, "hook.ID should be non-zero")
+	s.NotNil(hook.Snapshot())
+	s.Equal(1, hook.Snapshot().LenObservers())
 
-	id2 := AddAbortHook(func(key string, value []byte) error { return nil })
-	id3 := AddTransformHook(func(key string, value []byte) ([]byte, error) { return value, nil })
-	id4 := AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {})
-	s.Len(snapshotHooks().aborts, 1)
-	s.Len(snapshotHooks().transforms, 1)
-	s.Len(snapshotHooks().afters, 1)
+	id2 := hook.AddAbort(func(key string, value []byte) error { return nil })
+	id3 := hook.AddTransform(func(key string, value []byte) ([]byte, error) { return value, nil })
+	id4 := hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {})
+	s.Equal(1, hook.Snapshot().LenAborts())
+	s.Equal(1, hook.Snapshot().LenTransforms())
+	s.Equal(1, hook.Snapshot().LenAfters())
 
 	s.NotEqual(id1, id2)
 	s.NotEqual(id2, id3)
 	s.NotEqual(id3, id4)
 
-	RemoveHook(id2)
-	s.Len(snapshotHooks().aborts, 0)
-	s.Len(snapshotHooks().observers, 1)
-	s.Len(snapshotHooks().transforms, 1)
-	s.Len(snapshotHooks().afters, 1)
+	hook.Remove(id2)
+	s.Equal(0, hook.Snapshot().LenAborts())
+	s.Equal(1, hook.Snapshot().LenObservers())
+	s.Equal(1, hook.Snapshot().LenTransforms())
+	s.Equal(1, hook.Snapshot().LenAfters())
 
-	RemoveHook(id1)
-	RemoveHook(id3)
-	RemoveHook(id4)
-	reg := snapshotHooks()
+	hook.Remove(id1)
+	hook.Remove(id3)
+	hook.Remove(id4)
+	reg := hook.Snapshot()
 	s.Nil(reg, "after removing every hook, registry snapshot must be nil to keep the zero-cost default path")
 
-	RemoveHook(HookID(0))
-	RemoveHook(9999)
-	RemoveHook(id1)
+	hook.Remove(hook.ID(0))
+	hook.Remove(9999)
+	hook.Remove(id1)
 }
 
 func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
@@ -1568,7 +1174,7 @@ func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
 	var called bool
 	var gotKey string
 	var gotVal []byte
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		called = true
 		gotKey = key
 		gotVal = append([]byte(nil), value...)
@@ -1578,13 +1184,13 @@ func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-obs-1", "hello")
+	err = raw.Set("cli:hook-obs-1", "hello")
 	s.NoError(err)
 	s.True(called, "ObserverHook must be called")
 	s.Equal("cli:hook-obs-1", gotKey)
 	s.Equal([]byte("hello"), gotVal)
 
-	stored, err := GetRaw("cli:hook-obs-1")
+	stored, err := raw.Get("cli:hook-obs-1")
 	s.NoError(err)
 	s.Equal("hello", stored)
 }
@@ -1592,15 +1198,15 @@ func (s *ClientTestSuite) TestObserverHookCalledBeforeWrite() {
 func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
 	s.SetupTest()
 
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		panic("boom observer")
 	})
 
 	var ok bool
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		ok = true
 	})
 
@@ -1608,11 +1214,11 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-obs-panic", "val")
+	err = raw.Set("cli:hook-obs-panic", "val")
 	s.NoError(err, "ObserverHook panic must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run after panic in prior observer")
 
-	stored, err := GetRaw("cli:hook-obs-panic")
+	stored, err := raw.Get("cli:hook-obs-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1620,15 +1226,15 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnPanic() {
 func (s *ClientTestSuite) TestObserverHookFailOpenOnTimeout() {
 	s.SetupTest()
 
-	SetHookTimeout(50 * time.Millisecond)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(50 * time.Millisecond)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		time.Sleep(200 * time.Millisecond)
 	})
 
 	var ok bool
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		ok = true
 	})
 
@@ -1637,13 +1243,13 @@ func (s *ClientTestSuite) TestObserverHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = SetRaw("cli:hook-obs-timeout", "val")
+	err = raw.Set("cli:hook-obs-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverHook timeout must not abort write")
 	s.True(ok, "subsequent ObserverHooks must still run")
 	s.Less(elapsed, 500*time.Millisecond, "timeout should bound the hook time")
 
-	stored, err := GetRaw("cli:hook-obs-timeout")
+	stored, err := raw.Get("cli:hook-obs-timeout")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1652,7 +1258,7 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 	s.SetupTest()
 
 	customErr := errors.New("blocked by policy")
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		if key == "cli:forbidden" {
 			return customErr
 		}
@@ -1663,15 +1269,15 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:forbidden", "secret")
+	err = raw.Set("cli:forbidden", "secret")
 	s.ErrorIs(err, customErr)
 
-	_, err = GetRaw("cli:forbidden")
+	_, err = raw.Get("cli:forbidden")
 	s.Error(err, "key must not exist after abort")
 
-	err = SetRaw("cli:allowed", "public")
+	err = raw.Set("cli:allowed", "public")
 	s.NoError(err)
-	v, err := GetRaw("cli:allowed")
+	v, err := raw.Get("cli:allowed")
 	s.NoError(err)
 	s.Equal("public", v)
 }
@@ -1679,10 +1285,10 @@ func (s *ClientTestSuite) TestAbortHookBlocksWrite() {
 func (s *ClientTestSuite) TestAbortHookFailClosedOnPanic() {
 	s.SetupTest()
 
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		panic("abort panic")
 	})
 
@@ -1690,21 +1296,21 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-abort-panic", "val")
+	err = raw.Set("cli:hook-abort-panic", "val")
 	s.Error(err, "AbortHook panic must abort write (fail-closed)")
 	s.Contains(err.Error(), "panic")
 
-	_, err = GetRaw("cli:hook-abort-panic")
+	_, err = raw.Get("cli:hook-abort-panic")
 	s.Error(err, "key must not exist after AbortHook panic")
 }
 
 func (s *ClientTestSuite) TestAbortHookFailClosedOnTimeout() {
 	s.SetupTest()
 
-	SetHookTimeout(50 * time.Millisecond)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(50 * time.Millisecond)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		time.Sleep(200 * time.Millisecond)
 		return nil
 	})
@@ -1714,7 +1320,7 @@ func (s *ClientTestSuite) TestAbortHookFailClosedOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = SetRaw("cli:hook-abort-timeout", "val")
+	err = raw.Set("cli:hook-abort-timeout", "val")
 	elapsed := time.Since(start)
 	s.Error(err, "AbortHook timeout must abort write (fail-closed)")
 	s.Contains(err.Error(), "timeout")
@@ -1725,7 +1331,7 @@ func (s *ClientTestSuite) TestTransformHookChangesValue() {
 	s.SetupTest()
 
 	prefix := []byte("enc:")
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(prefix)+len(value))
 		copy(out, prefix)
 		copy(out[len(prefix):], value)
@@ -1736,10 +1342,10 @@ func (s *ClientTestSuite) TestTransformHookChangesValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-transform-1", "plain")
+	err = raw.Set("cli:hook-transform-1", "plain")
 	s.NoError(err)
 
-	stored, err := GetRaw("cli:hook-transform-1")
+	stored, err := raw.Get("cli:hook-transform-1")
 	s.NoError(err)
 	s.Equal("enc:plain", stored, "TransformHook must change the written value")
 }
@@ -1747,14 +1353,14 @@ func (s *ClientTestSuite) TestTransformHookChangesValue() {
 func (s *ClientTestSuite) TestTransformHookChain() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(value))
 		for i, b := range value {
 			out[i] = b + 1
 		}
 		return out, nil
 	})
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(value))
 		for i, b := range value {
 			out[i] = b * 2
@@ -1766,10 +1372,10 @@ func (s *ClientTestSuite) TestTransformHookChain() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-transform-chain", "\x01")
+	err = raw.Set("cli:hook-transform-chain", "\x01")
 	s.NoError(err)
 
-	stored, err := GetRaw("cli:hook-transform-chain")
+	stored, err := raw.Get("cli:hook-transform-chain")
 	s.NoError(err)
 	s.Equal([]byte{("\x01"[0] + 1) * 2}, []byte(stored),
 		"TransformHooks must chain in registration order: (+1) then (*2)")
@@ -1778,7 +1384,7 @@ func (s *ClientTestSuite) TestTransformHookChain() {
 func (s *ClientTestSuite) TestTransformHookFailClosedOnError() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		return nil, errors.New("transform failed")
 	})
 
@@ -1786,21 +1392,21 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnError() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-transform-err", "val")
+	err = raw.Set("cli:hook-transform-err", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "transform failed")
 
-	_, err = GetRaw("cli:hook-transform-err")
+	_, err = raw.Get("cli:hook-transform-err")
 	s.Error(err, "key must not exist after TransformHook error")
 }
 
 func (s *ClientTestSuite) TestTransformHookFailClosedOnPanic() {
 	s.SetupTest()
 
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		panic("transform panic")
 	})
 
@@ -1808,11 +1414,11 @@ func (s *ClientTestSuite) TestTransformHookFailClosedOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-transform-panic", "val")
+	err = raw.Set("cli:hook-transform-panic", "val")
 	s.Error(err)
 	s.Contains(err.Error(), "panic")
 
-	_, err = GetRaw("cli:hook-transform-panic")
+	_, err = raw.Get("cli:hook-transform-panic")
 	s.Error(err)
 }
 
@@ -1821,7 +1427,7 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 
 	var gotKey, gotVal string
 	var gotWriteErr error
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		gotKey = key
 		gotVal = string(value)
 		gotWriteErr = writeErr
@@ -1831,7 +1437,7 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-after-1", "hello-after")
+	err = raw.Set("cli:hook-after-1", "hello-after")
 	s.NoError(err)
 	s.Equal("cli:hook-after-1", gotKey)
 	s.Equal("hello-after", gotVal)
@@ -1841,7 +1447,7 @@ func (s *ClientTestSuite) TestObserverAfterHookCalledAfterWrite() {
 func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(value))
 		copy(out, value)
 		for i := range out {
@@ -1851,7 +1457,7 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	})
 
 	var gotVal []byte
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		gotVal = append([]byte(nil), value...)
 	})
 
@@ -1859,7 +1465,7 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-after-transformed", "ABC")
+	err = raw.Set("cli:hook-after-transformed", "ABC")
 	s.NoError(err)
 	s.Equal([]byte("BCD"), gotVal, "ObserverAfter must see the transformed value")
 }
@@ -1867,15 +1473,15 @@ func (s *ClientTestSuite) TestObserverAfterHookReceivesTransformedValue() {
 func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 	s.SetupTest()
 
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		panic("after hook boom")
 	})
 
 	var ok bool
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		ok = true
 	})
 
@@ -1883,11 +1489,11 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-after-panic", "val")
+	err = raw.Set("cli:hook-after-panic", "val")
 	s.NoError(err, "ObserverAfterHook panic must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
 
-	stored, err := GetRaw("cli:hook-after-panic")
+	stored, err := raw.Get("cli:hook-after-panic")
 	s.NoError(err)
 	s.Equal("val", stored)
 }
@@ -1895,15 +1501,15 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnPanic() {
 func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
 	s.SetupTest()
 
-	SetHookTimeout(50 * time.Millisecond)
-	defer SetHookTimeout(defaultHookTimeout)
+	hook.SetTimeout(50 * time.Millisecond)
+	defer hook.SetTimeout(defaultHookTimeout)
 
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		time.Sleep(200 * time.Millisecond)
 	})
 
 	var ok bool
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		ok = true
 	})
 
@@ -1912,7 +1518,7 @@ func (s *ClientTestSuite) TestObserverAfterHookFailOpenOnTimeout() {
 	s.ensureConnected()
 
 	start := time.Now()
-	err = SetRaw("cli:hook-after-timeout", "val")
+	err = raw.Set("cli:hook-after-timeout", "val")
 	elapsed := time.Since(start)
 	s.NoError(err, "ObserverAfterHook timeout must not affect write result")
 	s.True(ok, "subsequent ObserverAfterHooks must still run")
@@ -1928,23 +1534,23 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 		steps[idx] = seq.Add(1)
 	}
 
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		capture(0)
 		s.Equal("original", string(value), "Abort must see original value")
 		return nil
 	})
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		capture(1)
 		s.Equal("original", string(value), "Transform must see original value")
 		out := make([]byte, len("transformed"))
 		copy(out, "transformed")
 		return out, nil
 	})
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		capture(2)
 		s.Equal("transformed", string(value), "ObserverBefore must see POST-transform value (A5)")
 	})
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		capture(4)
 		s.Equal("transformed", string(value), "ObserverAfter must see transformed value")
 	})
@@ -1953,7 +1559,7 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-order", "original")
+	err = raw.Set("cli:hook-order", "original")
 	s.NoError(err)
 	steps[3] = seq.Add(1)
 
@@ -1965,7 +1571,7 @@ func (s *ClientTestSuite) TestHookExecutionOrder() {
 	s.Equal(int64(4), steps[4])
 	s.Equal(int64(5), steps[3])
 
-	stored, err := GetRaw("cli:hook-order")
+	stored, err := raw.Get("cli:hook-order")
 	s.NoError(err)
 	s.Equal("transformed", stored)
 }
@@ -1975,18 +1581,18 @@ func (s *ClientTestSuite) TestObserverBeforeSeesPostTransformValueButAbortSeesOr
 
 	var abortSaw, transformSaw, observerSaw []byte
 
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		abortSaw = append([]byte(nil), value...)
 		return nil
 	})
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		transformSaw = append([]byte(nil), value...)
 		out := make([]byte, len(value)+len("-transformed"))
 		copy(out, value)
 		copy(out[len(value):], "-transformed")
 		return out, nil
 	})
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		observerSaw = append([]byte(nil), value...)
 	})
 
@@ -1994,7 +1600,7 @@ func (s *ClientTestSuite) TestObserverBeforeSeesPostTransformValueButAbortSeesOr
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-see-orig", "raw-value")
+	err = raw.Set("cli:hook-see-orig", "raw-value")
 	s.NoError(err)
 	s.Equal([]byte("raw-value"), abortSaw,
 		"AbortHook must see ORIGINAL value (runs first)")
@@ -2008,16 +1614,16 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.SetupTest()
 
 	var afterCalled bool
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		afterCalled = true
 	})
 
 	var observerBeforeCalled bool
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		observerBeforeCalled = true
 	})
 
-	AddAbortHook(func(key string, value []byte) error {
+	hook.AddAbort(func(key string, value []byte) error {
 		return errors.New("abort")
 	})
 
@@ -2025,7 +1631,7 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:hook-no-after", "val")
+	err = raw.Set("cli:hook-no-after", "val")
 	s.Error(err)
 	s.False(observerBeforeCalled,
 		"ObserverBefore must NOT run when AbortHook aborted earlier (fail-closed propagates out of Abort phase)")
@@ -2035,19 +1641,20 @@ func (s *ClientTestSuite) TestNoAfterHooksOnBeforeAbort() {
 func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	id := hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		return nil, nil
 	})
+	defer hook.Remove(id)
 
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:nil-transform", "should-not-be-overwritten")
+	err = raw.Set("cli:nil-transform", "should-not-be-overwritten")
 	s.Error(err)
 	s.Contains(err.Error(), "returned nil bytes without error")
 
-	existing, gerr := GetRaw("cli:nil-transform")
+	existing, gerr := raw.Get("cli:nil-transform")
 	if gerr == nil {
 		s.Equal("", existing,
 			"key either should not exist OR be empty string; what we must NOT see is 'should-not-be-overwritten' overwritten to ''.")
@@ -2057,19 +1664,19 @@ func (s *ClientTestSuite) TestTransformReturnsNilBytesWithoutErrorFailsClosed() 
 func (s *ClientTestSuite) TestSetHookZeroTimeoutUsesSyncPathNoGoroutineAllocs() {
 	s.SetupTest()
 
-	old := getHookTimeout()
-	SetHookTimeout(0)
-	defer SetHookTimeout(old)
+	old := hook.GetTimeout()
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(old)
 
-	AddObserverHook(func(key string, value []byte) {})
+	hook.AddObserver(func(key string, value []byte) {})
 
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:sync-path", "v")
+	err = raw.Set("cli:sync-path", "v")
 	s.NoError(err)
-	v, gerr := GetRaw("cli:sync-path")
+	v, gerr := raw.Get("cli:sync-path")
 	s.NoError(gerr)
 	s.Equal("v", v)
 }
@@ -2080,7 +1687,7 @@ func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError()
 	var gotKey string
 	var gotCommitted bool
 	var gotErr error
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		gotKey = key
 		gotCommitted = committed
 		gotErr = writeErr
@@ -2090,17 +1697,17 @@ func (s *ClientTestSuite) TestObserverAfterCommittedOnNormalSetAndAbortOnError()
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetRaw("cli:after-commit-1", "v1")
+	err = raw.Set("cli:after-commit-1", "v1")
 	s.NoError(err)
 	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
 	s.NoError(gotErr)
 
-	abortID := AddAbortHook(func(key string, value []byte) error {
+	abortID := hook.AddAbort(func(key string, value []byte) error {
 		return errors.New("blocked in abort hook")
 	})
-	defer RemoveHook(abortID)
-	err = SetRaw("cli:after-commit-2", "v2")
+	defer hook.Remove(abortID)
+	err = raw.Set("cli:after-commit-2", "v2")
 	s.Error(err)
 	s.Equal("cli:after-commit-1", gotKey)
 	s.True(gotCommitted)
@@ -2110,13 +1717,13 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.SetupTest()
 
 	var obsKey, obsVal string
-	AddObserverHook(func(key string, value []byte) {
+	hook.AddObserver(func(key string, value []byte) {
 		obsKey = key
 		obsVal = string(value)
 	})
 
 	prefix := []byte("x:")
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(prefix)+len(value))
 		copy(out, prefix)
 		copy(out[len(prefix):], value)
@@ -2126,7 +1733,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	var afterErr error
 	var afterVal string
 	var afterCommitted bool
-	AddObserverAfterHook(func(key string, value []byte, committed bool, writeErr error) {
+	hook.AddObserverAfter(func(key string, value []byte, committed bool, writeErr error) {
 		afterErr = writeErr
 		afterVal = string(value)
 		afterCommitted = committed
@@ -2136,7 +1743,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNXRaw("cli:hook-setnx-1", "original")
+	ok, err := raw.SetNX("cli:hook-setnx-1", "original")
 	s.NoError(err)
 	s.True(ok)
 	s.True(afterCommitted, "first SetNX write actually occurred -> committed=true")
@@ -2146,11 +1753,11 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 	s.Equal("x:original", afterVal)
 	s.NoError(afterErr)
 
-	stored, err := GetRaw("cli:hook-setnx-1")
+	stored, err := raw.Get("cli:hook-setnx-1")
 	s.NoError(err)
 	s.Equal("x:original", stored)
 
-	ok, err = SetNXRaw("cli:hook-setnx-1", "another")
+	ok, err = raw.SetNX("cli:hook-setnx-1", "another")
 	s.NoError(err)
 	s.False(ok, "SetNX should return false on existing key")
 	s.False(afterCommitted,
@@ -2160,7 +1767,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNX() {
 func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(value))
 		copy(out, value)
 		return append(out, '-', 't', 't', 'l'), nil
@@ -2170,22 +1777,22 @@ func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = SetWithTTLRaw("cli:hook-ttl", "base", 100*time.Millisecond)
+	err = raw.SetWithTTL("cli:hook-ttl", "base", 100*time.Millisecond)
 	s.NoError(err)
 
-	v, err := GetRaw("cli:hook-ttl")
+	v, err := raw.Get("cli:hook-ttl")
 	s.NoError(err)
 	s.Equal("base-ttl", v)
 
 	time.Sleep(200 * time.Millisecond)
-	_, err = GetRaw("cli:hook-ttl")
+	_, err = raw.Get("cli:hook-ttl")
 	s.Error(err)
 }
 
 func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.SetupTest()
 
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		return append([]byte(nil), value...), nil
 	})
 
@@ -2193,23 +1800,23 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := SetNXWithTTLRaw("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
+	ok, err := raw.SetNXWithTTL("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
 	s.NoError(err)
 	s.True(ok)
 
-	v, err := GetRaw("cli:hook-setnx-ttl")
+	v, err := raw.Get("cli:hook-setnx-ttl")
 	s.NoError(err)
 	s.Equal("x", v)
 
 	time.Sleep(160 * time.Millisecond)
-	_, err = GetRaw("cli:hook-setnx-ttl")
+	_, err = raw.Get("cli:hook-setnx-ttl")
 	s.Error(err)
 }
 
 func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
 	s.SetupTest()
 
-	id := AddObserverHook(func(key string, value []byte) {})
+	id := hook.AddObserver(func(key string, value []byte) {})
 	_ = id
 
 	err := Connect(clientTestServerAddr, clientTestExternalAuthKey)
@@ -2220,13 +1827,13 @@ func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
 	go func() {
 		defer close(done)
 		for i := 0; i < 50; i++ {
-			RemoveHook(id)
-			AddObserverHook(func(key string, value []byte) {})
+			hook.Remove(id)
+			hook.AddObserver(func(key string, value []byte) {})
 		}
 	}()
 
 	for i := 0; i < 50; i++ {
-		_ = SetRaw(fmt.Sprintf("hook-safe-%d", i), "v")
+		_ = raw.Set(fmt.Sprintf("hook-safe-%d", i), "v")
 	}
 	<-done
 }
@@ -2497,7 +2104,7 @@ func readOneRESPCommand(br *bufio.Reader) (string, error) {
 }
 
 func BenchmarkSetNoHooks(b *testing.B) {
-	resetHooks()
+	hook.Reset()
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: 36379},
@@ -2520,23 +2127,23 @@ func BenchmarkSetNoHooks(b *testing.B) {
 		_ = mockClient.Close()
 		clearSharedClientIf(mockClient)
 		_ = db.Close()
-		resetHooks()
+		hook.Reset()
 	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTLRaw("cli:bench-nohook", "payload-value", 0)
+		_ = raw.SetWithTTL("cli:bench-nohook", "payload-value", 0)
 	}
 }
 
 func BenchmarkSetWithObserverHooks(b *testing.B) {
-	resetHooks()
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
-	AddObserverHook(func(key string, value []byte) {})
-	AddObserverHook(func(key string, value []byte) {})
-	AddObserverHook(func(key string, value []byte) {})
+	hook.Reset()
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
+	hook.AddObserver(func(key string, value []byte) {})
+	hook.AddObserver(func(key string, value []byte) {})
+	hook.AddObserver(func(key string, value []byte) {})
 
 	cfg := &server.Config{
 		DataPath: filepath.Join(b.TempDir(), "redisx-bench.db"),
@@ -2560,21 +2167,21 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 		_ = mockClient.Close()
 		clearSharedClientIf(mockClient)
 		_ = db.Close()
-		resetHooks()
+		hook.Reset()
 	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTLRaw("cli:bench-observer", "payload-value", 0)
+		_ = raw.SetWithTTL("cli:bench-observer", "payload-value", 0)
 	}
 }
 
 func BenchmarkSetWithAbortHook(b *testing.B) {
-	resetHooks()
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
-	AddAbortHook(func(key string, value []byte) error {
+	hook.Reset()
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
+	hook.AddAbort(func(key string, value []byte) error {
 		return nil
 	})
 
@@ -2600,21 +2207,21 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 		_ = mockClient.Close()
 		clearSharedClientIf(mockClient)
 		_ = db.Close()
-		resetHooks()
+		hook.Reset()
 	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTLRaw("cli:bench-abort", "payload-value", 0)
+		_ = raw.SetWithTTL("cli:bench-abort", "payload-value", 0)
 	}
 }
 
 func BenchmarkSetWithTransformHook(b *testing.B) {
-	resetHooks()
-	SetHookTimeout(0)
-	defer SetHookTimeout(defaultHookTimeout)
-	AddTransformHook(func(key string, value []byte) ([]byte, error) {
+	hook.Reset()
+	hook.SetTimeout(0)
+	defer hook.SetTimeout(defaultHookTimeout)
+	hook.AddTransform(func(key string, value []byte) ([]byte, error) {
 		out := make([]byte, len(value))
 		copy(out, value)
 		return out, nil
@@ -2642,22 +2249,22 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 		_ = mockClient.Close()
 		clearSharedClientIf(mockClient)
 		_ = db.Close()
-		resetHooks()
+		hook.Reset()
 	}()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = SetWithTTLRaw("cli:bench-transform", "payload-value", 0)
+		_ = raw.SetWithTTL("cli:bench-transform", "payload-value", 0)
 	}
 }
 
 func BenchmarkHooksStoreLoadBaseline(b *testing.B) {
-	resetHooks()
+	hook.Reset()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = snapshotHooks()
+		_ = hook.Snapshot()
 	}
 }
 
@@ -2815,25 +2422,25 @@ func (s *DocTestSuite) TestSearchKeyScopedLimitCarry4LayerAlignment() {
 
 func (s *DocTestSuite) TestDocHookForwarders() {
 	var obsKey, obsVal string
-	id1 := AddObserverHook(func(key string, valueJSON []byte) {
+	id1 := hook.AddObserver(func(key string, valueJSON []byte) {
 		obsKey = key
 		obsVal = string(valueJSON)
 	})
-	defer RemoveHook(id1)
+	defer hook.Remove(id1)
 
 	testAbortErr := errors.New("doc hook abort test")
 	aborted := false
-	id2 := AddAbortHook(func(key string, valueJSON []byte) error {
+	id2 := hook.AddAbort(func(key string, valueJSON []byte) error {
 		if string(valueJSON) == `{"id":"999","blocked":true}` {
 			aborted = true
 			return testAbortErr
 		}
 		return nil
 	})
-	defer RemoveHook(id2)
+	defer hook.Remove(id2)
 
 	transformed := false
-	id3 := AddTransformHook(func(key string, valueJSON []byte) ([]byte, error) {
+	id3 := hook.AddTransform(func(key string, valueJSON []byte) ([]byte, error) {
 		if key == "user:998" {
 			transformed = true
 			out := make([]byte, 0, len(valueJSON)+20)
@@ -2843,18 +2450,18 @@ func (s *DocTestSuite) TestDocHookForwarders() {
 		}
 		return valueJSON, nil
 	})
-	defer RemoveHook(id3)
+	defer hook.Remove(id3)
 
 	var afterKey, afterVal string
 	var afterWriteErr error
 	var afterCommitted bool
-	id4 := AddObserverAfterHook(func(key string, valueJSON []byte, committed bool, writeErr error) {
+	id4 := hook.AddObserverAfter(func(key string, valueJSON []byte, committed bool, writeErr error) {
 		afterKey = key
 		afterVal = string(valueJSON)
 		afterWriteErr = writeErr
 		afterCommitted = committed
 	})
-	defer RemoveHook(id4)
+	defer hook.Remove(id4)
 
 	orig := UserDoc(`{"id":"998","name":"Alice"}`)
 	err := Set(orig)
@@ -2965,7 +2572,7 @@ func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeCrossLayerMismatchNote_docSco
 	if kr == nil {
 		kr = x.KeysPattern("user:*")
 	}
-	res := SearchKeyRaw(kr, nil, false)
+	res := raw.SearchKey(kr, nil, false)
 	if res.IsError() {
 		s.Contains(res.Error().Error(), "wrong number of arguments",
 			"untyped client SearchKey error allowed (client may not be fully seeded); skipping cross-layer assertion in doc suite")
@@ -3035,7 +2642,7 @@ func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchNote_docS
 	memStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
 	memIdxName := naming.BuildIdxFullName(memStorageNs, "score")
 	diskKr := x.KeysPattern("user:*")
-	res := SearchIndexRaw(memIdxName, diskKr, nil, false)
+	res := raw.SearchIndex(memIdxName, diskKr, nil, false)
 	if res.IsError() {
 		s.Contains(res.Error().Error(), "different storage layer",
 			"mem index (%s) + disk KeyRange (user:*) must reject cross-layer; got err: %v", memIdxName, res.Error())
@@ -3467,4 +3074,558 @@ func (s *DocUpdateKeyRangeSuite) TestTypedScopedLimitCarry4LayerAlignment() {
 
 func TestDocUpdateKeyRangeSuite(t *testing.T) {
 	suite.Run(t, new(DocUpdateKeyRangeSuite))
+}
+
+// ———  KeyRange client suites (merged from key_range_client_test.go)  ———
+
+const (
+	searchKRClientNamespace = "probeclient"
+	updateKRClientNamespace = "updclient000"
+)
+
+type SearchFixtureDoc string
+
+func (SearchFixtureDoc) Namespace() string  { return searchKRClientNamespace }
+func (SearchFixtureDoc) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (SearchFixtureDoc) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d SearchFixtureDoc) RawJSON() string  { return string(d) }
+func (SearchFixtureDoc) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+func krClientID(id string) string {
+	return testutil.XIDKey(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), id)
+}
+
+type UpdateFixtureDoc string
+
+func (UpdateFixtureDoc) Namespace() string  { return updateKRClientNamespace }
+func (UpdateFixtureDoc) Mem() bool          { return testutil.KeyRangeFixtureMem() }
+func (UpdateFixtureDoc) KeyAttrs() []string { return testutil.KeyRangeDocKeyAttrs() }
+func (d UpdateFixtureDoc) RawJSON() string  { return string(d) }
+func (UpdateFixtureDoc) TTL() time.Duration { return testutil.KeyRangeDocTTL() }
+
+func updClientID(id string) string {
+	return testutil.XIDKey(updateKRClientNamespace, testutil.KeyRangeFixtureMem(), id)
+}
+
+func updClientIDPrefix() string {
+	return testutil.XKeyPrefix(updateKRClientNamespace, testutil.KeyRangeFixtureMem())
+}
+
+func updClientIDFromStorage(storageKeys []string) []string {
+	prefix := updClientIDPrefix()
+	out := make([]string, 0, len(storageKeys))
+	for _, k := range storageKeys {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			out = append(out, k[len(prefix):])
+			continue
+		}
+		out = append(out, "")
+	}
+	return out
+}
+
+func updClientRawGet(raw, path string) string { return gjson.Get(raw, path).String() }
+
+func (s *SearchKeyRangeSuite) TestSearchKeyRangeSeedCountIs100() {
+	s.ensureConnectedClientAndAuth()
+	kr := x.KeysPattern(krClientID("*"))
+	got := raw.SearchKey(kr, nil, false)
+	s.False(got.IsError(), "SearchKey err: %v", got.Error())
+	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *SearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
+	s.ensureConnectedClientAndAuth()
+
+	krWrongPrefix := x.KeysPattern("probe-client:*")
+	resWrong := raw.SearchKey(krWrongPrefix, nil, false)
+	s.False(resWrong.IsError())
+	s.Empty(resWrong.MustGet())
+
+	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
+	resServer := raw.SearchKey(krServer, nil, false)
+	s.False(resServer.IsError())
+	s.Empty(resServer.MustGet())
+}
+
+func (s *SearchKeyRangeSuite) TestSearchKeyRangeFullMatrix_TABLE_DRIVEN() {
+	s.ensureConnectedClientAndAuth()
+	run := func(kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := raw.SearchKey(kr, nil, desc)
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(res.MustGet()), true, ""
+	}
+	testutil.AssertSearchKeyMatrix(s.T(), run, testutil.KeyRangeCtorCases(), krClientID, "SK/")
+}
+
+func (s *SearchKeyRangeSuite) TestSearchKeyRangeGtGteGapEqualsOne() {
+	s.ensureConnectedClientAndAuth()
+	gte := raw.SearchKey(x.KeysGte(krClientID("p027")), nil, false)
+	s.Require().False(gte.IsError())
+	gt := raw.SearchKey(x.KeysGt(krClientID("p027")), nil, false)
+	s.Require().False(gt.IsError())
+	testutil.AssertGtGteGap1(s.T(),
+		testutil.XIDsFromValues(gte.MustGet()),
+		testutil.XIDsFromValues(gt.MustGet()),
+		"p027")
+}
+
+func (s *SearchKeyRangeSuite) TestSearchKeyRangeLtLteGapEqualsOne() {
+	s.ensureConnectedClientAndAuth()
+	lte := raw.SearchKey(x.KeysLte(krClientID("p072")), nil, false)
+	s.Require().False(lte.IsError())
+	lt := raw.SearchKey(x.KeysLt(krClientID("p072")), nil, false)
+	s.Require().False(lt.IsError())
+	testutil.AssertLtLteGap1(s.T(),
+		testutil.XIDsFromValues(lte.MustGet()),
+		testutil.XIDsFromValues(lt.MustGet()),
+		"p072")
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeScoreSeedCountIs100() {
+	s.ensureConnectedClientAndAuth()
+	kr := x.KeysPattern(krClientID("*"))
+	idxName := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+	got := raw.SearchIndex(idxName, kr, nil, false)
+	s.False(got.IsError(), "SearchIndex score ASC err: %v", got.Error())
+	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeScoreOrderingMatchesSearchKeyIdOrder() {
+	s.ensureConnectedClientAndAuth()
+	krAll := x.KeysPattern(krClientID("*"))
+	idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+
+	siAsc := raw.SearchIndex(idxScore, krAll, nil, false)
+	s.Require().False(siAsc.IsError())
+	skAsc := raw.SearchKey(krAll, nil, false)
+	s.Require().False(skAsc.IsError())
+	siDesc := raw.SearchIndex(idxScore, krAll, nil, true)
+	s.Require().False(siDesc.IsError())
+	skDesc := raw.SearchKey(krAll, nil, true)
+	s.Require().False(skDesc.IsError())
+
+	testutil.AssertScoreEqSKId(s.T(),
+		testutil.XIDsFromValues(siAsc.MustGet()),
+		testutil.XIDsFromValues(skAsc.MustGet()),
+		testutil.XIDsFromValues(siDesc.MustGet()),
+		testutil.XIDsFromValues(skDesc.MustGet()))
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeFullMatrix_TABLE_DRIVEN() {
+	s.ensureConnectedClientAndAuth()
+	idxName := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+	run := func(n string, kr x.KeyRange, desc bool) ([]string, bool, string) {
+		res := raw.SearchIndex(n, kr, nil, desc)
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return testutil.XIDsFromValues(res.MustGet()), true, ""
+	}
+	testutil.AssertSearchIndexMatrix(s.T(), run, idxName, testutil.KeyRangeCtorCases(), krClientID, "idx=score/")
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeBucketTiebreakersLexicographicById() {
+	s.ensureConnectedClientAndAuth()
+	krAll := x.KeysPattern(krClientID("*"))
+	idxBucket := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "bucket")
+	eqA := raw.SearchIndex(idxBucket, krAll, x.Eq("bucket", "A"), false)
+	s.Require().False(eqA.IsError())
+	eqC := raw.SearchIndex(idxBucket, krAll, x.Eq("bucket", "C"), false)
+	s.Require().False(eqC.IsError())
+	all := raw.SearchIndex(idxBucket, krAll, nil, false)
+	s.Require().False(all.IsError())
+	testutil.AssertBucketDistribution(s.T(),
+		testutil.XIDsFromValues(eqA.MustGet()),
+		testutil.XIDsFromValues(eqC.MustGet()),
+		testutil.XIDsFromValues(all.MustGet()))
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeSparseAmtLimit10() {
+	s.ensureConnectedClientAndAuth()
+	krLimit := x.KeysPattern(krClientID("*")).Limit(10)
+	idxSparse := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "sparseamt")
+	si := raw.SearchIndex(idxSparse, krLimit, nil, false)
+	s.Require().False(si.IsError())
+	testutil.AssertSparseLimit10(s.T(), testutil.XIDsFromValues(si.MustGet()))
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRangeCrossLayerMismatchRejects() {
+	s.ensureConnectedClientAndAuth()
+	krDisk := x.KeysPattern("user:*")
+	idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+	res := raw.SearchIndex(idxScore, krDisk, nil, false)
+	s.True(res.IsError(), "got Ok len=%d", len(res.OrEmpty()))
+	s.Contains(res.Error().Error(), "different storage layer")
+}
+
+func (s *SearchKeyRangeSuite) TestSearchIndexRange_InvalidInputs_EmptyIndexAndNilKeyrange() {
+	s.ensureConnectedClientAndAuth()
+	s.Run("empty index name → early error", func() {
+		res := raw.SearchIndex("", x.KeysPattern(krClientID("*")), nil, false)
+		s.Require().True(res.IsError(), "expected Err for empty indexName; got Ok len=%d", len(res.OrEmpty()))
+		s.Contains(res.Error().Error(), "index name is required",
+			"err=%v", res.Error())
+	})
+	s.Run("nil keyrange → early error", func() {
+		idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
+		res := raw.SearchIndex(idxScore, nil, nil, false)
+		s.Require().True(res.IsError(), "expected Err for nil kr; got Ok len=%d", len(res.OrEmpty()))
+		s.Contains(res.Error().Error(), "key range is required",
+			"err=%v", res.Error())
+	})
+}
+
+type SearchKeyRangeSuite struct {
+	suite.Suite
+}
+
+func (s *SearchKeyRangeSuite) SetupSuite() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.SetupSuite()
+}
+
+func (s *SearchKeyRangeSuite) SetupTest() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.SetupTest()
+}
+
+func (s *SearchKeyRangeSuite) ensureConnectedClientAndAuth() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.ensureConnectedClientAndAuth()
+}
+
+func TestSearchKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(SearchKeyRangeSuite))
+}
+
+type UpdateKeyRangeSuite struct {
+	suite.Suite
+}
+
+func (s *UpdateKeyRangeSuite) SetupSuite() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.SetupSuite()
+}
+
+func (s *UpdateKeyRangeSuite) SetupTest() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.SetupTest()
+	s.ensureConnectedClientAndAuth()
+	for _, kv := range testutil.LoadXFor(s.T(), updateKRClientNamespace, testutil.KeyRangeFixtureMem()) {
+		err := raw.Set(kv.K, kv.V)
+		s.Require().NoError(err, "UpdateKR SetupTest Set key=%s err=%v", kv.K, err)
+	}
+}
+
+func (s *UpdateKeyRangeSuite) ensureConnectedClientAndAuth() {
+	var clientSuite ClientTestSuite
+	clientSuite.SetT(s.T())
+	clientSuite.ensureConnectedClientAndAuth()
+}
+
+func (s *UpdateKeyRangeSuite) TestSeedCountMatchesSearchKey() {
+	allKr := x.KeysPattern(updClientID("*"))
+	skRes := raw.SearchKey(allKr, nil, false)
+	s.Require().False(skRes.IsError(), "SK err: %v", skRes.Error())
+	s.Len(skRes.MustGet(), testutil.CountX(), "UpdateKR seed count should equal fixture count")
+}
+
+func (s *UpdateKeyRangeSuite) TestNoCrossContamination() {
+	resWrong := raw.Update(x.KeysPattern("probenegcli:*"), nil, x.Set("tag_contam", true))
+	s.False(resWrong.IsError())
+	s.Empty(resWrong.MustGet(), "cross-contam probenegcli prefix should hit zero keys")
+
+	resServer := raw.Update(x.KeysPattern(testutil.XKeyPrefix("probeserver", true)+"*"), nil, x.Set("tag_contam", true))
+	s.False(resServer.IsError())
+	s.Empty(resServer.MustGet(), "cross-contam probe-server prefix should hit zero keys")
+
+	skAll := raw.SearchKey(x.KeysPattern(updClientID("*")), nil, false)
+	s.Require().False(skAll.IsError())
+	for _, v := range skAll.MustGet() {
+		got := updClientRawGet(v, "tag_contam")
+		s.NotEqual("true", got, "tag_contam leaked to fixture data; ctor_shape=%q raw=%s", updClientRawGet(v, "ctor_shape"), v)
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestBulkSetAllTagThenVerifyViaSearchKey() {
+	allKr := x.KeysPattern(updClientID("*"))
+	res := raw.Update(allKr, nil, x.Set("update_tagged", "bulk_all"))
+	s.Require().False(res.IsError(), "Update bulk_all err: %v", res.Error())
+	keys := res.MustGet()
+	s.Len(keys, testutil.CountX())
+	sort.Strings(keys)
+
+	skAfter := raw.SearchKey(allKr, nil, false)
+	s.Require().False(skAfter.IsError())
+	after := skAfter.MustGet()
+	s.Len(after, testutil.CountX())
+	for _, v := range after {
+		s.Equal("bulk_all", updClientRawGet(v, "update_tagged"),
+			"every value should carry update_tagged=bulk_all; raw=%s", v)
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestUpdateAllKeyRangeCtorShapes_TABLE_DRIVEN() {
+	epoch := 0
+	nextTag := func() string {
+		epoch++
+		return fmt.Sprintf("e%d", epoch)
+	}
+	runAsc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := raw.Update(kr, nil, x.Set("ctor_shape", tag))
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		return updClientIDFromStorage(res.MustGet()), true, ""
+	}
+	runDesc := func(kr x.KeyRange, tag string) ([]string, bool, string) {
+		res := raw.Update(kr, nil, x.Set("ctor_shape", tag))
+		if res.IsError() {
+			return nil, false, res.Error().Error()
+		}
+		ids := updClientIDFromStorage(res.MustGet())
+		for i, j := 0, len(ids)-1; i < j; i, j = i+1, j-1 {
+			ids[i], ids[j] = ids[j], ids[i]
+		}
+		return ids, true, ""
+	}
+	assertCtorShapeWritten := func(caseName, label string, wantCount int, verifyRange x.KeyRange, wantTag string) {
+		s.T().Helper()
+		skRes := raw.SearchKey(verifyRange, nil, false)
+		s.Require().False(skRes.IsError(), "%s/%s: SearchKey after Update err: %v", caseName, label, skRes.Error())
+		values := skRes.MustGet()
+		var count int
+		for _, v := range values {
+			if updClientRawGet(v, "ctor_shape") == wantTag {
+				count++
+			}
+		}
+		s.Equal(wantCount, count,
+			"%s/%s: ctor_shape=%q written count mismatch want=%d got=%d (SearchKey range len=%d)",
+			caseName, label, wantTag, wantCount, count, len(values))
+	}
+	for _, tc := range testutil.KeyRangeCtorCases() {
+		tc := tc
+		kr := tc.Build(updClientID)
+		fullCase := "UpdateKR/" + tc.Name
+
+		tag := nextTag()
+		ids, ok, errMsg := runAsc(kr, tag)
+		assertClientKRResult(s.T(), fullCase, "ASC_no_limit", tc.WantAsc, ids, ok, errMsg, false)
+		if ok && len(ids) > 0 {
+			assertCtorShapeWritten(fullCase, "ASC_no_limit", len(ids), kr, tag)
+		}
+
+		tag = nextTag()
+		ids, ok, errMsg = runDesc(kr, tag)
+		assertClientKRResult(s.T(), fullCase, "DESC_no_limit", tc.WantAsc, ids, ok, errMsg, true)
+		if ok && len(tc.WantAsc) > 0 {
+			assertCtorShapeWritten(fullCase, "DESC_no_limit", len(tc.WantAsc), kr, tag)
+		}
+
+		if len(tc.WantAsc) >= 5 {
+			limit5Asc := tc.WantAsc[:5]
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(5), tag)
+			assertClientKRResult(s.T(), fullCase, "ASC_Limit_5_is_first_5", limit5Asc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_5", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runDesc(kr.Limit(5), tag)
+			assertClientKRResult(s.T(), fullCase, "DESC_Limit_5_is_last_5_rev", limit5Asc, ids, ok, errMsg, true)
+			if ok && len(limit5Asc) > 0 {
+				assertCtorShapeWritten(fullCase, "DESC_Limit_5", 5, kr, tag)
+			}
+		}
+		if len(tc.WantAsc) >= 3 {
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)), tag)
+			assertClientKRResult(s.T(), fullCase, "ASC_Limit_EQ_count_returns_all", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_EQ_count", len(ids), kr, tag)
+			}
+			tag = nextTag()
+			ids, ok, errMsg = runAsc(kr.Limit(len(tc.WantAsc)+500), tag)
+			assertClientKRResult(s.T(), fullCase, "ASC_Limit_OVER_count_safe", tc.WantAsc, ids, ok, errMsg, false)
+			if ok && len(ids) > 0 {
+				assertCtorShapeWritten(fullCase, "ASC_Limit_OVER_count", len(ids), kr, tag)
+			}
+		}
+	}
+}
+
+func assertClientKRResult(t *testing.T, caseName, label string, wantAsc, ids []string, ok bool, errMsg string, desc bool) {
+	t.Helper()
+	if !ok {
+		t.Errorf("%s/%s: expected Ok, got Error: %s", caseName, label, errMsg)
+		return
+	}
+	if len(wantAsc) != len(ids) {
+		t.Errorf("%s/%s: length mismatch want=%d got=%d ids=%v", caseName, label, len(wantAsc), len(ids), ids)
+		return
+	}
+	var want []string
+	if desc {
+		want = make([]string, len(wantAsc))
+		copy(want, wantAsc)
+		for i, j := 0, len(want)-1; i < j; i, j = i+1, j-1 {
+			want[i], want[j] = want[j], want[i]
+		}
+	} else {
+		want = wantAsc
+	}
+	if len(want) == 0 && len(ids) == 0 {
+		return
+	}
+	for i := range want {
+		if want[i] != ids[i] {
+			t.Errorf("%s/%s content mismatch (desc=%v): want[%d]=%q got[%d]=%q", caseName, label, desc, i, want[i], i, ids[i])
+			return
+		}
+	}
+}
+
+func (s *UpdateKeyRangeSuite) TestGtGteBoundaryGapEqualsOne() {
+	krGte := x.KeysGte(updClientID("p027"))
+	resGte := raw.Update(krGte, nil, x.Set("boundary", "gte"))
+	s.Require().False(resGte.IsError())
+	idsGte := updClientIDFromStorage(resGte.MustGet())
+
+	skGte := raw.SearchKey(krGte, nil, false)
+	s.Require().False(skGte.IsError())
+	gotGte := skGte.MustGet()
+	s.Len(gotGte, len(idsGte), "Gte SK sweep after Update expected len=%d got=%d", len(idsGte), len(gotGte))
+	for _, v := range gotGte {
+		got := updClientRawGet(v, "boundary")
+		s.Equal("gte", got, "Update Gte value mismatch on boundary field: raw=%s", v)
+	}
+
+	krGt := x.KeysGt(updClientID("p027"))
+	resGt := raw.Update(krGt, nil, x.Set("boundary", "gt"))
+	s.Require().False(resGt.IsError())
+	idsGt := updClientIDFromStorage(resGt.MustGet())
+
+	skGt := raw.SearchKey(krGt, nil, false)
+	s.Require().False(skGt.IsError())
+	gotGt := skGt.MustGet()
+	s.Len(gotGt, len(idsGt), "Gt SK sweep after Update expected len=%d got=%d", len(idsGt), len(gotGt))
+	for _, v := range gotGt {
+		got := updClientRawGet(v, "boundary")
+		s.Equal("gt", got, "Update Gt value mismatch on boundary field: raw=%s", v)
+	}
+
+	testutil.AssertGtGteGap1(s.T(), idsGte, idsGt, "p027")
+}
+
+func (s *UpdateKeyRangeSuite) TestLtLteBoundaryGapEqualsOne() {
+	krLte := x.KeysLte(updClientID("p072"))
+	resLte := raw.Update(krLte, nil, x.Set("boundary", "lte"))
+	s.Require().False(resLte.IsError())
+	idsLte := updClientIDFromStorage(resLte.MustGet())
+
+	skLte := raw.SearchKey(krLte, nil, false)
+	s.Require().False(skLte.IsError())
+	gotLte := skLte.MustGet()
+	s.Len(gotLte, len(idsLte), "Lte SK sweep after Update expected len=%d got=%d", len(idsLte), len(gotLte))
+	for _, v := range gotLte {
+		got := updClientRawGet(v, "boundary")
+		s.Equal("lte", got, "Update Lte value mismatch on boundary field: raw=%s", v)
+	}
+
+	krLt := x.KeysLt(updClientID("p072"))
+	resLt := raw.Update(krLt, nil, x.Set("boundary", "lt"))
+	s.Require().False(resLt.IsError())
+	idsLt := updClientIDFromStorage(resLt.MustGet())
+
+	skLt := raw.SearchKey(krLt, nil, false)
+	s.Require().False(skLt.IsError())
+	gotLt := skLt.MustGet()
+	s.Len(gotLt, len(idsLt), "Lt SK sweep after Update expected len=%d got=%d", len(idsLt), len(gotLt))
+	for _, v := range gotLt {
+		got := updClientRawGet(v, "boundary")
+		s.Equal("lt", got, "Update Lt value mismatch on boundary field: raw=%s", v)
+	}
+
+	testutil.AssertLtLteGap1(s.T(), idsLte, idsLt, "p072")
+}
+
+func (s *UpdateKeyRangeSuite) TestLimit7PrefixEqualFullSet() {
+	allKr := x.KeysPattern(updClientID("*"))
+
+	fullRes := raw.Update(allKr, nil, x.Set("lim", "full"))
+	s.Require().False(fullRes.IsError(), "full err=%v", fullRes.Error())
+	full := fullRes.MustGet()
+	s.Len(full, testutil.CountX())
+	sort.Strings(full)
+	skFull := raw.SearchKey(allKr, nil, false)
+	s.Require().False(skFull.IsError())
+	gotFull := skFull.MustGet()
+	s.Len(gotFull, testutil.CountX())
+	for _, v := range gotFull {
+		got := updClientRawGet(v, "lim")
+		s.Equal("full", got, "Update lim=full value mismatch: raw=%s", v)
+	}
+
+	limitRes := raw.Update(x.KeysPattern(updClientID("*")).Limit(7), nil, x.Set("lim", "7"))
+	s.Require().False(limitRes.IsError(), "limit err=%v", limitRes.Error())
+	lim := limitRes.MustGet()
+	s.Len(lim, 7, "Limit(7) must truncate at callback=7, got len=%d", len(lim))
+	sort.Strings(lim)
+	s.Equal(full[:7], lim, "Limit(7) updated keys must equal ASC first-7 of full set — proves early-stop at callback")
+	skLim := raw.SearchKey(allKr, nil, false)
+	s.Require().False(skLim.IsError())
+	gotLim := skLim.MustGet()
+	var cntLim7 int
+	for _, v := range gotLim {
+		got := updClientRawGet(v, "lim")
+		if got == "7" {
+			cntLim7++
+			continue
+		}
+		s.Equal("full", got, "Limit=7 sweep: non-first-7 docs must keep lim=full, got %q; raw=%s", got, v)
+	}
+	s.Equal(7, cntLim7, "lim=7 want 7 docs with exact value lim==7 got=%d", cntLim7)
+}
+
+func (s *UpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
+	filter := x.Eq("bucket", "A")
+	res := raw.Update(x.KeysPattern(updClientID("*")), filter, x.Set("filtered_tag", "A-only"))
+	s.Require().False(res.IsError(), "filtered err=%v", res.Error())
+	ids := updClientIDFromStorage(res.MustGet())
+	s.Len(ids, 34, "Update+filter Eq(bucket,A) should match 34 bucket=A rows")
+
+	skAll := raw.SearchKey(x.KeysPattern(updClientID("*")), nil, false)
+	s.Require().False(skAll.IsError())
+	var count int
+	for _, v := range skAll.MustGet() {
+		if updClientRawGet(v, "filtered_tag") == "A-only" {
+			count++
+		}
+	}
+	s.Equal(len(ids), count, "only updated rows carry filtered_tag; count=%d", count)
+}
+
+func (s *UpdateKeyRangeSuite) TestNilKRRejects() {
+	res := raw.Update(nil, nil, x.Set("nil_tag", true))
+	s.Require().True(res.IsError(), "nil kr must reject")
+	s.Contains(res.Error().Error(), "key range is required")
+}
+
+func (s *UpdateKeyRangeSuite) TestEmptyValuesRejects() {
+	res := raw.Update(x.KeysPattern(updClientID("*")), nil)
+	s.Require().True(res.IsError(), "no mutation values must reject")
+	s.Contains(res.Error().Error(), "no update values provided")
+}
+
+func TestUpdateKeyRangeSuite(t *testing.T) {
+	suite.Run(t, new(UpdateKeyRangeSuite))
 }

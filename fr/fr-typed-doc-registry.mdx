@@ -483,7 +483,7 @@ Else (no TTL in SET)
 
 ### 6.2 Final Public Surface (client 包)
 
-**19 个 public 符号 = 11 (infrastructure) + 8 (typed CRUD [D])：**
+**20 个 public 符号 = 5 (infrastructure) + 8 (typed CRUD [D]) + 7 (write-hook facade)：**
 
 ```
 // Infrastructure (no-D, forever public)
@@ -492,12 +492,6 @@ ConnectEmbedded() error
 Auth(authKey string) error
 Publish(topic, msg string) bool
 Subscribe(topic string) mo.Result[<-chan *ReceivedMessage]
-SetHookTimeout(d time.Duration)
-AddAbortHook(h AbortHook) HookID
-AddTransformHook(h TransformHook) HookID
-AddObserverHook(h ObserverHook) HookID
-AddObserverAfterHook(h ObserverAfterHook) HookID
-RemoveHook(id HookID)
 
 // Typed CRUD [D] (the ONLY public CRUD surface)
 Get      [D x.Document](key string) (D, error)
@@ -508,6 +502,15 @@ Keys     [D x.Document](keyPattern string) mo.Result[[]string]
 SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D]
 SearchKey  [D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D]
 Update     [D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string]
+
+// Write-hook facade (public; engine in client/internal/hook)
+type HookID = uint64 // alias of hook.ID
+AddAbortHook(h func(key string, value []byte) error) HookID
+AddTransformHook(h func(key string, value []byte) ([]byte, error)) HookID
+AddObserverHook(h func(key string, value []byte)) HookID
+AddObserverAfterHook(h func(key string, value []byte, committed bool, writeErr error)) HookID
+RemoveHook(id HookID)
+SetHookTimeout(d time.Duration)
 ```
 
 ### 6.3 Test Reorg
@@ -635,8 +638,10 @@ Note: Client SDK generic surface `Get[D]`, `Set[D]`, `Keys[D]`, `SearchIndex[D]`
 
 User ruling 2026-08-25: Raw CRUD surface is **public** with mandatory `Raw` suffix on the short name. The bare short names (`Get`, `Set`, `SetNX`, `Delete`, `Keys`, `SearchIndex`, `SearchKey`, `Update`) are reserved for the **typesafe (generics) surface**, which always emits Doc-path (no `:` in arg1).
 
-- [x] `grep -E '^func (Get|Set|SetNX|Delete|Keys|SearchIndex|SearchKey|Update)\b' client/*.go` → all 8 short-name signatures carry a `[D any]` generic receiver (typesafe API). The underlying non-generic wire-callers carry the `Raw` suffix (`GetRaw`, `SetRaw`, `SetNXRaw`, `DeleteRaw`, `KeysRaw`, `SearchIndexRaw`, `SearchKeyRaw`, `UpdateRaw`). No bare public non-generic `Get(key string)` short form remains.
-- [x] `*Raw` methods emit literal args byte-for-byte; callers wishing to drive KV-path (arg1 with `:`) use `SetRaw("user:abc", v)` etc. directly and forego all registry/JSON/KeyAttrs gates on the server.
+Refactor 2026-08-27: the raw wire-callers moved to the dedicated `client/raw` package (file `client/raw/raw.go`) and dropped the `Raw` suffix — the package qualifier `raw.` now plays the disambiguation role the suffix used to. The `client` package keeps only the typesafe generics surface; it no longer re-exports raw wrappers.
+
+- [x] `grep -E '^func (Get|Set|SetNX|Delete|Keys|SearchIndex|SearchKey|Update)\b' client/typed.go` → all 8 short-name signatures carry a `[D x.Document]` generic receiver (typesafe API). The underlying non-generic wire-callers live in `client/raw` (`raw.Get`, `raw.Set`, `raw.SetNX`, `raw.Delete`, `raw.Keys`, `raw.SearchIndex`, `raw.SearchKey`, `raw.Update`). No bare public non-generic `Get(key string)` short form remains in the `client` package.
+- [x] `client/raw` methods emit literal args byte-for-byte; callers wishing to drive KV-path (arg1 with `:`) use `raw.Set("user:abc", v)` etc. directly and forego all registry/JSON/KeyAttrs gates on the server.
 - [x] KeyRange parity tests live in the single merged `cli_test.go` under the `Doc` prefix, asserting typed `[]D` and raw wire `[]string` gjson slices side by side.
 
 ### 7.7 Architecture SSoT Alignment
