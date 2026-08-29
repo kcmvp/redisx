@@ -35,13 +35,13 @@ about.
 
 | | Redis | MongoDB | redisx |
 |---|---|---|---|
-| Embed in your Go binary | ✗ | ✗ | ✓ |
-| Query JSON by field values | ✗ | ✓ | ✓ |
-| Use any Redis client | ✓ | ✗ | ✓ |
-| Secondary indexes | ✗ | ✓ | ✓ |
-| Type-safe Go API | ✗ | ✗ | ✓ |
-| Write hooks (DLP, CDC, …) | ✗ | ✗ | ✓ |
-| Runs without a separate server | ✓ | ✓ | ✓ |
+| Embed in your Go binary | ❌ | ❌ | ✅ |
+| Query JSON by field values | ❌ | ✅ | ✅ |
+| Use any Redis client | ✅ | ❌ | ✅ |
+| Secondary indexes | ❌ | ✅ | ✅ |
+| Type-safe Go API | ❌ | ❌ | ✅ |
+| Write hooks (DLP, CDC, …) | ❌ | ❌ | ✅ |
+| Runs without a separate server | ✅ | ✅ | ✅ |
 
 ## Start it in 30 seconds
 
