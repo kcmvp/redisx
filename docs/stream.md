@@ -55,6 +55,22 @@ out := s.C()
 _ = s.Write([]byte(`ping`))
 ```
 
+### Custom message handler
+
+Use `StartWithHandler` when incoming messages need transformation before
+they reach the output channel:
+
+```go
+s := stream.StartWithHandler[TradeDocument](
+    "wss://example/ws?streams=btcusdt@aggTrade",
+    func(raw []byte) (TradeDocument, error) {
+        // parse / filter / transform the raw websocket message
+        return TradeDocument(string(raw)), nil
+    },
+    30*time.Second,
+)
+```
+
 `Start` will:
 
 - dial the endpoint
@@ -68,14 +84,6 @@ Use `StartSubscribable` when subscriptions are connection state instead of URL
 state.
 
 ```go
-type TradeDocument string
-
-func (TradeDocument) Namespace() string  { return "trade" }
-func (TradeDocument) Mem() bool          { return false }
-func (TradeDocument) KeyAttrs() []string { return []string{"s"} }
-func (d TradeDocument) RawJSON() string  { return string(d) }
-func (TradeDocument) TTL() time.Duration { return time.Minute }
-
 s := stream.StartSubscribable[TradeDocument](
     "wss://example/ws",
     buildSubscribeMessage,
@@ -90,6 +98,20 @@ _ = s.Subscribe("bnbusdt@aggTrade")
 _ = s.Unsubscribe("ethusdt@aggTrade")
 current := s.List()
 _ = s.Write([]byte(`{"method":"LIST_SUBSCRIPTIONS","id":1}`))
+```
+
+### Custom handler + subscriptions
+
+```go
+s := stream.StartSubscribableWithHandler[TradeDocument](
+    "wss://example/ws",
+    func(raw []byte) (TradeDocument, error) {
+        return TradeDocument(string(raw)), nil
+    },
+    buildSubscribeMessage,
+    buildUnsubscribeMessage,
+    30*time.Second,
+)
 ```
 
 `Stream` keeps:

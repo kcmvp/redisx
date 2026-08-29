@@ -8,19 +8,13 @@
 > 🔌 [Stream ingest](stream.md)
 
 This guide is copy-paste oriented: RESP command examples plus the
-matching Go client and typed document calls. For background on the dual
-storage layer, server startup, AUTH model, or the `:` namespace
-convention used by `SEARCHINDEX` / `SEARCHKEY` / `UPDATE`, see
+matching Go client calls. For background on dual-port startup, the
+dual storage layer, AUTH model, or the `:` namespace convention, see
 [architecture.md](architecture.md).
 
-- RESP command examples for every supported command
-- the matching Go client calls for each command
-- typed document API entry points for document-centric workflows
-
 For intercepting writes (DLP gates, AES encryption, L1 cache invalidation,
-CDC, audit logging, debug-fixture capture) without modifying individual
-call sites, see **[write-hooks.md](write-hooks.md)** — the Write Hook
-Subsystem overview, usage patterns, and troubleshooting guide.
+CDC, audit logging) without modifying individual call sites, see
+**[write-hooks.md](write-hooks.md)**.
 
 ## Setup
 
@@ -28,10 +22,6 @@ Assume the server is started like this:
 
 ```go
 import (
-    "os"
-    "path/filepath"
-    "time"
-
     "github.com/kcmvp/redisx/server"
     "github.com/kcmvp/redisx/x"
 )
@@ -44,24 +34,34 @@ func (UserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u UserDoc) RawJSON() string  { return string(u) }
 func (UserDoc) TTL() time.Duration { return time.Hour }
 
-home, _ := os.UserHomeDir()
-dbPath := filepath.Join(home, ".redisx", "howto.db")
-
-db := server.Start(
-    "127.0.0.1:6380",
-    dbPath,
-    x.Idx[UserDoc]("age", "*", "age"),
-    x.Idx[UserDoc]("email", "*", "email"),
-)
+cfg := &server.Config{
+    App:  server.AppConfig{Bind: "127.0.0.1", Port: 7379},
+    Ctrl: server.CtrlConfig{Bind: "127.0.0.1", Port: 7381},
+}
+db := server.StartWithConfig(cfg, UserDoc(""))
+defer server.Stop()
 
 _ = db.Set("_auth_:demo-key", "2")
 ```
 
 The examples below assume:
 
-- server address: `127.0.0.1:6380`
+- app port: `127.0.0.1:7379`
 - auth key: `demo-key`
 - auth config already exists as `_auth_:demo-key -> 2`
+
+Go client examples use the `raw` sub-package for untyped key-value
+operations and the `client` package for typed document operations:
+
+```go
+import (
+    "github.com/kcmvp/redisx/client"
+    "github.com/kcmvp/redisx/client/raw"
+    "github.com/kcmvp/redisx/x"
+)
+
+_ = client.Connect("127.0.0.1:7379", "demo-key")
+```
 
 ## Connection Commands
 
@@ -73,23 +73,17 @@ Authenticate before using any stateful command.
 AUTH demo-key
 ```
 
-Expected response:
-
-```text
-OK
-```
+Expected response: `OK`
 
 Go client:
 
 ```go
-if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
-    panic(err)
-}
+_ = client.Connect("127.0.0.1:7379", "demo-key")
 ```
 
 ### `HELLO`
 
-Inspect basic server metadata before or after authentication.
+Inspect basic server metadata.
 
 ```text
 HELLO
@@ -105,20 +99,6 @@ mode: standalone
 role: master
 ```
 
-### `CLIENT`
-
-`CLIENT` currently returns a simple acknowledgement.
-
-```text
-CLIENT
-```
-
-Expected response:
-
-```text
-OK
-```
-
 ### `PING`
 
 Health check for one authenticated connection.
@@ -127,11 +107,7 @@ Health check for one authenticated connection.
 PING
 ```
 
-Expected response:
-
-```text
-PONG
-```
+Expected response: `PONG`
 
 ### `QUIT`
 
@@ -141,11 +117,7 @@ Close the current connection.
 QUIT
 ```
 
-Expected response:
-
-```text
-OK
-```
+Expected response: `OK`
 
 ## Key-Value Commands
 
@@ -157,34 +129,29 @@ Store one string value.
 SET user:1 {"id":"1","name":"ken","age":18}
 ```
 
-Expected response:
+Expected response: `OK`
+
+Go client:
+
+```go
+if err := raw.Set("user:1", `{"id":"1","name":"ken","age":18}`); err != nil {
+    panic(err)
+}
+```
+
+### `SET` with `EX` / `PX`
+
+Store one value with a TTL in seconds or milliseconds.
 
 ```text
-OK
+SET session:1 {"online":true} EX 60
+SET session:2 {"online":true} PX 1500
 ```
 
 Go client:
 
 ```go
-if err := client.Set("user:1", `{"id":"1","name":"ken","age":18}`); err != nil {
-    panic(err)
-}
-```
-
-### `SET` with `EX`
-
-Store one value with a TTL in seconds.
-
-```text
-SET session:1 {"online":true} EX 60
-```
-
-### `SET` with `PX`
-
-Store one value with a TTL in milliseconds.
-
-```text
-SET session:2 {"online":true} PX 1500
+_ = raw.SetWithTTL("session:1", `{"online":true}`, 60*time.Second)
 ```
 
 ### `SET` with `NX`
@@ -208,9 +175,7 @@ SETEX cache:user:1 30 {"name":"ken"}
 Go client:
 
 ```go
-if err := client.SetWithTTL("cache:user:1", `{"name":"ken"}`, 30*time.Second); err != nil {
-    panic(err)
-}
+_ = raw.SetWithTTL("cache:user:1", `{"name":"ken"}`, 30*time.Second)
 ```
 
 ### `SETNX`
@@ -221,18 +186,12 @@ Store one value only when the key does not already exist.
 SETNX user:2 {"id":"2","name":"alice"}
 ```
 
-Expected response:
-
-- `1` when the key was created
-- `0` when the key already existed
+Expected response: `1` when created, `0` when the key already existed.
 
 Go client:
 
 ```go
-ok, err := client.SetNX("user:2", `{"id":"2","name":"alice"}`)
-if err != nil {
-    panic(err)
-}
+ok, err := raw.SetNX("user:2", `{"id":"2","name":"alice"}`)
 _ = ok
 ```
 
@@ -253,11 +212,8 @@ Expected response:
 Go client:
 
 ```go
-raw, err := client.Get("user:1")
-if err != nil {
-    panic(err)
-}
-_ = raw
+val, err := raw.Get("user:1")
+_ = val
 ```
 
 ### `DEL`
@@ -268,18 +224,12 @@ Delete one key.
 DEL user:2
 ```
 
-Expected response:
-
-- `1` when the key existed
-- `0` when the key did not exist
+Expected response: `1` when the key existed, `0` when it did not.
 
 Go client:
 
 ```go
-deleted, err := client.Delete("user:2")
-if err != nil {
-    panic(err)
-}
+deleted, err := raw.Delete("user:2")
 _ = deleted
 ```
 
@@ -302,12 +252,11 @@ Important constraints:
 
 - `KEYS` must resolve one concrete storage layer first
 - patterns starting with `*` or `?` are rejected
-- patterns like `_au*` are also rejected because reserved prefixes must stay explicit
 
 Go client:
 
 ```go
-res := client.Keys("user:*")
+res := raw.Keys("user:*")
 if res.IsError() {
     panic(res.Error())
 }
@@ -335,36 +284,13 @@ Subscribe to one or more exact topics.
 SUBSCRIBE topic:user.created topic:user.updated
 ```
 
-This command enters subscription mode and streams messages on the same connection.
+This command enters subscription mode and streams messages on the same
+connection.
 
 Go client:
 
 ```go
-ch := client.Subscribe("topic:user.updated")
-msg := <-ch
-_ = msg
-```
-
-### `PSUBSCRIBE`
-
-Subscribe by pattern.
-
-```text
-PSUBSCRIBE topic:user.*
-```
-
-Example use case:
-
-- `topic:user.created`
-- `topic:user.updated`
-- `topic:user.deleted`
-
-All of them match `topic:user.*`.
-
-Go client:
-
-```go
-ch := client.PSubscribe("topic:user.*")
+ch := client.Subscribe("topic:user.updated").MustGet()
 msg := <-ch
 _ = msg
 ```
@@ -376,40 +302,33 @@ _ = msg
 Query JSON documents through one registered index.
 
 ```text
-SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}}
+SEARCHINDEX user:age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}}
 ```
 
 More examples:
 
 ```text
-SEARCHINDEX user_email {"op":"pattern","p":"user:*"} {"email":"ken@example.com"}
-SEARCHINDEX user_age {"op":"pattern","p":"user:Engineering:*"} {"$and":[{"age":{"$gte":18}},{"status":"active"}]}
-SEARCHINDEX user_age {"op":"gte","pivot":"user:engineering:"} {"age":{"$gte":18}} DESC
-SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} LIMIT 100
-SEARCHINDEX user_age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} DESC LIMIT 50
+SEARCHINDEX user:age {"op":"pattern","p":"user:*"} {"email":"ken@example.com"}
+SEARCHINDEX user:age {"op":"gte","pivot":"user:"} {"age":{"$gte":18}} DESC
+SEARCHINDEX user:age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} LIMIT 100
+SEARCHINDEX user:age {"op":"pattern","p":"user:*"} {"age":{"$gte":18}} DESC LIMIT 50
 ```
 
 Important constraints:
 
-- `index_name` is the full runtime index name, such as `user_age`
-- the second wire arg is a sealed `KeyRange` JSON payload. The **6 sealed
-  constructors**, the `:` namespace convention (first `:` splits scope/id),
-  the server-side `scopeGuard` gate, and the wire vs Go representations
-  for `LIMIT N` are all centralised in
-  **[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**;
-  the quick JSON/Go lookup table is kept under
-  **[SEARCHKEY "KeyRange JSON shape"](#keyrange-json-shape-one-of-6-sealed-constructors)**
-  in this file.
-- indexes must be registered at startup
-- the index chooses the storage layer first
-- a `KeyRange` routing that resolves to a **different storage layer**
-  than the index is rejected
+- `index_name` is the full runtime index name, such as `user:age`
+- the second wire arg is a sealed `KeyRange` JSON payload — see
+  [KeyRange constructors](#keyrange-json-shape) below
+- indexes must be registered before use (via `REGIDX` or
+  `client.RegisterIndex`)
+- the index chooses the storage layer; a `KeyRange` that resolves to a
+  **different** layer is rejected
 
 Go client:
 
 ```go
 kr := x.KeysPattern("user:*").Limit(100)
-res := client.SearchIndex("user_age", kr, x.Gte("age", 18), false)
+res := raw.SearchIndex("user:age", kr, x.Gte("age", 18), false)
 if res.IsError() {
     panic(res.Error())
 }
@@ -417,28 +336,10 @@ raws := res.MustGet()
 _ = raws
 ```
 
-Typed JSON document API:
-
-```go
-docs := doc.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
-typed := dbx.SearchIndex("age", x.KeysPattern("*"), x.Gte("age", 18), false)
-_ = docs
-_ = typed
-```
-
-Typed API rules:
-
-- `idxName` is logical, such as `age`
-- `scopedKR` is document-scoped, such as `x.KeysPattern("*")`
-- the namespace prefix comes from `D`
-
 ### `SEARCHKEY`
 
-Query JSON documents by scanning one storage-key range expressed as a sealed
-`KeyRange` JSON object (see the six constructors below). `SEARCHKEY` was
-upgraded in Issue #42 (FR: SEARCHKEY KeyRange) from a legacy glob string
-argument to a structured JSON shape — the first positional argument must
-be a JSON object, never a raw `"user:*"` string.
+Query JSON documents by scanning one storage-key range expressed as a
+sealed `KeyRange` JSON object.
 
 #### RESP wire format
 
@@ -446,44 +347,31 @@ be a JSON object, never a raw `"user:*"` string.
 SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
 ```
 
-Argument shapes (strict — the server rejects any count of positional args
-outside 2 / 3 / 4 / 5):
+Argument shapes:
 
 | argc after command | meaning |
 |---|---|
 | 2 | `{kr}` `{filter}` — ASC, no LIMIT |
-| 3 | `{kr}` `{filter}` `ASC\|DESC` — direction only, default LIMIT=∞ |
-| 4 | `{kr}` `{filter}` `LIMIT` `N` — count only, direction defaults to ASC |
+| 3 | `{kr}` `{filter}` `ASC\|DESC` — direction only |
+| 4 | `{kr}` `{filter}` `LIMIT` `N` — count only, ASC default |
 | 5 | `{kr}` `{filter}` `ASC\|DESC` `LIMIT` `N` |
 
 #### KeyRange JSON shape — one-of 6 sealed constructors
-
-KeyRange is a **sealed one-of algebra**. The exact 6 constructors, the
-`:` namespace convention (first `:` splits scope from id), the
-scopeGuard safety net, and the 4-layer signature parity between
-typed-doc / untyped-client / RESP-wire / server-engine are all defined in
-**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**.
-Copy that reference — do not re-derive the rules locally.
-
-This section only gives the quick JSON+Go lookup table:
 
 | Constructor | JSON wire shape | Go expression |
 |---|---|---|
 | `KeysPattern(p)` | `{"op":"pattern","p":"user:*"}` | `x.KeysPattern("user:*")` |
 | `KeysGte(pivot)` | `{"op":"gte","pivot":"user:100"}` | `x.KeysGte("user:100")` |
-| `KeysGt(pivot)`  | `{"op":"gt", "pivot":"user:100"}` | `x.KeysGt("user:100")` |
+| `KeysGt(pivot)`  | `{"op":"gt","pivot":"user:100"}` | `x.KeysGt("user:100")` |
 | `KeysLte(pivot)` | `{"op":"lte","pivot":"user:100"}` | `x.KeysLte("user:100")` |
-| `KeysLt(pivot)`  | `{"op":"lt", "pivot":"user:100"}` | `x.KeysLt("user:100")` |
+| `KeysLt(pivot)`  | `{"op":"lt","pivot":"user:100"}` | `x.KeysLt("user:100")` |
 | `KeysBt(ge, lt)` | `{"op":"bt","ge":"user:0100","lt":"user:0200"}` | `x.KeysBt("user:0100","user:0200")` |
 
 All 6 accept a chained `.Limit(N)` modifier on the Go side; on the wire
-`LIMIT N` is sent as a **separate trailing two-token pair**, never inside
-the JSON object. Wire wins if both are present.
+`LIMIT N` is a **separate trailing two-token pair**, never inside the
+JSON object. Wire wins if both are present.
 
 KeysBt is always **half-open `[ge, lt)`** regardless of direction.
-Literal pivots (any of the 5 non-`pattern` ctors) **cannot** have a
-leading wildcard — layer routing would be ambiguous; use `KeysPattern`
-with a non-wildcard prefix for glob-driven scans.
 
 #### RESP examples
 
@@ -491,27 +379,12 @@ with a non-wildcard prefix for glob-driven scans.
 SEARCHKEY {"op":"pattern","p":"user:*"} {"status":"active"}
 SEARCHKEY {"op":"gte","pivot":"order:2024-01"} {"region":"us"} DESC
 SEARCHKEY {"op":"bt","ge":"user:engineering:0100","lt":"user:engineering:0200"} {"total":{"$gte":100}} LIMIT 50
-SEARCHKEY {"op":"pattern","p":"product:*"} {"$and":[{"category":"book"},{"price":{"$lte":20}}]} DESC LIMIT 10
 ```
 
-Important constraints:
-
-- `KeyRange` must resolve one concrete storage layer before iteration begins
-  (handled by `x.LayerRoutingConstrained` — uses `Bounds()` / `Pattern()` to
-  derive the leading anchor and then routes to either memory or disk layer).
-- Patterns whose routing anchor starts with `*` or `?` are rejected (the
-  caller must narrow the range so it pins a layer).
-
-#### Go client (non-generic `[]string` raw-JSON API)
+Go client:
 
 ```go
-// x.KeyRange sealed ctors + optional chained Limit()
-kr := x.KeysPattern("user:*")
-kr = x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50)
-kr = x.KeysGte("order:2024-01").Limit(200)
-
-// Signature: SearchKey(kr x.KeyRange, filter x.Filter, desc bool)
-res := client.SearchKey(
+res := raw.SearchKey(
     x.KeysPattern("user:*"),
     x.Eq("status", "active"),
     false, // desc=false → ASC
@@ -523,31 +396,10 @@ rawJSONs := res.MustGet()
 _ = rawJSONs
 ```
 
-#### Typed JSON document API
-
-```go
-// doc.SearchKey[D] applies D's namespace + mem flag to build a KeyRange
-// prefix automatically, then runs SEARCHKEY.
-docs := doc.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
-
-// dbx typed helper mirrors the non-doc signature with a D-scoped prefix.
-typed := dbx.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
-_ = docs
-_ = typed
-```
-
-> Note — the `UPDATE` command still accepts the legacy `keyPattern string`
-> form as an intentional write-path exception.
-
-
-
 ### `UPDATE`
 
-Patch JSON documents matched by one sealed `x.KeyRange` (the same 6 constructors
-as `SEARCHKEY` / `SEARCHINDEX`), one optional JSON filter, and one JSON object
-of mutations. **Zero-legacy:** the first positional argument after the command
-word must be a JSON object (the KeyRange payload); a raw glob string like
-`"user:*"` is rejected on the wire.
+Patch JSON documents matched by one sealed `x.KeyRange`, one optional
+JSON filter, and one JSON object of mutations.
 
 #### RESP wire format
 
@@ -555,44 +407,25 @@ word must be a JSON object (the KeyRange payload); a raw glob string like
 UPDATE <keyrange_json> <filter_json> <update_json> [LIMIT count]
 ```
 
-Argument shapes (strict — the server rejects any count of positional args
-outside 3 / 5; UPDATE has **no** `ASC|DESC` keyword because resulting key
-ordering is always ascending after `sort.Strings` on the server):
+Argument shapes (UPDATE has **no** `ASC|DESC` keyword):
 
 | argc after cmd word | shape |
 |---|---|
-| 3 | `{kr}` `{filter}` `{update}` — no LIMIT, matched keys truncated at full range |
-| 5 | `{kr}` `{filter}` `{update}` `LIMIT` `count` — LIMIT callback early-stop wins if both set |
-
-The KeyRange JSON payload is identical to the one used by
-[`SEARCHKEY`](#keyrange-json-shape-one-of-6-sealed-constructors) and
-[`SEARCHINDEX`](#searchindex), with the same 6 sealed constructors, the same
-`:` namespace convention (first `:` splits scope from id), and the same
-server-side `scopeGuard` safety net. The full specification, including
-KeysBt half-open semantics, layer routing rules, and the Go/RESP split for
-`Limit` lives in
-**[architecture.md § KeyRange & namespace convention](architecture.md#keyrange-namespace-convention)**.
+| 3 | `{kr}` `{filter}` `{update}` — no LIMIT |
+| 5 | `{kr}` `{filter}` `{update}` `LIMIT` `count` |
 
 #### RESP examples
 
 ```text
 UPDATE {"op":"pattern","p":"user:*"} {"status":"pending"} {"status":"active"}
 UPDATE {"op":"gte","pivot":"order:2024-01-01"} {"region":"us"} {"verified":true}
-UPDATE {"op":"bt","ge":"user:engineering:0100","lt":"user:engineering:0200"} {"status":"review"} {"$set":{"status":"reviewed"}} LIMIT 50
-UPDATE {"op":"pattern","p":"product:*"} {"category":"book"} {"price":{"$mul":0.9}}
+UPDATE {"op":"bt","ge":"user:engineering:0100","lt":"user:engineering:0200"} {} {"$set":{"status":"reviewed"}} LIMIT 50
 ```
-
-Important constraints:
-
-- `<keyrange_json>` must resolve to one concrete storage layer (anchored prefix; pure leading wildcards rejected)
-- nested objects in `update_json` are supported
-- `LIMIT count` is an optional two-token suffix; server treats it as an early-stop callback truncation on matched keys (never a post-hoc slice)
-- there is **no** `ASC|DESC` keyword on UPDATE — the returned updated-key array is always sorted ascending by storage key on the server before being written back
 
 Go client:
 
 ```go
-res := client.Update(
+res := raw.Update(
     x.KeysPattern("user:*"),
     x.Eq("status", "pending"),
     x.Set("status", "active"),
@@ -605,96 +438,99 @@ keys := res.MustGet()
 _ = keys
 ```
 
-Opt-in range iteration:
-
-```go
-_ = client.Update(x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
-    x.Eq("status", "pending"),
-    x.Set("status", "active"))
-```
-
-Typed JSON document API:
-
-```go
-docs := doc.Update[UserDoc](x.KeysPattern("*"), x.Eq("status", "pending"), x.Set("status", "active"))
-typed := dbx.Update(x.KeysPattern("*"), x.Eq("status", "pending"), x.Set("status", "active"))
-_ = docs
-_ = typed
-```
-
 ## Memory-Only Keys
 
-Use the reserved `_m_` prefix for memory-only data. This is the
-**layer prefix** half of the dual storage layer; the full routing model,
-key examples, and SK/UPDATE layer-pinning rules live in
-**[architecture.md § Dual storage layer](architecture.md#dual-storage-layer)**.
-
-Short quick-reference examples:
+Use the reserved `_m_:` prefix for memory-only data.
 
 ```text
-SET _m_session:1 {"online":true}
-GET _m_session:1
-KEYS _m_session:*
+SET _m_:session:1 {"online":true}
+GET _m_:session:1
+KEYS _m_:session:*
 ```
 
 Go client:
 
 ```go
 key := x.MemKey("session:1")
-if err := client.Set(key, `{"online":true}`); err != nil {
+if err := raw.Set(key, `{"online":true}`); err != nil {
     panic(err)
 }
 ```
 
-## Typed JSON Document API End-To-End
+The full routing model lives in
+**[architecture.md § Dual storage layer](architecture.md#dual-storage-layer)**.
 
-The client-side typed helper package lives at `client/doc`; examples import it
-as `doc`.
+## Typed JSON Document API
 
-Client mode:
+The typed helpers live in the `client` package as generic functions
+parameterized by your document type `D`.
+
+### Remote mode (RESP client)
 
 ```go
 import (
     "github.com/kcmvp/redisx/client"
-    doc "github.com/kcmvp/redisx/client/doc"
     "github.com/kcmvp/redisx/x"
 )
 
-if err := client.Connect("127.0.0.1:6380", "demo-key"); err != nil {
-    panic(err)
-}
+_ = client.Connect("127.0.0.1:7379", "demo-key")
 
-_ = doc.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
+// Set — derives the storage key from d.RawJSON() + d.KeyAttrs()
+_ = client.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
 
-got, _ := doc.Get[UserDoc]("200")
-idx := doc.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
-keys := doc.Update[UserDoc](x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
+// Get — accepts the document-level key value, not the storage key
+got, _ := client.Get[UserDoc]("200")
+
+// SearchIndex — idxName is logical ("age"), not runtime ("user:age")
+idx := client.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
+
+// SearchKey
+keys := client.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
+
+// Update
+updated := client.Update[UserDoc](x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
 _ = idx
 _ = keys
+_ = updated
 ```
 
-Embedded mode:
+### Embedded mode (in-process DB)
 
 ```go
-dbx := server.As[UserDoc](db)
+// db is *server.DB returned by server.Start
+_ = db.Set("user:200", `{"id":"200","name":"Test","age":30}`)
 
-_ = dbx.Set(UserDoc(`{"id":"200","name":"Test","age":30}`))
+got := db.Get("user:200").MustGet()
 
-got, _ := dbx.Get("200")
-idx := dbx.SearchIndex("age", x.KeysPattern("*"), x.Gte("age", 18), false)
-keys := dbx.Update(x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
+// JSON commands work directly on *server.DB
+idx := db.SearchIndex("user:age", x.KeysPattern("user:*"), x.Gte("age", 18), false)
+keys := db.SearchKey(x.KeysPattern("user:*"), x.Eq("status", "active"), false)
+updated := db.Update(x.KeysPattern("user:*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
-_ = idx
-_ = keys
+_ = idx.MustGet()
+_ = keys.MustGet()
+_ = updated.MustGet()
 ```
+
+Typed API rules:
+
+- `idxName` is logical, such as `age`, not runtime `user:age`
+- `scopedKR` is document-scoped, such as `x.KeysPattern("*")`
+- the namespace prefix comes from `D`
+- typed helpers reject already-prefixed storage patterns
 
 ## Common Pitfalls
 
-- raw RESP commands use full storage keys, full key patterns, and full index names
-- typed JSON document API calls use logical index names and document-scoped sub-patterns
+- raw RESP commands use full storage keys, full key patterns, and full
+  index names (e.g. `user:age`, not `age`)
+- typed Go helpers use logical index names and document-scoped
+  sub-patterns
 - `SEARCHKEY`, `UPDATE`, and `KEYS` reject leading-wildcard patterns
-- `SEARCHINDEX` requires indexes declared during startup
+- `SEARCHINDEX` requires indexes declared via `REGIDX` or
+  `client.RegisterIndex`
 - external connections must authenticate before using stateful commands
+- memory-layer keys use `_m_:` prefix (with colon): `_m_:user:200`, not
+  `_m_user:200`

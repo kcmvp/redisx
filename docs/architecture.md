@@ -7,61 +7,32 @@
 > 🪝 [Write Hook Subsystem](write-hooks.md)
 > 🔌 [Stream ingest](stream.md)
 
-This document explains how redisx is structured: dual storage layer,
-server startup, the AUTH model, and the `x.KeyRange` algebra + namespace
-convention that powers the three JSON commands
+This document explains how redisx is structured: dual-port startup,
+dual storage layer, the AUTH model, and the `x.KeyRange` algebra +
+namespace convention that powers the three JSON commands
 (`SEARCHINDEX`, `SEARCHKEY`, `UPDATE`).
 
 For copy-paste examples, see [howto.md](howto.md).
 
-For typed document-scoped helpers, see [typed-document.md](typed-document.md).
-
 ---
 
-## Dual storage layer
+## Dual-port startup
 
-`redisx` always opens two storage layers in the same process. Routing is
-purely key-prefix based and deterministic — there is no runtime flag to
-flip.
+redisx always opens **two** TCP listeners:
 
-| Layer | Prefix | Lifecycle | `dbPath` influence |
-|---|---|---|---|
-| **Primary (disk-backed)** | any key **not** starting with `_m_` | Persisted to `dbPath` via BuntDB | `dbPath` stores exactly this layer |
-| **Memory-only (volatile)** | keys starting with `_m_` | Lost on process exit | Not touched |
+| Port | Role | Purpose |
+|---|---|---|
+| **App port** (default 7379) | Client-facing | RESP commands: SET, GET, SEARCHINDEX, pub/sub, … |
+| **Ctrl port** (default 7381) | Admin-facing | Schema/index registry (REGSCH, REGIDX, DROPSCH, DROPIDX), internal client bridge |
 
-Key points:
+The ctrl port is bound to `127.0.0.1` by default and is not meant for
+external traffic. The embedded Go client (`client.ConnectEmbedded`) uses
+it automatically via a shared per-process auth key.
 
-- The two layers share a single BuntDB `*DB` handle internally; the
-  memory layer uses an in-memory BuntDB opened alongside it.
-- Pattern scans (`KEYS`, `SEARCHKEY`, `UPDATE`) resolve exactly **one**
-  concrete layer first. Patterns that start with a wildcard (`*`, `?`)
-  are **rejected** for these commands — layer is ambiguous.
-- `SEARCHINDEX` always routes by index first, then runs the key-pattern
-  inside that same layer. Indexes have a 1-to-1 mapping to the layer of
-  the document that registered them.
-
-Memory key examples:
-
-```text
-_m_user:session1   → memory layer
-_m_cache:hits      → memory layer
-user:profile:200   → primary disk layer
-```
-
-See the `KeyRangeFixtureMem()` toggle in the test suite for a concrete
-proof that the exact same KeyRange expression resolves both layers.
-
----
-
-## Server startup
-
-Start the embedded RESP server with:
+### Starting the server
 
 ```go
 import (
-    "path/filepath"
-    "time"
-
     "github.com/kcmvp/redisx/server"
     "github.com/kcmvp/redisx/x"
 )
@@ -74,30 +45,85 @@ func (UserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u UserDoc) RawJSON() string  { return string(u) }
 func (UserDoc) TTL() time.Duration { return 0 }
 
-dbPath := filepath.Join("/var/lib/redisx", "app.db")
-
-db := server.Start(
-    "127.0.0.1:6380",
-    dbPath,
-    x.Idx[UserDoc]("age",   "*", "age"),
-    x.Idx[UserDoc]("email", "*", "email"),
-)
+// Zero-config: reads redisx.yaml from cwd (or applies defaults)
+db := server.Start(UserDoc(""))
+defer server.Stop()
 ```
 
-Rules for `Start(addr, dbPath, indexes...)`:
+`server.Start` accepts variadic `x.Schema` values. It loads configuration
+from `redisx.yaml` in the current working directory; when the file is
+missing, sensible defaults kick in (app 7379 on auto-selected RFC1918
+bind, ctrl 7381 on 127.0.0.1, database at `~/.redisx/redisx.db`).
 
-- `addr` is passed directly to `net.Listen("tcp", addr)`.
-- `dbPath` must be a **file path**, not `":memory:"` — the memory layer
-  is already `_m_`, so `:memory:` as a primary layer would be
-  ambiguous.
-- `dbPath` is forwarded to `buntdb.Open(dbPath)`. Missing parent dirs
-  are created; the file is created empty on first start.
-- `~` paths are **not** expanded — build an explicit path yourself.
-- `x.Idx[D](...)` registers one JSON secondary index for document `D`.
-  `SEARCHINDEX` can only use indexes that were registered at startup.
-- `Start` returns `*server.DB` for direct in-process access (no RESP
-  round-trip). Use `server.As[D](db)` to get a typed document view of
-  it — see [typed-document.md](typed-document.md).
+### Explicit configuration
+
+```go
+cfg := &server.Config{
+    App:      server.AppConfig{Bind: "127.0.0.1", Port: 7379},
+    Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 7381},
+    DataPath: "/var/lib/redisx/app.db",
+}
+db := server.StartWithConfig(cfg, UserDoc(""))
+```
+
+Rules:
+
+- `DataPath` must be a **file path**, not `":memory:"` — the memory layer
+  is already `_m_:`, so `:memory:` as a primary layer would be ambiguous.
+- Missing parent dirs are created automatically.
+- App and ctrl ports must be distinct and in the range 7001–65535.
+- `server.Start` returns `*server.DB` for direct in-process access (no
+  RESP round-trip).
+
+### Registering indexes
+
+Indexes are **not** passed as Go parameters to `Start`. They are created
+at runtime via the ctrl port:
+
+```text
+REGIDX user age user:* age
+```
+
+Or from Go, using the typed client:
+
+```go
+_ = client.RegisterIndex[UserDoc]("age", "*", "age")
+```
+
+`SEARCHINDEX` can only use indexes that have been registered. Indexes
+persist to the matching storage layer and are auto-recovered on restart.
+
+---
+
+## Dual storage layer
+
+`redisx` always opens two storage layers in the same process. Routing is
+purely key-prefix based and deterministic — there is no runtime flag to
+flip.
+
+| Layer | Prefix | Lifecycle | `DataPath` influence |
+|---|---|---|---|
+| **Primary (disk-backed)** | any key **not** starting with `_m_:` | Persisted to `DataPath` via BuntDB | `DataPath` stores exactly this layer |
+| **Memory-only (volatile)** | keys starting with `_m_:` | Lost on process exit | Not touched |
+
+Key points:
+
+- The two layers use separate BuntDB handles: one disk-backed, one
+  in-memory (`buntdb.Open(":memory:")`).
+- Pattern scans (`KEYS`, `SEARCHKEY`, `UPDATE`) resolve exactly **one**
+  concrete layer first. Patterns that start with a wildcard (`*`, `?`)
+  are **rejected** for these commands — layer is ambiguous.
+- `SEARCHINDEX` always routes by index first, then runs the key-pattern
+  inside that same layer. Indexes have a 1-to-1 mapping to the layer of
+  the document that registered them.
+
+Memory key examples:
+
+```text
+_m_:user:session1   → memory layer
+_m_:cache:hits      → memory layer
+user:profile:200    → primary disk layer
+```
 
 ---
 
@@ -128,7 +154,7 @@ Auth rules:
   range, the key is treated as disabled.
 - Every process also has one per-process `internalAuthKey` that is
   **not** stored in the DB and is always unlimited. It is used by the
-  in-process `client` package when connecting to a loopback server.
+  in-process `client` package when connecting via `ConnectEmbedded`.
 
 The minimal setup sequence is:
 
@@ -146,13 +172,9 @@ are all built on top of one sealed expression algebra:
 through **all four layers** of the stack with identical meaning:
 
 ```
-typed doc API  →  untyped client API  →  RESP wire  →  server engine
-(doc.ScopeKeyRange)   (client.SearchKey/Update)     (server.db.ApplyKeyRange)
+typed client API  →  raw client API  →  RESP wire  →  server engine
+(client.SearchKey)   (raw.SearchKey)    (JSON arg1)   (db.SearchKey)
 ```
-
-This section describes both the public constructors and the namespace
-convention that makes cross-namespace scans safe even when multiple
-consumers share one server.
 
 ### The `:` namespace convention (locked public spec)
 
@@ -160,7 +182,7 @@ consumers share one server.
 
 ```text
 disk layer   →  <namespace>:<id>            ← one colon, always
-memory layer →  _m_<namespace>:<id>         ← one colon after the _m_ layer prefix
+memory layer →  _m_:<namespace>:<id>        ← _m_: layer prefix, then one colon
 ```
 
 The **first `:` character** (counting from the left) separates the
@@ -169,24 +191,24 @@ scope prefix from the id part. Examples:
 | Storage key | Scope prefix | Id | Layer |
 |---|---|---|---|
 | `user:200` | `user:` | `200` | disk |
-| `_m_user:200` | `_m_user:` | `200` | memory |
+| `_m_:user:200` | `_m_:user:` | `200` | memory |
 | `trade:btcusdt@kline_1m` | `trade:` | `btcusdt@kline_1m` | disk |
 | `just-a-flat-key` | *(none)* | `just-a-flat-key` | disk *(bare key — not in any namespace)* |
 
 Consequences:
 
 1. **Layer** can always be derived before inspecting the namespace —
-   `strings.HasPrefix(key, "_m_")` is layer-complete.
+   `strings.HasPrefix(key, "_m_:")` is layer-complete.
 2. **The first `:`** is the only delimiter that matters for scoping.
    There is intentionally **no** multi-colon hierarchy: the id part is
    free-form and can contain colons itself.
 3. Pattern-based scans on the server side enforce this through
-   `scopeGuard` / `scopeGuard2` helpers in
-   `server/key_range.go`: for literal-range constructors (`KeysGte`,
-   `KeysBt`, etc.) every B-tree callback first checks "does this key's
-   first-colon scope prefix match the scan's scope prefix". This
-   prevents a `KeysGte(_m_nsA:p050)` from leaking into the larger
-   `_m_nsB:p000…p099` namespace just because of dictionary order.
+   `scopeGuard` helpers in `server/key_range.go`: for literal-range
+   constructors (`KeysGte`, `KeysBt`, etc.) every B-tree callback first
+   checks "does this key's first-colon scope prefix match the scan's
+   scope prefix". This prevents a `KeysGte(_m_:nsA:p050)` from leaking
+   into the larger `_m_:nsB:p000…p099` namespace just because of
+   dictionary order.
 
 ### Six sealed constructors + Limit
 
@@ -195,19 +217,18 @@ the unexported `keyRange` return type: add via helper only.
 
 | Constructor | Semantics | Accepts |
 |---|---|---|
-| `x.KeysPattern(pattern)` | Glob match; `*` / `?` are allowed | Pure glob, no prefix-only constraints for wildcard locations |
+| `x.KeysPattern(pattern)` | Glob match; `*` / `?` are allowed | Pure glob, no prefix-only constraints for wildcard location |
 | `x.KeysEq(key)` | Exactly one key = | Full storage key or (typed) doc-scoped id |
 | `x.KeysGt(pivot)` | Strictly greater than pivot, ASC default | Literal pivot (no wildcard) |
 | `x.KeysGte(pivot)` | Greater-or-equal | Literal pivot |
 | `x.KeysLt(pivot)` | Strictly less than | Literal pivot |
 | `x.KeysLte(pivot)` | Less-or-equal | Literal pivot |
-| `x.KeysBt(a, b)` | Strictly within the interval `(a, b)` — bounds excluded on both sides | Two literal pivots |
+| `x.KeysBt(a, b)` | Half-open `[a, b)` — ge included, lt excluded | Two literal pivots |
 
 Then one modifier:
 
 - `kr.Limit(count)` — with `count > 0` only. Callbacks are short-circuited
-  *during* the B-tree walk (proven by the `TestLimit7PrefixEqualFullSet`
-  suites: `sort(full)[:7]` byte-equals `Limit(7)` result).
+  *during* the B-tree walk.
 
 ### Four-layer signature parity
 
@@ -215,14 +236,12 @@ For each of the three commands, every layer accepts the **same**
 `x.KeyRange` (RESP takes it as a single JSON object):
 
 ```text
-Server engine — server/db.ApplySearchKey / ApplyUpdate / ApplySearchIndex
+Server engine — db.SearchKey / db.Update / db.SearchIndex
     ↑ RESP argv[1] = one JSON object matching the constructor shape
-Client API  — client.SearchKey / Update / SearchIndex(kr, …)
-    ↑ typed client/doc — doc.SearchKey[D](docScopedKR, …)  first runs
-                         internal.ScopeKeyRange[D](docScopedKR) to force
-                         D's fullNamespace+layer prefix onto every
-                         pivot/pattern — so typed APIs never hit the
-                         "different storage layer" server-side error.
+Client API  — client.SearchKey / client.Update / client.SearchIndex
+    ↑ typed client — client.SearchKey[D](docScopedKR, …) first runs
+                     x.ScopeKeyRange[D](docScopedKR) to force D's
+                     fullNamespace+layer prefix onto every pivot/pattern
 ```
 
 ### Input examples
@@ -230,13 +249,13 @@ Client API  — client.SearchKey / Update / SearchIndex(kr, …)
 ```go
 x.KeysPattern("user:*")                                 // every user
 x.KeysGte("user:200")                                   // users id ≥ 200
-x.KeysBt("user:200", "user:300").Limit(10)              // users (200,300) first 10 ASC
+x.KeysBt("user:200", "user:300").Limit(10)              // users [200,300) first 10 ASC
 x.KeysPattern("*")                                      // ← rejected for SK/UPDATE — ambiguous layer
 ```
 
 For typed helpers, the equivalent scoped inputs would be:
 
 ```go
-doc.SearchKey[UserDoc](x.KeysPattern("*"), nil, false)  // resolves to "user:*" or "_m_user:*" automatically
-doc.Update[UserDoc](x.KeysGte("200").Limit(10), …)      // resolves to ≥ "user:200" / "_m_user:200"
+client.SearchKey[UserDoc](x.KeysPattern("*"), nil, false)  // resolves to "user:*" or "_m_:user:*" automatically
+client.Update[UserDoc](x.KeysGte("200").Limit(10), …)      // resolves to ≥ "user:200" / "_m_:user:200"
 ```
