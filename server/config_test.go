@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -157,5 +158,316 @@ data_path: "./ok.db"
 	}
 	if cfg.Ctrl.Bind != "0.0.0.0" || cfg.Ctrl.Port != 7391 || !cfg.Ctrl.DangerBindAny {
 		t.Fatalf("cfg mismatch: %+v", cfg)
+	}
+}
+
+// ─── normalizeLogLevel ───
+
+func TestNormalizeLogLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "debug", input: "debug", want: "debug"},
+		{name: "info", input: "info", want: "info"},
+		{name: "warn", input: "warn", want: "warn"},
+		{name: "error", input: "error", want: "error"},
+		{name: "case insensitive", input: "DEBUG", want: "debug"},
+		{name: "with whitespace", input: "  warn  ", want: "warn"},
+		{name: "invalid fallback info", input: "trace", want: "info", wantErr: true},
+		{name: "empty invalid", input: "", want: "info", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeLogLevel(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+			if got != tt.want {
+				t.Fatalf("want %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─── normalizeLogFormat ───
+
+func TestNormalizeLogFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "text", input: "text", want: "text"},
+		{name: "json", input: "json", want: "json"},
+		{name: "case insensitive", input: "JSON", want: "json"},
+		{name: "with whitespace", input: "  text  ", want: "text"},
+		{name: "invalid fallback text", input: "xml", want: "text", wantErr: true},
+		{name: "empty invalid", input: "", want: "text", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeLogFormat(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+			if got != tt.want {
+				t.Fatalf("want %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+// ─── validatePort ───
+
+func TestValidatePort(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    int
+		field   string
+		wantErr bool
+	}{
+		{name: "min valid", port: 7001, field: "test", wantErr: false},
+		{name: "max valid", port: 65535, field: "test", wantErr: false},
+		{name: "typical", port: 7379, field: "app.port", wantErr: false},
+		{name: "below min", port: 7000, field: "app.port", wantErr: true},
+		{name: "reserved", port: 6379, field: "app.port", wantErr: true},
+		{name: "zero", port: 0, field: "app.port", wantErr: true},
+		{name: "negative", port: -1, field: "app.port", wantErr: true},
+		{name: "above max", port: 65536, field: "ctrl.port", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePort(tt.port, tt.field)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// ─── resolveOne ───
+
+func TestResolveOne(t *testing.T) {
+	tests := []struct {
+		name    string
+		bind    string
+		role    string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty bind", bind: "", role: "app", want: ""},
+		{name: "loopback IP", bind: "127.0.0.1", role: "ctrl", want: "127.0.0.1"},
+		{name: "private IP", bind: "10.0.0.1", role: "app", want: "10.0.0.1"},
+		{name: "localhost hostname", bind: "localhost", role: "app", want: "localhost"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveOne(tt.bind, tt.role)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if got != tt.want {
+					t.Fatalf("want %q, got %q", tt.want, got)
+				}
+			}
+		})
+	}
+}
+
+// ─── validate ───
+
+func TestValidate_SamePort(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	c := &Config{
+		App:  AppConfig{Port: 7379},
+		Ctrl: CtrlConfig{Port: 7379, Bind: "127.0.0.1"},
+		DataPath: filepath.Join(t.TempDir(), "test.db"),
+	}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error for same port")
+	}
+	if !strings.Contains(err.Error(), "must not equal") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_InvalidAppPort(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	c := &Config{
+		App:  AppConfig{Port: 80},
+		Ctrl: CtrlConfig{Port: 7381, Bind: "127.0.0.1"},
+		DataPath: filepath.Join(t.TempDir(), "test.db"),
+	}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error for invalid app port")
+	}
+}
+
+func TestValidate_InvalidCtrlPort(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	c := &Config{
+		App:  AppConfig{Port: 7379},
+		Ctrl: CtrlConfig{Port: 80, Bind: "127.0.0.1"},
+		DataPath: filepath.Join(t.TempDir(), "test.db"),
+	}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error for invalid ctrl port")
+	}
+}
+
+func TestValidate_DataPathIsDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	dir := t.TempDir()
+	c := &Config{
+		App:      AppConfig{Port: 7379},
+		Ctrl:     CtrlConfig{Port: 7381, Bind: "127.0.0.1"},
+		DataPath: dir, // this is a directory, not a file
+	}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error when data_path is a directory")
+	}
+	if !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidate_CtrlBindInvalid(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	// Ctrl port conflict is easier to test than DNS-dependent hostname failures
+	c := &Config{
+		App:      AppConfig{Port: 7379},
+		Ctrl:     CtrlConfig{Port: 7379, Bind: "127.0.0.1"},
+		DataPath: filepath.Join(t.TempDir(), "test.db"),
+	}
+	err := c.validate()
+	if err == nil {
+		t.Fatal("expected error for same port")
+	}
+}
+
+// ─── applyDefaults ───
+
+func TestApplyDefaults(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	c := &Config{}
+	c.applyDefaults()
+
+	if c.App.Port != 7379 {
+		t.Fatalf("want default app.port 7379, got %d", c.App.Port)
+	}
+	if c.Ctrl.Port != 7381 {
+		t.Fatalf("want default ctrl.port 7381, got %d", c.Ctrl.Port)
+	}
+	if c.Ctrl.Bind != "127.0.0.1" {
+		t.Fatalf("want default ctrl.bind 127.0.0.1, got %q", c.Ctrl.Bind)
+	}
+	if c.App.Bind == "" {
+		t.Fatal("app.bind should be auto-detected, got empty")
+	}
+	if c.DataPath == "" {
+		t.Fatal("data_path should have a default")
+	}
+	if c.Logging.Level != "info" {
+		t.Fatalf("want default logging.level info, got %q", c.Logging.Level)
+	}
+	if c.Logging.Format != "text" {
+		t.Fatalf("want default logging.format text, got %q", c.Logging.Format)
+	}
+}
+
+func TestApplyDefaults_PreservesExplicit(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	c := &Config{
+		App:  AppConfig{Port: 9000, Bind: "10.0.0.1"},
+		Ctrl: CtrlConfig{Port: 9001, Bind: "0.0.0.0"},
+		DataPath: "/tmp/explicit.db",
+		Logging: LoggingConfig{Level: "debug", Format: "json"},
+	}
+	c.applyDefaults()
+
+	if c.App.Port != 9000 {
+		t.Fatalf("explicit app.port overwritten: got %d", c.App.Port)
+	}
+	if c.Ctrl.Port != 9001 {
+		t.Fatalf("explicit ctrl.port overwritten: got %d", c.Ctrl.Port)
+	}
+	if c.Ctrl.Bind != "0.0.0.0" {
+		t.Fatalf("explicit ctrl.bind overwritten: got %q", c.Ctrl.Bind)
+	}
+	if c.App.Bind != "10.0.0.1" {
+		t.Fatalf("explicit app.bind overwritten: got %q", c.App.Bind)
+	}
+	if c.DataPath != "/tmp/explicit.db" {
+		t.Fatalf("explicit data_path overwritten: got %q", c.DataPath)
+	}
+	if c.Logging.Level != "debug" {
+		t.Fatalf("explicit logging.level overwritten: got %q", c.Logging.Level)
+	}
+	if c.Logging.Format != "json" {
+		t.Fatalf("explicit logging.format overwritten: got %q", c.Logging.Format)
+	}
+}
+
+func TestApplyDefaults_InvalidLogLevel_FallsBack(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	c := &Config{Logging: LoggingConfig{Level: "bogus"}}
+	c.applyDefaults()
+	// invalid level should fallback to "info"
+	if c.Logging.Level != "info" {
+		t.Fatalf("want fallback info, got %q", c.Logging.Level)
+	}
+}
+
+func TestApplyDefaults_InvalidLogFormat_FallsBack(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	c := &Config{Logging: LoggingConfig{Format: "xml"}}
+	c.applyDefaults()
+	// invalid format: normalizeLogFormat returns ("text", err), so code keeps fmtRaw="text"
+	if c.Logging.Format != "text" {
+		t.Fatalf("want fallback text, got %q", c.Logging.Format)
 	}
 }

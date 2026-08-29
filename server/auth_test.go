@@ -2,10 +2,12 @@ package server
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/tidwall/buntdb"
+	"github.com/tidwall/redcon"
 )
 
 func mustTempDBFile(t *testing.T, nameHint string) string {
@@ -327,5 +329,170 @@ func TestBootstrapAuth_IdempotentSeedsEqualPersisted(t *testing.T) {
 	}
 	if app != a || ctrl != c {
 		t.Fatalf("values should match seeds")
+	}
+}
+
+// ─── gate2_AuthKeyMatch ───
+
+// gate2MockConn is a minimal mock for gate2 testing.
+type gate2MockConn struct {
+	redcon.Conn
+	ctx      any
+	lastErr  string
+}
+
+func (m *gate2MockConn) Context() any            { return m.ctx }
+func (m *gate2MockConn) WriteError(msg string)   { m.lastErr = msg }
+func (m *gate2MockConn) RemoteAddr() string      { return "127.0.0.1:0" }
+
+func TestGate2_AuthKeyMatch(t *testing.T) {
+	db := mustOpenDB(t, mustTempDBFile(t, "gate2"))
+	// Bootstrap with known keys
+	_, _, _, err := db.bootstrapAuth("app-key-123", "ctrl-key-456")
+	if err != nil {
+		t.Fatalf("bootstrapAuth: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		cmdName    string
+		ctx        any
+		role       portRole
+		wantReject bool
+		errPhrase  string
+	}{
+		{
+			name:       "AUTH command always passes",
+			cmdName:    "AUTH",
+			ctx:        "",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+		{
+			name:       "HELLO command always passes",
+			cmdName:    "HELLO",
+			ctx:        "",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+		{
+			name:       "CLIENT command always passes",
+			cmdName:    "CLIENT",
+			ctx:        "",
+			role:       portRoleCtrl,
+			wantReject: false,
+		},
+		{
+			name:       "no auth context passes",
+			cmdName:    "SET",
+			ctx:        "",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+		{
+			name:       "internal key passes on any port",
+			cmdName:    "SET",
+			ctx:        "internal-test-key",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+		{
+			name:       "correct app key on app port passes",
+			cmdName:    "SET",
+			ctx:        "app-key-123",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+		{
+			name:       "correct ctrl key on ctrl port passes",
+			cmdName:    "REGSCH",
+			ctx:        "ctrl-key-456",
+			role:       portRoleCtrl,
+			wantReject: false,
+		},
+		{
+			name:       "ctrl key on app port rejected",
+			cmdName:    "SET",
+			ctx:        "ctrl-key-456",
+			role:       portRoleApp,
+			wantReject: true,
+			errPhrase:  "WRONGPASS",
+		},
+		{
+			name:       "app key on ctrl port rejected",
+			cmdName:    "REGSCH",
+			ctx:        "app-key-123",
+			role:       portRoleCtrl,
+			wantReject: true,
+			errPhrase:  "WRONGPASS",
+		},
+		{
+			name:       "external key (not in app/ctrl values) passes",
+			cmdName:    "SET",
+			ctx:        "external-limit-key",
+			role:       portRoleApp,
+			wantReject: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockConn := &gate2MockConn{ctx: tt.ctx}
+			// Set the port role
+			connRoleMu.Lock()
+			connRoleMap[mockConn] = tt.role
+			connRoleMu.Unlock()
+			defer func() {
+				connRoleMu.Lock()
+				delete(connRoleMap, mockConn)
+				connRoleMu.Unlock()
+			}()
+
+			// Set internal key for this test
+			globalMu.Lock()
+			origKey := internalAuthKey
+			internalAuthKey = "internal-test-key"
+			globalMu.Unlock()
+			defer func() {
+				globalMu.Lock()
+				internalAuthKey = origKey
+				globalMu.Unlock()
+			}()
+
+			rejected := gate2_AuthKeyMatch(mockConn, tt.cmdName, db)
+			if tt.wantReject {
+				if !rejected {
+					t.Fatal("expected rejection")
+				}
+				if tt.errPhrase != "" && !strings.Contains(mockConn.lastErr, tt.errPhrase) {
+					t.Fatalf("error %q does not contain %q", mockConn.lastErr, tt.errPhrase)
+				}
+			} else {
+				if rejected {
+					t.Fatalf("unexpected rejection: %s", mockConn.lastErr)
+				}
+			}
+		})
+	}
+}
+
+// TestGate2_NoAuthConfigured tests that when no auth is configured, all commands pass.
+func TestGate2_NoAuthConfigured(t *testing.T) {
+	db := mustOpenDB(t, mustTempDBFile(t, "gate2-noauth"))
+	// Don't bootstrap auth — DB has no _auth_ keys
+
+	mockConn := &gate2MockConn{ctx: "any-key"}
+	connRoleMu.Lock()
+	connRoleMap[mockConn] = portRoleApp
+	connRoleMu.Unlock()
+	defer func() {
+		connRoleMu.Lock()
+		delete(connRoleMap, mockConn)
+		connRoleMu.Unlock()
+	}()
+
+	rejected := gate2_AuthKeyMatch(mockConn, "SET", db)
+	if rejected {
+		t.Fatal("expected no rejection when auth not configured")
 	}
 }

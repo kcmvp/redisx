@@ -522,3 +522,83 @@ func (s *RawTestSuite) TestUpdateCommand() {
 		})
 	}
 }
+
+// ─── DropSchema / DropIndex ───
+
+func (s *RawTestSuite) TestDropSchemaAndIndex() {
+	tests := []struct {
+		name       string
+		setup      func()
+		action     func() error
+		expectErr  bool
+		errPhrase  string
+	}{
+		{
+			name:      "DropSchema not connected",
+			setup:     nil,
+			action:    func() error { return raw.DropSchema("user") },
+			expectErr: true,
+			errPhrase: "resp client is not connected",
+		},
+		{
+			name:      "DropSchema empty ns",
+			setup:     func() { s.connectRaw() },
+			action:    func() error { return raw.DropSchema("") },
+			expectErr: true,
+			errPhrase: "logical ns is empty",
+		},
+		{
+			name:      "DropIndex not connected",
+			setup:     nil,
+			action:    func() error { return raw.DropIndex("user", "age") },
+			expectErr: true,
+			errPhrase: "resp client is not connected",
+		},
+		{
+			name:      "DropIndex empty arg",
+			setup:     func() { s.connectRaw() },
+			action:    func() error { return raw.DropIndex("") },
+			expectErr: true,
+			errPhrase: "owner ns or full name is required",
+		},
+		{
+			name:      "DropIndex too many args",
+			setup:     func() { s.connectRaw() },
+			action:    func() error { return raw.DropIndex("a", "b", "c") },
+			expectErr: true,
+			errPhrase: "at most 2 args",
+		},
+		{
+			name:      "DropSchema nonexistent",
+			setup:     func() { s.connectRaw() },
+			action:    func() error { return raw.DropSchema("nonexistent") },
+			expectErr: true,
+			errPhrase: "not registered",
+		},
+		{
+			name:      "DropIndex nonexistent",
+			setup:     func() { s.connectRaw() },
+			action:    func() error { return raw.DropIndex("nonexistent", "fakeidx") },
+			expectErr: true,
+			errPhrase: "not registered",
+		},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			s.SetupTest()
+			if tt.setup != nil {
+				tt.setup()
+			}
+			err := tt.action()
+			if tt.expectErr {
+				s.Error(err)
+				if tt.errPhrase != "" {
+					s.Contains(err.Error(), tt.errPhrase)
+				}
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
+}

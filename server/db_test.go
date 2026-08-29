@@ -2072,3 +2072,225 @@ func updIDFromStorage(storageKeys []string) []string {
 func TestUpdateKeyRangeSuite(t *testing.T) {
 	suite.Run(t, new(UpdateKeyRangeSuite))
 }
+
+// ─── EffectiveAuthKeys ───
+
+func TestEffectiveAuthKeys(t *testing.T) {
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T) *DB
+		wantApp   string
+		wantCtrl  string
+	}{
+		{
+			name: "nil DB returns empty",
+			setup: func(t *testing.T) *DB {
+				return nil
+			},
+			wantApp:  "",
+			wantCtrl: "",
+		},
+		{
+			name: "empty DB returns empty",
+			setup: func(t *testing.T) *DB {
+				db := openDB(testutil.DBPath(t))
+				require.NotNil(t, db)
+				t.Cleanup(func() { _ = db.Close() })
+				return db
+			},
+			wantApp:  "",
+			wantCtrl: "",
+		},
+		{
+			name: "after bootstrap returns keys",
+			setup: func(t *testing.T) *DB {
+				db := openDB(testutil.DBPath(t))
+				require.NotNil(t, db)
+				t.Cleanup(func() { _ = db.Close() })
+				_, _, _, err := db.bootstrapAuth("test-app", "test-ctrl")
+				require.NoError(t, err)
+				return db
+			},
+			wantApp:  "test-app",
+			wantCtrl: "test-ctrl",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := tt.setup(t)
+			app, ctrl := db.EffectiveAuthKeys()
+			require.Equal(t, tt.wantApp, app)
+			require.Equal(t, tt.wantCtrl, ctrl)
+		})
+	}
+}
+
+// ─── registerSchemas ───
+
+func TestRegisterSchemas(t *testing.T) {
+	db := openDB(testutil.DBPath(t))
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	tests := []struct {
+		name    string
+		schemas []x.Schema
+		wantErr bool
+	}{
+		{
+			name:    "single schema",
+			schemas: []x.Schema{testUserDoc("{}")},
+			wantErr: false,
+		},
+		{
+			name:    "re-register same schema is idempotent",
+			schemas: []x.Schema{testUserDoc("{}")},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := db.registerSchemas(tt.schemas...)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+	// Verify schema was actually registered
+	db.docRegMu.Lock()
+	_, ok := db.docRegSpec[naming.BuildStorageNs("user", false)]
+	db.docRegMu.Unlock()
+	require.True(t, ok, "user schema should be registered")
+}
+
+// ─── generateBootstrapAuth ───
+
+func TestGenerateBootstrapAuth(t *testing.T) {
+	app, ctrl, err := generateBootstrapAuth()
+	require.NoError(t, err)
+	require.Len(t, app, 32, "app should be 32-char hex (128-bit)")
+	require.Len(t, ctrl, 32, "ctrl should be 32-char hex (128-bit)")
+	require.NotEqual(t, app, ctrl, "app and ctrl should be distinct")
+
+	// Multiple calls should produce different values
+	app2, ctrl2, err2 := generateBootstrapAuth()
+	require.NoError(t, err2)
+	require.NotEqual(t, app, app2)
+	require.NotEqual(t, ctrl, ctrl2)
+}
+
+// ─── openDB edge cases ───
+
+func TestOpenDB_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		wantNil bool
+	}{
+		{name: "empty path", path: "", wantNil: true},
+		{name: ":memory: reserved", path: ":memory:", wantNil: true},
+		{name: "directory path", path: t.TempDir(), wantNil: true},
+		{name: "valid file path", path: testutil.DBPath(t), wantNil: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openDB(tt.path)
+			if tt.wantNil {
+				require.Nil(t, db)
+			} else {
+				require.NotNil(t, db)
+				_ = db.Close()
+			}
+		})
+	}
+}
+
+// ─── idxSpec.UnmarshalJSON ───
+
+func TestIdxSpecUnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		wantPath []string
+		wantErr  bool
+	}{
+		{
+			name:     "new paths field",
+			json:     `{"owner_ns":"user","logical":"age","paths":["$.age","$.name"]}`,
+			wantPath: []string{"$.age", "$.name"},
+		},
+		{
+			name:     "legacy single path field",
+			json:     `{"owner_ns":"user","logical":"age","path":"$.age"}`,
+			wantPath: []string{"$.age"},
+		},
+		{
+			name:     "both fields paths wins",
+			json:     `{"owner_ns":"user","logical":"age","paths":["$.a"],"path":"$.b"}`,
+			wantPath: []string{"$.a"},
+		},
+		{
+			name:    "invalid json",
+			json:    `{invalid`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var idx idxSpec
+			err := json.Unmarshal([]byte(tt.json), &idx)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantPath, idx.Paths)
+		})
+	}
+}
+
+// ─── applyPatternRange ───
+
+func TestApplyPatternRange(t *testing.T) {
+	db := openDB(testutil.DBPath(t))
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	// Seed data
+	keys := []string{"user:1", "user:2", "user:3", "order:1", "order:2"}
+	for _, k := range keys {
+		require.NoError(t, db.Set(k, `{"k":"`+k+`"}`))
+	}
+
+	tests := []struct {
+		name    string
+		pattern string
+		dir     x.RangeDirection
+		wantLen int
+	}{
+		{name: "star matches all ASC", pattern: "*", dir: x.RangeAsc, wantLen: 5},
+		{name: "star matches all DESC", pattern: "*", dir: x.RangeDesc, wantLen: 5},
+		{name: "prefix wildcard ASC", pattern: "user:*", dir: x.RangeAsc, wantLen: 3},
+		{name: "prefix wildcard DESC", pattern: "user:*", dir: x.RangeDesc, wantLen: 3},
+		{name: "leading wildcard ASC", pattern: "*:1", dir: x.RangeAsc, wantLen: 2},
+		{name: "leading wildcard DESC", pattern: "*:1", dir: x.RangeDesc, wantLen: 2},
+		{name: "empty pattern", pattern: "", dir: x.RangeAsc, wantLen: 0},
+		{name: "no match pattern", pattern: "zzz:*", dir: x.RangeAsc, wantLen: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var collected []string
+			err := db.disk.View(func(tx *buntdb.Tx) error {
+				return applyPatternRange(tx, tt.pattern, 0, tt.dir, func(key, value string) bool {
+					collected = append(collected, key)
+					return true
+				})
+			})
+			require.NoError(t, err)
+			require.Len(t, collected, tt.wantLen)
+		})
+	}
+}

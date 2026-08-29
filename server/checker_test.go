@@ -8,6 +8,7 @@ import (
 	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestClassifyArg1(t *testing.T) {
@@ -210,4 +211,121 @@ func TestAutoTTLFromKey(t *testing.T) {
 
 	internal := naming.DocMetaKey("any", "placeholder")
 	require.Equal(t, time.Duration(0), db.autoTTLFromKey(internal, 0))
+}
+
+// ─── keyAttrString ───
+
+func TestKeyAttrString(t *testing.T) {
+	tests := []struct {
+		name  string
+		input gjson.Result
+		want  string
+	}{
+		{
+			name:  "string value",
+			input: gjson.Parse(`"hello"`),
+			want:  "hello",
+		},
+		{
+			name:  "number value",
+			input: gjson.Parse(`42`),
+			want:  "42",
+		},
+		{
+			name:  "true value",
+			input: gjson.Parse(`true`),
+			want:  "1",
+		},
+		{
+			name:  "false value",
+			input: gjson.Parse(`false`),
+			want:  "0",
+		},
+		{
+			name:  "null value",
+			input: gjson.Parse(`null`),
+			want:  "", // gjson null.String() returns empty
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := keyAttrString(tt.input)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// ─── lookupDocByLogicalOrStorageNs expanded ───
+
+func TestLookupDocByLogicalOrStorageNs_TableDriven(t *testing.T) {
+	db := openDB(testutil.DBPath(t))
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	require.NoError(t, db.writeDocSpec(docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}))
+	require.NoError(t, db.writeDocSpec(docSpec{Namespace: "session", Mem: true, KeyAttrs: []string{"sid"}, TTL: 0}))
+
+	diskNs := naming.BuildStorageNs("user", false)
+	memNs := naming.BuildStorageNs("session", true)
+
+	tests := []struct {
+		name      string
+		keyOrNs   string
+		wantOK    bool
+		wantNs    string
+		wantNSpec string
+	}{
+		{
+			name:      "logical namespace disk",
+			keyOrNs:   "user",
+			wantOK:    true,
+			wantNs:    diskNs,
+			wantNSpec: "user",
+		},
+		{
+			name:      "logical namespace mem",
+			keyOrNs:   "session",
+			wantOK:    true,
+			wantNs:    memNs,
+			wantNSpec: "session",
+		},
+		{
+			name:      "storage namespace disk",
+			keyOrNs:   diskNs,
+			wantOK:    true,
+			wantNs:    diskNs,
+			wantNSpec: "user",
+		},
+		{
+			name:      "storage namespace mem via logical name",
+			keyOrNs:   "session", // mem doc found via StripMemPrefixIfMem path
+			wantOK:    true,
+			wantNs:    memNs,
+			wantNSpec: "session",
+		},
+		{
+			name:      "storage key with colon",
+			keyOrNs:   diskNs + ":abc",
+			wantOK:    true,
+			wantNs:    diskNs,
+			wantNSpec: "user",
+		},
+		{
+			name:    "unknown namespace",
+			keyOrNs: "nonexistent",
+			wantOK:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ld, ok := db.lookupDocByLogicalOrStorageNs(tt.keyOrNs)
+			if tt.wantOK {
+				require.True(t, ok)
+				require.Equal(t, tt.wantNs, ld.StorageNs)
+				require.Equal(t, tt.wantNSpec, ld.Spec.Namespace)
+			} else {
+				require.False(t, ok)
+			}
+		})
+	}
 }

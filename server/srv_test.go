@@ -17,6 +17,7 @@ import (
 	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/privateip"
 	"github.com/kcmvp/redisx/internal/testutil"
+	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
@@ -1052,4 +1053,68 @@ func readKeyOrEmptyInternal(t *testing.T, db *DB, slot string) string {
 		return nil
 	})
 	return v
+}
+
+// ─── setupDB ───
+
+func TestSetupDB(t *testing.T) {
+	tests := []struct {
+		name      string
+		dbPath    string
+		schemas   []x.Schema
+		wantOK    bool
+	}{
+		{
+			name:   "normal path",
+			dbPath: testutil.DBPath(t),
+			wantOK: true,
+		},
+		{
+			name:   "empty path fails",
+			dbPath: "",
+			wantOK: false,
+		},
+		{
+			name:    "with schema registration",
+			dbPath:  testutil.DBPath(t),
+			schemas: []x.Schema{testUserDoc("{}")},
+			wantOK:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Mock osExitFn to prevent actual os.Exit
+			globalMu.Lock()
+			origExit := osExitFn
+			exitCalled := false
+			osExitFn = func(code int) { exitCalled = true }
+			globalMu.Unlock()
+
+			db, ok := setupDB(tt.dbPath, tt.schemas)
+			if tt.wantOK {
+				if !ok {
+					t.Fatal("expected setupDB to succeed")
+				}
+				if db == nil {
+					t.Fatal("expected non-nil db")
+				}
+				_ = db.Close()
+				// Clean up global state
+				globalMu.Lock()
+				currentDB = nil
+				globalMu.Unlock()
+			} else {
+				if ok {
+					t.Fatal("expected setupDB to fail")
+				}
+				if !exitCalled {
+					t.Fatal("expected osExitFn to be called on failure")
+				}
+			}
+
+			globalMu.Lock()
+			osExitFn = origExit
+			globalMu.Unlock()
+		})
+	}
 }
