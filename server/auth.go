@@ -19,7 +19,7 @@ const (
 	portRoleCtrl
 )
 
-func (p portRole) String() string {
+func (p portRole) string() string {
 	switch p {
 	case portRoleApp:
 		return "app"
@@ -135,7 +135,7 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 	appValues, ctrlValues, defaultApp, defaultCtrl, err := loadAllAuthPortKeys(db)
 	if err != nil {
 		slog.Warn("Gate2 reject: failed to read _auth_ port-role keys from storage",
-			"port_role", connPortRole(conn).String(), "remote", conn.RemoteAddr(), "cmd", cmdName, "error", err)
+			"port_role", connPortRole(conn).string(), "remote", conn.RemoteAddr(), "cmd", cmdName, "error", err)
 		conn.WriteError("ERR internal auth state unavailable")
 		return true
 	}
@@ -169,7 +169,7 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 	case portRoleApp:
 		if !inApp {
 			slog.Warn("Gate2 reject: app-port conn authenticated with wrong-role key",
-				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
+				"port_role", role.string(), "remote", conn.RemoteAddr(), "cmd", cmdName)
 			msg := "WRONGPASS invalid or wrong auth key for app port"
 			if defaultCtrl != "" && authedKey == defaultCtrl {
 				msg += " (looks like you supplied the ctrl_0 key to the app port)"
@@ -180,7 +180,7 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 	case portRoleCtrl:
 		if !inCtrl {
 			slog.Warn("Gate2 reject: ctrl-port conn authenticated with wrong-role key",
-				"port_role", role.String(), "remote", conn.RemoteAddr(), "cmd", cmdName)
+				"port_role", role.string(), "remote", conn.RemoteAddr(), "cmd", cmdName)
 			msg := "WRONGPASS invalid or wrong auth key for ctrl port"
 			if defaultApp != "" && authedKey == defaultApp {
 				msg += " (looks like you supplied the app_0 key to the ctrl port)"

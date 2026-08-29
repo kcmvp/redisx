@@ -1724,12 +1724,12 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 	})
 
 	t.Run("DB_level_CreateIndex", func(t *testing.T) {
-		require.NoError(t, s.db.CreateIndex(x.RawIndex(
+		require.NoError(t, s.db.createIndex(x.RawIndex(
 			naming.BuildIdxFullName("regidxowner", "dblvl"),
 			"regidxowner:*",
 			"age",
 		)))
-		err := s.db.CreateIndex(x.RawIndex("bogusns:cidx", "*", "age"))
+		err := s.db.createIndex(x.RawIndex("bogusns:cidx", "*", "age"))
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "key_pattern cannot start with wildcard")
 	})

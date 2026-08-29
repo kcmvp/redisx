@@ -17,7 +17,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 )
 
@@ -51,10 +50,7 @@ func seedRawTestServer(t *testing.T, db *server.DB, addr string) {
 	t.Helper()
 	req := require.New(t)
 
-	req.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
-		_, _, err := tx.Set(naming.AuthStorageKey(rawTestAuthKey), rawTestAuthLimit, nil)
-		return err
-	}))
+	req.NoError(db.Set(naming.AuthStorageKey(rawTestAuthKey), rawTestAuthLimit))
 
 	ctx := context.Background()
 	rdb := redis.NewClient(&redis.Options{Addr: addr, Password: rawTestAuthKey})

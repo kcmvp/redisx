@@ -31,7 +31,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 )
 
@@ -170,10 +169,7 @@ func ensureServerAndSeed(t *testing.T) {
 		)
 		require.NotNil(db)
 		sharedSeedBody(t, func(k, v string) error {
-			return db.Raw().Update(func(tx *buntdb.Tx) error {
-				_, _, err := tx.Set(k, v, nil)
-				return err
-			})
+			return db.Set(k, v)
 		})
 	}
 
@@ -286,10 +282,7 @@ func (s *ClientTestSuite) SetupSuite() {
 	s.Require().NotNil(db)
 
 	sharedSeedBody(s.T(), func(k, v string) error {
-		return db.Raw().Update(func(tx *buntdb.Tx) error {
-			_, _, err := tx.Set(k, v, nil)
-			return err
-		})
+		return db.Set(k, v)
 	})
 
 	for i := 0; i < 30; i++ {

@@ -113,15 +113,15 @@ func (suite *DBSuite) TestLifecycle() {
 }
 
 func (suite *DBSuite) TestRawHandlesExposeBothLayers() {
-	suite.NotNil(suite.db.Raw())
-	suite.NotNil(suite.db.RawMem())
-	suite.NotSame(suite.db.Raw(), suite.db.RawMem())
+	suite.NotNil(suite.db.raw())
+	suite.NotNil(suite.db.rawMem())
+	suite.NotSame(suite.db.raw(), suite.db.rawMem())
 
-	suite.NoError(suite.db.Raw().Update(func(tx *buntdb.Tx) error {
+	suite.NoError(suite.db.raw().Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set("disk:key", "disk", nil)
 		return err
 	}))
-	suite.NoError(suite.db.RawMem().Update(func(tx *buntdb.Tx) error {
+	suite.NoError(suite.db.rawMem().Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(naming.BuildStorageKey(naming.BuildStorageNs("mem", true), "key"), "mem", nil)
 		return err
 	}))
@@ -179,23 +179,23 @@ func (suite *DBSuite) TestLoadIndexes() {
 		spec.Version = versionHex
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := naming.IdxMetaKey(spec.FullName(), versionHex)
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		metaKey := naming.IdxMetaKey(spec.fullName(), versionHex)
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
 		}))
 
 		suite.NoError(db.loadIndexes())
-		loaded, ok := db.idxRegSpec[spec.FullName()]
+		loaded, ok := db.idxRegSpec[spec.fullName()]
 		suite.True(ok, "index should be registered")
-		suite.Equal(spec.FullName(), loaded.FullName())
+		suite.Equal(spec.fullName(), loaded.fullName())
 		suite.Equal(spec.Paths, loaded.Paths)
 		suite.Equal(versionHex, loaded.Version)
 		suite.False(naming.HasMemPrefix(loaded.OwnerNs))
 
 		suite.NoError(db.Set("user:1", `{"id":"1","age":20}`))
 		suite.NoError(db.Set("user:2", `{"id":"2","age":30}`))
-		res := db.SearchIndex(spec.FullName(), x.KeysPattern("user:*"), nil, false)
+		res := db.SearchIndex(spec.fullName(), x.KeysPattern("user:*"), nil, false)
 		suite.True(res.IsOk())
 		suite.Len(res.MustGet(), 2)
 	})
@@ -216,23 +216,23 @@ func (suite *DBSuite) TestLoadIndexes() {
 		spec.Version = versionHex
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := naming.IdxMetaKey(spec.FullName(), versionHex)
-		suite.NoError(db.RawMem().Update(func(tx *buntdb.Tx) error {
+		metaKey := naming.IdxMetaKey(spec.fullName(), versionHex)
+		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
 		}))
 
 		suite.NoError(db.loadIndexes())
-		loaded, ok := db.idxRegSpec[spec.FullName()]
+		loaded, ok := db.idxRegSpec[spec.fullName()]
 		suite.True(ok, "mem index should be registered")
 		suite.True(naming.HasMemPrefix(loaded.OwnerNs))
 		suite.Equal(versionHex, loaded.Version)
 
-		suite.NoError(db.RawMem().Update(func(tx *buntdb.Tx) error {
+		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(naming.BuildStorageKey(memStorageNs, "x1"), `{"id":"x1","rank":5}`, nil)
 			return e
 		}))
-		res := db.SearchIndex(spec.FullName(), x.KeysPattern(naming.StorageNsKeyPattern(memStorageNs)), nil, false)
+		res := db.SearchIndex(spec.fullName(), x.KeysPattern(naming.StorageNsKeyPattern(memStorageNs)), nil, false)
 		suite.True(res.IsOk())
 		suite.Len(res.MustGet(), 1)
 	})
@@ -243,7 +243,7 @@ func (suite *DBSuite) TestLoadIndexes() {
 		defer func() { _ = db.Close() }()
 
 		metaKey := naming.IdxMetaKey("user_broken", "placeholder")
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, "{not json", nil)
 			return e
 		}))
@@ -266,7 +266,7 @@ func (suite *DBSuite) TestLoadIndexes() {
 		suite.NoError(err)
 		badRaw := strings.ReplaceAll(string(raw), `"owner_ns":"user"`, `"owner_ns":""`)
 		metaKey := naming.IdxMetaKey("user_bad", "placeholder")
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, badRaw, nil)
 			return e
 		}))
@@ -293,14 +293,14 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		spec.Version = versionHex
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := naming.DocMetaKey(spec.StorageNs(), versionHex)
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		metaKey := naming.DocMetaKey(spec.storageNs(), versionHex)
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
 		}))
 
 		suite.NoError(db.loadDocSpecs())
-		loaded, ok := db.docRegSpec[spec.StorageNs()]
+		loaded, ok := db.docRegSpec[spec.storageNs()]
 		suite.True(ok, "doc should be registered")
 		suite.Equal("profile", loaded.Namespace)
 		suite.Equal([]string{"uid"}, loaded.KeyAttrs)
@@ -323,14 +323,14 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		spec.Version = versionHex
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
-		metaKey := naming.DocMetaKey(spec.StorageNs(), versionHex)
-		suite.NoError(db.RawMem().Update(func(tx *buntdb.Tx) error {
+		metaKey := naming.DocMetaKey(spec.storageNs(), versionHex)
+		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
 		}))
 
 		suite.NoError(db.loadDocSpecs())
-		loaded, ok := db.docRegSpec[spec.StorageNs()]
+		loaded, ok := db.docRegSpec[spec.storageNs()]
 		suite.True(ok)
 		suite.True(loaded.Mem)
 		suite.Equal("session", loaded.Namespace)
@@ -347,8 +347,8 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 			TTL: time.Hour,
 		}
 		suite.NoError(db.writeDocSpec(older))
-		v1hex := db.docRegSpec[older.StorageNs()].Version
-		v1created := db.docRegSpec[older.StorageNs()].CreatedAt
+		v1hex := db.docRegSpec[older.storageNs()].Version
+		v1created := db.docRegSpec[older.storageNs()].CreatedAt
 		suite.NotEmpty(v1hex)
 		suite.False(v1created.IsZero())
 
@@ -360,7 +360,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		err := db.writeDocSpec(incoming)
 		suite.NoError(err, "writeDocSpec upgrades semantic changes (MD5 diff)")
-		upgraded, ok := db.docRegSpec[older.StorageNs()]
+		upgraded, ok := db.docRegSpec[older.storageNs()]
 		suite.True(ok)
 		suite.Equal(48*time.Hour, upgraded.TTL, "TTL must reflect new spec on version upgrade")
 		suite.NotEqual(v1hex, upgraded.Version, "version must change after MD5 differs")
@@ -379,10 +379,10 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		suite.NoError(db.writeDocSpec(spec))
 		suite.NoError(db.loadDocSpecs())
-		firstUpdated := db.docRegSpec[spec.StorageNs()].UpdatedAt
+		firstUpdated := db.docRegSpec[spec.storageNs()].UpdatedAt
 		err := db.writeDocSpec(spec)
 		suite.NoError(err, "writeDocSpec with identical MD5 returns nil no-op")
-		loaded, ok := db.docRegSpec[spec.StorageNs()]
+		loaded, ok := db.docRegSpec[spec.storageNs()]
 		suite.True(ok)
 		suite.Equal(firstUpdated, loaded.UpdatedAt, "no-op write must leave UpdatedAt untouched")
 	})
@@ -397,7 +397,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 			TTL: time.Hour,
 		}
 		suite.NoError(db.writeDocSpec(spec))
-		v1created := db.docRegSpec[spec.StorageNs()].CreatedAt
+		v1created := db.docRegSpec[spec.storageNs()].CreatedAt
 		suite.NoError(db.loadDocSpecs())
 
 		bad := docSpec{
@@ -406,7 +406,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		err := db.writeDocSpec(bad)
 		suite.NoError(err, "writeDocSpec upgrades differing KeyAttrs (MD5 diff)")
-		overwritten, ok := db.docRegSpec[spec.StorageNs()]
+		overwritten, ok := db.docRegSpec[spec.storageNs()]
 		suite.True(ok)
 		suite.Equal([]string{"b"}, overwritten.KeyAttrs, "KeyAttrs must reflect latest spec on upgrade")
 		suite.Equal(v1created, overwritten.CreatedAt, "CreatedAt preserved across KeyAttrs upgrade")
@@ -419,7 +419,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		defer func() { _ = db.Close() }()
 
 		metaKey := naming.DocMetaKey("brokenns", "placeholder")
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, "not a json", nil)
 			return e
 		}))
@@ -437,7 +437,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		raw, err := json.Marshal(spec)
 		suite.NoError(err)
 		metaKey := naming.DocMetaKey("bad", "placeholder")
-		suite.NoError(db.Raw().Update(func(tx *buntdb.Tx) error {
+		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
 			_, _, e := tx.Set(metaKey, string(raw), nil)
 			return e
 		}))
@@ -781,7 +781,7 @@ func (suite *DBSuite) TestCompositeIndexOrderAscend() {
 		suite.NoError(suite.db.Set(key, val))
 	}
 
-	asc := suite.db.SearchIndex(idx.FullName(), x.KeysPattern(docSN+":*"), nil, false)
+	asc := suite.db.SearchIndex(idx.fullName(), x.KeysPattern(docSN+":*"), nil, false)
 	if !suite.True(asc.IsOk(), "SearchIndex ASC err: %v", asc.Error()) {
 		return
 	}
@@ -797,7 +797,7 @@ func (suite *DBSuite) TestCompositeIndexOrderAscend() {
 		suite.Equal(wantAgeOrder[i], gotAge, "ASC idx=%d age mismatch; raw=%s", i, raw)
 	}
 
-	desc := suite.db.SearchIndex(idx.FullName(), x.KeysPattern(docSN+":*"), nil, true)
+	desc := suite.db.SearchIndex(idx.fullName(), x.KeysPattern(docSN+":*"), nil, true)
 	suite.True(desc.IsOk(), "SearchIndex DESC err: %v", desc.Error())
 	gotDesc := desc.MustGet()
 	suite.Len(gotDesc, 6)
@@ -809,8 +809,8 @@ func (suite *DBSuite) TestDocSpecPersistsCreatedAt() {
 	suite.NoError(suite.db.writeDocSpec(spec))
 
 	var raw string
-	metaGlob := naming.DocMetaGlobFor(spec.StorageNs())
-	suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+	metaGlob := naming.DocMetaGlobFor(spec.storageNs())
+	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
 		found := false
 		scanErr := tx.AscendKeys(metaGlob, func(k, v string) bool {
 			raw = v
@@ -829,11 +829,11 @@ func (suite *DBSuite) TestDocSpecPersistsCreatedAt() {
 	suite.True(ca.Exists(), "doc meta raw json must contain created_at; got: %s", raw)
 	suite.NotEmpty(ca.String())
 
-	spec2 := idxSpec{OwnerNs: spec.StorageNs(), Logical: "age", KeyPattern: spec.StorageNs() + ":*", Paths: []string{"age"}}
+	spec2 := idxSpec{OwnerNs: spec.storageNs(), Logical: "age", KeyPattern: spec.storageNs() + ":*", Paths: []string{"age"}}
 	suite.NoError(suite.db.writeIndexSpec(spec2))
 	var iraw string
-	idxMetaGlob := naming.IdxMetaGlobFor(spec2.FullName())
-	suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+	idxMetaGlob := naming.IdxMetaGlobFor(spec2.fullName())
+	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
 		found := false
 		scanErr := tx.AscendKeys(idxMetaGlob, func(k, v string) bool {
 			iraw = v
@@ -857,7 +857,7 @@ func (suite *DBSuite) TestWriteDocSpecLifecycleRetainsCreatedAt() {
 	specV1 := docSpec{Namespace: "cyclens", Mem: false, KeyAttrs: []string{"id"}, TTL: time.Hour}
 	suite.NoError(suite.db.writeDocSpec(specV1))
 
-	storageNs := specV1.StorageNs()
+	storageNs := specV1.storageNs()
 	regV1, ok := suite.db.docRegSpec[storageNs]
 	suite.True(ok, "doc spec must be registered after writeDocSpec V1")
 	suite.False(regV1.CreatedAt.IsZero(), "V1 CreatedAt must be non-zero (first write)")
@@ -885,7 +885,7 @@ func (suite *DBSuite) TestWriteDocSpecLifecycleRetainsCreatedAt() {
 	suite.Equal(v1created, regV2b.CreatedAt, "CreatedAt still immutable after noop")
 
 	var metaKeys []string
-	suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
 		return tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, v string) bool {
 			metaKeys = append(metaKeys, k)
 			return true
@@ -900,7 +900,7 @@ func (suite *DBSuite) TestWriteIndexSpecVersionChangeDropsOldAndMountsNewCompara
 
 	idxV1 := idxSpec{OwnerNs: ownerNs, Logical: "age", KeyPattern: ownerNs + ":*", Paths: []string{"age"}}
 	suite.NoError(suite.db.writeIndexSpec(idxV1))
-	regV1, ok := suite.db.idxRegSpec[idxV1.FullName()]
+	regV1, ok := suite.db.idxRegSpec[idxV1.fullName()]
 	suite.True(ok)
 	suite.NotEmpty(regV1.Version)
 	v1hex := regV1.Version
@@ -916,7 +916,7 @@ func (suite *DBSuite) TestWriteIndexSpecVersionChangeDropsOldAndMountsNewCompara
 		suite.NoError(suite.db.Set(ownerNs+":"+gjson.Get(d, "id").String(), d))
 	}
 
-	resV1 := suite.db.SearchIndex(idxV1.FullName(), x.KeysPattern(ownerNs+":*"), nil, false)
+	resV1 := suite.db.SearchIndex(idxV1.fullName(), x.KeysPattern(ownerNs+":*"), nil, false)
 	suite.True(resV1.IsOk())
 	gotV1 := resV1.MustGet()
 	suite.Len(gotV1, 3)
@@ -928,13 +928,13 @@ func (suite *DBSuite) TestWriteIndexSpecVersionChangeDropsOldAndMountsNewCompara
 
 	idxV2 := idxSpec{OwnerNs: ownerNs, Logical: "age", KeyPattern: ownerNs + ":*", Paths: []string{"score"}}
 	suite.NoError(suite.db.writeIndexSpec(idxV2))
-	regV2, ok := suite.db.idxRegSpec[idxV2.FullName()]
+	regV2, ok := suite.db.idxRegSpec[idxV2.fullName()]
 	suite.True(ok)
 	suite.NotEqual(v1hex, regV2.Version, "paths change must produce different MD5 version")
 	suite.Equal(regV1.CreatedAt, regV2.CreatedAt, "CreatedAt immutable across index versions")
 	suite.False(regV2.UpdatedAt.IsZero(), "UpdatedAt must refresh on version change")
 
-	resV2 := suite.db.SearchIndex(idxV2.FullName(), x.KeysPattern(ownerNs+":*"), nil, false)
+	resV2 := suite.db.SearchIndex(idxV2.fullName(), x.KeysPattern(ownerNs+":*"), nil, false)
 	suite.True(resV2.IsOk())
 	gotV2 := resV2.MustGet()
 	suite.Len(gotV2, 3)
@@ -945,8 +945,8 @@ func (suite *DBSuite) TestWriteIndexSpecVersionChangeDropsOldAndMountsNewCompara
 	}, "V2 index must order rows by score ASC after DropIndex+CreateIndex remount")
 
 	var metaKeys []string
-	suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
-		return tx.AscendKeys(naming.IdxMetaGlobFor(idxV1.FullName()), func(k, v string) bool {
+	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
+		return tx.AscendKeys(naming.IdxMetaGlobFor(idxV1.fullName()), func(k, v string) bool {
 			metaKeys = append(metaKeys, k)
 			return true
 		})
@@ -964,7 +964,7 @@ func (suite *DBSuite) TestSingleMetaVersionPerLogicalOnDiskInvariant() {
 	countDocMeta := func() int {
 		suite.T().Helper()
 		var n int
-		suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+		suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
 			return tx.AscendKeys(naming.DocMetaGlobFor(storageNs), func(k, v string) bool {
 				n++
 				return true
@@ -986,7 +986,7 @@ func (suite *DBSuite) TestSingleMetaVersionPerLogicalOnDiskInvariant() {
 	suite.NoError(suite.db.writeDocSpec(writeDocZero))
 	memStorageNs := naming.BuildStorageNs("invariant", true)
 	var memMetaCount int
-	suite.NoError(suite.db.RawMem().View(func(tx *buntdb.Tx) error {
+	suite.NoError(suite.db.rawMem().View(func(tx *buntdb.Tx) error {
 		return tx.AscendKeys(naming.DocMetaGlobFor(memStorageNs), func(k, v string) bool {
 			memMetaCount++
 			return true
@@ -1003,7 +1003,7 @@ func (suite *DBSuite) TestSingleMetaVersionPerLogicalOnDiskInvariant() {
 	countIdxMeta := func() int {
 		suite.T().Helper()
 		var n int
-		suite.NoError(suite.db.Raw().View(func(tx *buntdb.Tx) error {
+		suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
 			return tx.AscendKeys(naming.IdxMetaGlobFor(idxFull), func(k, v string) bool {
 				n++
 				return true

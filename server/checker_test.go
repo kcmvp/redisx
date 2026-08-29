@@ -134,7 +134,7 @@ func TestStorageNsFromKRAnchor(t *testing.T) {
 
 func TestDeriveDocKey(t *testing.T) {
 	spec := docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id", "org"}}
-	storageNs := spec.StorageNs()
+	storageNs := spec.storageNs()
 
 	dk, err := deriveDocKey(spec, storageNs, `{"id":"1","org":"acme","age":30}`)
 	require.NoError(t, err)
@@ -154,14 +154,14 @@ func TestDeriveDocKey(t *testing.T) {
 	require.Contains(t, err.Error(), "document must be a json object")
 
 	pkBad := docSpec{Namespace: "user", Mem: false, KeyAttrs: []string{"id"}}
-	_, err = deriveDocKey(pkBad, pkBad.StorageNs(), `{"id":"1:2"}`)
+	_, err = deriveDocKey(pkBad, pkBad.storageNs(), `{"id":"1:2"}`)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must not contain")
 
 	zeroAttr := docSpec{Namespace: "cfg", Mem: false, KeyAttrs: nil}
-	dk, err = deriveDocKey(zeroAttr, zeroAttr.StorageNs(), `{"foo":1}`)
+	dk, err = deriveDocKey(zeroAttr, zeroAttr.storageNs(), `{"foo":1}`)
 	require.NoError(t, err)
-	require.Equal(t, naming.BuildStorageKey(zeroAttr.StorageNs(), ""), dk.FullStorageKey)
+	require.Equal(t, naming.BuildStorageKey(zeroAttr.storageNs(), ""), dk.FullStorageKey)
 }
 
 func TestLookupDocByLogicalOrStorageNs(t *testing.T) {

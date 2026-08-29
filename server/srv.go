@@ -6,20 +6,15 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/kcmvp/redisx/internal"
-	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/x"
 	"github.com/samber/lo"
-	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
@@ -57,34 +52,6 @@ func printBootstrapAuthBanner(appAuth, ctrlAuth string) {
 	fmt.Fprintf(&sb, "%s\n", bar)
 	_, _ = fmt.Fprint(os.Stdout, sb.String())
 }
-
-var (
-	effPortMu   sync.RWMutex
-	effPorts    = map[portRole]int{}
-	effPortsSet = map[portRole]bool{}
-)
-
-func recordEffectivePort(role portRole, port int) {
-	effPortMu.Lock()
-	defer effPortMu.Unlock()
-	effPorts[role] = port
-	effPortsSet[role] = true
-}
-
-func getEffectivePort(role portRole) (int, bool, int) {
-	effPortMu.RLock()
-	defer effPortMu.RUnlock()
-	v, ok := effPorts[role]
-	defaultV := defaultAppPort
-	if role == portRoleCtrl {
-		defaultV = defaultCtrlPort
-	}
-	return defaultV, ok, v
-}
-
-const (
-	unlimitedAuthConns = -1
-)
 
 var (
 	cmdAuth        = proto.LowerCmdAuth
@@ -145,20 +112,12 @@ var supportedCommandList = func() string {
 var (
 	internalAuthKey = internal.AuthKey()
 
-	authStateMu       sync.Mutex
-	authKeyMaxConns   = map[string]int{}
-	authKeyConnCounts = map[string]int{}
 	serverMu          sync.Mutex
 	serverListeners   = map[portRole]net.Listener{}
 	shutdownOnce      sync.Once
 	shutdownMu        sync.Mutex
-	shutdownSignalCh  chan os.Signal
-	shutdownDoneCh    chan struct{}
-
 	globalMu         sync.RWMutex
 	listenAndServeFn = listenAndServeWithStop
-	signalNotifyFn   = signal.Notify
-	signalStopFn     = signal.Stop
 	osExitFn         = os.Exit
 	currentDB        *DB
 	srvOnce          sync.Once
@@ -387,139 +346,6 @@ func getListenAndServeFn() func(portRole, string, func(redcon.Conn, redcon.Comma
 	return listenAndServeFn
 }
 
-func authLimitStoreKey(key string) string {
-	return naming.AuthStorageKey(key)
-}
-
-func loadAuthKeyLimits(db *DB) error {
-	limits := map[string]int{}
-
-	keysRes := db.Keys(naming.AuthStorageGlob())
-	if keysRes.IsError() {
-		return keysRes.Error()
-	}
-
-	for _, storeKey := range keysRes.MustGet() {
-		key, _ := naming.StripAuthPrefixIfAuth(storeKey)
-		valRes := db.Get(storeKey)
-		if valRes.IsError() {
-			if errors.Is(valRes.Error(), buntdb.ErrNotFound) {
-				slog.Info("skip expired auth key limit while loading", "auth_key", key)
-				continue
-			}
-			return valRes.Error()
-		}
-
-		limit, err := strconv.Atoi(valRes.MustGet())
-		if err != nil {
-			slog.Info("skip unavailable auth key limit while loading", "auth_key", key)
-			continue
-		}
-		limits[key] = limit
-	}
-
-	authStateMu.Lock()
-	authKeyMaxConns = limits
-	authKeyConnCounts = map[string]int{}
-	authStateMu.Unlock()
-	return nil
-}
-
-func refreshAuthLimit(db *DB, key string) (int, bool, error) {
-	if key == internalAuthKey {
-		return unlimitedAuthConns, true, nil
-	}
-
-	res := db.Get(authLimitStoreKey(key))
-	if res.IsError() {
-		if errors.Is(res.Error(), buntdb.ErrNotFound) {
-			authStateMu.Lock()
-			delete(authKeyMaxConns, key)
-			authStateMu.Unlock()
-			return 0, false, nil
-		}
-		return 0, false, res.Error()
-	}
-
-	limit, err := strconv.Atoi(res.MustGet())
-	if err != nil {
-		authStateMu.Lock()
-		delete(authKeyMaxConns, key)
-		authStateMu.Unlock()
-		slog.Info("treat unavailable auth key limit as expired", "auth_key", key)
-		return 0, false, nil
-	}
-
-	authStateMu.Lock()
-	authKeyMaxConns[key] = limit
-	authStateMu.Unlock()
-	return limit, true, nil
-}
-
-func releaseAuthConn(key string, db *DB) {
-	if key == "" || key == internalAuthKey {
-		return
-	}
-	appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
-	if err == nil {
-		if len(appValues) > 0 || len(ctrlValues) > 0 {
-			if _, isApp := appValues[key]; isApp {
-				return
-			}
-			if _, isCtrl := ctrlValues[key]; isCtrl {
-				return
-			}
-		}
-	}
-
-	authStateMu.Lock()
-	defer authStateMu.Unlock()
-
-	if current := authKeyConnCounts[key]; current > 1 {
-		authKeyConnCounts[key] = current - 1
-	} else {
-		delete(authKeyConnCounts, key)
-	}
-}
-
-func acquireAuthConn(db *DB, key string) error {
-	if key == internalAuthKey {
-		return nil
-	}
-	appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
-	if err != nil {
-		return err
-	}
-	if len(appValues) > 0 || len(ctrlValues) > 0 {
-		if _, isApp := appValues[key]; isApp {
-			return nil
-		}
-		if _, isCtrl := ctrlValues[key]; isCtrl {
-			return nil
-		}
-	}
-	limit, ok, err := refreshAuthLimit(db, key)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errors.New("auth key not found")
-	}
-	if limit != unlimitedAuthConns && limit < 0 {
-		return fmt.Errorf("invalid auth limit for key %s", key)
-	}
-
-	authStateMu.Lock()
-	defer authStateMu.Unlock()
-
-	if limit != unlimitedAuthConns && authKeyConnCounts[key] >= limit {
-		return fmt.Errorf("auth key connection limit exceeded")
-	}
-
-	authKeyConnCounts[key]++
-	return nil
-}
-
 func closeCon(conn redcon.Conn, err error, db *DB) {
 	clearConnPortRole(conn)
 
@@ -537,9 +363,9 @@ func closeCon(conn redcon.Conn, err error, db *DB) {
 
 	role := connPortRole(conn)
 	if err != nil {
-		slog.Info("connection closed", "port_role", role.String(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current, "error", err)
+		slog.Info("connection closed", "port_role", role.string(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current, "error", err)
 	} else {
-		slog.Info("connection closed", "port_role", role.String(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current)
+		slog.Info("connection closed", "port_role", role.string(), "remote", conn.RemoteAddr(), "auth_key", prevAuth, "active", current)
 	}
 }
 
@@ -569,35 +395,6 @@ func isServerShutdownErr(err error) bool {
 		return true
 	}
 	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection")
-}
-
-func handleShutdownSignals(sigCh <-chan os.Signal, doneCh <-chan struct{}, stopFn func() error) {
-	select {
-	case sig := <-sigCh:
-		if sig != nil {
-			slog.Info("redisx server caught shutdown signal", "signal", sig.String())
-		} else {
-			slog.Info("redisx server caught shutdown signal")
-		}
-		if err := stopFn(); err != nil {
-			slog.Warn("graceful shutdown failed", "error", err)
-		}
-	case <-doneCh:
-	}
-}
-
-func watchShutdownSignals() {
-	shutdownOnce.Do(func() {
-		sigCh := make(chan os.Signal, 1)
-		doneCh := make(chan struct{})
-		shutdownMu.Lock()
-		shutdownSignalCh = sigCh
-		shutdownDoneCh = doneCh
-		shutdownMu.Unlock()
-
-		signalNotifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
-		go handleShutdownSignals(sigCh, doneCh, Stop)
-	})
 }
 
 func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
@@ -647,12 +444,12 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 				if cmdName == cmdHello || cmdName == cmdPing || cmdName == cmdQuit {
 					conn.WriteError("NOAUTH authentication required")
 					slog.Warn("unauthenticated handshake/status command on port that requires AUTH",
-						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String(), "storage_error", err)
+						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.string(), "storage_error", err)
 					return
 				}
 				conn.WriteError("NOAUTH authentication required")
 				slog.Warn("unauthenticated command attempt on port that requires AUTH",
-					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.String(), "storage_error", err)
+					"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.string(), "storage_error", err)
 				_ = conn.Close()
 				return
 			}
@@ -724,7 +521,7 @@ func bootListener(role portRole, address string, db *DB, ps *redcon.PubSub) {
 		conn.SetContext("")
 		return true
 	}
-	slog.Info("starting listener", "port_role", role.String(), "addr", address)
+	slog.Info("starting listener", "port_role", role.string(), "addr", address)
 	err := listenFn(role, address,
 		func(conn redcon.Conn, cmd redcon.Command) {
 			handleCommand(conn, cmd, db, ps)
@@ -735,11 +532,11 @@ func bootListener(role portRole, address string, db *DB, ps *redcon.PubSub) {
 		},
 	)
 	if err != nil && !isServerShutdownErr(err) {
-		slog.Error("redisx listener stopped", "port_role", role.String(), "error", err)
+		slog.Error("redisx listener stopped", "port_role", role.string(), "error", err)
 		if exitFn := getOsExitFn(); exitFn != nil {
 			exitFn(1)
 		}
 	} else if err != nil {
-		slog.Info("redisx listener stopped", "port_role", role.String())
+		slog.Info("redisx listener stopped", "port_role", role.string())
 	}
 }
