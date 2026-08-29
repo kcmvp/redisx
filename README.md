@@ -16,9 +16,11 @@
   </a>
 </p>
 
-## The problem
+## The missing piece
 
-You need fast data access in your Go service. Your options:
+There are lots of databases, but none of them give you everything at once:
+fast embedded storage, JSON queries, and the Redis protocol you already
+know. You've always had to pick:
 
 - **Redis** — great protocol, but it stores strings. No JSON queries.
   And it's another process to run, monitor, and pay latency tax on.
@@ -26,10 +28,22 @@ You need fast data access in your Go service. Your options:
 - **BoltDB / Badger** — fast KV, but you're back to manual indexing
   and stringly-typed everything.
 
-**redisx** combines the best of all three into a single Go module you
-`go get` and forget about.
+**redisx** fills that gap — a single Go module you `go get` and forget
+about.
 
-## 30 seconds
+## How does it compare?
+
+| | Redis | MongoDB | redisx |
+|---|---|---|---|
+| Embed in your Go binary | ✗ | ✗ | ✓ |
+| Query JSON by field values | ✗ | ✓ | ✓ |
+| Use any Redis client | ✓ | ✗ | ✓ |
+| Secondary indexes | ✗ | ✓ | ✓ |
+| Type-safe Go API | ✗ | ✗ | ✓ |
+| Write hooks (DLP, CDC, …) | ✗ | ✗ | ✓ |
+| Runs without a separate server | ✓ | ✓ | ✓ |
+
+## Start it in 30 seconds
 
 ```go
 db := server.Start()
@@ -70,18 +84,6 @@ $ redis-cli -p 7379
   is automatic, based on a simple key prefix.
 - **Stream ingestion** — pipe websocket feeds straight into your
   document store, with auto-reconnect.
-
-## How does it compare?
-
-| | Redis | MongoDB | redisx |
-|---|---|---|---|
-| Embed in your Go binary | ✗ | ✗ | ✓ |
-| Query JSON by field values | ✗ | ✓ | ✓ |
-| Use any Redis client | ✓ | ✗ | ✓ |
-| Secondary indexes | ✗ | ✓ | ✓ |
-| Type-safe Go API | ✗ | ✗ | ✓ |
-| Write hooks (DLP, CDC, …) | ✗ | ✗ | ✓ |
-| Runs without a separate server | ✓ | ✓ | ✓ |
 
 ## Install
 
