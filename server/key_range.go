@@ -1,12 +1,14 @@
 package server
 
 import (
-	"strings"
-
-	"github.com/kcmvp/redisx/x"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/match"
+
+	"github.com/kcmvp/redisx/x"
 )
+
+// ——— Key-range iteration + apply pipeline ———
 
 func withLimit(limit int, fn func(key, value string) bool) func(key, value string) bool {
 	if limit <= 0 {
@@ -22,29 +24,13 @@ func withLimit(limit int, fn func(key, value string) bool) func(key, value strin
 	}
 }
 
-func scopeGuard(pivot string, fn func(k, v string) bool) func(k, v string) bool {
-	i := strings.IndexByte(pivot, ':')
-	if i < 0 {
+func nsGuard(pivot string, fn func(k, v string) bool) func(k, v string) bool {
+	storageNs, _, err := naming.SplitStorageKey(pivot)
+	if err != nil || storageNs == "" {
 		return fn
 	}
-	scope := pivot[:i+1]
-	n := i + 1
-	return func(k, v string) bool {
-		if len(k) <= n || k[:n] != scope {
-			return true
-		}
-		return fn(k, v)
-	}
-}
-
-func scopeGuard2(a, b string, fn func(k, v string) bool) func(k, v string) bool {
-	ia := strings.IndexByte(a, ':')
-	ib := strings.IndexByte(b, ':')
-	if ia < 0 || ib < 0 || ia != ib || a[:ia+1] != b[:ib+1] {
-		return fn
-	}
-	scope := a[:ia+1]
-	n := ia + 1
+	scope := naming.StorageNsScope(storageNs)
+	n := len(scope)
 	return func(k, v string) bool {
 		if len(k) <= n || k[:n] != scope {
 			return true
@@ -89,7 +75,7 @@ func lowerBoundCutoff(lo string, fn func(key, value string) bool) func(key, valu
 func applyBtRange(tx *buntdb.Tx, ge, lt string, limit int, dir x.RangeDirection, fn func(key, value string) bool) error {
 	cb := withLimit(limit, fn)
 	if x.IsLiteral(ge) && x.IsLiteral(lt) {
-		cb = scopeGuard2(ge, lt, cb)
+		cb = nsGuard(ge, cb)
 		if dir == x.RangeAsc {
 			return tx.AscendRange("", ge, lt, cb)
 		}
@@ -118,7 +104,7 @@ func applyBtRange(tx *buntdb.Tx, ge, lt string, limit int, dir x.RangeDirection,
 }
 
 func applySingleBoundaryLiteralASC(tx *buntdb.Tx, op string, pivot string, cb func(k, v string) bool) error {
-	cb = scopeGuard(pivot, cb)
+	cb = nsGuard(pivot, cb)
 	switch op {
 	case "gt":
 		return tx.AscendGreaterOrEqual("", x.NextLex(pivot), cb)
@@ -133,7 +119,7 @@ func applySingleBoundaryLiteralASC(tx *buntdb.Tx, op string, pivot string, cb fu
 }
 
 func applySingleBoundaryLiteralDESC(tx *buntdb.Tx, op string, pivot string, cb func(k, v string) bool) error {
-	cb = scopeGuard(pivot, cb)
+	cb = nsGuard(pivot, cb)
 	switch op {
 	case "gt":
 		return tx.DescendRange("", "\xFF\xFF\xFF\xFF", pivot, cb)

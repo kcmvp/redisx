@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/tidwall/match"
 )
 
@@ -62,7 +63,7 @@ func isLiteral(s string) bool { return IsLiteral(s) }
 // hasLeadingWildcard reports whether the first byte of the candidate
 // "anchor" returned by Pattern() / Bounds() is a glob metacharacter. A
 // leading wildcard means the candidate does NOT anchor the keyspace. This
-// mirrors resolvePatternLayer semantics in server/db.go exactly — first
+// mirrors resolveLayer semantics in server/db.go exactly — first
 // byte check only, metachar set limited to '*' and '?' (matches legacy).
 func hasLeadingWildcard(s string) bool {
 	return s != "" && (s[0] == '*' || s[0] == '?')
@@ -518,7 +519,7 @@ func MatchesStorageKey(kr KeyRange, storageKey string) bool {
 //
 //  1. If Pattern() reports (glob, true) → use glob as the anchor (so
 //     leading wildcards are preserved for routing exactly as
-//     resolvePatternLayer(keyPattern) would have computed them in the
+//     resolveLayer(keyPattern) would have computed them in the
 //     legacy string-only days).
 //  2. Otherwise use the concatenated lo:hi Bounds string; a literal-only
 //     range will have real non-wildcard bytes on both sides.
@@ -535,13 +536,13 @@ func LayerRoutingAnchor(kr KeyRange) string {
 
 // LayerRoutingConstrained reports whether a given KeyRange is sufficiently
 // constrained to pin down a single storage layer without scanning both the
-// disk and memory stores. It mirrors the behaviour of resolvePatternLayer:
+// disk and memory stores. It mirrors the behaviour of resolveLayer:
 // false means the caller should reject (SearchKey) or double-sweep
 // (future cross-layer scans if ever desired). True, layer reports the
 // pinned layer.
 //
 // caller is responsible for providing a layerForKey function that mirrors
-// db.go's storageLayer routing (strings.HasPrefix(key, MemKeyPrefix) vs.
+// db.go's storageLayer routing (strings.HasPrefix(key, MemNsPrefix) vs.
 // not). This avoids importing the server package from x.
 func LayerRoutingConstrained(kr KeyRange, layerForKey func(string) any) (any /*storageLayer*/, bool) {
 	anchor := LayerRoutingAnchor(kr)
@@ -549,4 +550,85 @@ func LayerRoutingConstrained(kr KeyRange, layerForKey func(string) any) (any /*s
 		return nil, false
 	}
 	return layerForKey(anchor), true
+}
+
+// ScopeKeyRange resolves one document-scoped x.KeyRange into its fully
+// qualified storage key range. It rejects any field value that already starts
+// with the document namespace prefix (mirroring ValidateKeyPattern on the
+// legacy string path). Every string field in the 6 sealed ctors is prefixed
+// with the D namespace + separator, and any LIMIT set on the input scopedKR
+// is carried onto the returned sealed range via .Limit(old).
+func ScopeKeyRange[D Document](scopedKR KeyRange) (KeyRange, error) {
+	fullNamespace := StorageKeyValue[D]("")
+	fullPrefix := naming.StorageNsScope(fullNamespace)
+
+	checkPrefixed := func(fieldName, v string) error {
+		if v == fullNamespace || strings.HasPrefix(v, fullPrefix) {
+			return fmt.Errorf("key range %s must be document-scoped, got prefixed storage value: %s", fieldName, v)
+		}
+		return nil
+	}
+	prefix := func(s string) string {
+		if s == "" {
+			return fullNamespace
+		}
+		return fullPrefix + s
+	}
+
+	wireBytes, err := scopedKR.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("scoped key range marshal: %w", err)
+	}
+	var wire wireKeyRange
+	if err := json.Unmarshal(wireBytes, &wire); err != nil {
+		return nil, fmt.Errorf("scoped key range unmarshal: %w", err)
+	}
+
+	var built KeyRange
+	switch strings.ToLower(wire.Op) {
+	case "bt":
+		if wire.Ge != "" {
+			if perr := checkPrefixed("ge", wire.Ge); perr != nil {
+				return nil, perr
+			}
+		}
+		if wire.Lt != "" {
+			if perr := checkPrefixed("lt", wire.Lt); perr != nil {
+				return nil, perr
+			}
+		}
+		built = KeysBt(prefix(wire.Ge), prefix(wire.Lt))
+	case "gt":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysGt(prefix(wire.Pivot))
+	case "gte":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysGte(prefix(wire.Pivot))
+	case "lt":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysLt(prefix(wire.Pivot))
+	case "lte":
+		if perr := checkPrefixed("pivot", wire.Pivot); perr != nil {
+			return nil, perr
+		}
+		built = KeysLte(prefix(wire.Pivot))
+	case "pattern":
+		if perr := checkPrefixed("p", wire.P); perr != nil {
+			return nil, perr
+		}
+		built = KeysPattern(prefix(wire.P))
+	default:
+		return nil, fmt.Errorf("unknown key range op: %s", wire.Op)
+	}
+
+	if carry := scopedKR.GetLimit(); carry != -1 {
+		built = built.Limit(carry)
+	}
+	return built, nil
 }

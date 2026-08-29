@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,17 +10,19 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/kcmvp/redisx/internal"
+	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/samber/mo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
 	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
 )
+
+// ——— Type / Struct definitions ———
 
 type storageLayer uint8
 
@@ -27,113 +31,64 @@ const (
 	storageMem
 )
 
-// SECTION: Open
+const (
+	installedAppAuth  = "app_0"
+	installedCtrlAuth = "ctrl_0"
+)
 
-// openDB creates one hybrid DB instance backed by:
-//   - one primary layer opened from path
-//   - one dedicated memory-only layer used by keys prefixed with "_m_"
-//
-// path is passed through to buntdb.Open(path).
-//
-// Use one real database file path such as "/tmp/redisx.db". The special value
-// ":memory:" is rejected because redisx already opens its own dedicated
-// memory-only layer for keys prefixed with "_m_". For filesystem paths,
-// missing parent directories are created automatically, and the database file
-// itself is created on first open when it does not already exist. An empty
-// path is invalid. Directory paths are rejected.
-func openDB(path string) *DB {
-	if path == "" {
-		slog.Error("failed to open storage", "error", "db path is required")
-		return nil
-	}
-	if path == ":memory:" {
-		slog.Error("failed to open storage", "path", path, "error", `db path must be a file path; ":memory:" is reserved for buntdb in-memory mode`)
-		return nil
-	}
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		slog.Error("failed to open storage", "path", path, "error", "db path must be a file path, not a directory")
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		slog.Error("failed to create db directory", "path", path, "error", err)
-		return nil
-	}
-
-	disk, err := buntdb.Open(path)
-	if err != nil {
-		slog.Error("failed to open buntdb", "path", path, "error", err)
-		return nil
-	}
-
-	mem, err := buntdb.Open(":memory:")
-	if err != nil {
-		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
-		_ = disk.Close()
-		return nil
-	}
-
-	return &DB{
-		disk:        disk,
-		mem:         mem,
-		indexLayers: map[string]storageLayer{},
-	}
-}
-
-// DB is a lightweight two-layer BuntDB wrapper for the high-frequency
-// operations exposed by redisx.
-//
-// It is designed for two in-process use cases:
-//   - direct embedded access from the same application
-//   - the backing implementation behind RESP X commands
-//
-// redisx always opens two underlying BuntDB instances:
-//   - one primary layer from dbPath
-//   - one dedicated memory-only layer for keys prefixed with "_m_"
-//
-// For lower-level or BuntDB-specific operations, use [DB.Raw].
+// DB is a lightweight two-layer BuntDB wrapper (disk + memory). Memory layer
+// keys are routed via the "_m_:" storageNs prefix. All typed-doc registry
+// logic (docRegSpec / idxRegSpec maps) live in-process alongside storage so
+// registry lookups are zero I/O.
 type DB struct {
-	disk        *buntdb.DB
-	mem         *buntdb.DB
-	indexLayers map[string]storageLayer
+	disk *buntdb.DB
+	mem  *buntdb.DB
+
+	docRegMu   sync.RWMutex
+	docRegSpec map[string]docSpec
+
+	idxRegMu   sync.RWMutex
+	idxRegSpec map[string]idxSpec
 }
 
-// DBX binds one document type to an existing DB.
-//
-// It keeps the DB-side API symmetric with client/doc while avoiding passing the
-// same DB value on every call.
-type DBX[D x.Document] DB
+// ——— Public (exported) DB methods ———
 
-// SECTION: Core DB
+// ——— DB raw access + lifecycle ———
 
-// Raw exposes the primary storage layer for advanced use cases.
-//
-// This is useful when your application needs direct transactions, indexes,
-// or iteration APIs that are intentionally not re-exposed by redisx.
-//
-// This is the layer opened from dbPath.
-//
-// Example:
-//
-//	raw := db.Raw()
-//	err := raw.Update(func(tx *buntdb.Tx) error {
-//		_, _, err := tx.Set("native:key", "value", nil)
-//		return err
-//	})
-func (db *DB) Raw() *buntdb.DB {
+// Raw exposes the primary (disk) BuntDB instance. For "_m_:" keys use RawMem.
+func (db *DB) raw() *buntdb.DB {
 	return db.disk
 }
 
-// RawMem exposes the in-memory storage layer used by keys with the "_m_"
-// prefix.
-//
-// Keys routed to this layer are not persisted across restarts.
-func (db *DB) RawMem() *buntdb.DB {
+// RawMem exposes the in-memory-only storage layer. Keys here are NOT persisted
+// across server restarts.
+func (db *DB) rawMem() *buntdb.DB {
 	return db.mem
 }
 
-// Close closes both the persistent and in-memory storage layers.
-//
-// The first close error is returned, if any.
+// EffectiveAuthKeys returns the two effective port-role-bound auth keys that
+// are persisted on disk under `_auth_:app_0` and `_auth_:ctrl_0`. These are
+// the keys printed on the bootstrap banner whenever any slot was generated.
+// Empty strings are returned for slots that have not been written yet
+// (should never happen after a successful StartWithConfig bootstrap).
+// SSoT = direct DB read from `_auth_` namespace, no in-memory cache.
+func (db *DB) EffectiveAuthKeys() (app_0, ctrl_0 string) {
+	if db == nil || db.disk == nil {
+		return "", ""
+	}
+	_ = db.disk.View(func(tx *buntdb.Tx) error {
+		if v, err := tx.Get(naming.AuthStorageKey(installedAppAuth)); err == nil {
+			app_0 = v
+		}
+		if v, err := tx.Get(naming.AuthStorageKey(installedCtrlAuth)); err == nil {
+			ctrl_0 = v
+		}
+		return nil
+	})
+	return app_0, ctrl_0
+}
+
+// Close closes both storage layers and returns the first error, if any.
 func (db *DB) Close() error {
 	var firstErr error
 	if db.mem != nil {
@@ -151,107 +106,148 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
-// TODO(Go 1.27): when generic methods are available in the project toolchain,
-// fold this helper into (*DB).As[D]() so the typed view is exposed directly
-// from DB instead of a package-level helper.
+// bootstrapAuth resolves the dual-port AUTH pair using a strict per-slot
+// priority cascade:  cfg seed  →  DB stored value  →  crypto/rand 128-bit hex.
 //
-// As returns a typed view over db without creating a new wrapper object.
-func As[D x.Document](db *DB) *DBX[D] {
-	return (*DBX[D])(db)
-}
-
-// SECTION: Storage Routing
-
-func isMemKey(key string) bool {
-	return strings.HasPrefix(key, contract.MemKeyPrefix)
-}
-
-func hasLeadingWildcard(keyPattern string) bool {
-	return keyPattern != "" && (keyPattern[0] == '*' || keyPattern[0] == '?')
-}
-
-func layerForKey(key string) storageLayer {
-	if isMemKey(key) {
-		return storageMem
-	}
-	return storageDisk
-}
-
-// resolvePatternLayer parses one full storage-key pattern and reports whether
-// the pattern itself constrains the operation to a concrete storage layer.
+// Rules (simplified SSoT):
 //
-// It answers the single routing question shared by all key/index operations:
-// can this pattern alone determine the target layer?
+//  1. If cfg.App.Auth (seedApp) is non-empty → it wins the app slot unconditio-
+//     nally. The ctrl slot resolves similarly from seedCtrl.
+//  2. For whichever slot the seed is empty, fall back to whatever is stored on
+//     disk under `_auth_:app` / `_auth_:ctrl`; if that slot is also missing,
+//     generate a fresh 128-bit random hex for just that one missing slot.
+//  3. The resulting resolved values are written back to disk (in a single
+//     Update tx) iff the slot's value differs from what was on disk (no-op
+//     reads are never persisted).
+//  4. `anyGenerated` is true if at least one slot had to be randomly produced
+//     this call; callers (srv.StartWithConfig) use this flag to decide whether
+//     to print the credentials banner to stdout.
 //
-// The return values mean:
-//   - layer: the resolved layer when constrained is true
-//   - constrained: whether keyPattern itself pins the operation to one layer
-//   - error: syntactic validation failure such as an empty pattern
-//
-// A leading wildcard does not identify one layer, so it is treated as
-// unconstrained rather than as an error. Callers that require a single layer
-// must reject constrained == false themselves.
-func resolvePatternLayer(keyPattern string) (storageLayer, bool, error) {
-	if keyPattern == "" {
-		return storageDisk, false, errors.New("key pattern is required")
+// No dual-port distinctness invariant is enforced here; equality between the
+// two slots is allowed and the caller does not error on it. No "partial pair
+// corrupted" failure mode: partial storage (one slot on disk, one missing) is
+// silently repaired by generating only the missing half.
+func (db *DB) bootstrapAuth(seedApp, seedCtrl string) (finalApp, finalCtrl string, anyGenerated bool, err error) {
+	if db == nil || db.disk == nil {
+		return "", "", false, fmt.Errorf("bootstrapAuth: storage not initialised")
 	}
-	if hasLeadingWildcard(keyPattern) {
-		return storageDisk, false, nil
-	}
-	return layerForKey(keyPattern), true, nil
-}
+	appKey := naming.AuthStorageKey(installedAppAuth)
+	ctrlKey := naming.AuthStorageKey(installedCtrlAuth)
 
-// store returns the underlying storage handle for layer.
-func (db *DB) store(layer storageLayer) *buntdb.DB {
-	if layer == storageMem {
-		return db.mem
-	}
-	return db.disk
-}
-
-func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
-	if ttl <= 0 {
+	var storedApp, storedCtrl string
+	err = db.disk.View(func(tx *buntdb.Tx) error {
+		if av, aerr := tx.Get(appKey); aerr == nil {
+			storedApp = av
+		} else if aerr != buntdb.ErrNotFound {
+			return fmt.Errorf("bootstrapAuth: read %s: %w", appKey, aerr)
+		}
+		if cv, cerr := tx.Get(ctrlKey); cerr == nil {
+			storedCtrl = cv
+		} else if cerr != buntdb.ErrNotFound {
+			return fmt.Errorf("bootstrapAuth: read %s: %w", ctrlKey, cerr)
+		}
 		return nil
+	})
+	if err != nil {
+		return "", "", false, err
 	}
-	return &buntdb.SetOptions{Expires: true, TTL: ttl}
+
+	finalApp = storedApp
+	finalCtrl = storedCtrl
+	writeApp := false
+	writeCtrl := false
+	if seedApp != "" {
+		if finalApp != seedApp {
+			finalApp = seedApp
+			writeApp = true
+		}
+	} else if finalApp == "" {
+		gapp, _, gerr := generateBootstrapAuth()
+		if gerr != nil {
+			return "", "", false, fmt.Errorf("bootstrapAuth: gen app slot: %w", gerr)
+		}
+		finalApp = gapp
+		writeApp = true
+		anyGenerated = true
+	}
+	if seedCtrl != "" {
+		if finalCtrl != seedCtrl {
+			finalCtrl = seedCtrl
+			writeCtrl = true
+		}
+	} else if finalCtrl == "" {
+		_, gctrl, gerr := generateBootstrapAuth()
+		if gerr != nil {
+			return "", "", false, fmt.Errorf("bootstrapAuth: gen ctrl slot: %w", gerr)
+		}
+		finalCtrl = gctrl
+		writeCtrl = true
+		anyGenerated = true
+	}
+	if !writeApp && !writeCtrl {
+		return finalApp, finalCtrl, anyGenerated, nil
+	}
+	err = db.disk.Update(func(tx *buntdb.Tx) error {
+		if writeApp {
+			if _, _, serr := tx.Set(appKey, finalApp, nil); serr != nil {
+				return fmt.Errorf("bootstrapAuth: persist app slot: %w", serr)
+			}
+		}
+		if writeCtrl {
+			if _, _, serr := tx.Set(ctrlKey, finalCtrl, nil); serr != nil {
+				return fmt.Errorf("bootstrapAuth: persist ctrl slot: %w", serr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", false, err
+	}
+	if writeApp && seedApp != "" {
+		slog.Info("bootstrapAuth: app slot overwritten by cfg.App.Auth")
+	}
+	if writeCtrl && seedCtrl != "" {
+		slog.Info("bootstrapAuth: ctrl slot overwritten by cfg.Ctrl.Auth")
+	}
+	return finalApp, finalCtrl, anyGenerated, nil
 }
 
-// SECTION: Query And Update
+// CreateIndex is a small alias over registerIndexes; see registerIndexes for
+// the actual x.Index → idxSpec conversion + writeIndexSpec persistence flow.
+func (db *DB) createIndex(idx x.Index) error {
+	return db.registerIndexes(idx)
+}
 
-// The target values must be valid JSON documents. Each x.Mutation is applied
-// with sjson semantics, so the path may address top-level or nested fields.
-// keyPattern must be one full storage-key pattern, using key glob matching such
-// as "*" and "?".
-//
-// RESP equivalent:
-//
-//	UPDATE <key_pattern> <json_filter> <update_json>
-//
-// Example:
-//
-//	res := db.Update(
-//		"user:*",
-//		x.And(
-//			x.Gte("age", 18),
-//			x.Eq("status", "pending"),
-//		),
-//		x.Set("status", "active"),
-//		x.Set("verified", true),
-//	)
-//	updatedKeys := res.MustGet()
+// ——— Typed-doc query & update API ———
+
+// Update is TYPED-DOC ONLY (there is no KV-style UPDATE bypass per the colon-
+// routing SSOT; the cmd.go UPDATE handler already resolved the keyrange anchor
+// to a single storageNs, verified it is registered (non-internal) and rejected
+// KV-shaped bare patterns). Caller provides the key-range + filter that pins
+// to exactly one storage layer; mutations are sjson path writes executed
+// inside a single BuntDB Update tx so either all matched rows change or none
+// do. Primary keys derived from KeyAttrs are re-derived post-mutation; if any
+// pk would drift the whole tx is aborted with zero writes.
 func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		l, ok, lerr := resolveLayer(k)
+		if lerr != nil || !ok {
+			return fmt.Errorf("Update: key %q is not a concrete key (err=%v constrained=%v)", k, lerr, ok)
+		}
+		return l
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	layer, ok := layerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
+		if lerr, isErr := layerObj.(error); isErr {
+			return mo.Err[[]string](lerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", layerObj))
 	}
 	var updatedKeys []string
 	var err error
@@ -287,6 +283,20 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 				}
 			}
 
+			storageNs, _, splitErr := naming.SplitStorageKey(key)
+			if splitErr == nil && !naming.IsInternalStorageNs(storageNs) {
+				doc, regOK := db.docRegSpec[storageNs]
+				if regOK {
+					oldDK, dkErr := deriveDocKey(doc, storageNs, val)
+					if dkErr == nil {
+						newDK, dkErr2 := deriveDocKey(doc, storageNs, newVal)
+						if dkErr2 == nil && oldDK.FullStorageKey != newDK.FullStorageKey {
+							return fmt.Errorf("UPDATE would change primary key of %q from %q to %q — pk mutations are not allowed", key, oldDK.FullStorageKey, newDK.FullStorageKey)
+						}
+					}
+				}
+			}
+
 			if newVal != val {
 				_, _, err = tx.Set(key, newVal, setOptionsForTTL(ttl))
 				if err != nil {
@@ -306,87 +316,14 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 	return mo.Ok(updatedKeys)
 }
 
-// registerIndexes creates all declared SEARCHINDEX indexes on the correct
-// storage layer.
-//
-// Routing rules:
-//   - key patterns starting with "_m_" are created on the in-memory layer
-//   - all other patterns are created on the persistent layer
-//
-// Index key patterns must not start with "*" or "?" because the target layer
-// must be decided at startup time without scanning both layers.
-func (db *DB) registerIndexes(defs ...x.Index) error {
-	if db.indexLayers == nil {
-		db.indexLayers = map[string]storageLayer{}
-	}
-	for _, def := range defs {
-		if def.Name() == "" {
-			return errors.New("index name is required")
-		}
-		if def.KeyPattern() == "" {
-			return errors.New("index key pattern is required")
-		}
-		if def.Path() == "" {
-			return errors.New("index json path is required")
-		}
-		layer, constrained, err := resolvePatternLayer(def.KeyPattern())
-		if err != nil {
-			return fmt.Errorf("index %w", err)
-		}
-		if !constrained {
-			return errors.New("index key pattern cannot start with wildcard")
-		}
-		if _, exists := db.indexLayers[def.Name()]; exists {
-			return fmt.Errorf("index already declared: %s", def.Name())
-		}
-		if err := db.store(layer).CreateIndex(def.Name(), def.KeyPattern(), buntdb.IndexJSON(def.Path())); err != nil {
-			return err
-		}
-		db.indexLayers[def.Name()] = layer
-	}
-
-	return nil
-}
-
-// SearchIndex scans one registered full index name on its bound storage layer,
-// narrows results by one full storage-key pattern, applies the optional filter,
-// and returns the matched JSON documents ordered by that index.
-//
-// The index must be declared during server startup with x.Idx[D](...). The
-// indexName argument must be the internal full index name, while keyPattern
-// must be one full storage-key pattern. indexName chooses the storage layer
-// first; keyPattern only narrows matches within that layer. A concrete
-// keyPattern that points at a different layer is rejected.
-//
-// SearchIndex resolves one sealed x.KeyRange inside a secondary-index BTree
-// sweep. Because the index's first sort dimension is the serialized indexed
-// JSON field (not the storage key), the KeyRange predicate is applied purely
-// as a CALLBACK storage-key filter via the shared MatchesStorageKey helper —
-// identical algorithm to SEARCHINDEX's legacy string-keyPattern path, just
-// with the full 6-ctor expressive power of the sealed KeyRange instead of a
-// single glob. LIMIT truncation fires as an early-stop inside the iterator
-// callback when result count reaches kr.GetLimit() (no post-hoc slice).
-//
-// Ordering rules:
-//   - ascending when desc is false
-//   - descending when desc is true
-//
-// RESP equivalent:
-//
-//	SEARCHINDEX <index_name> <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
-//
-// Example:
-//
-//	res := db.SearchIndex(
-//		"idx_user_age",
-//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
-//		x.And(
-//			x.Gte("age", 18),
-//			x.Eq("status", "active"),
-//		),
-//		false,
-//	)
-//	users := res.MustGet()
+// SearchIndex scans via a buntdb-native secondary index handle. The index
+// name must already be registered (REGIDX / boot registerSchemas seed or
+// runtime REGIDX); an unregistered name returns Err "index not found". Key-
+// range layer and index ownerNs layer must match (cross-layer searches are
+// parameter-ERR). Matched rows are optionally narrowed by filter.Eval; the
+// SEARCHINDEX command also respects colon-routing (cmd.go searchIndexCommand
+// — index name is always logical, KV-passthrough route is SEARCHKEY only),
+// per the typed-doc-SSOT for registry-bound queries.
 func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
 		return mo.Err[[]string](errors.New("index name is required"))
@@ -394,19 +331,30 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
-	layer, ok := db.indexLayers[indexName]
+	idxSpec, ok := db.idxRegSpec[indexName]
 	if !ok {
 		return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 	}
+	layer, constrained, lerr := resolveLayer(idxSpec.OwnerNs)
+	if lerr != nil || !constrained {
+		return mo.Err[[]string](fmt.Errorf("SearchIndex: owner_ns %q is not a concrete ns (err=%v constrained=%v)", idxSpec.OwnerNs, lerr, constrained))
+	}
 	krLayerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		kl, kok, klerr := resolveLayer(k)
+		if klerr != nil || !kok {
+			return fmt.Errorf("SearchIndex: key %q is not a concrete key (err=%v constrained=%v)", k, klerr, kok)
+		}
+		return kl
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	krLayer, ok := krLayerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", krLayerObj))
+		if klerr, isErr := krLayerObj.(error); isErr {
+			return mo.Err[[]string](klerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", krLayerObj))
 	}
 	if krLayer != layer {
 		return mo.Err[[]string](fmt.Errorf("key range targets a different storage layer than index %s", indexName))
@@ -446,11 +394,6 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	})
 
 	if err != nil {
-		// Defense-in-depth branch: normally unreachable because the
-		// preceding `db.indexLayers[indexName]` check (L391) already
-		// rejects unknown indexes before calling buntdb.Ascend/Descend.
-		// Kept intentionally to guard against future concurrent DropIndex
-		// or TTL-on-index implementations that could race this path.
 		if errors.Is(err, buntdb.ErrNotFound) {
 			return mo.Err[[]string](fmt.Errorf("index not found: %s", indexName))
 		}
@@ -459,43 +402,33 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	return mo.Ok(results)
 }
 
-// SearchKey resolves one sealed x.KeyRange to one storage layer first, then
-// walks the matching default storage-index key range using buntdb's native
-// six BTree iterators, applies the optional x.Filter to each JSON value, and
-// returns matched documents in key order (ASC or DESC). LIMIT truncation is
-// applied inside the native iterator callback via kr.GetLimit() when set.
-//
-// The KeyRange itself must pin exactly one storage layer: either a literal
-// anchor via its Bounds().Lo, or a non-leading-wildcard glob pattern via
-// Pattern(). Unanchored KeyRanges (leading-wildcard pattern such as "*foo")
-// are rejected with an error exactly as the legacy string-keyPattern path
-// used to reject them via resolvePatternLayer.
-//
-// RESP equivalent:
-//
-//	SEARCHKEY <keyrange_json> <json_filter> [ASC|DESC] [LIMIT count]
-//
-// Example:
-//
-//	res := db.SearchKey(
-//		x.KeysBt("user:engineering:0100", "user:engineering:0200").Limit(50),
-//		x.Eq("region", "us"),
-//		true,
-//	)
-//	users := res.MustGet()
+// SearchKey walks the raw storage-key order (no secondary index) for a key-
+// range; used both for typed-doc queries (colon-routing doc-path, KeyRange
+// anchor resolves to storageNs) AND for generic KV-pattern passthrough (colon-
+// routing KV-path, caller supplies a wildcard pattern on keys that contain
+// ':'). The cmd.go searchKeyCommand already handled the 4-branch KEYS-style
+// colon-routing before this method is invoked; this method does NOT consult
+// the typed-doc registry for KV-pattern forms.
 func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
 	}
 	layerObj, constrained := x.LayerRoutingConstrained(kr, func(k string) any {
-		return layerForKey(k)
+		l, ok, lerr := resolveLayer(k)
+		if lerr != nil || !ok {
+			return fmt.Errorf("SearchKey: key %q is not a concrete key (err=%v constrained=%v)", k, lerr, ok)
+		}
+		return l
 	})
 	if !constrained {
 		return mo.Err[[]string](errors.New("key range cannot start with wildcard"))
 	}
 	layer, ok := layerObj.(storageLayer)
 	if !ok {
-		return mo.Err[[]string](fmt.Errorf("layerForKey returned non-storageLayer type %T for key range routing", layerObj))
+		if lerr, isErr := layerObj.(error); isErr {
+			return mo.Err[[]string](lerr)
+		}
+		return mo.Err[[]string](fmt.Errorf("resolveLayer returned non-storageLayer type %T for key range routing", layerObj))
 	}
 
 	dir := x.RangeAsc
@@ -520,71 +453,72 @@ func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]s
 	return mo.Ok(results)
 }
 
-// SECTION: Key Value
+// ——— Raw KV passthrough (Set/SetNX/Get/Delete/Keys) ———
+//
+// These methods are the thin storage-layer counterparts to the RESP KV
+// commands. They implement 0 registry gates: if the caller already routed a
+// key with ':' (colon-routing KV-path) it reaches here as a full storage
+// key; the typed-doc registry / KeyAttrs / JSON schema checks and the
+// internal-namespace write-guard (_doc_/_idx_/_auth_ via validateKVMutationKey)
+// are all performed ABOVE this layer (cmd.go handlers + checker.go).
 
-// Set stores one string value under key.
-//
-// Routing rules:
-//   - keys prefixed with "_m_" are stored in the in-memory layer
-//   - all other keys are stored in the persistent layer
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	SET <key> <value>
+// Set stores value under key (unconditional overwrite). "_m_:" prefix routes
+// to the in-memory layer. RESP equivalent: SET.
 func (db *DB) Set(key string, value string) error {
-	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return err
+	}
+	if !constrained {
+		return fmt.Errorf("Set: key %q is a pattern, not a concrete key", key)
+	}
+	return db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, nil)
 		return err
 	})
 }
 
-// SetWithTtl stores one string value under key with an optional TTL.
-//
-// A positive ttl makes the key expire automatically. A zero or negative ttl
-// behaves the same as [DB.Set].
-//
-// key must be the full storage key.
-//
-// RESP equivalents:
-//
-//	SET <key> <value> EX <seconds>
-//	SETEX <key> <seconds> <value>
+// SetWithTtl sets key→value with optional positive TTL (zero/negative = no
+// TTL, same as Set). autoTTLFromKey injects the doc TTL when the caller
+// comes from a typed-doc SET/SETEX/SETNX handler. RESP: SET EX / SETEX.
 func (db *DB) SetWithTtl(key string, value string, ttl time.Duration) error {
+	ttl = db.autoTTLFromKey(key, ttl)
 	opt := setOptionsForTTL(ttl)
 	if opt == nil {
 		return db.Set(key, value)
 	}
-	return db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return err
+	}
+	if !constrained {
+		return fmt.Errorf("SetWithTtl: key %q is a pattern, not a concrete key", key)
+	}
+	return db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, _, err := tx.Set(key, value, opt)
 		return err
 	})
 }
 
-// SetNX stores value only when key does not already exist.
-//
-// The returned boolean reports whether the write happened.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	SETNX <key> <value>
+// SetNX sets key→value only when key does NOT already exist (Redis SETNX).
+// Returns true when the write actually happened.
 func (db *DB) SetNX(key string, value string) (bool, error) {
 	return db.SetNXWithTtl(key, value, 0)
 }
 
-// SetNXWithTtl stores value only when key does not already exist, and applies
-// the provided TTL when it is positive.
-//
-// The returned boolean reports whether the write happened.
-//
-// key must be the full storage key.
+// SetNXWithTtl is SetNX with a positive TTL applied to newly-created keys.
 func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, error) {
+	ttl = db.autoTTLFromKey(key, ttl)
 	var set bool
 	opt := setOptionsForTTL(ttl)
-	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return false, err
+	}
+	if !constrained {
+		return false, fmt.Errorf("SetNXWithTtl: key %q is a pattern, not a concrete key", key)
+	}
+	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
 		_, err := tx.Get(key)
 		if err == buntdb.ErrNotFound {
 			_, _, err = tx.Set(key, value, opt)
@@ -601,18 +535,17 @@ func (db *DB) SetNXWithTtl(key string, value string, ttl time.Duration) (bool, e
 	return set, nil
 }
 
-// Get returns the string value stored under key.
-//
-// A missing key is returned as an error result.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	GET <key>
+// Get returns the value stored under key. Missing key = Err result. RESP: GET.
 func (db *DB) Get(key string) mo.Result[string] {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return mo.Err[string](err)
+	}
+	if !constrained {
+		return mo.Err[string](fmt.Errorf("Get: key %q is a pattern, not a concrete key", key))
+	}
 	var val string
-	err := db.store(layerForKey(key)).View(func(tx *buntdb.Tx) error {
+	err = db.store(layer).View(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Get(key)
 		return innerErr
@@ -624,18 +557,20 @@ func (db *DB) Get(key string) mo.Result[string] {
 	return mo.Ok(val)
 }
 
-// Delete removes key from its routed storage layer.
-//
-// The returned boolean reports whether the key existed.
-//
-// key must be the full storage key.
-//
-// RESP equivalent:
-//
-//	DEL <key>
+// Delete removes key from its routed layer. Returns true if the key existed.
+// RESP equivalent: DEL single-key form. Multi-key DEL, doc-path DEL ns
+// <pk1> [pk2…] and the "multi-KV DEL not allowed" guard are all enforced
+// above this layer in cmd.go delCommand.
 func (db *DB) Delete(key string) (bool, error) {
+	layer, constrained, err := resolveLayer(key)
+	if err != nil {
+		return false, err
+	}
+	if !constrained {
+		return false, fmt.Errorf("Delete: key %q is a pattern, not a concrete key", key)
+	}
 	var val string
-	err := db.store(layerForKey(key)).Update(func(tx *buntdb.Tx) error {
+	err = db.store(layer).Update(func(tx *buntdb.Tx) error {
 		var innerErr error
 		val, innerErr = tx.Delete(key)
 		if innerErr == buntdb.ErrNotFound {
@@ -649,16 +584,13 @@ func (db *DB) Delete(key string) (bool, error) {
 	return len(val) > 0, nil
 }
 
-// Keys resolves one full storage-key pattern to one storage layer first, then
-// returns all matching keys from that layer.
-//
-// keyPattern uses key glob matching such as "*" and "?".
-//
-// RESP equivalent:
-//
-//	KEYS <key_pattern>
+// Keys returns storage keys matching a single-layer pinned pattern. Pattern
+// cannot start with wildcard (resolveLayer enforces single layer).
+// The cmd.go keysCommand 4-branch colon-routing logic sits above this call:
+// ':' in pattern → KV-glob straight through; no ':' + bare registered ns →
+// auto-scoped `<ns>:*`; no ':' + wildcard → ERR. RESP: KEYS.
 func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
-	layer, constrained, err := resolvePatternLayer(keyPattern)
+	layer, constrained, err := resolveLayer(keyPattern)
 	if err != nil {
 		return mo.Err[[]string](err)
 	}
@@ -679,143 +611,122 @@ func (db *DB) Keys(keyPattern string) mo.Result[[]string] {
 	return mo.Ok(keys)
 }
 
-// SECTION: Typed Document View
+// ——— Private (unexported) helpers ———
 
-// Get loads one document by its document-level key value.
+func generateBootstrapAuth() (appAuth, ctrlAuth string, err error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generateBootstrapAuth: crypto/rand: %w", err)
+	}
+	appAuth = hex.EncodeToString(raw)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("generateBootstrapAuth: crypto/rand ctrl: %w", err)
+	}
+	ctrlAuth = hex.EncodeToString(raw)
+	// Guarantee distinctness (crypto-lottery collision probability is ~2^-64
+	// per run; enforce to satisfy the dual-port "different passwords" hard
+	// gate in Config.validate, which runs BEFORE BootstrapAuth writes back).
+	if appAuth == ctrlAuth {
+		// Flip the first byte of the ctrl copy.
+		if raw[0] == 0xFF {
+			raw[0] = 0x00
+		} else {
+			raw[0]++
+		}
+		ctrlAuth = hex.EncodeToString(raw)
+	}
+	return appAuth, ctrlAuth, nil
+}
+
+// ——— Storage routing helpers ———
+
+// hasLeadingWildcard reports a pattern is unbounded (starts with * or ?).
+// Unconstrained patterns are treated as "unpinned to any single layer".
+func hasLeadingWildcard(keyPattern string) bool {
+	return keyPattern != "" && (keyPattern[0] == '*' || keyPattern[0] == '?')
+}
+
+// resolveLayer is the single source of truth for storage-layer routing.
+// It unifies the previous layerForKey / layerForStorageNs / resolvePatternLayer
+// / isMemKey helpers. Callers ALWAYS handle all three returns explicitly:
+//   - s == ""                 → (disk, false, err)
+//   - s starts with '*'/'?'   → (disk, false, nil)    // pattern is unconstrained
+//   - otherwise ("_m_:" pref) → (mem,  true,  nil)
+//   - otherwise (flat ns/key) → (disk, true,  nil)
+func resolveLayer(s string) (storageLayer, bool, error) {
+	if s == "" {
+		return storageDisk, false, errors.New("storage key or pattern is required")
+	}
+	if hasLeadingWildcard(s) {
+		return storageDisk, false, nil
+	}
+	if naming.HasMemPrefix(s) {
+		return storageMem, true, nil
+	}
+	return storageDisk, true, nil
+}
+
+// store returns the BuntDB handle for the given layer (disk XOR mem).
+func (db *DB) store(layer storageLayer) *buntdb.DB {
+	if layer == storageMem {
+		return db.mem
+	}
+	return db.disk
+}
+
+// setOptionsForTTL returns nil for TTL<=0 (persist forever) or a buntdb
+// SetOptions instance that expires after the provided TTL.
+func setOptionsForTTL(ttl time.Duration) *buntdb.SetOptions {
+	if ttl <= 0 {
+		return nil
+	}
+	return &buntdb.SetOptions{Expires: true, TTL: ttl}
+}
+
+// openDB constructs a two-layer DB instance (disk file + volatile in-memory
+// layer for "_m_:" prefixed keys). Note that the "_m_:<ns>" prefix itself is
+// reserved and rejected by HasUnderscorePrefix in the checker layer (above the
+// storage layer) — the store simply routes; the semantic gate lives in
+// checker.go / cmd.go handlers.
 //
-// The input key is the resolved JSON-layer key value, not the final storage
-// key. The storage namespace is derived from D automatically.
-func (dbx *DBX[D]) Get(key string) (D, error) {
-	var zero D
-	if dbx == nil {
-		return zero, errors.New("db is nil")
+// AUTH lifecycle is owned 1:1 by the pair of physical keys `_auth_:app` and
+// `_auth_:ctrl` (SSoT lives in the storage layer itself, NOT in-process).
+// First-read of the pair via `BootstrapAuth(seedApp, seedCtrl)` generates and
+// SETNX-atomic-writes both keys iff both slots are empty; there is no
+// per-process duplicate state on *DB and no file-creation-time dependence on
+// this constructor.
+func openDB(path string) *DB {
+	if path == "" {
+		slog.Error("failed to open storage", "error", "db path is required")
+		return nil
 	}
-
-	res := (*DB)(dbx).Get(x.StorageKeyValue[D](key))
-	if res.IsError() {
-		return zero, res.Error()
+	if path == ":memory:" {
+		slog.Error("failed to open storage", "path", path, "error", `db path must be a file path; ":memory:" is reserved for buntdb in-memory mode`)
+		return nil
 	}
-	return D(res.MustGet()), nil
-}
-
-// Set stores one document using its derived storage key and document TTL.
-func (dbx *DBX[D]) Set(d D) error {
-	if dbx == nil {
-		return errors.New("db is nil")
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		slog.Error("failed to open storage", "path", path, "error", "db path must be a file path, not a directory")
+		return nil
 	}
-
-	key, err := x.StorageKey(d)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Error("failed to create db directory", "path", path, "error", err)
+		return nil
+	}
+	disk, err := buntdb.Open(path)
 	if err != nil {
-		return err
+		slog.Error("failed to open buntdb", "path", path, "error", err)
+		return nil
 	}
-	return (*DB)(dbx).SetWithTtl(key, d.RawJSON(), d.TTL())
-}
-
-// SetNX stores one document only when its key does not already exist, using
-// the document TTL.
-func (dbx *DBX[D]) SetNX(d D) (bool, error) {
-	if dbx == nil {
-		return false, errors.New("db is nil")
-	}
-
-	key, err := x.StorageKey(d)
+	mem, err := buntdb.Open(":memory:")
 	if err != nil {
-		return false, err
+		slog.Error("failed to open buntdb", "path", ":memory:", "error", err)
+		_ = disk.Close()
+		return nil
 	}
-	return (*DB)(dbx).SetNXWithTtl(key, d.RawJSON(), d.TTL())
-}
-
-// Delete removes one document by its derived storage key.
-func (dbx *DBX[D]) Delete(d D) (bool, error) {
-	if dbx == nil {
-		return false, errors.New("db is nil")
+	return &DB{
+		disk:       disk,
+		mem:        mem,
+		docRegSpec: map[string]docSpec{},
+		idxRegSpec: map[string]idxSpec{},
 	}
-
-	key, err := x.StorageKey(d)
-	if err != nil {
-		return false, err
-	}
-	return (*DB)(dbx).Delete(key)
-}
-
-// Keys returns keys matching the document namespace and key sub-pattern.
-func (dbx *DBX[D]) Keys(keyPattern string) mo.Result[[]string] {
-	if dbx == nil {
-		return mo.Err[[]string](errors.New("db is nil"))
-	}
-	fullKeyPattern, err := internal.ValidateKeyPattern[D](keyPattern)
-	if err != nil {
-		return mo.Err[[]string](err)
-	}
-	return (*DB)(dbx).Keys(fullKeyPattern)
-}
-
-// SearchIndex delegates to the underlying DB index search.
-func (dbx *DBX[D]) SearchIndex(idxName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
-	if dbx == nil {
-		return mo.Err[[]D](errors.New("db is nil"))
-	}
-	if kr == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
-	}
-
-	fullIdxName, err := internal.ValidateIdxName[D](idxName)
-	if err != nil {
-		return mo.Err[[]D](err)
-	}
-
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]D](err)
-	}
-
-	res := (*DB)(dbx).SearchIndex(fullIdxName, fullKR, filter, desc)
-	if res.IsError() {
-		return mo.Err[[]D](res.Error())
-	}
-
-	raws := res.MustGet()
-	out := make([]D, 0, len(raws))
-	for _, raw := range raws {
-		out = append(out, D(raw))
-	}
-	return mo.Ok(out)
-}
-
-// SearchKey returns documents matching the prefixed scoped key range and filter.
-func (dbx *DBX[D]) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
-	if dbx == nil {
-		return mo.Err[[]D](errors.New("db is nil"))
-	}
-	if kr == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
-	}
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]D](err)
-	}
-
-	res := (*DB)(dbx).SearchKey(fullKR, filter, desc)
-	if res.IsError() {
-		return mo.Err[[]D](res.Error())
-	}
-
-	raws := res.MustGet()
-	out := make([]D, 0, len(raws))
-	for _, raw := range raws {
-		out = append(out, D(raw))
-	}
-	return mo.Ok(out)
-}
-
-// Update applies mutations to documents matching the prefixed key range.
-func (dbx *DBX[D]) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
-	if dbx == nil {
-		return mo.Err[[]string](errors.New("db is nil"))
-	}
-	fullKR, err := internal.ScopeKeyRange[D](kr)
-	if err != nil {
-		return mo.Err[[]string](err)
-	}
-	return (*DB)(dbx).Update(fullKR, filter, values...)
 }

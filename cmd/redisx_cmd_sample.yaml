@@ -1,0 +1,46 @@
+# redisx cmd (REPL client) sample configuration
+#
+# Top-level key layout intentionally mirrors redis_srv_sample.yaml, so the
+# same dual-port mental model ("app" data plane vs "ctrl" control plane)
+# carries over. The CLI never opens the server's database file directly —
+# it always connects via the raw RESP wire protocol to one endpoint at a
+# time (pass --port / --host / --auth on the command line).
+#
+# Loading convention:
+#   · the `redisx` binary consumes these values via FLAGS, not by parsing
+#     this YAML (flags: -h/--host, -p/--port, -a/--auth, --timeout-ms)
+#   · this file is a human-readable reference mirroring the server-side
+#     `app` / `ctrl` shape; use it to hand off the right -p/-a pair to the
+#     operator or to your deployment config system
+
+app:
+  # Business / data-plane RESP port. Corresponds to `server.Config.App.Port`.
+  # Use -p 7379 when connecting the CLI as a regular data client.
+  # Default server-side value: 7379
+  port: 7379
+  # Bind-address hint — informational only. The CLI always uses its own
+  # explicit --host/-h flag (default 127.0.0.1); listed here purely to keep
+  # shape parity with redis_srv_sample.yaml.
+  bind: ""
+  # AUTH key for the business port. Pass with -a when CLI is pointed at the
+  # app port. On first server startup this key is auto-generated and stored
+  # under "_auth_:app"; leave empty when operating against a standard
+  # redisx deploy (see redis_srv_sample.yaml for bootstrap semantics).
+  auth: ""
+
+ctrl:
+  # Control-plane RESP port. Corresponds to `server.Config.Ctrl.Port`.
+  # Use -p 7381 (the CLI's built-in default) when connecting for meta ops.
+  # Default server-side value: 7381
+  port: 7381
+  # Bind-address hint — informational only; see `app.bind` note.
+  # Default server-side value: "127.0.0.1"
+  bind: "127.0.0.1"
+  # AUTH key for the control-plane port. Pass with -a when the CLI is
+  # pointed at the ctrl port. Auto-generated and stored under "_auth_:ctrl"
+  # on first server startup; see redis_srv_sample.yaml bootstrap notes.
+  auth: ""
+  # Informational mirror of server config (read-only reference for the
+  # operator — the CLI never acts on these).
+  trust_proxy: false
+  danger_bind_any: false

@@ -1,268 +1,67 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
-	"time"
 
-	"github.com/kcmvp/redisx/internal/xcmd"
-	"github.com/kcmvp/redisx/x"
-	"github.com/kcmvp/redisx/x/contract"
-	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/redcon"
+
+	"github.com/kcmvp/redisx/x"
 )
 
-func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 2 {
-		conn.WriteError("ERR authentication failed")
-		slog.Warn("auth format error", "remote", conn.RemoteAddr())
-		_ = conn.Close()
-		return
-	}
-	providedKey := string(cmd.Args[1])
-	prevAuth, _ := conn.Context().(string)
+// ——— ——— 工具函数 / Pure helpers ——— ———
 
-	if prevAuth != "" {
-		if prevAuth == providedKey {
-			conn.WriteString("OK")
-			return
-		}
-		conn.WriteError("ERR connection already authenticated")
-		slog.Warn("auth rejected on authenticated connection", "remote", conn.RemoteAddr(), "current_auth_key", prevAuth, "provided_auth_key", providedKey)
-		_ = conn.Close()
-		return
+// appearsDocIntentJSON reports whether a raw SET/SETEX/SETNX value string
+// "looks like" typed-document JSON — i.e. parses as a JSON object or
+// JSON array. When namespace is missing and the value matches, we emit
+// a "schema not registered" error instead of a generic "need separator"
+// error, which is a much better diagnostic for callers migrating from
+// raw KV to typed docs.
+func appearsDocIntentJSON(v string) bool {
+	if !gjson.Valid(v) {
+		return false
 	}
-
-	if err := acquireAuthConn(db, providedKey); err == nil {
-		conn.SetContext(providedKey)
-		conn.WriteString("OK")
-		slog.Info("connection authenticated", "remote", conn.RemoteAddr(), "auth_key", providedKey)
-	} else {
-		msg := "ERR authentication failed"
-		if strings.Contains(err.Error(), "connection limit exceeded") {
-			msg = "ERR auth key connection limit exceeded"
-		}
-		if strings.Contains(err.Error(), "invalid auth limit") {
-			msg = "ERR invalid auth key limit"
-		}
-		if strings.Contains(err.Error(), "not found") && providedKey != internalAuthKey {
-			msg = "ERR authentication failed"
-		}
-		conn.WriteError(msg)
-		slog.Warn("auth failed", "remote", conn.RemoteAddr(), "auth_key", providedKey, "error", err)
-		_ = conn.Close()
-		return
-	}
+	r := gjson.Parse(v)
+	return r.IsObject() || r.IsArray()
 }
 
-func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	conn.WriteAny(map[string]any{
-		"server":  "redisx",
-		"version": "1.0.0",
-		"proto":   2,
-		"id":      1,
-		"mode":    "standalone",
-		"role":    "master",
-		"modules": []any{},
-	})
-}
-
-func clientCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	conn.WriteString("OK")
-}
-
-func pingCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	conn.WriteString("PONG")
-}
-
-func quitCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	conn.WriteString("OK")
-	_ = conn.Close()
-}
-
-func setCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 3 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
+// normalizeKRJSONArg normalises the first positional argument of
+// UPDATE / SEARCHKEY to a valid x.KeyRange JSON payload.
+//
+// Accepts two forms:
+//   - already-JSON `{ "op": "pattern", "p": "<ns>:*" }` — returned as-is
+//   - legacy shorthand string `<ns>:*` (or any string without a leading
+//     '{') — wrapped into `{"op":"pattern","p":"<raw>"}` via json.Marshal
+//
+// If json.Marshal fails for a non-JSON raw, the input string is returned
+// unchanged so downstream UnmarshalKeyRange can surface the exact parse
+// error instead of a misleading wrapper failure.
+func normalizeKRJSONArg(raw string) []byte {
+	if len(raw) > 0 && raw[0] == '{' {
+		return []byte(raw)
 	}
-
-	var ttl time.Duration
-	var nx bool
-	if len(cmd.Args) > 3 {
-		for i := 3; i < len(cmd.Args); i++ {
-			arg := strings.ToUpper(string(cmd.Args[i]))
-			if arg == "EX" && i+1 < len(cmd.Args) {
-				secs, err := strconv.Atoi(string(cmd.Args[i+1]))
-				if err != nil {
-					conn.WriteError("ERR value is not an integer or out of range")
-					return
-				}
-				ttl = time.Duration(secs) * time.Second
-				i++
-			} else if arg == "PX" && i+1 < len(cmd.Args) {
-				msecs, err := strconv.Atoi(string(cmd.Args[i+1]))
-				if err != nil {
-					conn.WriteError("ERR value is not an integer or out of range")
-					return
-				}
-				ttl = time.Duration(msecs) * time.Millisecond
-				i++
-			} else if arg == "NX" {
-				nx = true
-			}
-		}
-	}
-
-	if nx {
-		set, err := db.SetNXWithTtl(string(cmd.Args[1]), string(cmd.Args[2]), ttl)
-		if err != nil {
-			conn.WriteError("ERR " + err.Error())
-			return
-		}
-		if set {
-			conn.WriteString("OK")
-		} else {
-			conn.WriteNull()
-		}
-		return
-	}
-
-	if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[2]), ttl); err != nil {
-		conn.WriteError("ERR " + err.Error())
-		return
-	}
-	conn.WriteString("OK")
-}
-
-func setExCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 4 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	secs, err := strconv.Atoi(string(cmd.Args[2]))
+	b, err := json.Marshal(map[string]string{"op": "pattern", "p": raw})
 	if err != nil {
-		conn.WriteError("ERR value is not an integer or out of range")
-		return
+		return []byte(raw)
 	}
-	ttl := time.Duration(secs) * time.Second
-	if err := db.SetWithTtl(string(cmd.Args[1]), string(cmd.Args[3]), ttl); err != nil {
-		conn.WriteError("ERR " + err.Error())
-		return
-	}
-	conn.WriteString("OK")
+	return b
 }
 
-func setNxCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 3 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	set, err := db.SetNX(string(cmd.Args[1]), string(cmd.Args[2]))
-	if err != nil {
-		conn.WriteError("ERR " + err.Error())
-	} else if set {
-		conn.WriteInt(1)
-	} else {
-		conn.WriteInt(0)
-	}
-}
-
-func getCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 2 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	res := db.Get(string(cmd.Args[1]))
-	if res.IsError() {
-		if errors.Is(res.Error(), buntdb.ErrNotFound) {
-			conn.WriteNull()
-		} else {
-			conn.WriteError("ERR " + res.Error().Error())
-		}
-	} else {
-		conn.WriteBulk([]byte(res.MustGet()))
-	}
-}
-
-func delCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 2 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	var deleted bool
-	deleted, err := db.Delete(string(cmd.Args[1]))
-	if err != nil {
-		conn.WriteError("ERR " + err.Error())
-	} else if deleted {
-		conn.WriteInt(1)
-	} else {
-		conn.WriteInt(0)
-	}
-}
-
-func keysCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 2 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-
-	keyPattern := string(cmd.Args[1])
-	if hasLeadingWildcard(keyPattern) {
-		conn.WriteError("ERR forbidden key pattern")
-		return
-	}
-	if strings.HasPrefix(keyPattern, "_") && !strings.HasPrefix(keyPattern, contract.MemKeyPrefix) {
-		conn.WriteError("ERR forbidden key pattern")
-		return
-	}
-
-	res := db.Keys(keyPattern)
-	if res.IsError() {
-		conn.WriteError("ERR " + res.Error().Error())
-	} else {
-		keys := res.MustGet()
-		conn.WriteArray(len(keys))
-		for _, key := range keys {
-			conn.WriteBulk([]byte(key))
-		}
-	}
-}
-
-func publishCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) != 3 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	conn.WriteInt(ps.Publish(string(cmd.Args[1]), string(cmd.Args[2])))
-}
-
-func subscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 2 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	for i := 1; i < len(cmd.Args); i++ {
-		ps.Subscribe(conn, string(cmd.Args[i]))
-	}
-}
-
-func pSubscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	if len(cmd.Args) < 2 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	for i := 1; i < len(cmd.Args); i++ {
-		ps.Psubscribe(conn, string(cmd.Args[i]))
-	}
-}
-
-// X Commands
-
-// parseFilter recursively parses a MongoDB-style JSON string into an x.Filter.
+// parseFilter recursively parses a MongoDB-style JSON filter string into
+// an x.Filter tree. Empty / "{}" passes everything.
+//
+// Supported operators:
+//   - Top-level keys combine with implicit $and
+//   - `$and` / `$or` — array of sub-filters
+//   - `$eq`, `$neq` — scalar equality
+//   - `$gt`, `$gte`, `$lt`, `$lte` — numeric comparisons (parsed as float64)
+//   - `$contains` — string substring match
+//   - `$in` — array value, any match passes
+//   - `"field": <scalar>` — shorthand implicit `$eq`
 func parseFilter(jsonStr string) (x.Filter, error) {
 	if jsonStr == "" || jsonStr == "{}" {
 		return nil, nil // empty filter passes everything
@@ -276,6 +75,12 @@ func parseFilter(jsonStr string) (x.Filter, error) {
 	return parseNode(root)
 }
 
+// parseNode recursively parses one gjson JSON object node into an
+// x.Filter. See parseFilter for the supported operator grammar.
+//
+// Field-comparison sub-objects (e.g. `{"age":{"$gt":18}}`) are parsed in
+// the `default` branch; an unrecognised operator bubbles up as a parse
+// error via the closure-local `parseErr` variable.
 func parseNode(node gjson.Result) (x.Filter, error) {
 	if node.Type != gjson.JSON {
 		return nil, errors.New("expected JSON object")
@@ -300,7 +105,12 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 					parseErr = err
 					return false
 				}
-				subFilters = append(subFilters, f)
+				// nil sub-filter = empty object = passes everything;
+				// skip it so And/Or never receive a nil Filter (would
+				// panic on Eval).
+				if f != nil {
+					subFilters = append(subFilters, f)
+				}
 				return true
 			})
 			if parseErr != nil {
@@ -319,7 +129,9 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 					parseErr = err
 					return false
 				}
-				subFilters = append(subFilters, f)
+				if f != nil {
+					subFilters = append(subFilters, f)
+				}
 				return true
 			})
 			if parseErr != nil {
@@ -387,262 +199,182 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 	return x.And(filters...), nil
 }
 
-func searchIndexCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	// Strict RESP positional argc shape (fr-searchindex.md §2):
-	// shifted +1 from SEARCHKEY argc table because the first positional arg
-	// is indexName. LIMIT count is TWO tokens (the keyword + the numeric
-	// value), so the 4th argc shape covers "LIMIT count" (2 trailing tokens).
-	//
-	//   argc after cmd word | shape
-	//   -------------------+---------------------------------------------------
-	//   3                  |  idx_name  kr_json  filter_json                  (ASC, no LIMIT)
-	//   4                  |  idx_name  kr_json  filter_json  ASC|DESC        (dir only)
-	//   5                  |  idx_name  kr_json  filter_json  LIMIT count     (count only, ASC default)
-	//   6                  |  idx_name  kr_json  filter_json  ASC|DESC LIMIT count
-	//   2 / 7+             |  WRONG ARGS
-	nArgs := len(cmd.Args) - 1
-	if nArgs < 3 || nArgs > 6 {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
+// ——— ——— 握手 / 元命令 / Auth & Hello & Client & Ping & Quit ——— ———
+
+// authCommand implements the AUTH wire command for RedisX's dual-port
+// (app + ctrl) model.
+//
+// Flow:
+//  1. If the connection is already authenticated and the caller repeats
+//     the same key we answer OK; if they send a DIFFERENT key we close
+//     the connection (security: no silent re-auth downgrade).
+//  2. If --ctrl-auth is configured on the ctrl port we REFUSE the
+//     app-auth key (and vice versa on the app port) to prevent leaking
+//     the wrong role.
+//  3. acquireAuthConn() checks the global per-key connection limit and
+//     validates existence of the key via `_auth_:<key>` storage lookup
+//     (or the bootstrap internalAuthKey literal). Internal-NS Write
+//     Guard forbids wire clients from mutating `_auth_:` keys directly
+//     through SET / DEL; AUTH key rotation is a ctrl-only operation.
+func authCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	if len(cmd.Args) != 2 {
+		conn.WriteError("ERR authentication failed")
+		slog.Warn("auth format error", "remote", conn.RemoteAddr())
+		_ = conn.Close()
+		return
+	}
+	providedKey := string(cmd.Args[1])
+	prevAuth, _ := conn.Context().(string)
+
+	if prevAuth != "" {
+		if prevAuth == providedKey {
+			conn.WriteString("OK")
+			return
+		}
+		conn.WriteError("ERR connection already authenticated")
+		slog.Warn("auth rejected on authenticated connection", "remote", conn.RemoteAddr(), "current_auth_key", prevAuth, "provided_auth_key", providedKey)
+		_ = conn.Close()
 		return
 	}
 
-	indexName := string(cmd.Args[1])
-	krJSON := string(cmd.Args[2])
-	filterJSON := string(cmd.Args[3])
-	// Zero-legacy: Arg#2 must be JSON object (not a legacy glob string).
-	if len(krJSON) == 0 || krJSON[0] != '{' {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
-	if krErr != nil {
-		conn.WriteError("ERR invalid key range: " + krErr.Error())
-		return
-	}
-
-	desc := false
-	switch nArgs {
-	case 4:
-		a := strings.ToUpper(string(cmd.Args[4]))
-		if a != "ASC" && a != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
-			return
+	if err := acquireAuthConn(db, providedKey); err == nil {
+		// If the provided AUTH key is a port-role-bound key (exists in EITHER
+		// the app or ctrl accept sets), immediately validate that it matches the role
+		// of the listener the client connected to. This is fail-fast, so that
+		// a connection dialed to the app port with a ctrl-only key gets
+		// WRONGPASS on AUTH itself rather than only on the next command.
+		// External limit keys and IPC keys (values not in EITHER set) continue
+		// to pass through without role validation here.
+		appValues, ctrlValues, defaultApp, defaultCtrl, lerr := loadAllAuthPortKeys(db)
+		if lerr == nil && (len(appValues) > 0 || len(ctrlValues) > 0) {
+			_, inApp := appValues[providedKey]
+			_, inCtrl := ctrlValues[providedKey]
+			if inApp || inCtrl {
+				role := connPortRole(conn)
+				switch role {
+				case portRoleApp:
+					if !inApp {
+						msg := "WRONGPASS invalid or wrong auth key for app port"
+						if defaultCtrl != "" && providedKey == defaultCtrl {
+							msg += " (looks like you supplied the ctrl_0 key to the app port)"
+						}
+						conn.WriteError(msg)
+						slog.Warn("AUTH role mismatch: ctrl-only key provided on app port, rejected", "remote", conn.RemoteAddr(), "auth_key", providedKey)
+						_ = conn.Close()
+						return
+					}
+				case portRoleCtrl:
+					if !inCtrl {
+						msg := "WRONGPASS invalid or wrong auth key for ctrl port"
+						if defaultApp != "" && providedKey == defaultApp {
+							msg += " (looks like you supplied the app_0 key to the ctrl port)"
+						}
+						conn.WriteError(msg)
+						slog.Warn("AUTH role mismatch: app-only key provided on ctrl port, rejected", "remote", conn.RemoteAddr(), "auth_key", providedKey)
+						_ = conn.Close()
+						return
+					}
+				}
+			}
 		}
-		desc = a == "DESC"
-	case 5:
-		a := strings.ToUpper(string(cmd.Args[4]))
-		if a != "LIMIT" {
-			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
-			return
-		}
-		countStr := string(cmd.Args[5])
-		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
-			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
-			return
-		}
-		kr = kr.Limit(count)
-	case 6:
-		a4 := strings.ToUpper(string(cmd.Args[4]))
-		a5 := strings.ToUpper(string(cmd.Args[5]))
-		if a4 != "ASC" && a4 != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[4]))
-			return
-		}
-		desc = a4 == "DESC"
-		if a5 != "LIMIT" {
-			conn.WriteError("ERR invalid argument: " + string(cmd.Args[5]))
-			return
-		}
-		countStr := string(cmd.Args[6])
-		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
-			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
-			return
-		}
-		kr = kr.Limit(count)
-	}
-
-	filter, err := parseFilter(filterJSON)
-	if err != nil {
-		conn.WriteError("ERR invalid query: " + err.Error())
-		return
-	}
-
-	res := db.SearchIndex(indexName, kr, filter, desc)
-	if res.IsError() {
-		if errors.Is(res.Error(), buntdb.ErrNotFound) {
-			conn.WriteArray(0)
-		} else {
-			conn.WriteError("ERR " + res.Error().Error())
-		}
+		conn.SetContext(providedKey)
+		conn.WriteString("OK")
+		slog.Info("connection authenticated", "remote", conn.RemoteAddr(), "auth_key", providedKey)
 	} else {
-		results := res.MustGet()
-		conn.WriteArray(len(results))
-		for _, val := range results {
-			conn.WriteBulkString(val)
+		msg := "ERR authentication failed"
+		if strings.Contains(err.Error(), "connection limit exceeded") {
+			msg = "ERR auth key connection limit exceeded"
 		}
+		if strings.Contains(err.Error(), "invalid auth limit") {
+			msg = "ERR invalid auth key limit"
+		}
+		if strings.Contains(err.Error(), "not found") && providedKey != internalAuthKey {
+			msg = "ERR authentication failed"
+		}
+		conn.WriteError(msg)
+		slog.Warn("auth failed", "remote", conn.RemoteAddr(), "auth_key", providedKey, "error", err)
+		_ = conn.Close()
+		return
 	}
 }
 
-func updateCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	// Strict RESP positional argc shape (fr-update-keyrange.mdx §2):
-	//
-	//   argc after cmd word | shape
-	//   -------------------+-----------------------------------------------
-	//   3                  |  <kr_json> <filter_json> <update_json>             (no LIMIT)
-	//   5                  |  <kr_json> <filter_json> <update_json> LIMIT count  (count only, ASC default)
-	//   1 / 2 / 4 / 6+    |  WRONG ARGS
-	nArgs := len(cmd.Args) - 1
-	if nArgs != 3 && nArgs != 5 {
+// helloCommand implements HELLO handshake for client/server identity probing.
+//
+// SSoT: Minimal identity response — intentionally returns ONLY the server
+// string "redisx". This follows the "backend command upgrade, frontend App
+// no update needed" decoupling principle: the client owns its command
+// catalogue, feature flags, and ctrl/app UI distinctions. The server's
+// only job during HELLO is to prove it's a RedisX peer so the client
+// SDK can enable typed-doc / colon-mode routing internally.
+//
+// All further metadata is accessed via dedicated wire commands (KEYS,
+// SEARCHKEY, etc.) — never via HELLO field inflation.
+func helloCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteAny(map[string]any{"server": "redisx"})
+}
+
+// clientCommand answers CLIENT * subcommands. RedisX temporarily
+// implements the minimum viable subset to keep generic Redis clients
+// happy (redis-py, ioredis, Jedis all issue CLIENT SETINFO lib-name/…
+// after HELLO). Currently a no-op that always answers OK.
+func clientCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteString("OK")
+}
+
+// pingCommand answers PING with PONG. No argc stricter than len(cmd.Args)
+// ≥ 1 needed because dispatcher already validates argv≥1; redis-cli
+// customarily supports `PING <msg>` to round-trip arbitrary payloads
+// but we use the strict zero-arg form to avoid leaking echoes.
+func pingCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteString("PONG")
+}
+
+// quitCommand closes the redcon connection and writes OK so redis-cli's
+// "exit / Ctrl-D" path stays indistinguishable from Redis native
+// behaviour. Calling conn.Close() while writing is idempotent in our
+// redcon fork; the slog-level event lives at the listener layer.
+func quitCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	conn.WriteString("OK")
+	_ = conn.Close()
+}
+
+// ——— ——— Pub/Sub ——— ———
+
+// publishCommand implements PUBLISH. Delegates to the redcon.PubSub
+// handle attached to both listeners; RedisX does not namespace pub/sub
+// into storage layers — channels are global like vanilla Redis.
+func publishCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	if len(cmd.Args) != 3 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
+	conn.WriteInt(ps.Publish(string(cmd.Args[1]), string(cmd.Args[2])))
+}
 
-	krJSON := string(cmd.Args[1])
-	filterJSON := string(cmd.Args[2])
-	updateJSON := string(cmd.Args[3])
-	// Zero-legacy: Arg#1 must be a JSON object (not a legacy glob string).
-	if len(krJSON) == 0 || krJSON[0] != '{' {
+// subscribeCommand implements SUBSCRIBE. 1..n channel names; subscribes
+// each in order and does NOT WriteOK per channel manually — redcon's
+// PubSub machinery already emits the `subscribe` streaming push to the
+// connection on Subscribe().
+func subscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
-	if krErr != nil {
-		conn.WriteError("ERR invalid key range: " + krErr.Error())
-		return
-	}
-
-	if nArgs == 5 {
-		a := strings.ToUpper(string(cmd.Args[4]))
-		if a != "LIMIT" {
-			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
-			return
-		}
-		countStr := string(cmd.Args[5])
-		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
-			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
-			return
-		}
-		kr = kr.Limit(count)
-	}
-
-	filter, err := parseFilter(filterJSON)
-	if err != nil {
-		conn.WriteError("ERR invalid query: " + err.Error())
-		return
-	}
-
-	pairs, err := xcmd.ParseUpdate(updateJSON)
-	if err != nil {
-		conn.WriteError("ERR " + err.Error())
-		return
-	}
-
-	res := db.Update(kr, filter, pairs...)
-	if res.IsError() {
-		conn.WriteError("ERR " + res.Error().Error())
-	} else {
-		updatedKeys := res.MustGet()
-		conn.WriteArray(len(updatedKeys))
-		for _, key := range updatedKeys {
-			conn.WriteBulk([]byte(key))
-		}
+	for i := 1; i < len(cmd.Args); i++ {
+		ps.Subscribe(conn, string(cmd.Args[i]))
 	}
 }
 
-func searchKeyCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
-	// Strict RESP positional argc shape (fr-searchkeyrange.md §2):
-	//
-	//   argc after cmd word | shape
-	//   -------------------+------------------------------------------------
-	//   2                  |  <kr_json> <filter_json>                 (ASC,  no LIMIT)
-	//   3                  |  <kr_json> <filter_json> ASC|DESC        (dir only, no LIMIT)
-	//   4                  |  <kr_json> <filter_json> LIMIT count     (count only, ASC default)
-	//   5                  |  <kr_json> <filter_json> ASC|DESC LIMIT count
-	//   1 / 6+             |  WRONG ARGS
-	nArgs := len(cmd.Args) - 1
-	if nArgs < 2 || nArgs > 5 {
+// pSubscribeCommand implements PSUBSCRIBE (glob-pattern subscribe).
+// Semantics mirror subscribeCommand; pattern matching is handled by
+// redcon's implementation. RedisX doesn't split channels by storage
+// layer, so channel names don't route through resolveLayer.
+func pSubscribeCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub) {
+	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
 		return
 	}
-
-	krJSON := string(cmd.Args[1])
-	filterJSON := string(cmd.Args[2])
-	// Zero-legacy: Arg#1 must be a JSON object (not a legacy glob string).
-	if len(krJSON) == 0 || krJSON[0] != '{' {
-		conn.WriteError("ERR wrong number of arguments for '" + string(cmd.Args[0]) + "' command")
-		return
-	}
-	kr, krErr := x.UnmarshalKeyRange([]byte(krJSON))
-	if krErr != nil {
-		conn.WriteError("ERR invalid key range: " + krErr.Error())
-		return
-	}
-
-	desc := false
-	switch nArgs {
-	case 3:
-		a := strings.ToUpper(string(cmd.Args[3]))
-		if a != "ASC" && a != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
-			return
-		}
-		desc = a == "DESC"
-	case 4:
-		a := strings.ToUpper(string(cmd.Args[3]))
-		if a != "LIMIT" {
-			conn.WriteError("ERR invalid argument: " + string(cmd.Args[3]))
-			return
-		}
-		countStr := string(cmd.Args[4])
-		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
-			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
-			return
-		}
-		// wire count > 0 assert first → kr.Limit(count) never panics.
-		kr = kr.Limit(count)
-	case 5:
-		a3 := strings.ToUpper(string(cmd.Args[3]))
-		a4 := strings.ToUpper(string(cmd.Args[4]))
-		if a3 != "ASC" && a3 != "DESC" {
-			conn.WriteError("ERR invalid order: " + string(cmd.Args[3]))
-			return
-		}
-		desc = a3 == "DESC"
-		if a4 != "LIMIT" {
-			conn.WriteError("ERR invalid argument: " + string(cmd.Args[4]))
-			return
-		}
-		countStr := string(cmd.Args[5])
-		count, err := strconv.Atoi(countStr)
-		if err != nil || count <= 0 {
-			conn.WriteError("ERR invalid count for LIMIT: " + countStr)
-			return
-		}
-		kr = kr.Limit(count)
-	}
-
-	filter, err := parseFilter(filterJSON)
-	if err != nil {
-		conn.WriteError("ERR invalid query: " + err.Error())
-		return
-	}
-
-	res := db.SearchKey(kr, filter, desc)
-	if res.IsError() {
-		if errors.Is(res.Error(), buntdb.ErrNotFound) {
-			conn.WriteArray(0)
-		} else {
-			conn.WriteError("ERR " + res.Error().Error())
-		}
-	} else {
-		results := res.MustGet()
-		conn.WriteArray(len(results))
-		for _, val := range results {
-			conn.WriteBulkString(val)
-		}
+	for i := 1; i < len(cmd.Args); i++ {
+		ps.Psubscribe(conn, string(cmd.Args[i]))
 	}
 }

@@ -180,18 +180,18 @@ func TestIsLiteral(t *testing.T) {
 
 func TestLayerRoutingAnchor(t *testing.T) {
 	t.Run("pattern uses glob anchor", func(t *testing.T) {
-		kr := KeysPattern("_m_probe:*")
-		require.Equal(t, "_m_probe:*", LayerRoutingAnchor(kr))
+		kr := KeysPattern("_m_:probe:*")
+		require.Equal(t, "_m_:probe:*", LayerRoutingAnchor(kr))
 	})
 	t.Run("literal range with non-empty lo uses lo", func(t *testing.T) {
-		kr := KeysBt("_m_probe:p020", "_m_probe:p070")
-		require.Equal(t, "_m_probe:p020", LayerRoutingAnchor(kr))
+		kr := KeysBt("_m_:probe:p020", "_m_:probe:p070")
+		require.Equal(t, "_m_:probe:p020", LayerRoutingAnchor(kr))
 	})
 	t.Run("literal range empty lo falls back to hi", func(t *testing.T) {
-		kr := KeysLt("_m_probe:p050")
+		kr := KeysLt("_m_:probe:p050")
 		lo, _ := kr.Bounds()
 		require.Empty(t, lo)
-		require.Equal(t, "_m_probe:p050", LayerRoutingAnchor(kr))
+		require.Equal(t, "_m_:probe:p050", LayerRoutingAnchor(kr))
 	})
 	t.Run("fully unanchored pure star returns star glob itself (not empty)", func(t *testing.T) {
 		kr := KeysPattern("*")
@@ -211,7 +211,7 @@ func TestLayerRoutingConstrained(t *testing.T) {
 		return diskLayer
 	}
 	t.Run("mem literal pinned for mem prefix Gte", func(t *testing.T) {
-		l, ok := LayerRoutingConstrained(KeysGte("_m_probe:p050"), layerForKey)
+		l, ok := LayerRoutingConstrained(KeysGte("_m_:probe:p050"), layerForKey)
 		require.True(t, ok)
 		require.Equal(t, memLayer, l)
 	})

@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,50 @@ import (
 func DBPath(tb testing.TB) string {
 	tb.Helper()
 	return filepath.Join(tb.TempDir(), "redisx.db")
+}
+
+// AllocateFreePort picks a free TCP port on 127.0.0.1 by binding to :0 then
+// immediately releasing the socket. Callers should be aware of the inherent
+// TIME_WAIT race on Darwin: re-binding the returned port in the same process
+// within a few milliseconds can occasionally fail with "address already in
+// use" when the kernel hands it to another concurrent goroutine before the
+// original listener's close fully propagates. In practice the 10 ms sleep
+// injected by server.StartWithConfig plus per-port randomization inside Go's
+// `net` package is enough to keep the window tiny.
+func AllocateFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = l.Close() }()
+	tcpAddr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("AllocateFreePort: unexpected addr type %T", l.Addr())
+	}
+	return tcpAddr.Port, nil
+}
+
+// AllocateTwoFreePorts returns two distinct free TCP ports on 127.0.0.1. The
+// two ports are NEVER equal even if a transient listener release leaves an
+// overlap window for the second allocate.
+func AllocateTwoFreePorts(tb testing.TB) (appPort, ctrlPort int) {
+	tb.Helper()
+	var err error
+	appPort, err = AllocateFreePort()
+	if err != nil {
+		tb.Fatalf("allocate free app port: %v", err)
+	}
+	for tries := 0; tries < 10; tries++ {
+		ctrlPort, err = AllocateFreePort()
+		if err != nil {
+			tb.Fatalf("allocate free ctrl port: %v", err)
+		}
+		if ctrlPort != appPort {
+			return
+		}
+	}
+	tb.Fatalf("AllocateTwoFreePorts: ctrl port collided with appPort=%d after 10 retries", appPort)
+	return 0, 0
 }
 
 // LoadFeature dynamically loads a JSON file based on the calling test's context.

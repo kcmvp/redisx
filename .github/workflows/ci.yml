@@ -13,17 +13,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: '1.26.5'
 
     - name: Check go mod
       run: |
-        go mod tidy
-        git diff --exit-code go.mod go.sum || (echo "go.mod or go.sum is not tidied" && exit 1)
+        go mod tidy -diff >/dev/null || (go mod tidy && git diff --exit-code go.mod go.sum) || (echo "go.mod or go.sum is not tidied" && exit 1)
 
   # Step 2: Run tests (depends on go-mod passing)
   test:
@@ -37,15 +36,15 @@ jobs:
         go-version: ['1.26.5', '1.27.0']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go-version }}
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -58,7 +57,7 @@ jobs:
       run: go mod download
 
     - name: Run tests
-      run: go test -v -race -coverprofile=coverage.txt ./...
+      run: go test -tags testonly -v -race -coverprofile=coverage.txt ./...
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
@@ -73,15 +72,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
         go-version: '1.26.5'
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -97,9 +96,9 @@ jobs:
       run: |
         set -euo pipefail
 
-        echo "--- (1) Direct source import audit: no redisx/server, buntdb, or client→server in core SDK packages (x, client, client/doc); excluding *_test.go ---"
+        echo "--- (1) Direct source import audit: no redisx/server, buntdb, or client→server in core SDK packages (x, client); excluding *_test.go ---"
         DIRECT_FORBIDDEN=$(
-          ( grep -RIlsE '"github.com/kcmvp/redisx/server"|"github.com/tidwall/buntdb"' x/ client/ client/doc/ 2>/dev/null || true ) \
+          ( grep -RIlsE '"github.com/kcmvp/redisx/server"|"github.com/tidwall/buntdb"' x/ client/ 2>/dev/null || true ) \
             | grep -v '_test.go$' || true
         )
         if [ -n "$DIRECT_FORBIDDEN" ]; then
@@ -109,16 +108,16 @@ jobs:
         fi
         echo "OK: no direct import of redisx/server or buntdb in x/client/client-doc non-test files."
 
-        echo "--- (2) Transitive dep audit: ./x ./client ./client/doc non-test graphs must NOT pull server or buntdb ---"
-        for pkg in ./x ./client ./client/doc; do
+        echo "--- (2) Transitive dep audit: ./x ./client non-test graphs must NOT pull server or buntdb ---"
+        for pkg in ./x ./client; do
           echo "Checking transitive deps of $pkg (non-test)..."
-          SERVER_DEPS=$(go list -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/kcmvp/redisx/server($|/)' || true; })
+          SERVER_DEPS=$(go list -tags testonly -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/kcmvp/redisx/server($|/)' || true; })
           if [ -n "$SERVER_DEPS" ]; then
             echo "ERROR: $pkg transitively depends on redisx/server — forbidden."
             echo "$SERVER_DEPS"
             exit 1
           fi
-          BUNTDB_DEPS=$(go list -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/tidwall/buntdb($|/)' || true; })
+          BUNTDB_DEPS=$(go list -tags testonly -f '{{join .Deps "\n"}}' "$pkg" | { grep -E '^github\.com/tidwall/buntdb($|/)' || true; })
           if [ -n "$BUNTDB_DEPS" ]; then
             echo "ERROR: $pkg transitively depends on buntdb — storage engine leaked into SDK/API layer."
             echo "$BUNTDB_DEPS"
@@ -128,7 +127,7 @@ jobs:
         echo "OK: x + client + client-doc non-test transitive deps free of redisx/server and buntdb."
 
         echo "--- (3) Reverse direction sanity: server (non-test) must NOT depend on client ---"
-        REVERSE_CLIENT=$(go list -f '{{join .Deps "\n"}}' ./server | { grep -E '^github\.com/kcmvp/redisx/client($|/)' || true; })
+        REVERSE_CLIENT=$(go list -tags testonly -f '{{join .Deps "\n"}}' ./server | { grep -E '^github\.com/kcmvp/redisx/client($|/)' || true; })
         if [ -n "$REVERSE_CLIENT" ]; then
           echo "ERROR: ./server transitively depends on redisx/client — dependency direction reversed (must be client→x←server, never server→client)."
           echo "$REVERSE_CLIENT"
@@ -136,8 +135,49 @@ jobs:
         fi
         echo "OK: ./server (non-test) does not depend on client."
 
+        echo "--- (4) cmd boundary — non-test files must NOT import redisx/client or redisx/server (two explicit allowlist exceptions) ---"
+        echo "    (allowlist A) cmd/_shared/harness/harness.go may import redisx/server (it IS the integration test harness)"
+        echo "    (allowlist B) cmd/*/internal/demo/main.go may import redisx/server (it IS the demo server-start entry)"
+        CMD_CLIENT=$(
+          ( grep -RIlsE '"github.com/kcmvp/redisx/client' cmd/ 2>/dev/null || true ) \
+            | grep -v '_test.go$' || true
+        )
+        if [ -n "$CMD_CLIENT" ]; then
+          echo "ERROR: cmd/ non-test files import redisx/client — cmd/ must reach server via raw RESP wire (cmd/_shared/session), not the Go SDK."
+          echo "$CMD_CLIENT"
+          exit 1
+        fi
+        echo "OK: cmd/ non-test files do NOT import redisx/client (raw RESP wire only)."
+        CMD_SERVER=$(
+          ( grep -RIlsE '"github.com/kcmvp/redisx/server' cmd/ 2>/dev/null || true ) \
+            | grep -v '_test.go$' \
+            | grep -v 'cmd/_shared/harness/harness\.go$' \
+            | grep -v 'cmd/.*/internal/demo/main\.go$' || true
+        )
+        if [ -n "$CMD_SERVER" ]; then
+          echo "ERROR: cmd/ non-test files import redisx/server (outside the harness/demo allowlist) — forbidden."
+          echo "       Allowlist: cmd/_shared/harness/harness.go (tests only) + cmd/*/internal/demo/main.go (demo server entry)."
+          echo "$CMD_SERVER"
+          exit 1
+        fi
+        echo "OK: cmd/ non-test server imports restricted to harness.go + demo/main.go allowlist."
+
+        echo "--- (5) harness boundary — cmd/_shared/harness/harness.go must ONLY be imported by *_test.go ---"
+        HARNESS_IMPORTERS=$(
+          ( grep -RIlsE 'cmd/_shared/harness"|_shared/harness"' cmd/ server/ client/ x/ internal/ ingest/ 2>/dev/null || true ) \
+            | grep -v '_test.go$' \
+            | grep -v 'cmd/_shared/harness/harness\.go$' || true
+        )
+        if [ -n "$HARNESS_IMPORTERS" ]; then
+          echo "ERROR: non-_test.go files import the test-only cmd/_shared/harness package — forbidden."
+          echo "       Only *_test.go files (integration tests) may reference the test harness."
+          echo "$HARNESS_IMPORTERS"
+          exit 1
+        fi
+        echo "OK: cmd/_shared/harness is only imported by *_test.go files (plus itself)."
+
     - name: Build
-      run: go build -v ./...
+      run: go build -tags testonly -v ./...
 
     - name: Lint
       uses: golangci/golangci-lint-action@v9
@@ -146,7 +186,7 @@ jobs:
         args: --timeout=5m --output.text.path=stdout
 
     - name: Vet
-      run: go vet ./...
+      run: go vet -tags testonly ./...
 
   # Summary job (depends on all previous jobs)
   ci-success:

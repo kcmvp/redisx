@@ -1,0 +1,44 @@
+# redisx CLI / client sample configuration
+# This file documents the connection parameters accepted by:
+#   · the `redisx` REPL binary (cmd/redisx)
+#   · the Go client SDK (redisx/client)
+#
+# All fields map directly to CLI flags or session.Options / respconn.Options.
+# No server-side knobs live here — ports, bind addresses, persistence paths and
+# logging belong to `redisx_sample.yaml` (the server variant).
+#
+# Loading convention:
+#   · the CLI binary takes these values via FLAGS, not by parsing this file
+#     (flags: -H/--host, -p/--port, -a/--auth, --timeout-ms)
+#   · this yaml is a human-readable reference; feed the values into your
+#     preferred secret/config system at deploy time
+#   · the Go client SDK accepts equivalent options programmatically; see
+#     client/cli.go -> respconn.DialAndHandshake
+
+connection:
+  # Target RESP host. Must be an IP or resolvable hostname.
+  # Default (CLI flag): 127.0.0.1
+  host: "127.0.0.1"
+
+  # Target RESP port.
+  #   · 7381 — default control-plane port when pointing at a redisx server
+  #   · 7379 — default business/data port of a redisx server
+  #   · 6379 — standard Redis, when using redisx CLI as a generic client
+  # Default (CLI flag): 7381
+  port: 7381
+
+  # AUTH key transmitted via the RESP AUTH command after the TCP handshake
+  # succeeds (issued by go-redis OnConnect hook, before HELLO 3 / PING probe).
+  # Empty string = no AUTH sent.
+  # Default (CLI flag): ""
+  auth: ""
+
+  # Combined dial/read/write timeout in milliseconds. Applied to every raw
+  # round-trip the CLI/session issues.
+  # Default (CLI flag): 3000
+  timeout_ms: 3000
+
+# Client zero-assumptions reminder (enforced at session layer):
+#   · the CLI does NOT probe server capabilities before sending commands
+#   · every unrecognised token is forwarded VERBATIM as a raw RESP call
+#   · availability, permission and error messages are 100% server-authored

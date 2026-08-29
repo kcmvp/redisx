@@ -1,0 +1,790 @@
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/kcmvp/redisx/client/internal/conn"
+	"github.com/kcmvp/redisx/client/raw"
+	"github.com/kcmvp/redisx/internal"
+	"github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/proto"
+	"github.com/kcmvp/redisx/internal/respconn"
+	"github.com/kcmvp/redisx/x"
+	"github.com/redis/go-redis/v9"
+	"github.com/samber/lo"
+	"github.com/samber/mo"
+)
+
+const (
+	bufferSize     = 200
+	dialTimeout    = 3 * time.Second
+	reconnectEvery = 5 * time.Second
+)
+
+// ReceivedMessage is a transport-agnostic message exposed to callers.
+type ReceivedMessage struct {
+	Channel string
+	Pattern string
+	Payload string
+}
+
+type outgoingMessage struct {
+	topic   string
+	payload string
+}
+
+var (
+	pubChan        = make(chan outgoingMessage, bufferSize)
+	pipeDrops      uint64
+	subscribeReqCh = make(chan string, bufferSize)
+
+	handlersMu        sync.RWMutex
+	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+
+	cliOnce sync.Once
+
+	signalNotifyFn = signal.Notify
+	signalStopFn   = signal.Stop
+)
+
+// resetHandlers closes all registered subscription channels and clears the
+// topic registry. This is reserved for explicit full shutdown paths such as
+// Disconnect, not for transient consumer restarts during reconnect.
+func resetHandlers() {
+	handlersMu.Lock()
+	defer handlersMu.Unlock()
+	for _, ch := range deliveryChByTopic {
+		if ch != nil {
+			close(ch)
+		}
+	}
+	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+}
+
+func setSharedClient(client *redis.Client) *redis.Client {
+	return conn.SetSharedClient(client)
+}
+
+func getSharedClient() *redis.Client {
+	return conn.GetSharedClient()
+}
+
+func clearSharedClientIf(target *redis.Client) {
+	conn.ClearSharedClientIf(target)
+}
+
+// Subscribe registers one local delivery channel for a topic and returns that
+// read-only channel to the caller.
+//
+// Internally it does two things:
+//   - stores the topic -> channel mapping in deliveryChByTopic so incoming
+//     messages can be dispatched locally
+//   - enqueues a request on subscribeReqCh so the background consumer can
+//     sync the remote SUBSCRIBE state for newly added topics
+//
+// Callers consume messages from the returned channel. Duplicate topic
+// registration is rejected.
+func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
+	if topic == "" {
+		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
+	}
+
+	handlersMu.Lock()
+	if _, exists := deliveryChByTopic[topic]; exists {
+		handlersMu.Unlock()
+		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
+	}
+	ch := make(chan *ReceivedMessage, bufferSize)
+	deliveryChByTopic[topic] = ch
+	handlersMu.Unlock()
+
+	select {
+	case subscribeReqCh <- topic:
+	default:
+		slog.Warn(
+			"subscribe request dropped before remote subscribe",
+			"topic", topic,
+			"queue_len", len(subscribeReqCh),
+			"queue_cap", cap(subscribeReqCh),
+		)
+	}
+
+	// Potential issue: if the subscribe request is dropped above, the local
+	// topic -> channel mapping still exists, but the remote SUBSCRIBE is not
+	// issued for the current consumer lifecycle.
+	return mo.Ok[<-chan *ReceivedMessage](ch)
+}
+
+func setLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
+	conn.SetLifecycleCtx(ctx, cancel)
+}
+
+func getLifecycleCtx() (context.Context, context.CancelFunc) {
+	return conn.GetLifecycleCtx()
+}
+
+// Connect starts the bridge lifecycle.
+func Connect(respAddr, authKey string) error {
+	if authKey == "" {
+		return errors.New("auth key is empty")
+	}
+
+	cliOnce.Do(func() {
+		ctx, cancelRoot := context.WithCancel(context.Background())
+		sigCh := make(chan os.Signal, 1)
+		notifyFn := signalNotifyFn
+		stopFn := signalStopFn
+		notifyFn(sigCh, os.Interrupt, syscall.SIGTERM)
+		cancel := func() {
+			stopFn(sigCh)
+			cancelRoot()
+		}
+		setLifecycleCtx(ctx, cancel)
+
+		go func() {
+			select {
+			case sig := <-sigCh:
+				if sig != nil {
+					slog.Info("redisx client caught shutdown signal", "signal", sig.String())
+				} else {
+					slog.Info("redisx client caught shutdown signal")
+				}
+				cancel()
+			case <-ctx.Done():
+				stopFn(sigCh)
+			}
+		}()
+
+		go func() {
+			for {
+				var err error
+				var client *redis.Client
+				_, _, _ = lo.AttemptWhileWithDelay(-1, reconnectEvery, func(i int, duration time.Duration) (error, bool) {
+					runCtx, _ := getLifecycleCtx()
+					if runCtx == nil {
+						return nil, false
+					}
+
+					select {
+					case <-runCtx.Done():
+						return nil, false
+					default:
+					}
+					if client, err = connect(respAddr, authKey); err != nil {
+						slog.Warn("redisx connect failed", "error", err)
+						return err, true
+					}
+					return nil, false
+				})
+
+				runCtx, _ := getLifecycleCtx()
+				if runCtx == nil || runCtx.Err() != nil {
+					return
+				}
+
+				if prev := setSharedClient(client); prev != nil && prev != client {
+					if err := prev.Close(); err != nil {
+						slog.Warn("redisx close previous client failed", "error", err)
+					}
+				}
+
+				slog.Info("redisx connected")
+
+				rootCtx, _ := getLifecycleCtx()
+				workerCtx, cancelRun := context.WithCancel(rootCtx)
+
+				firstExit := make(chan string, 1)
+				var wg sync.WaitGroup
+				notifyExit := func(worker string) {
+					select {
+					case firstExit <- worker:
+					default:
+					}
+				}
+
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					if err := produce(workerCtx, client); err != nil && err != context.Canceled {
+						slog.Warn("redisx producer exited", "error", err)
+					}
+					notifyExit("producer")
+				}()
+				go func() {
+					defer wg.Done()
+					if err := consume(workerCtx, client); err != nil && err != context.Canceled {
+						slog.Warn("redisx consumer exited", "error", err)
+					}
+					notifyExit("consumer")
+				}()
+
+				healthTicker := time.NewTicker(5 * time.Second)
+				lost := false
+
+				for !lost {
+					select {
+					case <-rootCtx.Done():
+						lost = true
+					case worker := <-firstExit:
+						slog.Warn("redisx connection lost, restarting lifecycle", "worker", worker)
+						lost = true
+					case <-healthTicker.C:
+						if err := healthCheck(context.Background(), client); err != nil {
+							slog.Warn("redisx connection lost, restarting lifecycle", "error", err)
+							lost = true
+						}
+					}
+				}
+
+				healthTicker.Stop()
+				cancelRun()
+
+				// Remove this client from shared state first, then close it to unblock workers.
+				clearSharedClientIf(client)
+				if err := client.Close(); err != nil {
+					slog.Warn("redisx close client failed", "error", err)
+				}
+
+				waitDone := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(waitDone)
+				}()
+
+				waitTicker := time.NewTicker(1 * time.Second)
+				for {
+					select {
+					case <-waitDone:
+						waitTicker.Stop()
+						goto workersStopped
+					case <-waitTicker.C:
+						slog.Warn("redisx waiting for workers to stop")
+					}
+				}
+			workersStopped:
+				stopCtx, _ := getLifecycleCtx()
+				if stopCtx == nil || stopCtx.Err() != nil {
+					slog.Info("redisx client stopped")
+					return
+				}
+			}
+		}()
+	})
+
+	return nil
+}
+
+// ConnectEmbedded starts the bridge lifecycle against the in-process embedded
+// server. It reads the ctrl-port address set by server.StartWithConfig via
+// internal.CtrlAddr() and authenticates with the shared per-process
+// internal.AuthKey(). Callers that have not booted an in-process server (or
+// that want to dial a remote cross-process server) should use Connect() with
+// an explicit address and auth key.
+func ConnectEmbedded() error {
+	addr := internal.CtrlAddr()
+	if addr == "" {
+		return errors.New("ConnectEmbedded: no in-process ctrl address registered; call server.StartWithConfig first, or use Connect(addr, auth) for remote servers")
+	}
+	return Connect(addr, internal.AuthKey())
+}
+
+// disconnect stops the current bridge lifecycle and closes the shared client.
+//
+// Note: this is currently treated as a best-effort shutdown helper for tests
+// and examples. It does not reset cliOnce, so calling Connect again after
+// disconnect does not start a brand new lifecycle.
+//
+// If production usage later requires a full stop-then-restart flow, revisit
+// the lifecycle state model here instead of relying on the current behavior.
+func disconnect() {
+	_, cancel := getLifecycleCtx()
+
+	if cancel != nil {
+		cancel()
+	}
+	client := getSharedClient()
+	if client != nil {
+		_ = client.Close()
+		clearSharedClientIf(client)
+	}
+	resetHandlers()
+}
+
+// ———  Typesafe API (top-most as user requested)  ———
+
+func Get[D x.Document](key string) (D, error) {
+	var zero D
+	val, err := raw.Get(x.StorageKeyValue[D](key))
+	if err != nil {
+		return zero, err
+	}
+	return D(val), nil
+}
+
+func Set[D x.Document](d D) error {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return err
+	}
+	return raw.SetWithTTL(key, d.RawJSON(), d.TTL())
+}
+
+func SetNX[D x.Document](d D) (bool, error) {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return raw.SetNXWithTTL(key, d.RawJSON(), d.TTL())
+}
+
+func Delete[D x.Document](d D) (bool, error) {
+	key, err := x.StorageKey(d)
+	if err != nil {
+		return false, err
+	}
+	return raw.Delete(key)
+}
+
+func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
+	fullKeyPattern, err := x.ValidateKeyPattern[D](keyPattern)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return raw.Keys(fullKeyPattern)
+}
+
+func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
+	fullIdxName, err := x.ValidateIdxName[D](idxName)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := raw.SearchIndex(fullIdxName, fullKR, filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
+	if scopedKR == nil {
+		return mo.Err[[]D](errors.New("key range is required"))
+	}
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]D](err)
+	}
+
+	res := raw.SearchKey(fullKR, filter, desc)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, raw := range raws {
+		out = append(out, D(raw))
+	}
+	return mo.Ok(out)
+}
+
+func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
+	if scopedKR == nil {
+		return mo.Err[[]string](errors.New("key range is required"))
+	}
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[[]string](err)
+	}
+	return raw.Update(fullKR, filter, values...)
+}
+
+func RegisterSchema[T x.Schema]() error {
+	var zero T
+	type raw struct {
+		Namespace string        `json:"namespace"`
+		Mem       bool          `json:"mem"`
+		KeyAttrs  []string      `json:"key_attrs"`
+		TTL       time.Duration `json:"ttl_ns"`
+	}
+	r := raw{
+		Namespace: zero.Namespace(),
+		Mem:       zero.Mem(),
+		KeyAttrs:  append([]string(nil), zero.KeyAttrs()...),
+		TTL:       zero.TTL(),
+	}
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	return RegisterSchemaFromJSON(string(b))
+}
+
+func RegisterIndex[D x.Document](logical string, keyPattern string, jsonPaths ...string) error {
+	if logical == "" {
+		return errors.New("logical index name is empty")
+	}
+	if keyPattern == "" {
+		return errors.New("key pattern is empty")
+	}
+	if len(jsonPaths) == 0 {
+		return errors.New("at least one jsonPath is required")
+	}
+	var zero D
+	ns := zero.Namespace()
+	mem := zero.Mem()
+	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
+		return err
+	}
+	storageNs := naming.BuildStorageNs(ns, mem)
+	paths := make([]string, 0, len(jsonPaths))
+	for _, p := range jsonPaths {
+		if p == "" {
+			return errors.New("jsonPaths contains empty path")
+		}
+		paths = append(paths, strings.ReplaceAll(p, ".", "_"))
+	}
+	type raw struct {
+		OwnerNs    string   `json:"owner_ns"`
+		OwnerMem   bool     `json:"owner_mem,omitempty"`
+		Logical    string   `json:"logical"`
+		Paths      []string `json:"paths"`
+		KeyPattern string   `json:"key_pattern"`
+	}
+	spec := raw{
+		OwnerNs:    storageNs,
+		OwnerMem:   mem,
+		Logical:    strings.ToLower(logical),
+		Paths:      paths,
+		KeyPattern: keyPattern,
+	}
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("RegisterIndex build JSON: %w", err)
+	}
+	return RegisterIndexFromJSON(string(b))
+}
+
+func DropSchema[T x.Schema]() error {
+	var zero T
+	ns := zero.Namespace()
+	if ns == "" {
+		return errors.New("schema returned empty namespace")
+	}
+	return raw.DropSchema(ns)
+}
+
+func DropIndex[D x.Document](logical string) error {
+	if logical == "" {
+		return errors.New("logical index name is empty")
+	}
+	var zero D
+	ns := zero.Namespace()
+	mem := zero.Mem()
+	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
+		return err
+	}
+	storageNs := naming.BuildStorageNs(ns, mem)
+	return raw.DropIndex(storageNs, strings.ToLower(logical))
+}
+
+// Auth authenticates the shared resp client connection with the given key.
+func Auth(authKey string) error {
+	if authKey == "" {
+		return errors.New("auth key is empty")
+	}
+
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+
+	return client.Do(ctx, "AUTH", authKey).Err()
+}
+
+// Publish enqueues a message for publishing to a specific topic.
+func Publish(topic, msg string) bool {
+	if topic == "" {
+		return false
+	}
+
+	if getSharedClient() == nil {
+		slog.Warn("redisx send skipped, resp client is not connected")
+		return false
+	}
+
+	select {
+	case pubChan <- outgoingMessage{topic: topic, payload: msg}:
+		return true
+	default:
+		cnt := atomic.AddUint64(&pipeDrops, 1)
+		if cnt%100 == 0 {
+			slog.Warn("pubChan is full, message dropped", "total_drops", cnt)
+		}
+		return false
+	}
+}
+
+// healthCheck checks if a redis client is alive by sending a Ping with timeout.
+// Returns error if the ping fails or times out.
+func healthCheck(ctx context.Context, client *redis.Client) error {
+	ctxPing, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	return client.Ping(ctxPing).Err()
+}
+
+func hostPortFromAddr(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid resp address %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid resp port %q: %w", portStr, err)
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return host, port, nil
+}
+
+// connect attempts to create and verify a single Resp client connection.
+// Returns the connected client on success, or nil + error on failure.
+// Caller must handle cleanup (Close) if an error is returned.
+func connect(respAddr, authKey string) (*redis.Client, error) {
+	if authKey == "" {
+		return nil, errors.New("auth key is empty")
+	}
+	host, port, err := hostPortFromAddr(respAddr)
+	if err != nil {
+		return nil, err
+	}
+	res, err := internalDialForRespconnInternal(respconn.Options{
+		Host:         host,
+		Port:         port,
+		Auth:         authKey,
+		TimeoutMs:    int(dialTimeout.Milliseconds()),
+		AuthOptional: false,
+		ReadTimeout:  0,
+	})
+	if err != nil {
+		if res != nil && res.Client != nil {
+			if closeErr := res.Client.Close(); closeErr != nil {
+				slog.Warn("redisx close client after failed dial handshake failed", "error", closeErr)
+			}
+		}
+		return nil, err
+	}
+	return res.Client, nil
+}
+
+var internalDialForRespconnInternal = respconn.DialAndHandshake
+
+// produce publishes messages from pubChan using the provided client until ctx is done.
+func produce(ctx context.Context, client *redis.Client) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case msg := <-pubChan:
+			if msg.topic == "" {
+				continue
+			}
+			if err := client.Publish(ctx, msg.topic, msg.payload).Err(); err != nil {
+				slog.Warn("redisx publish failed", "topic", msg.topic, "error", err)
+				return err
+			}
+		}
+	}
+}
+
+// consume rebuilds remote subscriptions from deliveryChByTopic, applies
+// incremental subscription requests from subscribeReqCh, and dispatches
+// incoming messages to the registered local handlers.
+func consume(ctx context.Context, client *redis.Client) error {
+	consumerTopics := make(map[string]struct{})
+
+	handlersMu.RLock()
+	for topic := range deliveryChByTopic {
+		if topic != "" {
+			consumerTopics[topic] = struct{}{}
+		}
+	}
+	handlersMu.RUnlock()
+
+	var consumer *redis.PubSub
+	var remoteMsgCh <-chan *redis.Message
+	subscribed := make(map[string]struct{}, len(consumerTopics))
+
+	remoteSubscription := func(topic string) error {
+		if topic == "" {
+			return nil
+		}
+		if _, exists := subscribed[topic]; exists {
+			return nil
+		}
+
+		if consumer == nil {
+			consumer = client.Subscribe(ctx, topic)
+			if _, err := consumer.Receive(ctx); err != nil {
+				slog.Warn("redisx subscribe receive error", "error", err)
+				return err
+			}
+			remoteMsgCh = consumer.Channel()
+			subscribed[topic] = struct{}{}
+			return nil
+		}
+
+		if err := consumer.Subscribe(ctx, topic); err != nil {
+			return err
+		}
+		subscribed[topic] = struct{}{}
+		return nil
+	}
+
+	defer func() {
+		if consumer != nil {
+			if err := consumer.Close(); err != nil {
+				slog.Warn("redisx close consumer failed", "error", err)
+			}
+		}
+	}()
+
+	// Rebuild all already-registered subscriptions on each fresh consumer
+	// lifecycle, including reconnects.
+	for topic := range consumerTopics {
+		if err := remoteSubscription(topic); err != nil {
+			return err
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		// Handle newly registered subscriptions after this consumer started.
+		case topic := <-subscribeReqCh:
+			if err := remoteSubscription(topic); err != nil {
+				return err
+			}
+		case msg, ok := <-remoteMsgCh:
+			if !ok {
+				return fmt.Errorf("subscribe channel closed")
+			}
+			handlersMu.RLock()
+			h := deliveryChByTopic[msg.Channel]
+			handlersMu.RUnlock()
+			if h == nil {
+				continue
+			}
+			select {
+			case h <- &ReceivedMessage{Channel: msg.Channel, Pattern: msg.Pattern, Payload: msg.Payload}:
+			default:
+				slog.Warn("message handler channel full, message dropped", "topic", msg.Channel)
+			}
+		}
+	}
+}
+
+func RegisterSchemaFromJSON(specJSON string) error {
+	if specJSON == "" {
+		return errors.New("schema spec json is empty")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterSchema, specJSON).Err()
+}
+
+func RegisterIndexShort(ownerNs, logical string, paths ...string) error {
+	if ownerNs == "" {
+		return errors.New("owner_ns is empty")
+	}
+	if logical == "" {
+		return errors.New("logical is empty")
+	}
+	if len(paths) == 0 {
+		return errors.New("at least one path is required")
+	}
+	clean := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			return errors.New("paths contains an empty entry")
+		}
+		clean = append(clean, strings.ReplaceAll(p, ".", "_"))
+	}
+	type raw struct {
+		OwnerNs    string   `json:"owner_ns"`
+		Logical    string   `json:"logical"`
+		Paths      []string `json:"paths"`
+		KeyPattern string   `json:"key_pattern,omitempty"`
+	}
+	ownerMem := strings.HasPrefix(ownerNs, "_m_")
+	nsScope := ownerNs
+	if !ownerMem {
+		nsScope = "_d_" + ownerNs
+	}
+	spec := raw{
+		OwnerNs:    ownerNs,
+		Logical:    strings.ToLower(logical),
+		Paths:      clean,
+		KeyPattern: nsScope + ":*",
+	}
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("RegisterIndexShort build JSON: %w", err)
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterIndex, string(b)).Err()
+}
+
+func RegisterIndexFromJSON(specJSON string) error {
+	if specJSON == "" {
+		return errors.New("index spec json is empty")
+	}
+	client := getSharedClient()
+	if client == nil {
+		return errors.New("resp client is not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	return client.Do(ctx, proto.CmdRegisterIndex, specJSON).Err()
+}

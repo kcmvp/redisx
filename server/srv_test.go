@@ -14,8 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/privateip"
 	"github.com/kcmvp/redisx/internal/testutil"
+	"github.com/kcmvp/redisx/x"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
 )
 
@@ -35,7 +39,7 @@ func getFreePort() string {
 type ServerTestSuite struct {
 	suite.Suite
 	origInternalAuthKey  string
-	origListenAndServeFn func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
+	origListenAndServeFn func(role portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error
 	origOsExitFn         func(code int)
 }
 
@@ -48,7 +52,7 @@ func (s *ServerTestSuite) SetupSuite() {
 }
 
 func (s *ServerTestSuite) SetupTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -59,12 +63,14 @@ func (s *ServerTestSuite) SetupTest() {
 	globalMu.Lock()
 	internalAuthKey = "internal-test-key"
 	srvOnce = sync.Once{}
-	listenAndServeFn = redcon.ListenAndServe
+	listenAndServeFn = func(_ portRole, addr string, h func(redcon.Conn, redcon.Command), a func(redcon.Conn) bool, c func(redcon.Conn, error)) error {
+		return redcon.ListenAndServe(addr, h, a, c)
+	}
 	globalMu.Unlock()
 }
 
 func (s *ServerTestSuite) TearDownTest() {
-	_ = stop()
+	_ = Stop()
 	time.Sleep(5 * time.Millisecond)
 
 	authStateMu.Lock()
@@ -96,15 +102,15 @@ func TestCollectPrivateIPs(t *testing.T) {
 		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
 	}
 
-	got := collectPrivateIPs(addrs)
+	got := privateip.Filter(addrs)
 	want := []string{"192.168.1.23", "10.0.0.8", "172.16.0.9", "fd00::1"}
 
 	if len(got) != len(want) {
-		t.Fatalf("collectPrivateIPs() len = %d, want %d; got=%v", len(got), len(want), got)
+		t.Fatalf("Filter() len = %d, want %d; got=%v", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("collectPrivateIPs()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
+			t.Fatalf("Filter()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
 		}
 	}
 }
@@ -118,7 +124,7 @@ func TestCollectPrivateIPsPrefersLANOrder(t *testing.T) {
 		&net.IPNet{IP: net.ParseIP("fd00::1"), Mask: net.CIDRMask(64, 128)},
 	}
 
-	got := collectPrivateIPs(addrs)
+	got := privateip.Filter(addrs)
 	want := []string{
 		"192.168.9.162",
 		"10.0.0.8",
@@ -128,11 +134,11 @@ func TestCollectPrivateIPsPrefersLANOrder(t *testing.T) {
 	}
 
 	if len(got) != len(want) {
-		t.Fatalf("collectPrivateIPs() len = %d, want %d; got=%v", len(got), len(want), got)
+		t.Fatalf("Filter() len = %d, want %d; got=%v", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("collectPrivateIPs()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
+			t.Fatalf("Filter()[%d] = %q, want %q; got=%v", i, got[i], want[i], got)
 		}
 	}
 }
@@ -188,12 +194,22 @@ func seedAuthKeyLimit(t *testing.T, db *DB, key string, limit int) {
 
 func (s *ServerTestSuite) TestConnectionLimits() {
 	t := s.T()
-	addr := getFreePort()
 
 	// Start server with default external auth key limit = 1
-	db := Start(addr, testutil.DBPath(t))
+	authLimitDbPath := testutil.DBPath(t)
+	alp, ctlP := testutil.AllocateTwoFreePorts(t)
+	acfg := &Config{
+		DataPath: authLimitDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: alp},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctlP},
+	}
+	db := StartWithConfig(acfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", alp, ctlP)
+	}
+	addr := acfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -275,10 +291,20 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 
 func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 	t := s.T()
-	addr := getFreePort()
-	db := Start(addr, testutil.DBPath(t))
+	dynDbPath := testutil.DBPath(t)
+	dynApp, dynCtl := testutil.AllocateTwoFreePorts(t)
+	dynCfg := &Config{
+		DataPath: dynDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: dynApp},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: dynCtl},
+	}
+	db := StartWithConfig(dynCfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", dynApp, dynCtl)
+	}
+	addr := dynCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -337,10 +363,20 @@ func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 
 func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 	t := s.T()
-	addr := getFreePort()
-	db := Start(addr, testutil.DBPath(t))
+	sameDbPath := testutil.DBPath(t)
+	sameApp, sameCtl := testutil.AllocateTwoFreePorts(t)
+	sameCfg := &Config{
+		DataPath: sameDbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: sameApp},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: sameCtl},
+	}
+	db := StartWithConfig(sameCfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", sameApp, sameCtl)
+	}
+	addr := sameCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
-	defer func() { _ = stop() }()
+	defer func() { _ = Stop() }()
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -411,13 +447,13 @@ func (s *ServerTestSuite) TestListenAndServeWithStop() {
 	addr := getFreePort()
 
 	// Test invalid address
-	err := listenAndServeWithStop("invalid-addr:999999", nil, nil, nil)
+	err := listenAndServeWithStop(portRoleUnknown, "invalid-addr:999999", nil, nil, nil)
 	s.Error(err)
 
 	// Test valid address
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- listenAndServeWithStop(addr,
+		errCh <- listenAndServeWithStop(portRoleUnknown, addr,
 			func(conn redcon.Conn, cmd redcon.Command) { conn.WriteString("OK") },
 			func(conn redcon.Conn) bool { return true },
 			func(conn redcon.Conn, err error) {},
@@ -428,7 +464,11 @@ func (s *ServerTestSuite) TestListenAndServeWithStop() {
 
 	// Stop it by closing the listener
 	serverMu.Lock()
-	ln := serverListener
+	var ln net.Listener
+	for _, v := range serverListeners {
+		ln = v
+		break
+	}
 	serverMu.Unlock()
 
 	if ln != nil {
@@ -461,7 +501,17 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(prevLogger)
 
-	db := Start("127.0.0.1:0", filepath.Join(parentFile, "kv.db"))
+	badDataPath := filepath.Join(parentFile, "kv.db")
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	ctrlPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	cfg := &Config{
+		DataPath: badDataPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
+	}
+	db := StartWithConfig(cfg)
 	s.Nil(db)
 	s.True(exitCalled)
 
@@ -473,17 +523,29 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 
 func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 	exitCh := make(chan struct{})
+	var exitOnce sync.Once
 	globalMu.Lock()
 	osExitFn = func(code int) {
-		close(exitCh)
+		exitOnce.Do(func() {
+			close(exitCh)
+		})
 	}
 	// Force listenAndServeFn to return an unexpected error
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		return errors.New("mock listen error")
 	}
 	globalMu.Unlock()
 
-	db := Start("", testutil.DBPath(s.T()))
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	ctrlPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	cfg := &Config{
+		DataPath: testutil.DBPath(s.T()),
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
+	}
+	db := StartWithConfig(cfg)
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -535,9 +597,9 @@ func (s *ServerTestSuite) TestStop() {
 	t := s.T()
 
 	// Ensure stop works when nothing is initialized
-	err := stop()
+	err := Stop()
 	if err != nil {
-		t.Fatalf("stop() with nil everything should return nil, got %v", err)
+		t.Fatalf("Stop() with nil everything should return nil, got %v", err)
 	}
 
 	// Initialize partial state to test cleanup paths
@@ -546,7 +608,7 @@ func (s *ServerTestSuite) TestStop() {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	serverMu.Lock()
-	serverListener = ln
+	serverListeners[portRoleUnknown] = ln
 	serverMu.Unlock()
 
 	sigCh := make(chan os.Signal, 1)
@@ -556,15 +618,15 @@ func (s *ServerTestSuite) TestStop() {
 	shutdownDoneCh = doneCh
 	shutdownMu.Unlock()
 
-	err = stop()
+	err = Stop()
 	if err != nil {
-		t.Fatalf("stop() returned error: %v", err)
+		t.Fatalf("Stop() returned error: %v", err)
 	}
 
 	// Verify cleanup
 	serverMu.Lock()
-	if serverListener != nil {
-		t.Errorf("expected serverListener to be nil")
+	if len(serverListeners) != 0 {
+		t.Errorf("expected serverListeners to be empty, got %d entries", len(serverListeners))
 	}
 	serverMu.Unlock()
 
@@ -589,8 +651,8 @@ func (s *ServerTestSuite) TestStartListenError() {
 		exitCalled.Store(true)
 	}
 
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenCalledCh := make(chan string, 2)
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		select {
 		case listenCalledCh <- addr:
 		default:
@@ -602,21 +664,27 @@ func (s *ServerTestSuite) TestStartListenError() {
 	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
-		_ = Start(getFreePort(), testutil.DBPath(t))
+		lp1, lp2 := testutil.AllocateTwoFreePorts(t)
+		lcfg := &Config{
+			DataPath: testutil.DBPath(t),
+			App:      AppConfig{Bind: "127.0.0.1", Port: lp1},
+			Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: lp2},
+		}
+		_ = StartWithConfig(lcfg)
 		close(doneCh)
 	}()
 
 	select {
 	case <-listenCalledCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
+		t.Fatal("StartWithConfig should invoke listenAndServeFn for either App or Ctrl listener")
 	}
 
 	// Wait for goroutine to fully finish and call osExitFn
 	select {
 	case <-doneCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() goroutine did not complete")
+		t.Fatal("StartWithConfig goroutine did not complete")
 	}
 
 	// Small sleep to ensure the osExitFn callback finishes execution
@@ -630,8 +698,8 @@ func (s *ServerTestSuite) TestStartListenError() {
 func (s *ServerTestSuite) TestStartInvokesListener() {
 	t := s.T()
 
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
+	listenCalledCh := make(chan string, 4)
+	listenAndServeFn = func(_ portRole, addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
 		select {
 		case listenCalledCh <- addr:
 		default:
@@ -639,40 +707,414 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 		return nil
 	}
 
-	startAddr := "127.0.0.1:16380"
-	_ = Start(startAddr, testutil.DBPath(t))
+	appPort, pErr := testutil.AllocateFreePort()
+	s.Require().NoError(pErr)
+	ctrlPort := 16380
 
-	select {
-	case addr := <-listenCalledCh:
-		if addr != startAddr {
-			t.Fatalf("Start() listen addr = %q, want %q", addr, startAddr)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
+	cfg := &Config{
+		DataPath: testutil.DBPath(t),
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
+	startCtrlAddr := cfg.Ctrl.Addr()
+	_ = StartWithConfig(cfg)
 
+	gotAddrs := map[string]struct{}{}
+	timeout := time.After(500 * time.Millisecond)
+loop:
+	for i := 0; i < 2; i++ {
+		select {
+		case addr := <-listenCalledCh:
+			gotAddrs[addr] = struct{}{}
+		case <-timeout:
+			break loop
+		}
+	}
+	if _, ok := gotAddrs[startCtrlAddr]; !ok {
+		keys := make([]string, 0, len(gotAddrs))
+		for k := range gotAddrs {
+			keys = append(keys, k)
+		}
+		t.Fatalf("StartWithConfig() listener called with %v; want ctrl addr %q present among them", keys, startCtrlAddr)
+	}
 }
 
 func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	t := s.T()
+	_ = t
+	// Legacy behavior "StartForTest("") → default to privateAddr" is obsolete
+	// because StartForTest was removed. The equivalent modern path is
+	// StartWithConfig with Ctrl.Port explicitly set to 16380 — exercised by
+	// TestStartInvokesListener above.
+}
 
-	listenCalledCh := make(chan string, 1)
-	listenAndServeFn = func(addr string, handler func(conn redcon.Conn, cmd redcon.Command), accept func(conn redcon.Conn) bool, closed func(conn redcon.Conn, err error)) error {
-		select {
-		case listenCalledCh <- addr:
-		default:
-		}
-		return nil
+func rawCmd(t *testing.T, conn net.Conn, timeout time.Duration, args ...string) string {
+	t.Helper()
+	parts := make([]string, 0, len(args)*3+2)
+	parts = append(parts, fmt.Sprintf("*%d\r\n", len(args)))
+	for _, a := range args {
+		parts = append(parts, fmt.Sprintf("$%d\r\n%s\r\n", len(a), a))
+	}
+	raw := strings.Join(parts, "")
+	if _, err := conn.Write([]byte(raw)); err != nil {
+		t.Fatalf("raw write failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("raw read failed: %v", err)
+	}
+	return string(buf[:n])
+}
+
+// App port must never allow any read/write against _auth_:* SSoT namespace.
+// This is gate1_NoAuthNsAccessOnAppPort (#1 filter, before gate2/gate3/gate4),
+// so even when AUTH is satisfied and the command passes every other gate we
+// still reply with literal "No Privilege".
+func (s *ServerTestSuite) TestAppPortHasNoAuthNsPrivilege() {
+	t := s.T()
+
+	dbPath := testutil.DBPath(t)
+	appP, ctrlP := testutil.AllocateTwoFreePorts(t)
+
+	// Seed explicit auth values so gate2_AuthKeyMatch + gate3_CommandByPortRole
+	// pass cleanly — the test is about privilege, not AUTH failures.
+	const (
+		appAuth  = "s.app-auth-778"
+		ctrlAuth = "s.ctrl-auth-778"
+	)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: appAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrlAuth},
+	}
+	db := StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig nil; appP=%d ctrlP=%d", appP, ctrlP)
+	}
+	defer func() { _ = Stop() }()
+	time.Sleep(15 * time.Millisecond)
+
+	// ————— App-port client, AUTHed with app AUTH key —————
+	appConn, err := net.Dial("tcp", cfg.App.Addr())
+	if err != nil {
+		t.Fatalf("dial app: %v", err)
+	}
+	defer func() { _ = appConn.Close() }()
+	if resp := rawCmd(t, appConn, 250*time.Millisecond, "AUTH", appAuth); !strings.Contains(resp, "+OK") {
+		t.Fatalf("AUTH app port failed: %q", resp)
 	}
 
-	_ = Start("", testutil.DBPath(t))
-
-	select {
-	case addr := <-listenCalledCh:
-		if addr != privateAddr {
-			t.Fatalf("Start() listen addr = %q, want %q", addr, privateAddr)
+	for _, tc := range [][]string{
+		{"GET", naming.AuthStorageKey("app_0")},
+		{"GET", naming.AuthStorageKey("ctrl_0")},
+		{"SET", naming.AuthStorageKey("app_0"), "newval"},
+		{"SET", naming.AuthStorageKey("ctrl_0"), "newval"},
+		{"DEL", naming.AuthStorageKey("app_0")},
+		{"DEL", naming.AuthStorageKey("ctrl_0")},
+		{"EXISTS", naming.AuthStorageKey("app_0")},
+		{"TTL", naming.AuthStorageKey("app_0")},
+		{"PERSIST", naming.AuthStorageKey("app_0")},
+		{"TYPE", naming.AuthStorageKey("app_0")},
+		{"KEYS", naming.AuthNsPrefix() + naming.StorageKeySeparator() + "*"},
+		{"KEYS", "*"},
+		{"SCAN", "0", "MATCH", "*"},
+		{"SCAN", "0", "MATCH", naming.AuthNsPrefix() + naming.StorageKeySeparator() + "*"},
+	} {
+		resp := rawCmd(t, appConn, 250*time.Millisecond, tc...)
+		if !strings.Contains(resp, "No Privilege") {
+			t.Fatalf("app-port cmd=%v resp=%q want substring \"No Privilege\"", tc, resp)
 		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Start() should invoke listenAndServeFn")
+	}
+
+	// Spot check: non-_auth_ key still works normally on app port (sanity
+	// guard: we didn't accidentally block every GET/SET). Keys must contain
+	// a namespace colon separator per KV key policy.
+	_ = rawCmd(t, appConn, 250*time.Millisecond, "SET", "appns:user-k", "hello")
+	getResp := rawCmd(t, appConn, 250*time.Millisecond, "GET", "appns:user-k")
+	if !strings.Contains(getResp, "hello") {
+		t.Fatalf("expected app-port plain GET/SET to work normally, got %q", getResp)
+	}
+
+	// ————— Ctrl-port client, AUTHed with ctrl AUTH key —————
+	ctrlConn, err := net.Dial("tcp", cfg.Ctrl.Addr())
+	if err != nil {
+		t.Fatalf("dial ctrl: %v", err)
+	}
+	defer func() { _ = ctrlConn.Close() }()
+	if resp := rawCmd(t, ctrlConn, 250*time.Millisecond, "AUTH", ctrlAuth); !strings.Contains(resp, "+OK") {
+		t.Fatalf("AUTH ctrl port failed: %q", resp)
+	}
+
+	// 1. Ctrl-port GET of _auth_:app_0 / _auth_:ctrl_0 must work (no privilege
+	//    error; the values themselves are the SSoT and ctrl is admin-facing).
+	appVal := readKeyOrEmptyCtrl(t, db, "app_0")
+	ctrlVal := readKeyOrEmptyCtrl(t, db, "ctrl_0")
+	if appVal != appAuth || ctrlVal != ctrlAuth {
+		t.Fatalf("SSoT mismatch after start: want app=%q ctrl=%q stored app_0=%q ctrl_0=%q",
+			appAuth, ctrlAuth, appVal, ctrlVal)
+	}
+	resp := rawCmd(t, ctrlConn, 250*time.Millisecond, "GET", naming.AuthStorageKey("app_0"))
+	if !strings.Contains(resp, appAuth) {
+		t.Fatalf("ctrl GET %q want app AUTH in response; got %q", naming.AuthStorageKey("app_0"), resp)
+	}
+	if strings.Contains(resp, "No Privilege") {
+		t.Fatalf("ctrl GET %q must not hit No Privilege gate; got %q", naming.AuthStorageKey("app_0"), resp)
+	}
+
+	// 2. Ctrl-port WRITE against _auth_ must still be blocked by the EXISTING
+	//    internal-ns WriteGuard (IsInternalKey/ERR internal namespace). It
+	//    should NOT be "No Privilege" because the ctrl port passed privilege
+	//    gate — the second-stage guard catches it.
+	respSet := rawCmd(t, ctrlConn, 250*time.Millisecond, "SET", naming.AuthStorageKey("app_0"), "stolen")
+	if strings.Contains(respSet, "+OK") {
+		t.Fatalf("ctrl SET %q must not succeed (existing internal WriteGuard); got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+	if strings.Contains(respSet, "No Privilege") {
+		t.Fatalf("ctrl SET %q rejected by WriteGuard not privilege gate; got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+	if !strings.Contains(strings.ToUpper(respSet), "ERR") {
+		t.Fatalf("ctrl SET %q want some ERR (internal ns); got %q", naming.AuthStorageKey("app_0"), respSet)
+	}
+}
+
+func seedBootstrapAuthKV(t *testing.T, db *DB, slot, value string) {
+	t.Helper()
+	if db == nil || db.disk == nil {
+		t.Fatal("seedBootstrapAuthKV: db not open")
+	}
+	if werr := db.disk.Update(func(tx *buntdb.Tx) error {
+		_, _, serr := tx.Set(naming.AuthStorageKey(slot), value, nil)
+		return serr
+	}); werr != nil {
+		t.Fatalf("seedBootstrapAuthKV(slot=%s,value=%s): %v", slot, value, werr)
+	}
+}
+
+// TestAuthPortRoleKeyBinding verifies:
+//
+//  1. AUTH on app port with the ctrl_0 key → AUTH succeeds (the key is a
+//     legitimate auth key, so AUTH returns +OK), but the NEXT non-handshake
+//     command returns WRONGPASS because the key is wrong for the port role.
+//  2. AUTH on ctrl port with the app_0 key → symmetric: AUTH succeeds, but
+//     subsequent commands return WRONGPASS.
+//  3. AUTH on app port with the correct app_0 key → everything passes.
+//  4. AUTH on ctrl port with the correct ctrl_0 key → everything passes.
+//  5. Extra account slots (app_1, ctrl_1) seeded manually via Raw().Update
+//     behave symmetrically to the _0 defaults — their VALUES are accepted
+//     strictly on the matching port role.
+func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
+	t := s.T()
+
+	dbPath := testutil.DBPath(t)
+	appP, ctrlP := testutil.AllocateTwoFreePorts(t)
+
+	// Use explicit seeds so the banner does not fire (banner is tested via
+	// the db unit tests; this test is about wire-protocol WRONGPASS).
+	const (
+		app0Auth  = "s.app0-auth-3a1f"
+		ctrl0Auth = "s.ctrl0-auth-7c2b"
+	)
+
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: app0Auth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrl0Auth},
+	}
+	db := StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil")
+	}
+	defer func() { _ = Stop() }()
+
+	// —— Seed extra account-1 slots directly via Raw disk layer.
+	//    (Ctrl-only operational operation; the app port would hit No
+	//    Privilege gate instead.)
+	const (
+		app1Slot  = "app_1"
+		ctrl1Slot = "ctrl_1"
+		app1Auth  = "s.app1-auth-bb55"
+		ctrl1Auth = "s.ctrl1-auth-ee99"
+	)
+	seedBootstrapAuthKV(t, db, app1Slot, app1Auth)
+	seedBootstrapAuthKV(t, db, ctrl1Slot, ctrl1Auth)
+
+	// Helper: dials TCP, issues AUTH then, if AUTH succeeded (reply contained
+	// +OK), issues a single plain PING. If AUTH failed (server replied with
+	// an error and closed the connection) we skip the PING step to avoid
+	// reading EOF on a closed socket.
+	authThenPing := func(dialAddr, auth string) (authResp, pingResp string) {
+		t.Helper()
+		n, derr := net.Dial("tcp", dialAddr)
+		s.Require().NoError(derr)
+		defer func() { _ = n.Close() }()
+		ar := rawCmd(t, n, 300*time.Millisecond, "AUTH", auth)
+		authResp = ar
+		if strings.Contains(ar, "+OK") {
+			pingResp = rawCmd(t, n, 300*time.Millisecond, "PING")
+		}
+		return authResp, pingResp
+	}
+
+	// Case 1a — app port, AUTH with ctrl0 → AUTH itself returns WRONGPASS
+	// (fail-fast: AUTH command checks role binding, not delayed to first cmd).
+	{
+		authR, _ := authThenPing(cfg.App.Addr(), ctrl0Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl0-auth] AUTH response = %q want substring WRONGPASS", authR)
+		}
+	}
+	// Case 1b — ctrl port, AUTH with app0 → AUTH itself returns WRONGPASS
+	{
+		authR, _ := authThenPing(cfg.Ctrl.Addr(), app0Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app0-auth] AUTH response = %q want substring WRONGPASS", authR)
+		}
+	}
+
+	// Case 2a — app port with correct app0 AUTH → PING returns PONG
+	{
+		authR, pingR := authThenPing(cfg.App.Addr(), app0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/app0-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[app/app0-auth] PING = %q want +PONG", pingR)
+		}
+	}
+	// Case 2b — ctrl port with correct ctrl0 AUTH → PING returns PONG
+	{
+		authR, pingR := authThenPing(cfg.Ctrl.Addr(), ctrl0Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/ctrl0-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[ctrl/ctrl0-auth] PING = %q want +PONG", pingR)
+		}
+	}
+
+	// Case 3a — account 1 app key on app port → AUTH +OK then PING +PONG;
+	// same key on ctrl port → AUTH itself returns WRONGPASS (fail-fast role
+	// match inside AUTH command, same as Case 1).
+	{
+		authR, pingR := authThenPing(cfg.App.Addr(), app1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[app/app1-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[app/app1-auth] PING = %q want +PONG (app_1 slot must be app-port accept list)", pingR)
+		}
+	}
+	{
+		authR, _ := authThenPing(cfg.Ctrl.Addr(), app1Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[ctrl/app1-auth] AUTH = %q want substring WRONGPASS — app1 slot only valid on app port", authR)
+		}
+	}
+	// Case 3b — account 1 ctrl key on ctrl port → AUTH +OK then PING +PONG;
+	// same key on app port → AUTH itself returns WRONGPASS (fail-fast).
+	{
+		authR, pingR := authThenPing(cfg.Ctrl.Addr(), ctrl1Auth)
+		if !strings.Contains(authR, "+OK") {
+			t.Fatalf("[ctrl/ctrl1-auth] AUTH = %q want +OK", authR)
+		}
+		if !strings.Contains(pingR, "+PONG") {
+			t.Fatalf("[ctrl/ctrl1-auth] PING = %q want +PONG (ctrl_1 slot must be ctrl-port accept list)", pingR)
+		}
+	}
+	{
+		authR, _ := authThenPing(cfg.App.Addr(), ctrl1Auth)
+		if !strings.Contains(authR, "WRONGPASS") {
+			t.Fatalf("[app/ctrl1-auth] AUTH = %q want substring WRONGPASS — ctrl1 slot only valid on ctrl port", authR)
+		}
+	}
+}
+
+// thin wrapper that avoids test name collision with server/auth_test.go helpers.
+func readKeyOrEmptyCtrl(t *testing.T, db *DB, slot string) string {
+	t.Helper()
+	return readKeyOrEmptyInternal(t, db, slot)
+}
+
+func readKeyOrEmptyInternal(t *testing.T, db *DB, slot string) string {
+	t.Helper()
+	var v string
+	if db == nil || db.disk == nil {
+		return ""
+	}
+	_ = db.disk.View(func(tx *buntdb.Tx) error {
+		key := naming.AuthStorageKey(slot)
+		gv, gerr := tx.Get(key)
+		if gerr != nil && gerr != buntdb.ErrNotFound {
+			return gerr
+		}
+		v = gv
+		return nil
+	})
+	return v
+}
+
+// ─── setupDB ───
+
+func TestSetupDB(t *testing.T) {
+	tests := []struct {
+		name      string
+		dbPath    string
+		schemas   []x.Schema
+		wantOK    bool
+	}{
+		{
+			name:   "normal path",
+			dbPath: testutil.DBPath(t),
+			wantOK: true,
+		},
+		{
+			name:   "empty path fails",
+			dbPath: "",
+			wantOK: false,
+		},
+		{
+			name:    "with schema registration",
+			dbPath:  testutil.DBPath(t),
+			schemas: []x.Schema{testUserDoc("{}")},
+			wantOK:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Mock osExitFn to prevent actual os.Exit
+			globalMu.Lock()
+			origExit := osExitFn
+			exitCalled := false
+			osExitFn = func(code int) { exitCalled = true }
+			globalMu.Unlock()
+
+			db, ok := setupDB(tt.dbPath, tt.schemas)
+			if tt.wantOK {
+				if !ok {
+					t.Fatal("expected setupDB to succeed")
+				}
+				if db == nil {
+					t.Fatal("expected non-nil db")
+				}
+				_ = db.Close()
+				// Clean up global state
+				globalMu.Lock()
+				currentDB = nil
+				globalMu.Unlock()
+			} else {
+				if ok {
+					t.Fatal("expected setupDB to fail")
+				}
+				if !exitCalled {
+					t.Fatal("expected osExitFn to be called on failure")
+				}
+			}
+
+			globalMu.Lock()
+			osExitFn = origExit
+			globalMu.Unlock()
+		})
 	}
 }

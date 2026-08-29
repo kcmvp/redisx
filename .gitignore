@@ -1,5 +1,4 @@
 ### Go template
-# If you prefer the allow list template instead of the deny list, see community template:
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
@@ -8,13 +7,24 @@
 *.dll
 *.so
 *.dylib
-*.py
+
+# Root-level redisx / demo binary outputs from `go build` in repo root
+/redisx
+/demo
+
+# Binary outputs from building a cmd directly (e.g. `cd cmd/redisx && go build`)
+/cmd/redisx/redisx
+/cmd/redisx/demo
+/cmd/redisx/internal/demo/demo
+/cmd/redisx/internal/demo/redisx
 
 # Test binary, built with `go test -c`
 *.test
 
-# Output of the go coverage tool, specifically when used with LiteIDE
+# Output of the go coverage tool
 *.out
+coverage.out
+coverage.txt
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -23,12 +33,23 @@
 go.work
 go.work.sum
 
-# env file
+# Env & tooling
 .env
-.idea
+.idea/
+.trae/
 *.html
 *.patch
 *.txt
 *.db
 fr/*.md
+.trae
 
+# Local SQLite / storage artifacts (never commit the embedded DB)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local-only docs / patches (project-specific broad patterns go below)
+*.patch
+*.html

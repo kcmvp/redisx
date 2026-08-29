@@ -1,0 +1,22 @@
+# redisx sample / demo configuration
+# All fields below represent their defaults. Omitting data_path causes the
+# server to use ~/.redisx/redisx.db.
+#
+# AUTH keys are pinned here for the local demo (deterministic credentials for
+# tests / CI / CLI shortcuts). When left empty, on FIRST startup (brand-new DB
+# file) the server generates 2× crypto-rand hex keys, stores them under
+# "_auth_:app" and "_auth_:ctrl", prints a one-shot banner to stdout
+# containing both, and never re-prints on subsequent runs.
+
+app:
+  bind: "127.0.0.1"
+  port: 7379
+  # bind defaults to the first private IP detected (or 127.0.0.1 as fallback)
+  auth: "123"
+
+ctrl:
+  bind: "127.0.0.1"
+  port: 7381
+  auth: "234"
+
+# data_path intentionally omitted → falls back to $HOME/.redisx/redisx.db
