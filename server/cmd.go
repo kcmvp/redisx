@@ -109,7 +109,12 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 					parseErr = err
 					return false
 				}
-				subFilters = append(subFilters, f)
+				// nil sub-filter = empty object = passes everything;
+				// skip it so And/Or never receive a nil Filter (would
+				// panic on Eval).
+				if f != nil {
+					subFilters = append(subFilters, f)
+				}
 				return true
 			})
 			if parseErr != nil {
@@ -128,7 +133,9 @@ func parseNode(node gjson.Result) (x.Filter, error) {
 					parseErr = err
 					return false
 				}
-				subFilters = append(subFilters, f)
+				if f != nil {
+					subFilters = append(subFilters, f)
+				}
 				return true
 			})
 			if parseErr != nil {

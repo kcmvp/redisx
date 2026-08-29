@@ -565,6 +565,212 @@ func (s *ClientTestSuite) TestConnectCommand() {
 	}
 }
 
+// p1RegSchDoc / p1RegSchV2Doc share namespace "p1regsch" but differ in
+// KeyAttrs so the suite can exercise REGSCH idempotent-skip and
+// fingerprint-upgrade paths through the client facades.
+type p1RegSchDoc string
+
+func (p1RegSchDoc) Namespace() string  { return "p1regsch" }
+func (p1RegSchDoc) Mem() bool          { return false }
+func (p1RegSchDoc) KeyAttrs() []string { return []string{"id"} }
+func (d p1RegSchDoc) RawJSON() string  { return string(d) }
+func (p1RegSchDoc) TTL() time.Duration { return 0 }
+
+type p1RegSchV2Doc string
+
+func (p1RegSchV2Doc) Namespace() string  { return "p1regsch" }
+func (p1RegSchV2Doc) Mem() bool          { return false }
+func (p1RegSchV2Doc) KeyAttrs() []string { return []string{"id", "email"} }
+func (d p1RegSchV2Doc) RawJSON() string  { return string(d) }
+func (p1RegSchV2Doc) TTL() time.Duration { return 0 }
+
+type p1DropSchDoc string
+
+func (p1DropSchDoc) Namespace() string  { return "p1dropsch" }
+func (p1DropSchDoc) Mem() bool          { return false }
+func (p1DropSchDoc) KeyAttrs() []string { return []string{"id"} }
+func (d p1DropSchDoc) RawJSON() string  { return string(d) }
+func (p1DropSchDoc) TTL() time.Duration { return 0 }
+
+func (s *ClientTestSuite) TestRegisterSchema() {
+	s.SetupTest()
+	s.ensureConnectedClientAndAuth()
+
+	tests := []struct {
+		name       string
+		fn         func() error
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{"success new schema", func() error { return RegisterSchema[p1RegSchDoc]() }, false, ""},
+		{"idempotent identical re-register", func() error { return RegisterSchema[p1RegSchDoc]() }, false, ""},
+		{"upgrade on fingerprint change", func() error { return RegisterSchema[p1RegSchV2Doc]() }, false, ""},
+		{"empty json", func() error { return RegisterSchemaFromJSON("") }, true, "schema spec json is empty"},
+		{"invalid json format", func() error { return RegisterSchemaFromJSON("{bad") }, true, "ERR REGSCH invalid JSON format"},
+		{"unknown field rejected", func() error {
+			return RegisterSchemaFromJSON(`{"namespace":"p1x","bogus":1}`)
+		}, true, "ERR REGSCH schema"},
+		{"reserved field indexes rejected", func() error {
+			return RegisterSchemaFromJSON(`{"namespace":"p1x","indexes":[]}`)
+		}, true, "reserved field 'indexes'"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			err := tc.fn()
+			if tc.wantErr {
+				s.Require().Error(err)
+				s.Contains(err.Error(), tc.wantErrMsg)
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestRegisterIndex() {
+	s.SetupTest()
+	s.ensureConnectedClientAndAuth()
+
+	// Self-contained: guarantee the owner schema exists regardless of
+	// TestRegisterSchema's outcome.
+	s.Require().NoError(RegisterSchema[p1RegSchDoc]())
+
+	tests := []struct {
+		name       string
+		fn         func() error
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{"success", func() error {
+			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age")
+		}, false, ""},
+		{"idempotent identical re-register", func() error {
+			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age")
+		}, false, ""},
+		{"empty logical", func() error {
+			return RegisterIndex[p1RegSchDoc]("", "p1regsch:*", "age")
+		}, true, "logical index name is empty"},
+		{"empty key pattern", func() error {
+			return RegisterIndex[p1RegSchDoc]("age", "", "age")
+		}, true, "key pattern is empty"},
+		{"no paths", func() error {
+			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*")
+		}, true, "at least one jsonPath is required"},
+		{"empty path entry", func() error {
+			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age", "")
+		}, true, "jsonPaths contains empty path"},
+		{"short success", func() error {
+			return RegisterIndexShort("p1regsch", "email", "profile.email")
+		}, false, ""},
+		{"short empty owner ns", func() error {
+			return RegisterIndexShort("", "email", "age")
+		}, true, "owner_ns is empty"},
+		{"short empty logical", func() error {
+			return RegisterIndexShort("p1regsch", "", "age")
+		}, true, "logical is empty"},
+		{"short no paths", func() error {
+			return RegisterIndexShort("p1regsch", "email")
+		}, true, "at least one path is required"},
+		{"short empty path entry", func() error {
+			return RegisterIndexShort("p1regsch", "email", "age", "")
+		}, true, "paths contains an empty entry"},
+		{"from json empty", func() error {
+			return RegisterIndexFromJSON("")
+		}, true, "index spec json is empty"},
+		{"from json invalid", func() error {
+			return RegisterIndexFromJSON("{bad")
+		}, true, "ERR REGIDX invalid JSON format"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			err := tc.fn()
+			if tc.wantErr {
+				s.Require().Error(err)
+				s.Contains(err.Error(), tc.wantErrMsg)
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestDropSchemaAndDropIndex() {
+	s.SetupTest()
+	s.ensureConnectedClientAndAuth()
+
+	// Self-contained fixture: schema + attached index on "p1dropsch".
+	s.Require().NoError(RegisterSchema[p1DropSchDoc]())
+	s.Require().NoError(RegisterIndex[p1DropSchDoc]("age", "p1dropsch:*", "age"))
+
+	tests := []struct {
+		name       string
+		fn         func() error
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{"drop schema blocked by attached index", func() error {
+			return DropSchema[p1DropSchDoc]()
+		}, true, "attached index"},
+		{"drop index empty logical", func() error {
+			return DropIndex[p1DropSchDoc]("")
+		}, true, "logical index name is empty"},
+		{"raw drop schema empty ns", func() error {
+			return raw.DropSchema("")
+		}, true, "logical ns is empty"},
+		{"raw drop index empty ns", func() error {
+			return raw.DropIndex("")
+		}, true, "owner ns or full name is required"},
+		{"raw drop index too many args", func() error {
+			return raw.DropIndex("p1dropsch", "age", "extra")
+		}, true, "at most 2 args"},
+		{"drop index success", func() error {
+			return DropIndex[p1DropSchDoc]("age")
+		}, false, ""},
+		{"drop schema success after index removed", func() error {
+			return DropSchema[p1DropSchDoc]()
+		}, false, ""},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			err := tc.fn()
+			if tc.wantErr {
+				s.Require().Error(err)
+				s.Contains(err.Error(), tc.wantErrMsg)
+			} else {
+				s.NoError(err)
+			}
+		})
+	}
+}
+
+func (s *ClientTestSuite) TestRegistryAPIsRequireConnection() {
+	// SetupTest disconnects the shared client; every registry facade must
+	// fail fast instead of panicking on a nil client.
+	s.SetupTest()
+
+	tests := []struct {
+		name string
+		fn   func() error
+	}{
+		{"RegisterSchemaFromJSON", func() error { return RegisterSchemaFromJSON(`{"namespace":"x"}`) }},
+		{"RegisterIndexFromJSON", func() error {
+			return RegisterIndexFromJSON(`{"owner_ns":"x","logical":"y","paths":["a"],"key_pattern":"x:*"}`)
+		}},
+		{"RegisterIndexShort", func() error { return RegisterIndexShort("x", "y", "a") }},
+		{"DropSchema", func() error { return DropSchema[testUserDoc]() }},
+		{"DropIndex", func() error { return DropIndex[testUserDoc]("age") }},
+		{"raw.DropSchema", func() error { return raw.DropSchema("x") }},
+		{"raw.DropIndex", func() error { return raw.DropIndex("x", "y") }},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			err := tc.fn()
+			s.Require().Error(err)
+			s.Contains(err.Error(), "resp client is not connected")
+		})
+	}
+}
+
 func (s *ClientTestSuite) TestConnectEmbedded() {
 	s.SetupTest()
 

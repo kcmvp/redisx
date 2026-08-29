@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -705,6 +706,8 @@ func (s *CmdTestSuite) TestParseFilter() {
 		{"Or not array", `{"$or": {"age": 18}}`, true, false},
 		{"And element error", `{"$and": [{"age": {"$unknown": 18}}]}`, true, false},
 		{"Or element error", `{"$or": [{"age": {"$unknown": 18}}]}`, true, false},
+		{"And empty array passes everything", `{"$and": []}`, false, true},
+		{"And empty object element passes everything", `{"$and": [{}]}`, false, true},
 	}
 
 	for _, tt := range tests {
@@ -1424,5 +1427,749 @@ func (s *CmdTestSuite) TestStrictGates() {
 		afterFirstNX := afterSetEx[idx1+len(":1\r\n"):]
 		require.Contains(t, afterFirstNX, ":0\r\n", "duplicate SETNX on same pk-suffix must return integer 0 (SETNX NX semantics, not SET overwrite)")
 		require.NotContains(t, afterFirstNX[strings.Index(afterFirstNX, ":0\r\n"):], `"age":9999`, "SETNX duplicate must NOT overwrite original body")
+	})
+}
+
+// respRoundTrip dials addr, optionally AUTHs with auth, sends cmds in order
+// and concatenates all replies read back (deadline-bounded reads).
+func respRoundTrip(t *testing.T, addr, auth string, cmds [][]string) string {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial %s: %v", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+	var sb strings.Builder
+	if auth != "" {
+		b := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(auth), auth)
+		if _, err := conn.Write([]byte(b)); err == nil {
+			buf := make([]byte, 4096)
+			_ = conn.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+			n, _ := conn.Read(buf)
+			if n > 0 {
+				sb.Write(buf[:n])
+			}
+		}
+	}
+	for _, args := range cmds {
+		if len(args) == 0 {
+			continue
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "*%d\r\n", len(args))
+		for _, a := range args {
+			fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(a), a)
+		}
+		if _, err := conn.Write([]byte(b.String())); err != nil {
+			break
+		}
+		buf := make([]byte, 16384)
+		_ = conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+		n, rerr := conn.Read(buf)
+		if rerr == nil && n > 0 {
+			sb.Write(buf[:n])
+		}
+	}
+	return sb.String()
+}
+
+// TestRegistryCommands exercises the REGSCH/REGIDX/DROPSCH/DROPIDX wire
+// command matrix (happy paths, idempotent re-register, fingerprint upgrade,
+// argv/JSON/semantic rejections) plus the DEL doc-path multi-pk batch and
+// the DB-level CreateIndex / deleteBatchAtomic entry points.
+func (s *CmdTestSuite) TestRegistryCommands() {
+	t := s.T()
+	dbPath := testutil.DBPath(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
+	ctrlAuth := "regcmd-ctrl-key"
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: "regcmd-app-key"},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+	}
+	s.db = StartWithConfig(cfg)
+	if s.db == nil {
+		t.Fatalf("StartWithConfig returned nil for registry commands; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+	}
+	ctrlAddr := cfg.Ctrl.Addr()
+
+	runRESP := func(cmds [][]string) string {
+		return respRoundTrip(t, ctrlAddr, ctrlAuth, cmds)
+	}
+
+	sch := func(ns string, mem bool, attrs ...string) string {
+		b, _ := json.Marshal(map[string]any{
+			"namespace": ns,
+			"mem":       mem,
+			"key_attrs": attrs,
+			"ttl_ns":    0,
+		})
+		return string(b)
+	}
+
+	t.Run("REGSCH_matrix", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			cmds    [][]string
+			want    string
+			wantNot string
+		}{
+			{"disk happy", [][]string{{"regsch", sch("regcmd", false, "id")}}, "+OK\r\n", ""},
+			{"mem happy", [][]string{{"regsch", sch("regcmdmem", true, "id")}}, "+OK\r\n", ""},
+			{"idempotent re-register", [][]string{
+				{"regsch", sch("regschidem", false, "id")},
+				{"regsch", sch("regschidem", false, "id")},
+			}, "+OK\r\n+OK\r\n", ""},
+			{"fingerprint upgrade adds attr", [][]string{
+				{"regsch", sch("regschup", false, "id")},
+				{"regsch", sch("regschup", false, "id", "email")},
+			}, "+OK\r\n+OK\r\n", ""},
+			{"argc missing json", [][]string{{"regsch"}}, "wrong number of arguments for 'regsch'", ""},
+			{"invalid json", [][]string{{"regsch", "{bad"}}, "ERR REGSCH invalid JSON format", ""},
+			{"unknown field", [][]string{{"regsch", `{"namespace":"regcmdx","zzz":1}`}}, "ERR REGSCH schema:", ""},
+			{"invalid namespace underscore", [][]string{{"regsch", sch("_bad", false, "id")}}, "ERR REGSCH writeDocSpec:", ""},
+			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: key_attrs[1] is empty", ""},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := runRESP(tc.cmds)
+				require.Contains(t, resp, tc.want)
+				if tc.wantNot != "" {
+					require.NotContains(t, resp, tc.wantNot)
+				}
+			})
+		}
+	})
+
+	t.Run("REGIDX_matrix", func(t *testing.T) {
+		require.Contains(t, runRESP([][]string{{"regsch", sch("regidxowner", false, "id")}}), "+OK\r\n")
+		require.Contains(t, runRESP([][]string{{"regsch", sch("regidxmem", true, "id")}}), "+OK\r\n")
+
+		tests := []struct {
+			name string
+			cmds [][]string
+			want string
+		}{
+			{"owner_ns plus logical", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"age","paths":["age"]}`},
+			}, "+OK\r\n"},
+			{"full_name form", [][]string{
+				{"regidx", `{"full_name":"regidxowner:email","paths":["email"],"key_pattern":"regidxowner:*"}`},
+			}, "+OK\r\n"},
+			{"owner_doc_logical_ns disk", [][]string{
+				{"regidx", `{"owner_doc_logical_ns":"regidxowner","logical":"org","paths":["org"]}`},
+			}, "+OK\r\n"},
+			{"owner_doc_logical_ns mem", [][]string{
+				{"regidx", `{"owner_doc_logical_ns":"regidxmem","owner_mem":true,"logical":"age","paths":["age"]}`},
+			}, "+OK\r\n"},
+			{"mem owner_ns form", [][]string{
+				{"regidx", `{"owner_ns":"_m_:regidxmem","logical":"email","paths":["email"]}`},
+			}, "+OK\r\n"},
+			{"default key_pattern omitted", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"nick","paths":["nick"]}`},
+			}, "+OK\r\n"},
+			{"idempotent re-register", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"dup","paths":["age"]}`},
+				{"regidx", `{"owner_ns":"regidxowner","logical":"dup","paths":["age"]}`},
+			}, "+OK\r\n+OK\r\n"},
+			{"fingerprint upgrade paths change", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"upg","paths":["age"],"key_pattern":"regidxowner:*"}`},
+				{"regidx", `{"owner_ns":"regidxowner","logical":"upg","paths":["age","email"],"key_pattern":"regidxowner:*"}`},
+			}, "+OK\r\n+OK\r\n"},
+			{"path dot to underscore", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"pfx","paths":["profile.email"]}`},
+			}, "+OK\r\n"},
+			{"argc too few", [][]string{{"regidx"}}, "wrong number of arguments for 'regidx'"},
+			{"argc too many", [][]string{{"regidx", "a", "b"}}, "wrong number of arguments for 'regidx'"},
+			{"invalid json", [][]string{{"regidx", "{bad"}}, "ERR REGIDX invalid JSON format"},
+			{"full_name no separator", [][]string{
+				{"regidx", `{"full_name":"regidxownerage","paths":["age"]}`},
+			}, "ERR REGIDX index full name"},
+			{"owner_ns without logical", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","paths":["age"]}`},
+			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
+			{"no identity fields", [][]string{
+				{"regidx", `{"paths":["age"]}`},
+			}, "ERR REGIDX either full_name or owner_ns + logical is required"},
+			{"owner_doc_logical_ns missing logical", [][]string{
+				{"regidx", `{"owner_doc_logical_ns":"regidxowner","paths":["age"]}`},
+			}, "ERR REGIDX logical is required"},
+			{"owner_doc_logical_ns invalid", [][]string{
+				{"regidx", `{"owner_doc_logical_ns":"_bad","logical":"age","paths":["age"]}`},
+			}, "ERR REGIDX "},
+			{"logical reserved chars", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"a-g-e","paths":["age"]}`},
+			}, "ERR REGIDX logical index name"},
+			{"logical underscore join char", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"a_b","paths":["age"]}`},
+			}, "ERR REGIDX logical index name"},
+			{"paths missing", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"nopaths"}`},
+			}, `ERR REGIDX either "path" (string, single-field) or "paths" ([string], multi-field) is required`},
+			{"paths empty entry", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"emptyp","paths":["age",""]}`},
+			}, "ERR REGIDX paths[1] is empty or not a string"},
+			{"key_pattern leading wildcard", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"wild","paths":["age"],"key_pattern":"*"}`},
+			}, "key_pattern cannot start with wildcard"},
+			{"single path legacy form", [][]string{
+				{"regidx", `{"owner_ns":"regidxowner","logical":"single","path":"age"}`},
+			}, "+OK\r\n"},
+			{"owner_ns with owner_doc_logical_ns overrides storage ns", [][]string{
+				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"regidxowner","paths":["age"]}`},
+			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
+			{"owner_ns with owner_doc_logical_ns mem fallback", [][]string{
+				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"regidxmem","owner_mem":true,"paths":["age"]}`},
+			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
+			{"owner_ns with invalid owner_doc_logical_ns", [][]string{
+				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"_bad","paths":["age"]}`},
+			}, "ERR REGIDX "},
+			{"owner_doc_logical_ns with invalid logical name", [][]string{
+				{"regidx", `{"owner_doc_logical_ns":"regidxowner","logical":"a-g-e","paths":["age"]}`},
+			}, "ERR REGIDX logical index name"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := runRESP(tc.cmds)
+				require.Contains(t, resp, tc.want, "resp=%s", resp)
+			})
+		}
+	})
+
+	t.Run("DROPSCH_DROPIDX_matrix", func(t *testing.T) {
+		require.Contains(t, runRESP([][]string{
+			{"regsch", sch("regdrop", false, "id")},
+			{"regidx", `{"owner_ns":"regdrop","logical":"age","paths":["age"]}`},
+			{"regsch", sch("regdropsolo", false, "id")},
+		}), "+OK\r\n+OK\r\n+OK\r\n")
+
+		tests := []struct {
+			name string
+			cmds [][]string
+			want string
+		}{
+			{"dropsch blocked by attached index", [][]string{
+				{"dropsch", "regdrop"},
+			}, "still has 1 attached index(es)"},
+			{"dropidx two-arg form", [][]string{
+				{"dropidx", "regdrop", "age"},
+			}, "+OK\r\n"},
+			{"dropsch after index removed", [][]string{
+				{"dropsch", "regdrop"},
+			}, "+OK\r\n"},
+			{"dropsch unregistered", [][]string{
+				{"dropsch", "neverreg"},
+			}, "not registered"},
+			{"dropidx full name form", [][]string{
+				{"regsch", sch("regdropfull", false, "id")},
+				{"regidx", `{"owner_ns":"regdropfull","logical":"age","paths":["age"]}`},
+				{"dropidx", "regdropfull:age"},
+			}, "+OK\r\n+OK\r\n+OK\r\n"},
+			{"dropidx unregistered", [][]string{
+				{"dropidx", "neverreg", "age"},
+			}, "not registered"},
+			{"dropsch argc zero", [][]string{{"dropsch"}}, "wrong number of arguments for 'dropsch'"},
+			{"dropsch argc too many", [][]string{{"dropsch", "a", "b"}}, "wrong number of arguments for 'dropsch'"},
+			{"dropidx argc zero", [][]string{{"dropidx"}}, "wrong number of arguments for 'dropidx'"},
+			{"dropidx argc too many", [][]string{{"dropidx", "a", "b", "c"}}, "wrong number of arguments for 'dropidx'"},
+			{"dropsch solo schema", [][]string{
+				{"dropsch", "regdropsolo"},
+			}, "+OK\r\n"},
+			{"dropsch invalid ns name", [][]string{
+				{"dropsch", "_bad"},
+			}, "ERR DROPSCH "},
+			{"dropidx invalid ns name", [][]string{
+				{"dropidx", "_bad", "age"},
+			}, "ERR DROPIDX "},
+			{"dropidx invalid logical name", [][]string{
+				{"dropidx", "regidxowner", "a-g-e"},
+			}, "ERR DROPIDX "},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := runRESP(tc.cmds)
+				require.Contains(t, resp, tc.want, "resp=%s", resp)
+			})
+		}
+	})
+
+	t.Run("DEL_doc_multipk_batch", func(t *testing.T) {
+		require.Contains(t, runRESP([][]string{{"regsch", sch("regdel", false, "id")}}), "+OK\r\n")
+		seed := [][]string{
+			{"set", "regdel", `{"id":"d1","age":1}`},
+			{"set", "regdel", `{"id":"d2","age":2}`},
+			{"set", "regdel", `{"id":"d3","age":3}`},
+		}
+		require.Contains(t, runRESP(seed), "+OK\r\n+OK\r\n+OK\r\n")
+
+		tests := []struct {
+			name string
+			cmds [][]string
+			want string
+		}{
+			{"batch delete two", [][]string{{"del", "regdel", "d1", "d2"}}, ":2\r\n"},
+			{"delete missing counts zero", [][]string{{"del", "regdel", "nope"}}, ":0\r\n"},
+			{"mixed found and missing", [][]string{{"del", "regdel", "d3", "nope"}}, ":1\r\n"},
+			{"duplicate suffix rejected", [][]string{{"del", "regdel", "d1", "d1"}}, "ERR DEL batch: duplicate key"},
+			{"unregistered ns rejected", [][]string{{"del", "neverreg2", "x"}}, "not registered"},
+			{"pk with colon rejected", [][]string{{"del", "regdel", "a:b"}}, "ERR DEL"},
+			{"ns alone not a target", [][]string{{"del", "regdel"}}, "doc-pattern requires <ns> <pk-suffix>"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := runRESP(tc.cmds)
+				require.Contains(t, resp, tc.want, "resp=%s", resp)
+			})
+		}
+	})
+
+	t.Run("DB_level_CreateIndex", func(t *testing.T) {
+		require.NoError(t, s.db.CreateIndex(x.RawIndex(
+			naming.BuildIdxFullName("regidxowner", "dblvl"),
+			"regidxowner:*",
+			"age",
+		)))
+		err := s.db.CreateIndex(x.RawIndex("bogusns:cidx", "*", "age"))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "key_pattern cannot start with wildcard")
+	})
+
+	t.Run("DB_level_deleteBatchAtomic_direct", func(t *testing.T) {
+		n, err := s.db.deleteBatchAtomic(nil)
+		require.NoError(t, err)
+		require.Equal(t, 0, n)
+
+		_, err = s.db.deleteBatchAtomic([]string{"regdel:d1", "_m_:regdel:d1"})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "cannot span storage layers")
+
+		_, err = s.db.deleteBatchAtomic([]string{"regdel:dup", "regdel:dup"})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "duplicate key")
+	})
+}
+
+// bootServerFor starts a fresh dual-port server for one test method and
+// returns the ctrl/app addresses plus the db handle. Empty auth seeds are
+// replaced with defaults so bootstrapAuth never generates random keys
+// (which would force NOAUTH on every unauthenticated connection).
+func (s *CmdTestSuite) bootServerFor(appAuth, ctrlAuth string) (appAddr, ctrlAddr string, db *DB) {
+	t := s.T()
+	if appAuth == "" {
+		appAuth = "matrix-app-key"
+	}
+	if ctrlAuth == "" {
+		ctrlAuth = "matrix-ctrl-key"
+	}
+	dbPath := testutil.DBPath(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+	}
+	db = StartWithConfig(cfg)
+	if db == nil {
+		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+	}
+	return cfg.App.Addr(), cfg.Ctrl.Addr(), db
+}
+
+// TestWireProtocolBasics covers the handshake/status command family
+// (HELLO, CLIENT, PING) plus SUBSCRIBE/PSUBSCRIBE/PUBLISH argv errors and
+// a full pattern-subscribe → publish delivery round trip.
+func (s *CmdTestSuite) TestWireProtocolBasics() {
+	_, ctrlAddr, _ := s.bootServerFor("", "")
+	ctrlAuth := "matrix-ctrl-key"
+
+	tests := []struct {
+		name string
+		cmds [][]string
+		want string
+	}{
+		{"hello", [][]string{{"hello"}}, "redisx"},
+		{"client setinfo", [][]string{{"client", "setinfo", "lib-name", "redisx-test"}}, "+OK\r\n"},
+		{"ping", [][]string{{"ping"}}, "+PONG\r\n"},
+		{"publish argc too few", [][]string{{"publish", "chan"}}, "wrong number of arguments for 'publish'"},
+		{"publish argc too many", [][]string{{"publish", "chan", "msg", "extra"}}, "wrong number of arguments for 'publish'"},
+		{"subscribe argc zero", [][]string{{"subscribe"}}, "wrong number of arguments for 'subscribe'"},
+		{"psubscribe argc zero", [][]string{{"psubscribe"}}, "wrong number of arguments for 'psubscribe'"},
+		{"unknown command", [][]string{{"nosuchcmd"}}, "unknown command"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			resp := respRoundTrip(s.T(), ctrlAddr, ctrlAuth, tc.cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+
+	// Subscriber connections are locked to (P)SUBSCRIBE commands after the
+	// first subscription, so pushes are asserted with a two-connection
+	// harness: conn A subscribes, conn B publishes.
+	pubsubPush := func(subCmd, channel, pattern, pushKind string) {
+		t := s.T()
+		sub, err := net.Dial("tcp", ctrlAddr)
+		if err != nil {
+			t.Fatalf("dial subscriber: %v", err)
+		}
+		defer func() { _ = sub.Close() }()
+		b := fmt.Sprintf("*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n", len(ctrlAuth), ctrlAuth)
+		_, _ = sub.Write([]byte(b))
+		buf := make([]byte, 4096)
+		_ = sub.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		_, _ = sub.Read(buf)
+
+		var w strings.Builder
+		fmt.Fprintf(&w, "*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(subCmd), subCmd, len(pattern), pattern)
+		_, _ = sub.Write([]byte(w.String()))
+		_ = sub.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+		n, _ := sub.Read(buf)
+		confirm := string(buf[:n])
+		s.Contains(confirm, subCmd)
+
+		pub := respRoundTrip(t, ctrlAddr, ctrlAuth, [][]string{{"publish", channel, "hello"}})
+		s.Contains(pub, ":1\r\n")
+
+		_ = sub.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+		n, _ = sub.Read(buf)
+		push := string(buf[:n])
+		s.Contains(push, pushKind)
+		s.Contains(push, channel)
+		s.Contains(push, "hello")
+	}
+
+	s.Run("psubscribe then publish delivers push", func() {
+		pubsubPush("psubscribe", "news.tech", "news.*", "pmessage")
+	})
+
+	s.Run("subscribe then publish delivers push", func() {
+		pubsubPush("subscribe", "alerts", "alerts", "message")
+	})
+}
+
+// TestSetCommandFlagsMatrix covers SET/SETEX/SETNX/GET/DEL argv shapes,
+// TTL flag parsing (EX/PX, bad values), NX semantics, the internal-NS
+// write guard, and the doc-path branch (unregistered ns, bad JSON,
+// array-of-scalars, scalar value, missing pk attrs).
+func (s *CmdTestSuite) TestSetCommandFlagsMatrix() {
+	_, ctrlAddr, db := s.bootServerFor("", "")
+	ctrlAuth := "matrix-ctrl-key"
+	require.NoError(s.T(), db.writeDocSpec(docSpec{
+		Namespace: "flagdoc",
+		KeyAttrs:  []string{"id"},
+	}))
+	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
+
+	tests := []struct {
+		name string
+		cmds [][]string
+		want string
+	}{
+		{"set argc too few", [][]string{{"set", "flagkv:k1"}}, "wrong number of arguments for 'set'"},
+		{"set plain", [][]string{{"set", "flagkv:a", "v1"}}, "+OK\r\n"},
+		{"set ex ok", [][]string{{"set", "flagkv:b", "v2", "EX", "60"}}, "+OK\r\n"},
+		{"set px ok", [][]string{{"set", "flagkv:c", "v3", "PX", "5000"}}, "+OK\r\n"},
+		{"set ex not integer", [][]string{{"set", "flagkv:d", "v", "EX", "bad"}}, "ERR value is not an integer or out of range"},
+		{"set px not integer", [][]string{{"set", "flagkv:e", "v", "PX", "bad"}}, "ERR value is not an integer or out of range"},
+		{"set nx fresh", [][]string{{"set", "flagkv:nx1", "v", "NX"}}, "+OK\r\n"},
+		{"set nx existing returns null", [][]string{
+			{"set", "flagkv:nx1", "orig", "NX"},
+			{"set", "flagkv:nx1", "v2", "NX"},
+		}, "$-1\r\n"},
+		{"set internal ns guard", [][]string{{"set", "_doc_:x", "v"}}, "ERR SET "},
+		{"set unregistered ns json intent", [][]string{{"set", "nope", `{"id":1}`}}, "not registered — doc-pattern requires REGSCH first"},
+		{"set unregistered ns kv intent", [][]string{{"set", "nope", "plain"}}, "kv-pattern key must contain namespace separator"},
+		{"set doc invalid json", [][]string{{"set", "flagdoc", "{bad"}}, "value must be valid JSON"},
+		{"set doc array of scalars", [][]string{{"set", "flagdoc", "[1,2]"}}, "array must contain JSON objects"},
+		{"set doc scalar value", [][]string{{"set", "flagdoc", "123"}}, "value must be JSON object or array of objects"},
+		{"set doc missing pk attr", [][]string{{"set", "flagdoc", `{"name":"x"}`}}, "object[0]"},
+		{"set doc happy", [][]string{{"set", "flagdoc", `{"id":"d1","age":1}`}}, "+OK\r\n"},
+		{"set doc batch happy", [][]string{{"set", "flagdoc", `[{"id":"d2"},{"id":"d3"}]`}}, "+OK\r\n"},
+		{"setex argc too few", [][]string{{"setex", "flagkv:f", "60"}}, "wrong number of arguments for 'setex'"},
+		{"setex bad seconds", [][]string{{"setex", "flagkv:f", "bad", "v"}}, "ERR value is not an integer or out of range"},
+		{"setex ok", [][]string{{"setex", "flagkv:f", "60", "v"}}, "+OK\r\n"},
+		{"setex doc happy", [][]string{{"setex", "flagdoc", "60", `{"id":"d4"}`}}, "+OK\r\n"},
+		{"setex doc invalid json", [][]string{{"setex", "flagdoc", "60", "{bad"}}, "ERR SETEX doc-pattern: value must be valid JSON"},
+		{"setnx argc too few", [][]string{{"setnx", "flagkv:g"}}, "wrong number of arguments for 'setnx'"},
+		{"setnx fresh then duplicate", [][]string{
+			{"setnx", "flagkv:g", "v1"},
+			{"setnx", "flagkv:g", "v2"},
+		}, ":1\r\n:0\r\n"},
+		{"setnx internal ns guard", [][]string{{"setnx", "_idx_:x", "v"}}, "ERR SETNX "},
+		{"get happy", [][]string{{"set", "flagkv:h", "vv"}, {"get", "flagkv:h"}}, "$2\r\nvv\r\n"},
+		{"get missing returns null", [][]string{{"get", "flagkv:none"}}, "$-1\r\n"},
+		{"get argc zero", [][]string{{"get"}}, "wrong number of arguments for 'get'"},
+		{"get kv argc too many", [][]string{{"get", "flagkv:h", "extra"}}, "kv-pattern accepts exactly 1 key argument"},
+		{"get kv reserved mem prefix", [][]string{{"get", "_m_x:1"}}, "must not start with reserved internal prefix"},
+		{"get doc pk suffix with colon", [][]string{{"get", "flagdoc", "a:b"}}, "ERR GET pk suffix must not contain namespace separator"},
+		{"get doc unregistered ns", [][]string{{"get", "nope", "x"}}, "not registered"},
+		{"get doc happy", [][]string{
+			{"set", "flagdoc", `{"id":"d5"}`},
+			{"get", "flagdoc", "d5"},
+		}, `"id":"d5"`},
+		{"set doc nx fresh returns ok", [][]string{{"set", "flagdoc", `{"id":"nx1"}`, "NX"}}, "+OK\r\n"},
+		{"set doc nx duplicate returns null", [][]string{
+			{"set", "flagdoc", `{"id":"nx2"}`, "NX"},
+			{"set", "flagdoc", `{"id":"nx2"}`, "NX"},
+		}, "$-1\r\n"},
+		{"set doc nx batch duplicate pk errors", [][]string{
+			{"set", "flagdoc", `[{"id":"nx3"},{"id":"nx3"}]`, "NX"},
+		}, `ERR SET batch: duplicate key "flagdoc:nx3"`},
+		{"setex argc too many", [][]string{{"setex", "flagkv:f", "60", "v", "x"}}, "wrong number of arguments for 'setex'"},
+		{"setex internal ns guard", [][]string{{"setex", "_doc_:x", "60", "v"}}, "ERR SETEX "},
+		{"setex unregistered ns json intent", [][]string{{"setex", "nope", "60", `{"id":1}`}}, "not registered — doc-pattern requires REGSCH first"},
+		{"setex unregistered ns kv intent", [][]string{{"setex", "nope", "60", "plain"}}, "kv-pattern key must contain namespace separator"},
+		{"setex doc array of scalars", [][]string{{"setex", "flagdoc", "60", "[1,2]"}}, "array must contain JSON objects"},
+		{"setex doc scalar value", [][]string{{"setex", "flagdoc", "60", "123"}}, "value must be JSON object or array of objects"},
+		{"setex doc missing pk attr", [][]string{{"setex", "flagdoc", "60", `{"name":"x"}`}}, "object[0]"},
+		{"setnx doc happy then duplicate", [][]string{
+			{"setnx", "flagdoc", `{"id":"sx1"}`},
+			{"setnx", "flagdoc", `{"id":"sx1"}`},
+		}, ":1\r\n:0\r\n"},
+		{"setnx unregistered ns json intent", [][]string{{"setnx", "nope", `{"id":1}`}}, "not registered — doc-pattern requires REGSCH first"},
+		{"setnx unregistered ns kv intent", [][]string{{"setnx", "nope", "plain"}}, "kv-pattern key must contain namespace separator"},
+		{"setnx doc invalid json", [][]string{{"setnx", "flagdoc", "{bad"}}, "ERR SETNX doc-pattern: value must be valid JSON"},
+		{"setnx doc array of scalars", [][]string{{"setnx", "flagdoc", "[1,2]"}}, "array must contain JSON objects"},
+		{"setnx doc scalar value", [][]string{{"setnx", "flagdoc", "123"}}, "value must be JSON object or array of objects"},
+		{"setnx doc missing pk attr", [][]string{{"setnx", "flagdoc", `{"name":"x"}`}}, "object[0]"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			resp := rt(tc.cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+}
+
+// TestSearchArgvMatrix covers SEARCHKEY / SEARCHINDEX argv bounds, order /
+// LIMIT tail parsing errors, key-range validation, and filter JSON errors.
+func (s *CmdTestSuite) TestSearchArgvMatrix() {
+	_, ctrlAddr, db := s.bootServerFor("", "")
+	ctrlAuth := "matrix-ctrl-key"
+	require.NoError(s.T(), db.writeDocSpec(docSpec{
+		Namespace: "srchdoc",
+		KeyAttrs:  []string{"id"},
+	}))
+	require.NoError(s.T(), db.writeIndexSpec(idxSpec{
+		OwnerNs:    "srchdoc",
+		Logical:    "age",
+		KeyPattern: "srchdoc:*",
+		Paths:      []string{"age"},
+	}))
+	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
+	kr := `{"op":"pattern","p":"srchdoc:*"}`
+
+	tests := []struct {
+		name string
+		cmds [][]string
+		want string
+	}{
+		{"searchkey argc zero", [][]string{{"searchkey"}}, "wrong number of arguments for 'searchkey'"},
+		{"searchkey argc one", [][]string{{"searchkey", kr}}, "wrong number of arguments for 'searchkey'"},
+		{"searchkey argc six", [][]string{{"searchkey", kr, "{}", "ASC", "LIMIT", "1", "x"}}, "wrong number of arguments for 'searchkey'"},
+		{"searchkey invalid kr json", [][]string{{"searchkey", "{bad", "{}"}}, "ERR invalid key range"},
+		{"searchkey leading wildcard", [][]string{{"searchkey", `{"op":"pattern","p":"*x"}`, "{}"}}, "must be anchored to a namespace"},
+		// NOTE: the "not registered — doc-pattern requires REGSCH first"
+		// branch in searchKeyCommand is defensive dead code: it only fires
+		// for colon-free anchors, but storageNsFromKRAnchor always errors
+		// on anchors without the ":" separator. Actual behaviour for an
+		// unregistered colon-free range is an empty result.
+		{"searchkey unregistered colon-free ns returns empty", [][]string{{"searchkey", `{"op":"gte","pivot":"norp"}`, "{}"}}, "*0\r\n"},
+		{"searchkey bad order", [][]string{{"searchkey", kr, "{}", "SIDEWAYS"}}, "ERR invalid order: SIDEWAYS"},
+		{"searchkey order word instead of limit", [][]string{{"searchkey", kr, "{}", "5"}}, "ERR invalid order: 5"},
+		{"searchkey limit without keyword", [][]string{{"searchkey", kr, "{}", "TAKE", "1"}}, "ERR invalid argument: TAKE"},
+		{"searchkey limit bad count", [][]string{{"searchkey", kr, "{}", "LIMIT", "0"}}, "ERR invalid count for LIMIT: 0"},
+		{"searchkey order then bad limit kw", [][]string{{"searchkey", kr, "{}", "ASC", "TAKE", "1"}}, "ERR invalid argument: TAKE"},
+		{"searchkey invalid filter json", [][]string{{"searchkey", kr, "{bad"}}, "ERR invalid query"},
+		{"searchindex argc too few", [][]string{{"searchindex", "srchdoc:age", kr}}, "wrong number of arguments for 'searchindex'"},
+		{"searchindex argc too many", [][]string{{"searchindex", "srchdoc:age", kr, "{}", "ASC", "LIMIT", "1", "x"}}, "wrong number of arguments for 'searchindex'"},
+		{"searchindex kr not json", [][]string{{"searchindex", "srchdoc:age", "notjson", "{}"}}, "wrong number of arguments for 'searchindex'"},
+		{"searchindex kr invalid json", [][]string{{"searchindex", "srchdoc:age", "{bad", "{}"}}, "ERR invalid key range"},
+		{"searchindex invalid index name", [][]string{{"searchindex", "nostrategy", kr, "{}"}}, "ERR SEARCHINDEX invalid index name"},
+		{"searchindex unregistered owner ns", [][]string{{"searchindex", "nope:age", kr, "{}"}}, "not registered"},
+		{"searchindex six args bad order", [][]string{{"searchindex", "srchdoc:age", kr, "{}", "SIDEWAYS", "LIMIT", "1"}}, "ERR invalid order: SIDEWAYS"},
+		{"searchindex six args bad limit keyword", [][]string{{"searchindex", "srchdoc:age", kr, "{}", "ASC", "TAKE", "1"}}, "ERR invalid argument: TAKE"},
+		{"searchindex six args bad count", [][]string{{"searchindex", "srchdoc:age", kr, "{}", "ASC", "LIMIT", "0"}}, "ERR invalid count for LIMIT: 0"},
+		{"searchkey five args bad order", [][]string{{"searchkey", kr, "{}", "5", "LIMIT", "1"}}, "ERR invalid order: 5"},
+		{"searchkey five args bad limit keyword", [][]string{{"searchkey", kr, "{}", "ASC", "TAKE", "1"}}, "ERR invalid argument: TAKE"},
+		{"searchkey five args bad count", [][]string{{"searchkey", kr, "{}", "ASC", "LIMIT", "0"}}, "ERR invalid count for LIMIT: 0"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			resp := rt(tc.cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+
+	s.Run("searchkey happy with tail variants", func() {
+		resp := rt([][]string{
+			{"set", "srchdoc", `{"id":"s1","age":10}`},
+			{"set", "srchdoc", `{"id":"s2","age":20}`},
+			{"searchkey", kr, "{}", "ASC"},
+			{"searchkey", kr, "{}", "LIMIT", "1"},
+			{"searchkey", kr, "{}", "DESC", "LIMIT", "1"},
+		})
+		s.Contains(resp, `{"id":"s1","age":10}`)
+		s.Contains(resp, `{"id":"s2","age":20}`)
+	})
+
+	s.Run("searchindex happy with order and limit", func() {
+		resp := rt([][]string{
+			{"searchindex", "srchdoc:age", kr, "{}", "ASC", "LIMIT", "1"},
+			{"searchindex", "srchdoc:age", kr, "{}", "DESC", "LIMIT", "1"},
+		})
+		s.Contains(resp, `{"id":"s1","age":10}`)
+		s.Contains(resp, `{"id":"s2","age":20}`)
+	})
+}
+
+// TestKeysArgvMatrix covers KEYS argv bounds, the leading-wildcard /
+// reserved-namespace guards, registry introspection expansions (_doc_ /
+// _idx_), doc-path bare-namespace validation, and the empty-pattern
+// resolveLayer error.
+func (s *CmdTestSuite) TestKeysArgvMatrix() {
+	_, ctrlAddr, db := s.bootServerFor("", "")
+	ctrlAuth := "matrix-ctrl-key"
+	require.NoError(s.T(), db.writeDocSpec(docSpec{
+		Namespace: "keysdoc",
+		KeyAttrs:  []string{"id"},
+	}))
+	require.NoError(s.T(), db.writeIndexSpec(idxSpec{
+		OwnerNs:    "keysdoc",
+		Logical:    "age",
+		KeyPattern: "keysdoc:*",
+		Paths:      []string{"age"},
+	}))
+	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
+	require.Contains(s.T(), rt([][]string{{"set", "keysdoc", `{"id":"k1","age":1}`}}), "+OK\r\n")
+
+	tests := []struct {
+		name string
+		cmds [][]string
+		want string
+	}{
+		{"keys argc zero", [][]string{{"keys"}}, "wrong number of arguments for 'keys'"},
+		{"keys argc too many", [][]string{{"keys", "a", "b"}}, "wrong number of arguments for 'keys'"},
+		{"keys empty pattern", [][]string{{"keys", ""}}, "ERR KEYS storage key or pattern is required"},
+		{"keys leading wildcard", [][]string{{"keys", "*x"}}, "ERR forbidden key pattern"},
+		{"keys auth ns forbidden", [][]string{{"keys", "_auth_:x"}}, "ERR forbidden key pattern"},
+		{"keys bare idx ns expands", [][]string{{"keys", "_idx_"}}, "_idx_"},
+		{"keys bare doc ns expands", [][]string{{"keys", "_doc_"}}, "_doc_"},
+		{"keys doc ns glob forbidden", [][]string{{"keys", "abc*"}}, "ERR KEYS for doc-path requires bare"},
+		{"keys bare unregistered ns", [][]string{{"keys", "notregns"}}, "not registered"},
+		{"keys bare registered ns lists storage keys", [][]string{{"keys", "keysdoc"}}, "keysdoc:k1"},
+		{"keys kv pattern passthrough", [][]string{{"keys", "keysdoc:*"}}, "keysdoc:k1"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			resp := rt(tc.cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+}
+
+// TestUpdateArgvMatrix covers UPDATE argv bounds, key-range validation
+// (invalid JSON, leading-wildcard anchor), the LIMIT tail (bad keyword,
+// bad count, happy), filter JSON errors, and update-JSON parse errors.
+func (s *CmdTestSuite) TestUpdateArgvMatrix() {
+	_, ctrlAddr, db := s.bootServerFor("", "")
+	ctrlAuth := "matrix-ctrl-key"
+	require.NoError(s.T(), db.writeDocSpec(docSpec{
+		Namespace: "upddoc",
+		KeyAttrs:  []string{"id"},
+	}))
+	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
+	require.Contains(s.T(), rt([][]string{
+		{"set", "upddoc", `{"id":"u1","age":10}`},
+		{"set", "upddoc", `{"id":"u2","age":20}`},
+	}), "+OK\r\n+OK\r\n")
+	upd := `[{"op":"replace","path":"/age","value":21}]`
+
+	tests := []struct {
+		name string
+		cmds [][]string
+		want string
+	}{
+		{"update argc too few", [][]string{{"update", "upddoc:*", "{}"}}, "wrong number of arguments for 'update'"},
+		{"update argc too many", [][]string{{"update", "upddoc:*", "{}", upd, "LIMIT", "1", "x"}}, "wrong number of arguments for 'update'"},
+		{"update invalid kr json", [][]string{{"update", "{bad", "{}", upd}}, "ERR invalid key range"},
+		{"update leading wildcard anchor", [][]string{{"update", `{"op":"pattern","p":"*x"}`, "{}", upd}}, "must be anchored to a registered storage namespace"},
+		{"update limit bad keyword", [][]string{{"update", "upddoc:*", "{}", upd, "TAKE", "1"}}, "ERR invalid argument: TAKE"},
+		{"update limit bad count", [][]string{{"update", "upddoc:*", "{}", upd, "LIMIT", "0"}}, "ERR invalid count for LIMIT: 0"},
+		{"update invalid filter json", [][]string{{"update", "upddoc:*", "{bad", upd}}, "ERR invalid query"},
+		{"update invalid update json", [][]string{{"update", "upddoc:*", "{}", "{bad"}}, "ERR"},
+	}
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			resp := rt(tc.cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+
+	s.Run("update happy with limit", func() {
+		resp := rt([][]string{{"update", "upddoc:*", `{"age":{"$gt":0}}`, upd, "LIMIT", "1"}})
+		s.Contains(resp, "upddoc:")
+	})
+}
+
+// TestPortRoleGates covers the auth gates over the wire: AUTH role
+// mismatch (WRONGPASS on the wrong port), re-AUTH semantics, gate1
+// (_auth_ namespace + wildcard KEYS on app port), gate3 (ctrl-only
+// commands on app port) and NOAUTH for unauthenticated commands.
+func (s *CmdTestSuite) TestPortRoleGates() {
+	appAuth, ctrlAuth := "gate-app-key", "gate-ctrl-key"
+	appAddr, ctrlAddr, _ := s.bootServerFor(appAuth, ctrlAuth)
+
+	s.Run("auth argc wrong closes conn", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"auth", appAuth, "extra"}})
+		s.Contains(resp, "ERR authentication failed")
+	})
+
+	s.Run("auth with ctrl key on app port rejected", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"auth", ctrlAuth}})
+		s.Contains(resp, "WRONGPASS invalid or wrong auth key for app port")
+	})
+
+	s.Run("auth with app key on ctrl port rejected", func() {
+		resp := respRoundTrip(s.T(), ctrlAddr, "", [][]string{{"auth", appAuth}})
+		s.Contains(resp, "WRONGPASS invalid or wrong auth key for ctrl port")
+	})
+
+	s.Run("reauth same key ok different key rejected", func() {
+		resp := respRoundTrip(s.T(), ctrlAddr, ctrlAuth, [][]string{
+			{"auth", ctrlAuth},
+			{"auth", "another-key"},
+		})
+		s.Contains(resp, "+OK\r\n")
+		s.Contains(resp, "ERR connection already authenticated")
+	})
+
+	s.Run("unauthenticated command gets NOAUTH", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"get", "somekey"}})
+		s.Contains(resp, "NOAUTH authentication required")
+	})
+
+	s.Run("gate1 literal auth ns key on app port", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{{"get", "_auth_:app_0"}})
+		s.Contains(resp, "No Privilege")
+	})
+
+	s.Run("gate1 wildcard keys sweep on app port", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{{"keys", "user:*"}})
+		s.Contains(resp, "No Privilege")
+	})
+
+	s.Run("gate3 ctrl-only command on app port", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{{"regsch", `{"namespace":"g","key_attrs":["id"]}`}})
+		s.Contains(resp, "only allowed on the ctrl port")
+	})
+
+	s.Run("app port kv round trip works with correct key", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{
+			{"set", "gatekv:a", "v"},
+			{"get", "gatekv:a"},
+		})
+		s.Contains(resp, "+OK\r\n")
+		s.Contains(resp, "$1\r\nv\r\n")
 	})
 }
