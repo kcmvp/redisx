@@ -2684,6 +2684,83 @@ func (s *DocTestSuite) TestDocHookForwarders() {
 	s.True(aborted)
 }
 
+func (s *DocTestSuite) TestAll_TABLE_DRIVEN() {
+	// Seed a dedicated set of documents for this test.
+	fixtures := []struct {
+		id   string
+		name string
+		age  int
+	}{
+		{"all_1", "Alice", 25},
+		{"all_2", "Bob", 30},
+		{"all_3", "Carol", 35},
+		{"all_4", "Dave", 25},
+		{"all_5", "Eve", 40},
+	}
+	for _, f := range fixtures {
+		doc := UserDoc(fmt.Sprintf(`{"id":%q,"name":%q,"age":%d}`, f.id, f.name, f.age))
+		s.Require().NoError(Set(doc))
+	}
+	defer func() {
+		for _, f := range fixtures {
+			_, _ = Delete(UserDoc(fmt.Sprintf(`{"id":%q}`, f.id)))
+		}
+	}()
+
+	tests := []struct {
+		name    string
+		filters []x.Filter
+		wantIDs []string // sorted ascending for deterministic comparison
+	}{
+		{
+			name:    "no_filter_returns_all",
+			filters: nil,
+			wantIDs: []string{"all_1", "all_2", "all_3", "all_4", "all_5"},
+		},
+		{
+			name:    "single_eq_filter",
+			filters: []x.Filter{x.Eq("age", 25)},
+			wantIDs: []string{"all_1", "all_4"},
+		},
+		{
+			name:    "gt_filter",
+			filters: []x.Filter{x.Gt("age", 30)},
+			wantIDs: []string{"all_3", "all_5"},
+		},
+		{
+			name:    "multiple_filters_anded",
+			filters: []x.Filter{x.Eq("age", 25), x.Eq("name", "Alice")},
+			wantIDs: []string{"all_1"},
+		},
+		{
+			name:    "filter_matches_none",
+			filters: []x.Filter{x.Eq("age", 999)},
+			wantIDs: []string{},
+		},
+		{
+			name:    "contains_filter",
+			filters: []x.Filter{x.Contains("name", "ob")},
+			wantIDs: []string{"all_2"},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		s.Run(tc.name, func() {
+			res := All[UserDoc](tc.filters...)
+			s.Require().NoError(res.Error())
+			got := res.MustGet()
+
+			gotIDs := make([]string, 0, len(got))
+			for _, d := range got {
+				gotIDs = append(gotIDs, gjson.Get(string(d), "id").String())
+			}
+			sort.Strings(gotIDs)
+			s.Equal(tc.wantIDs, gotIDs)
+		})
+	}
+}
+
 func krDocID(id string) string  { return id }
 func updDocID(id string) string { return id }
 

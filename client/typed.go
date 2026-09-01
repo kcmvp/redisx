@@ -415,6 +415,27 @@ func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 	return mo.Ok(out)
 }
 
+func All[D x.Document](filters ...x.Filter) mo.Result[[]D] {
+	fullKR := x.KeysPattern(x.StorageNsKeyPattern[D]("*"))
+
+	var filter x.Filter
+	if len(filters) > 0 {
+		filter = x.And(filters...)
+	}
+
+	res := raw.SearchKey(fullKR, filter, false)
+	if res.IsError() {
+		return mo.Err[[]D](res.Error())
+	}
+
+	raws := res.MustGet()
+	out := make([]D, 0, len(raws))
+	for _, r := range raws {
+		out = append(out, D(r))
+	}
+	return mo.Ok(out)
+}
+
 func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if scopedKR == nil {
 		return mo.Err[[]string](errors.New("key range is required"))
