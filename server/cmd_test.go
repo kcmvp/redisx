@@ -1552,8 +1552,8 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 				`{"namespace":"regttlns","mem":false,"key_attrs":["id"]}`, -1},
 			{"null ttl_ns defaults to permanent -1", "regttlnull",
 				`{"namespace":"regttlnull","mem":false,"key_attrs":["id"],"ttl_ns":null}`, -1},
-			{"explicit ttl_ns 0 stays 0", "regttlzero",
-				`{"namespace":"regttlzero","mem":false,"key_attrs":["id"],"ttl_ns":0}`, 0},
+			{"explicit ttl_ns 0 normalises to permanent -1", "regttlzero",
+				`{"namespace":"regttlzero","mem":false,"key_attrs":["id"],"ttl_ns":0}`, -1},
 			{"explicit ttl_ns 5s stays 5s", "regttl5s",
 				`{"namespace":"regttl5s","mem":false,"key_attrs":["id"],"ttl_ns":5000000000}`, 5 * time.Second},
 		}
