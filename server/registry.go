@@ -121,6 +121,9 @@ func md5VersionHex(v any) (string, error) {
 // three server-internal fields (Version/CreatedAt/UpdatedAt) are deliberately
 // excluded.
 func canonicalDocMD5(spec docSpec) (string, error) {
+	if spec.TTL <= 0 {
+		spec.TTL = -1
+	}
 	if len(spec.KeyAttrs) == 0 {
 		spec.KeyAttrs = []string{}
 	}
