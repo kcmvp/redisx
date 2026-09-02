@@ -22,7 +22,7 @@ func DBPath(tb testing.TB) string {
 // within a few milliseconds can occasionally fail with "address already in
 // use" when the kernel hands it to another concurrent goroutine before the
 // original listener's close fully propagates. In practice the 10 ms sleep
-// injected by server.StartWithConfig plus per-port randomization inside Go's
+// injected by server.StartWith plus per-port randomization inside Go's
 // `net` package is enough to keep the window tiny.
 func AllocateFreePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")

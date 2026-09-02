@@ -38,7 +38,7 @@ cfg := &server.Config{
     App:  server.AppConfig{Bind: "127.0.0.1", Port: 7379},
     Ctrl: server.CtrlConfig{Bind: "127.0.0.1", Port: 7381},
 }
-db := server.StartWithConfig(cfg, UserDoc(""))
+db := server.StartWith(cfg, UserDoc(""))
 defer server.Stop()
 
 _ = db.Set("_auth_:demo-key", "2")

@@ -63,7 +63,7 @@ cfg := &server.Config{
     Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 7381},
     DataPath: "/var/lib/redisx/app.db",
 }
-db := server.StartWithConfig(cfg, UserDoc(""))
+db := server.StartWith(cfg, UserDoc(""))
 ```
 
 Rules:

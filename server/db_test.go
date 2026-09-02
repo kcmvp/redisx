@@ -2077,10 +2077,10 @@ func TestUpdateKeyRangeSuite(t *testing.T) {
 
 func TestEffectiveAuthKeys(t *testing.T) {
 	tests := []struct {
-		name      string
-		setup     func(t *testing.T) *DB
-		wantApp   string
-		wantCtrl  string
+		name     string
+		setup    func(t *testing.T) *DB
+		wantApp  string
+		wantCtrl string
 	}{
 		{
 			name: "nil DB returns empty",
@@ -2293,4 +2293,195 @@ func TestApplyPatternRange(t *testing.T) {
 			require.Len(t, collected, tt.wantLen)
 		})
 	}
+}
+
+func TestWriteDocSpecValidationParityWithXRegisterSchema(t *testing.T) {
+	db := openDB(testutil.DBPath(t))
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	cases := []struct {
+		name      string
+		spec      docSpec
+		errPhrase string
+	}{
+		{
+			name:      "negative TTL normalised to -1 and accepted",
+			spec:      docSpec{Namespace: "ttlneg", Mem: false, KeyAttrs: []string{"id"}, TTL: -2 * time.Second},
+			errPhrase: "",
+		},
+		{
+			name:      "empty key_attrs is rejected",
+			spec:      docSpec{Namespace: "noattrs", Mem: false, KeyAttrs: nil, TTL: -1},
+			errPhrase: "schema: at least one keyAttr is required",
+		},
+		{
+			name:      "empty key_attr entry is rejected",
+			spec:      docSpec{Namespace: "emptyattr", Mem: false, KeyAttrs: []string{"id", ""}, TTL: -1},
+			errPhrase: "schema: keyAttrs[1] is empty",
+		},
+		{
+			name:      "duplicate key_attr entry is rejected",
+			spec:      docSpec{Namespace: "dupattr", Mem: false, KeyAttrs: []string{"tenant", "id", "tenant"}, TTL: 0},
+			errPhrase: `schema: keyAttrs contains duplicate entry "tenant"`,
+		},
+		{
+			name:      "invalid namespace character is rejected",
+			spec:      docSpec{Namespace: "bad_ns", Mem: false, KeyAttrs: []string{"id"}, TTL: -1},
+			errPhrase: "schema: doc logical namespace \"bad_ns\" contains '_' which is reserved",
+		},
+	}
+	for _, cc := range cases {
+		t.Run(cc.name, func(t *testing.T) {
+			err := db.writeDocSpec(cc.spec)
+			if cc.errPhrase == "" {
+				require.NoError(t, err, "writeDocSpec must accept %+v", cc.spec)
+			} else {
+				require.Error(t, err, "writeDocSpec must fail for invalid input %+v", cc.spec)
+				require.Contains(t, err.Error(), cc.errPhrase, "got err: %v", err)
+			}
+		})
+	}
+
+	t.Run("boundary_values_pass", func(t *testing.T) {
+		permanent := docSpec{Namespace: "permns", Mem: false, KeyAttrs: []string{"pk"}, TTL: -1}
+		require.NoError(t, db.writeDocSpec(permanent), "TTL=-1 (permanent) must be accepted")
+
+		noDefaultTTL := docSpec{Namespace: "nodefaultns", Mem: true, KeyAttrs: []string{"pk"}, TTL: 0}
+		require.NoError(t, db.writeDocSpec(noDefaultTTL), "TTL=0 (no default) must be accepted")
+
+		positive := docSpec{Namespace: "positivens", Mem: false, KeyAttrs: []string{"pk"}, TTL: 10 * time.Minute}
+		require.NoError(t, db.writeDocSpec(positive), "TTL=positive must be accepted")
+	})
+
+	t.Run("sdk_and_server_parity_via_x_validate", func(t *testing.T) {
+		xGood := x.RegisterSchema[testUserDoc]("registeredgood", false, time.Hour, "tenant", "id")
+		require.NotNil(t, xGood)
+		specFromGood := docSpec{
+			Namespace: xGood.Namespace(), Mem: xGood.Mem(),
+			KeyAttrs: xGood.KeyAttrs(), TTL: xGood.TTL(),
+		}
+		require.NoError(t, db.writeDocSpec(specFromGood),
+			"a Schema accepted by x.RegisterSchema MUST also be accepted by writeDocSpec")
+
+		bad := docSpec{Namespace: "duppkns", Mem: false, KeyAttrs: []string{"pk", "pk"}, TTL: 0}
+		errSrv := db.writeDocSpec(bad)
+		errX := x.Validate(bad.asSchema())
+		require.Error(t, errSrv, "writeDocSpec duplicate pk should fail")
+		require.Error(t, errX, "x.Validate duplicate pk should fail")
+		require.Contains(t, errSrv.Error(), "duplicate entry",
+			"identical semantic failure mode between SDK Validate and server writeDocSpec")
+	})
+}
+
+// TestTTLSsoTNormalisation asserts the single source of truth for TTL
+// semantics across all write paths: any TTL <= 0 is normalised to -1
+// (permanent) BEFORE the canonical MD5 fingerprint is computed, so that
+// the version hex is stable no matter which call path (SDK default 0,
+// wire default -1, explicit 0) produced the spec.
+func TestTTLSsoTNormalisation(t *testing.T) {
+	db := openDB(testutil.DBPath(t))
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	t.Run("register_schema_ttl0_normalised_to_minus1_in_memory", func(t *testing.T) {
+		sch := x.RegisterSchema[testUserDoc]("ttlnorm0", false, 0, "pk")
+		require.Equal(t, time.Duration(-1), sch.TTL(),
+			"x.RegisterSchema with ttl=0 must return TTL=-1 (permanent SSoT)")
+
+		schN1 := x.RegisterSchema[testUserDoc]("ttlnormn1", false, -1, "pk")
+		require.Equal(t, time.Duration(-1), schN1.TTL())
+
+		schNeg := x.RegisterSchema[testUserDoc]("ttlnormneg", false, -3*time.Second, "pk")
+		require.Equal(t, time.Duration(-1), schNeg.TTL(),
+			"negative TTLs beyond -1 are also clamped to -1 post-validation")
+	})
+
+	t.Run("writeDocSpec_ttl0_persists_as_minus1_and_stable_version", func(t *testing.T) {
+		spec0 := docSpec{Namespace: "ttlzero", Mem: false, KeyAttrs: []string{"pk"}, TTL: 0}
+		require.NoError(t, db.writeDocSpec(spec0))
+		loaded, ok, err := db.loadDocSpec(spec0.storageNs())
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, time.Duration(-1), loaded.TTL,
+			"TTL=0 written via writeDocSpec must persist as TTL=-1")
+		versionZero := loaded.Version
+
+		// A spec that differs only in TTL=0 vs TTL=-1 must produce the
+		// exact same canonical fingerprint AFTER normalisation. SSoT is
+		// writeDocSpec, which runs normalisation BEFORE canonicalDocMD5.
+		specN1 := docSpec{Namespace: "ttlzero", Mem: false, KeyAttrs: []string{"pk"}, TTL: -1}
+		spec0Copy := spec0
+		spec0Copy.TTL = -1
+		md5_0N, err0N := canonicalDocMD5(spec0Copy)
+		require.NoError(t, err0N)
+		md5_N1, errN1 := canonicalDocMD5(specN1)
+		require.NoError(t, errN1)
+		require.Equal(t, md5_N1, md5_0N,
+			"canonicalDocMD5(TTL=0 after normalisation) must equal canonicalDocMD5(TTL=-1)")
+
+		// Re-running writeDocSpec with TTL=-1 variant on the same ns
+		// must be a no-op (identical fingerprint = version match).
+		require.NoError(t, db.writeDocSpec(specN1))
+		reloaded, ok2, err2 := db.loadDocSpec(specN1.storageNs())
+		require.NoError(t, err2)
+		require.True(t, ok2)
+		require.Equal(t, versionZero, reloaded.Version,
+			"writing TTL=-1 after TTL=0 must NOT bump version (same fingerprint)")
+	})
+
+	t.Run("kv_set_explicit_minus1_does_not_fallback_to_doc_default", func(t *testing.T) {
+		specWithTTL := docSpec{
+			Namespace: "with24h", Mem: false,
+			KeyAttrs: []string{"pk"}, TTL: 24 * time.Hour,
+		}
+		require.NoError(t, db.writeDocSpec(specWithTTL))
+
+		key := "with24h:alice"
+		value := "x"
+
+		// Rule1 caller passed explicit -1. autoTTLFromKey must honor it
+		// rather than falling back to schema default 24h.
+		resolved := db.autoTTLFromKey(key, -1)
+		require.Equal(t, time.Duration(-1), resolved,
+			"KV SET explicit=-1 must be passed through as-is, NOT fallback to 24h doc default")
+
+		// Sanity check: if caller really did pass 0, we DO get doc TTL.
+		resolved0 := db.autoTTLFromKey(key, 0)
+		require.Equal(t, 24*time.Hour, resolved0,
+			"KV SET with no TTL (explicit=0) must fallback to doc default TTL")
+
+		// Sanity check: positive explicit TTL also passes through.
+		resolvedP := db.autoTTLFromKey(key, 30*time.Minute)
+		require.Equal(t, 30*time.Minute, resolvedP,
+			"KV SET explicit>0 passes through as-is")
+
+		// Now actually write to buntdb with TTL=-1 and TTL=0-fallback,
+		// then read back buntdb-level TTL to verify storage semantics.
+		require.NoError(t, db.SetWithTtl(key, value, -1))
+		got := db.Get(key).MustGet()
+		require.Equal(t, value, got)
+
+		var ttlPermanent time.Duration
+		require.NoError(t, db.raw().View(func(tx *buntdb.Tx) error {
+			ttl, ttlErr := tx.TTL(key)
+			ttlPermanent = ttl
+			return ttlErr
+		}), "buntdb view for permanent TTL must succeed")
+		require.LessOrEqual(t, ttlPermanent, time.Duration(0),
+			"SetWithTtl(ttl=-1) must yield TTL<=0 on disk (permanent)")
+
+		require.NoError(t, db.SetWithTtl(key+"_fallback", value, 0))
+		gotFb := db.Get(key + "_fallback").MustGet()
+		require.Equal(t, value, gotFb)
+
+		var ttlFallback time.Duration
+		require.NoError(t, db.raw().View(func(tx *buntdb.Tx) error {
+			ttl, ttlErr := tx.TTL(key + "_fallback")
+			ttlFallback = ttl
+			return ttlErr
+		}), "buntdb view for fallback TTL must succeed")
+		require.Greater(t, ttlFallback, 22*time.Hour,
+			"SetWithTtl(ttl=0) should fall back to doc 24h TTL, got %v", ttlFallback)
+	})
 }

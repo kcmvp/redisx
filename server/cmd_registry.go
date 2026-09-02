@@ -43,14 +43,12 @@ func normalizeIndexPathFields(rawMap map[string]any) ([]string, error) {
 //
 // JSON payload must match the public x.Schema fields; unknown fields
 // are rejected (via json.Decoder.DisallowUnknownFields) to avoid silent
-// typos like "indexes" on the payload (the review guard below
-// explicitly catches `"indexes"` first so users are told to use REGIDX
-// rather than generic "unknown field").
+// typos.
 //
-// Semantic validation (field types, TTL positive, pk+attribute paths
-// unique, ValidateDocLogicalNamespace compliance) lives inside
-// db.writeDocSpec and is the SSoT for schema checks; cmd.go only does
-// JSON-shape + unknown-field guard.
+// Semantic validation (namespace shape via ValidateDocLogicalNamespace,
+// non-empty key-attr entries) lives inside db.writeDocSpec and is the
+// SSoT for schema checks; regSchemaCommand only does JSON-shape +
+// unknown-field guard before delegating to writeDocSpec.
 //
 // Internal-NS Write Guard doesn't apply here because REGSCH itself IS
 // the designated ctrl write path for `_doc_:` meta keys — wire
@@ -66,21 +64,15 @@ func regSchemaCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.P
 		conn.WriteError("ERR REGSCH invalid JSON format")
 		return
 	}
-	var rawMap map[string]any
-	if err := json.Unmarshal([]byte(rawJSON), &rawMap); err != nil {
-		conn.WriteError("ERR REGSCH invalid JSON: " + err.Error())
-		return
-	}
-	if _, has := rawMap["indexes"]; has {
-		conn.WriteError("ERR REGSCH schema contains reserved field 'indexes'; register indexes via REGIDX, not inside REGSCH payload")
-		return
-	}
 	var spec docSpec
 	dec := json.NewDecoder(strings.NewReader(rawJSON))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
 		conn.WriteError("ERR REGSCH schema: " + err.Error())
 		return
+	}
+	if spec.TTL <= 0 {
+		spec.TTL = -1
 	}
 	if err := db.writeDocSpec(spec); err != nil {
 		conn.WriteError("ERR REGSCH " + err.Error())

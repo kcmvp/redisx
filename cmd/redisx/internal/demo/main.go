@@ -25,9 +25,9 @@ func main() {
 		"app", cfg.App.Addr(),
 		"ctrl", cfg.Ctrl.Addr(),
 	)
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
-		slog.Error("StartWithConfig returned nil (Validate fatal above, refusing to continue)")
+		slog.Error("StartWith returned nil (Validate fatal above, refusing to continue)")
 		os.Exit(1)
 	}
 

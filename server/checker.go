@@ -191,8 +191,27 @@ func (db *DB) lookupDocByStorageNs(storageNs string) (lookedUpDoc, bool) {
 	return lookedUpDoc{Spec: spec, StorageNs: storageNs}, true
 }
 
+// autoTTLFromKey resolves the effective TTL for a SET/SETEX performed on a
+// user KV storage key (i.e. a key whose *storage-layer* name already
+// follows the ns:rest convention). It is the KV-path mirror of the
+// doc-path finalTTL calculation in cmd_set.go and must share exactly
+// equivalent semantics.
+//
+// Resolution rules (SSoT, identical for KV and doc paths):
+//  1. If the caller supplied an explicit TTL that is NOT zero → use it
+//     verbatim, even if it is negative. A caller-supplied -1 means
+//     "force permanent, do NOT use the schema default", just like the
+//     doc-path SET/PUT callers. Previously this rule was `explicit > 0`
+//     which caused KV callers passing -1 to fall through to the schema
+//     default TTL, contradicting the caller's intent (FM-fix).
+//  2. Otherwise (explicit == 0, i.e. caller did not pass a TTL flag)
+//     fall back to the document-schema default TTL for this storage
+//     namespace, if a schema is registered.
+//  3. No schema registered / internal namespace / malformed key →
+//     return 0, meaning "no TTL, permanent" (caller then passes 0
+//     through setOptionsForTTL → nil SetOptions → permanent storage).
 func (db *DB) autoTTLFromKey(fullStorageKey string, explicit time.Duration) time.Duration {
-	if explicit > 0 {
+	if explicit != 0 {
 		return explicit
 	}
 	ns, _, err := naming.SplitStorageKey(fullStorageKey)

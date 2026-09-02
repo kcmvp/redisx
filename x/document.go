@@ -96,7 +96,14 @@ type Schema interface {
 	KeyAttrs() []string
 	// TTL returns the default document TTL. It is applied automatically by
 	// SetWithTtl / SetNXWithTtl whenever the caller passes an explicit
-	// TTL of 0. Pass 0 to mean "no default TTL".
+	// TTL of 0.
+	//
+	// The returned value is always either -1 (permanent / no default TTL)
+	// or a strictly-positive duration. Callers never observe the Go zero
+	// value 0; the three public entry points (RegisterSchema,
+	// regSchemaCommand, writeDocSpec) all coalesce any non-positive input
+	// to -1 before the value is stored or validated, so MD5 canonical
+	// fingerprints are version-stable across entry points.
 	TTL() time.Duration
 }
 
@@ -113,6 +120,92 @@ type Document interface {
 	// RawJSON returns the raw JSON payload carried by this document
 	// instance. For a zero-value alias (e.g. UserDoc("")) it returns "".
 	RawJSON() string
+}
+
+// ============================================================
+// Schema factory: typed constructor with basic format validation.
+// Namespace conflict detection is handled at the server layer
+// via writeDocSpec storageNs dedup.
+// ============================================================
+
+type registeredSchema struct {
+	namespace string
+	mem       bool
+	keyAttrs  []string
+	ttl       time.Duration
+}
+
+func (s registeredSchema) Namespace() string  { return s.namespace }
+func (s registeredSchema) Mem() bool          { return s.mem }
+func (s registeredSchema) KeyAttrs() []string { return append([]string(nil), s.keyAttrs...) }
+func (s registeredSchema) TTL() time.Duration { return s.ttl }
+
+var _ Schema = registeredSchema{}
+
+// Validate runs the full input-validation contract over any Schema value.
+// It is the single source of truth for ALL schema-validity checks across
+// both code paths:
+//   - Go SDK callers via RegisterSchema (panics on invalid input)
+//   - Wire/REGSCH callers via server.writeDocSpec (returns ERR to client)
+//
+// TTL normalisation (any non-positive value → -1) runs BEFORE Validate at
+// every entry point, so Validate itself always observes TTL ∈ {-1} ∪ ℝ⁺.
+// The set of checks performed here (in order, fail-fast on first hit):
+//  1. Namespace shape via naming.ValidateDocLogicalNamespace
+//  2. At least one key attr (len(KeyAttrs) > 0)
+//  3. No empty-string entries inside KeyAttrs
+//  4. No duplicate entries inside KeyAttrs
+//
+// Any Schema type that passes Validate is, by definition, a well-formed
+// document schema acceptable at both the SDK factory layer and the server
+// registry persistence layer. Callers do NOT need to re-run these checks.
+func Validate(s Schema) error {
+	if err := naming.ValidateDocLogicalNamespace(s.Namespace()); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+	ttl := s.TTL()
+	if ttl < -1 {
+		return fmt.Errorf("schema: ttl %v is invalid (must be >= -1)", ttl)
+	}
+	keyAttrs := s.KeyAttrs()
+	if len(keyAttrs) == 0 {
+		return errors.New("schema: at least one keyAttr is required")
+	}
+	seen := map[string]bool{}
+	for i, attr := range keyAttrs {
+		if attr == "" {
+			return fmt.Errorf("schema: keyAttrs[%d] is empty", i)
+		}
+		if seen[attr] {
+			return fmt.Errorf("schema: keyAttrs contains duplicate entry %q", attr)
+		}
+		seen[attr] = true
+	}
+	return nil
+}
+
+// RegisterSchema creates a Schema bound to a concrete Document type T.
+// Panics on invalid input. Returns a Schema value whose 4 accessors
+// return the registered values.
+//
+// Input validation is delegated entirely to [Validate] (the SSoT); this
+// function only wraps the returned error in a panic so that SDK-side
+// factory errors are fail-fast at program boot (no silent corruption of
+// the registry later).
+func RegisterSchema[T Document](namespace string, mem bool, ttl time.Duration, keyAttrs ...string) Schema {
+	if ttl <= 0 {
+		ttl = -1
+	}
+	s := registeredSchema{
+		namespace: namespace,
+		mem:       mem,
+		keyAttrs:  append([]string(nil), keyAttrs...),
+		ttl:       ttl,
+	}
+	if err := Validate(s); err != nil {
+		panic(fmt.Sprintf("RegisterSchema: %v", err))
+	}
+	return s
 }
 
 // Index describes one declared JSON BTree index. Instances are normally
@@ -166,29 +259,23 @@ func StorageKey[D Document](d D) (string, error) {
 // RESP / CLI / HTTP). All shape decisions are delegated to the naming SSoT;
 // the x package never writes any separator literal directly.
 //
-// Returns an error if D declares an invalid namespace (per
-// [ValidateDocLogicalNamespace]), a KeyAttrs path is empty, or any declared
-// KeyAttr is missing from the provided raw JSON payload.
+// Returns an error if any declared KeyAttr is missing from the
+// provided raw JSON payload.
+//
+// All structural Schema integrity invariants (namespace shape per
+// naming.ValidateDocLogicalNamespace, non-empty keyAttr set, no
+// empty entries, no duplicates, TTL ∈ {-1} ∪ ℝ⁺) are enforced once
+// at registration time via [Validate] and assumed true here (SSoT).
+// Callers that construct Schema values manually (not via the
+// RegisterSchema factory) MUST invoke [Validate] themselves BEFORE
+// calling [Key].
 func Key[D Schema](rawJSON string) (string, error) {
 	var d D
 	ns := d.Namespace()
 	mem := d.Mem()
-
-	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
-		return "", fmt.Errorf("document namespace invalid: %w", err)
-	}
 	paths := d.KeyAttrs()
-	for _, p := range paths {
-		if p == "" {
-			return "", fmt.Errorf("key attr path is empty")
-		}
-	}
 
 	storageNs := naming.BuildStorageNs(ns, mem)
-
-	if len(paths) == 0 {
-		return naming.BuildStorageKey(storageNs, ""), nil
-	}
 
 	parts := make([]string, 0, len(paths))
 	for _, path := range paths {
@@ -212,19 +299,17 @@ func keyAttrValue(result gjson.Result) string {
 	return result.String()
 }
 
-func validateStorageNs[D Document]() string {
+// validateStorageNs is the internal routing primitive used by
+// [StorageKeyValue] and [StorageNsKeyPattern]. It produces the canonical
+// mem/disk-scoped storage namespace header for document type D.
+//
+// Schema integrity invariants (namespace shape, non-empty KeyAttr set, no
+// empty KeyAttr entries, no duplicate entries, TTL ∈ {-1} ∪ ℝ⁺) are
+// enforced once at Schema registration time via [Validate] and assumed
+// true here (SSoT).
+func validateStorageNs[D Schema]() string {
 	var d D
-	ns := d.Namespace()
-	mem := d.Mem()
-	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
-		panic(fmt.Sprintf("x.validateStorageNs: %v", err))
-	}
-	for _, p := range d.KeyAttrs() {
-		if p == "" {
-			panic("x.validateStorageNs: document key attr path is empty")
-		}
-	}
-	return naming.BuildStorageNs(ns, mem)
+	return naming.BuildStorageNs(d.Namespace(), d.Mem())
 }
 
 // StorageKeyValue joins a resolved key value with the document namespace

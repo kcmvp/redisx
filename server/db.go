@@ -70,7 +70,7 @@ func (db *DB) rawMem() *buntdb.DB {
 // are persisted on disk under `_auth_:app_0` and `_auth_:ctrl_0`. These are
 // the keys printed on the bootstrap banner whenever any slot was generated.
 // Empty strings are returned for slots that have not been written yet
-// (should never happen after a successful StartWithConfig bootstrap).
+// (should never happen after a successful StartWith bootstrap).
 // SSoT = direct DB read from `_auth_` namespace, no in-memory cache.
 func (db *DB) EffectiveAuthKeys() (app_0, ctrl_0 string) {
 	if db == nil || db.disk == nil {
@@ -120,7 +120,7 @@ func (db *DB) Close() error {
 //     Update tx) iff the slot's value differs from what was on disk (no-op
 //     reads are never persisted).
 //  4. `anyGenerated` is true if at least one slot had to be randomly produced
-//     this call; callers (srv.StartWithConfig) use this flag to decide whether
+//     this call; callers (srv.StartWith) use this flag to decide whether
 //     to print the credentials banner to stdout.
 //
 // No dual-port distinctness invariant is enforced here; equality between the

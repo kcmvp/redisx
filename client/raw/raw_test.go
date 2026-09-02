@@ -98,7 +98,7 @@ func (s *RawTestSuite) SetupSuite() {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	rawTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg, rawTestUserDoc(""))
+	db := server.StartWith(cfg, rawTestUserDoc(""))
 	s.Require().NotNil(db)
 
 	seedRawTestServer(s.T(), db, rawTestServerAddr)

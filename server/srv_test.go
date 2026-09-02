@@ -203,9 +203,9 @@ func (s *ServerTestSuite) TestConnectionLimits() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: alp},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctlP},
 	}
-	db := StartWithConfig(acfg)
+	db := StartWith(acfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", alp, ctlP)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", alp, ctlP)
 	}
 	addr := acfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
@@ -298,9 +298,9 @@ func (s *ServerTestSuite) TestDynamicAuthLimitRefresh() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: dynApp},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: dynCtl},
 	}
-	db := StartWithConfig(dynCfg)
+	db := StartWith(dynCfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", dynApp, dynCtl)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", dynApp, dynCtl)
 	}
 	addr := dynCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 1)
@@ -370,9 +370,9 @@ func (s *ServerTestSuite) TestAuthSameConnectionDoesNotDoubleCount() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: sameApp},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: sameCtl},
 	}
-	db := StartWithConfig(sameCfg)
+	db := StartWith(sameCfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", sameApp, sameCtl)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", sameApp, sameCtl)
 	}
 	addr := sameCfg.Ctrl.Addr()
 	seedAuthKeyLimit(t, db, testExternalAuthKey, 2)
@@ -511,7 +511,7 @@ func (s *ServerTestSuite) TestStartStorageFailure() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	db := StartWithConfig(cfg)
+	db := StartWith(cfg)
 	s.Nil(db)
 	s.True(exitCalled)
 
@@ -545,7 +545,7 @@ func (s *ServerTestSuite) TestStartListenAndServeFailure() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	db := StartWithConfig(cfg)
+	db := StartWith(cfg)
 	s.NotNil(db) // DB opens successfully, but background listen fails
 
 	select {
@@ -643,12 +643,14 @@ func (s *ServerTestSuite) TestStop() {
 func (s *ServerTestSuite) TestStartListenError() {
 	t := s.T()
 
-	// We use an atomic flag to track if exit was called
-	var exitCalled atomic.Bool
+	exitCh := make(chan int, 1)
 
 	globalMu.Lock()
 	osExitFn = func(code int) {
-		exitCalled.Store(true)
+		select {
+		case exitCh <- code:
+		default:
+		}
 	}
 
 	listenCalledCh := make(chan string, 2)
@@ -661,7 +663,6 @@ func (s *ServerTestSuite) TestStartListenError() {
 	}
 	globalMu.Unlock()
 
-	// Make sure the Start completes execution before the test finishes
 	doneCh := make(chan struct{})
 	go func() {
 		lp1, lp2 := testutil.AllocateTwoFreePorts(t)
@@ -670,28 +671,27 @@ func (s *ServerTestSuite) TestStartListenError() {
 			App:      AppConfig{Bind: "127.0.0.1", Port: lp1},
 			Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: lp2},
 		}
-		_ = StartWithConfig(lcfg)
+		_ = StartWith(lcfg)
 		close(doneCh)
 	}()
 
 	select {
 	case <-listenCalledCh:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("StartWithConfig should invoke listenAndServeFn for either App or Ctrl listener")
+		t.Fatal("StartWith should invoke listenAndServeFn for either App or Ctrl listener")
 	}
 
-	// Wait for goroutine to fully finish and call osExitFn
+	select {
+	case code := <-exitCh:
+		require.Equal(t, 1, code, "osExitFn must be called with exit code 1 on listen error")
+	case <-time.After(2 * time.Second):
+		t.Fatal("osExitFn was not invoked within timeout on listen error")
+	}
+
 	select {
 	case <-doneCh:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("StartWithConfig goroutine did not complete")
-	}
-
-	// Small sleep to ensure the osExitFn callback finishes execution
-	time.Sleep(10 * time.Millisecond)
-
-	if !exitCalled.Load() {
-		t.Error("expected osExitFn to be called on listen error")
+	case <-time.After(1 * time.Second):
+		t.Fatal("StartWith goroutine did not complete after exit hook fired")
 	}
 }
 
@@ -717,7 +717,7 @@ func (s *ServerTestSuite) TestStartInvokesListener() {
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	startCtrlAddr := cfg.Ctrl.Addr()
-	_ = StartWithConfig(cfg)
+	_ = StartWith(cfg)
 
 	gotAddrs := map[string]struct{}{}
 	timeout := time.After(500 * time.Millisecond)
@@ -735,7 +735,7 @@ loop:
 		for k := range gotAddrs {
 			keys = append(keys, k)
 		}
-		t.Fatalf("StartWithConfig() listener called with %v; want ctrl addr %q present among them", keys, startCtrlAddr)
+		t.Fatalf("StartWith() listener called with %v; want ctrl addr %q present among them", keys, startCtrlAddr)
 	}
 }
 
@@ -744,7 +744,7 @@ func (s *ServerTestSuite) TestStartUsesPrivateAddr() {
 	_ = t
 	// Legacy behavior "StartForTest("") → default to privateAddr" is obsolete
 	// because StartForTest was removed. The equivalent modern path is
-	// StartWithConfig with Ctrl.Port explicitly set to 16380 — exercised by
+	// StartWith with Ctrl.Port explicitly set to 16380 — exercised by
 	// TestStartInvokesListener above.
 }
 
@@ -789,9 +789,9 @@ func (s *ServerTestSuite) TestAppPortHasNoAuthNsPrivilege() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: appAuth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrlAuth},
 	}
-	db := StartWithConfig(cfg)
+	db := StartWith(cfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig nil; appP=%d ctrlP=%d", appP, ctrlP)
+		t.Fatalf("StartWith nil; appP=%d ctrlP=%d", appP, ctrlP)
 	}
 	defer func() { _ = Stop() }()
 	time.Sleep(15 * time.Millisecond)
@@ -922,9 +922,9 @@ func (s *ServerTestSuite) TestAuthPortRoleKeyBinding() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appP, Auth: app0Auth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlP, Auth: ctrl0Auth},
 	}
-	db := StartWithConfig(cfg)
+	db := StartWith(cfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil")
+		t.Fatalf("StartWith returned nil")
 	}
 	defer func() { _ = Stop() }()
 

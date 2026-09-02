@@ -64,6 +64,23 @@ func (p docSpec) storageNs() string {
 	return naming.BuildStorageNs(p.Namespace, p.Mem)
 }
 
+// asSchema returns an x.Schema view over docSpec so that the SSoT
+// x.Validate function can be invoked without requiring docSpec to
+// directly implement x.Schema (which is blocked because field names
+// clash with Go method names in Go).
+func (p docSpec) asSchema() x.Schema {
+	return schemaAdapter{p: p}
+}
+
+type schemaAdapter struct{ p docSpec }
+
+func (a schemaAdapter) Namespace() string  { return a.p.Namespace }
+func (a schemaAdapter) Mem() bool          { return a.p.Mem }
+func (a schemaAdapter) KeyAttrs() []string { return append([]string(nil), a.p.KeyAttrs...) }
+func (a schemaAdapter) TTL() time.Duration { return a.p.TTL }
+
+var _ x.Schema = schemaAdapter{}
+
 // FullName returns the canonical composite key used for idx meta-keys and the
 // buntdb native index handle: "<ownerNs>!_!<logical>".
 func (i idxSpec) fullName() string { return naming.BuildIdxFullName(i.OwnerNs, i.Logical) }
@@ -279,16 +296,11 @@ func deleteIdxSpecMeta(tx *buntdb.Tx, idxFullName string) error {
 //     under docRegMu (no partial state on disk-write failure).
 //   - CreatedAt preserved across upgrades; UpdatedAt bumped only on change.
 func (db *DB) writeDocSpec(spec docSpec) error {
-	if spec.Namespace == "" {
-		return errors.New("writeDocSpec: namespace is required")
+	if spec.TTL <= 0 {
+		spec.TTL = -1
 	}
-	if err := naming.ValidateDocLogicalNamespace(spec.Namespace); err != nil {
+	if err := x.Validate(spec.asSchema()); err != nil {
 		return fmt.Errorf("writeDocSpec: %w", err)
-	}
-	for i, p := range spec.KeyAttrs {
-		if p == "" {
-			return fmt.Errorf("writeDocSpec: key_attrs[%d] is empty", i)
-		}
 	}
 	storageNs := spec.storageNs()
 	versionHex, err := canonicalDocMD5(spec)
@@ -491,7 +503,7 @@ func (db *DB) registerIndexes(indexes ...x.Index) error {
 
 // loadIndexes scans disk+mem layers for persisted idx meta keys and mounts
 // every idxSpec found. Intentionally runs BEFORE serving begins (openDB →
-// StartWithConfig bootstrap). Caller holds idxRegMu for the entire pass.
+// StartWith bootstrap). Caller holds idxRegMu for the entire pass.
 //
 // The "no multi-version" invariant applies here: writeIndexSpec always
 // deletes the prior meta key before writing the new one, so AscendKeys only
