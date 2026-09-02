@@ -1528,7 +1528,7 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 			{"invalid json", [][]string{{"regsch", "{bad"}}, "ERR REGSCH invalid JSON format", ""},
 			{"unknown field", [][]string{{"regsch", `{"namespace":"regcmdx","zzz":1}`}}, "ERR REGSCH schema:", ""},
 			{"invalid namespace underscore", [][]string{{"regsch", sch("_bad", false, "id")}}, "ERR REGSCH writeDocSpec:", ""},
-			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: key_attrs[1] is empty", ""},
+			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: schema: keyAttrs[1] is empty", ""},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
