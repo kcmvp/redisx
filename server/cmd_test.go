@@ -1297,7 +1297,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	t.Run("Doc_REGSCH_reserved_indexes_field_ERR", func(t *testing.T) {
 		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", bad}})
-		require.Contains(t, resp, "reserved field 'indexes'")
+		require.Contains(t, resp, `json: unknown field "indexes"`)
 	})
 
 	t.Run("Doc_SET_object_ok", func(t *testing.T) {
