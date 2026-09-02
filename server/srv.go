@@ -123,7 +123,7 @@ var (
 	srvOnce          sync.Once
 )
 
-// StartWithConfig boots a redisx dual-port server from a Go-native Config
+// StartWith boots a redisx dual-port server from a Go-native Config
 // struct and eagerly registers any passed doc schemas before listeners
 // accept traffic. It is the single Go-API counterpart to Start (which loads
 // redisx.yaml from disk).
@@ -149,7 +149,7 @@ var (
 //     · Both slots PRESENT → silent load, zero logs.
 //     · Exactly ONE slot present → hard FATAL "_auth_ namespace corrupted"
 //     requiring operator intervention (delete partial key or wipe db file).
-//   - cfg.App.Auth / cfg.Ctrl.Auth set explicitly (yaml or StartWithConfig)
+//   - cfg.App.Auth / cfg.Ctrl.Auth set explicitly (yaml or StartWith)
 //     → BootstrapAuth's seed parameters ALWAYS win. Non-empty seeds are
 //     written unconditionally to their respective storage slots, with a
 //     slog.Info when an existing DB value is being overwritten. If the
@@ -167,10 +167,10 @@ var (
 //	    Ctrl: server.CtrlConfig{Bind: "127.0.0.1", Port: 7381, DangerBindAny: true},
 //	    DataPath: "/tmp/redisx.test.db",
 //	}
-//	db := server.StartWithConfig(cfg, UserDoc(""))
+//	db := server.StartWith(cfg, UserDoc(""))
 //	_ = db
 //	defer server.Stop()
-func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
+func StartWith(cfg *Config, schemas ...x.Schema) *DB {
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -260,7 +260,7 @@ func StartWithConfig(cfg *Config, schemas ...x.Schema) *DB {
 // Ctrl 7381 on 127.0.0.1, and database file at ~/.redisx/redisx.db.
 //
 // To supply a Config struct directly (e.g. from tests or harnesses) instead
-// of loading a file, use StartWithConfig.
+// of loading a file, use StartWith.
 func Start(schemas ...x.Schema) *DB {
 	cfg, err := LoadConfig("redisx.yaml")
 	if err != nil {
@@ -270,7 +270,7 @@ func Start(schemas ...x.Schema) *DB {
 		}
 		return nil
 	}
-	return StartWithConfig(cfg, schemas...)
+	return StartWith(cfg, schemas...)
 }
 
 func Stop() error {

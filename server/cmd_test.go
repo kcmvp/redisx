@@ -85,9 +85,9 @@ func (s *CmdTestSuite) TestCmd() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	s.db = StartWithConfig(cfg)
+	s.db = StartWith(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	s.addr = cfg.Ctrl.Addr()
 	if err := s.db.writeDocSpec(docSpec{
@@ -600,9 +600,9 @@ func (s *CmdTestSuite) TestPubSub() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	db := StartWithConfig(cfg)
+	db := StartWith(cfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	addr := cfg.Ctrl.Addr()
 	defer func() { _ = Stop() }()
@@ -748,9 +748,9 @@ func (s *CmdTestSuite) TestXCmd() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
-	s.db = StartWithConfig(cfg)
+	s.db = StartWith(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	s.addr = cfg.Ctrl.Addr()
 	if err := s.db.writeDocSpec(docSpec{
@@ -1184,9 +1184,9 @@ func (s *CmdTestSuite) TestStrictGates() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	s.db = StartWithConfig(cfg)
+	s.db = StartWith(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil for strict gates; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil for strict gates; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	appAddr := cfg.App.Addr()
 	ctrlAddr := cfg.Ctrl.Addr()
@@ -1297,7 +1297,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 	t.Run("Doc_REGSCH_reserved_indexes_field_ERR", func(t *testing.T) {
 		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", bad}})
-		require.Contains(t, resp, "reserved field 'indexes'")
+		require.Contains(t, resp, `json: unknown field "indexes"`)
 	})
 
 	t.Run("Doc_SET_object_ok", func(t *testing.T) {
@@ -1487,9 +1487,9 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: "regcmd-app-key"},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	s.db = StartWithConfig(cfg)
+	s.db = StartWith(cfg)
 	if s.db == nil {
-		t.Fatalf("StartWithConfig returned nil for registry commands; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil for registry commands; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	ctrlAddr := cfg.Ctrl.Addr()
 
@@ -1528,7 +1528,7 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 			{"invalid json", [][]string{{"regsch", "{bad"}}, "ERR REGSCH invalid JSON format", ""},
 			{"unknown field", [][]string{{"regsch", `{"namespace":"regcmdx","zzz":1}`}}, "ERR REGSCH schema:", ""},
 			{"invalid namespace underscore", [][]string{{"regsch", sch("_bad", false, "id")}}, "ERR REGSCH writeDocSpec:", ""},
-			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: key_attrs[1] is empty", ""},
+			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: schema: keyAttrs[1] is empty", ""},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -1537,6 +1537,33 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 				if tc.wantNot != "" {
 					require.NotContains(t, resp, tc.wantNot)
 				}
+			})
+		}
+	})
+
+	t.Run("REGSCH_ttl_default", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			ns      string
+			payload string
+			wantTTL time.Duration
+		}{
+			{"absent ttl_ns defaults to permanent -1", "regttlns",
+				`{"namespace":"regttlns","mem":false,"key_attrs":["id"]}`, -1},
+			{"null ttl_ns defaults to permanent -1", "regttlnull",
+				`{"namespace":"regttlnull","mem":false,"key_attrs":["id"],"ttl_ns":null}`, -1},
+			{"explicit ttl_ns 0 normalises to permanent -1", "regttlzero",
+				`{"namespace":"regttlzero","mem":false,"key_attrs":["id"],"ttl_ns":0}`, -1},
+			{"explicit ttl_ns 5s stays 5s", "regttl5s",
+				`{"namespace":"regttl5s","mem":false,"key_attrs":["id"],"ttl_ns":5000000000}`, 5 * time.Second},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Contains(t, runRESP([][]string{{"regsch", tc.payload}}), "+OK\r\n")
+				spec, exists, err := s.db.loadDocSpec(naming.BuildStorageNs(tc.ns, false))
+				require.NoError(t, err)
+				require.True(t, exists)
+				require.Equal(t, tc.wantTTL, spec.TTL)
 			})
 		}
 	})
@@ -1768,9 +1795,9 @@ func (s *CmdTestSuite) bootServerFor(appAuth, ctrlAuth string) (appAddr, ctrlAdd
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	db = StartWithConfig(cfg)
+	db = StartWith(cfg)
 	if db == nil {
-		t.Fatalf("StartWithConfig returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+		t.Fatalf("StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
 	return cfg.App.Addr(), cfg.Ctrl.Addr(), db
 }

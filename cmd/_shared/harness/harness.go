@@ -94,9 +94,9 @@ func NewHarness(t *testing.T, opt HarnessOpts) *Harness {
 		opt.AppBindIP, appPort, opt.CtrlBindIP, ctrlPort, dbPath,
 		opt.AppAuth, opt.CtrlAuth, opt.CtrlTrustProxy, opt.CtrlDangerBindAny)
 
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
-		t.Fatalf("harness: StartWithConfig returned nil (Validate fatal; check slog output above)")
+		t.Fatalf("harness: StartWith returned nil (Validate fatal; check slog output above)")
 	}
 	t.Cleanup(func() { _ = server.Stop() })
 

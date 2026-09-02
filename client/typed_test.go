@@ -158,7 +158,7 @@ func ensureServerAndSeed(t *testing.T) {
 			Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 		}
 		clientTestServerAddr = cfg.Ctrl.Addr()
-		db := server.StartWithConfig(cfg,
+		db := server.StartWith(cfg,
 			testUserDoc(""),
 			SearchFixtureDoc(""),
 			UpdateFixtureDoc(""),
@@ -270,7 +270,7 @@ func (s *ClientTestSuite) SetupSuite() {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg,
+	db := server.StartWith(cfg,
 		testUserDoc(""),
 		SearchFixtureDoc(""),
 		UpdateFixtureDoc(""),
@@ -605,7 +605,7 @@ func (s *ClientTestSuite) TestRegisterSchema() {
 		}, true, "ERR REGSCH schema"},
 		{"reserved field indexes rejected", func() error {
 			return RegisterSchemaFromJSON(`{"namespace":"p1x","indexes":[]}`)
-		}, true, "reserved field 'indexes'"},
+		}, true, `json: unknown field "indexes"`},
 	}
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
@@ -916,9 +916,9 @@ func runEmbedSignalChild(t *testing.T) {
 		App:      server.AppConfig{Bind: ctrlHost, Port: appPort},
 		Ctrl:     server.CtrlConfig{Bind: ctrlHost, Port: ctrlPort},
 	}
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
-		t.Fatalf("server.StartWithConfig() returned nil; appPort=%d ctrlPort=%d — likely a bind race, retry", appPort, ctrlPort)
+		t.Fatalf("server.StartWith() returned nil; appPort=%d ctrlPort=%d — likely a bind race, retry", appPort, ctrlPort)
 	}
 
 	if err := ConnectEmbedded(); err != nil {
@@ -2087,7 +2087,7 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	require.NotNil(t, db)
 	defer func() {
 		stopAndResetGlobalState()
@@ -2137,7 +2137,7 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	require.NotNil(t, db)
 	defer func() {
 		stopAndResetGlobalState()
@@ -2310,7 +2310,7 @@ func BenchmarkSetNoHooks(b *testing.B) {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
@@ -2350,7 +2350,7 @@ func BenchmarkSetWithObserverHooks(b *testing.B) {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
@@ -2390,7 +2390,7 @@ func BenchmarkSetWithAbortHook(b *testing.B) {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}
@@ -2432,7 +2432,7 @@ func BenchmarkSetWithTransformHook(b *testing.B) {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: 36380},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWithConfig(cfg)
+	db := server.StartWith(cfg)
 	if db == nil {
 		b.Fatal("embedded server Start returned nil")
 	}

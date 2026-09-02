@@ -216,14 +216,6 @@ func (bareMemPrefixDoc) KeyAttrs() []string { return []string{"id"} }
 func (u bareMemPrefixDoc) RawJSON() string  { return string(u) }
 func (bareMemPrefixDoc) TTL() time.Duration { return time.Hour }
 
-type emptyKeyAttrDoc string
-
-func (emptyKeyAttrDoc) Namespace() string  { return "userempty" }
-func (emptyKeyAttrDoc) Mem() bool          { return false }
-func (emptyKeyAttrDoc) KeyAttrs() []string { return []string{""} }
-func (u emptyKeyAttrDoc) RawJSON() string  { return string(u) }
-func (emptyKeyAttrDoc) TTL() time.Duration { return time.Hour }
-
 type multiKeyDoc string
 
 func (multiKeyDoc) Namespace() string  { return "tenantuser" }
@@ -255,14 +247,6 @@ func (memBoolKeyDoc) Mem() bool          { return true }
 func (memBoolKeyDoc) KeyAttrs() []string { return []string{"enabled"} }
 func (u memBoolKeyDoc) RawJSON() string  { return string(u) }
 func (memBoolKeyDoc) TTL() time.Duration { return time.Hour }
-
-type invalidNsDoc string
-
-func (invalidNsDoc) Namespace() string  { return "_bad_ns" }
-func (invalidNsDoc) Mem() bool          { return false }
-func (invalidNsDoc) KeyAttrs() []string { return []string{"id"} }
-func (u invalidNsDoc) RawJSON() string  { return string(u) }
-func (invalidNsDoc) TTL() time.Duration { return time.Hour }
 
 func TestStorageKeyValue(t *testing.T) {
 	tests := []struct {
@@ -342,14 +326,6 @@ func TestStorageKeyValue(t *testing.T) {
 				})
 			},
 		},
-		{
-			name: "rejects empty key attr path during registration",
-			run: func(t *testing.T) {
-				require.Panics(t, func() {
-					StorageKeyValue[emptyKeyAttrDoc]("201")
-				})
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -417,13 +393,6 @@ func TestStorageKey(t *testing.T) {
 				return StorageKey(boolKeyDoc(`{"enabled":false}`))
 			},
 			want: "flagdoc:0",
-		},
-		{
-			name: "rejects empty key attr path",
-			run: func() (string, error) {
-				return StorageKey(emptyKeyAttrDoc(`{"id":"202"}`))
-			},
-			wantErr: "key attr path is empty",
 		},
 		{
 			name: "rejects missing key attr",
@@ -608,20 +577,6 @@ func TestKey(t *testing.T) {
 			want: "_m_:flagdoc:0",
 		},
 		{
-			name: "returns error when namespace is invalid",
-			run: func() (string, error) {
-				return Key[invalidNsDoc](`{"id":"1"}`)
-			},
-			wantErr: "document namespace invalid:",
-		},
-		{
-			name: "returns error for empty key attr path",
-			run: func() (string, error) {
-				return Key[emptyKeyAttrDoc](`{"id":"1"}`)
-			},
-			wantErr: "key attr path is empty",
-		},
-		{
 			name: "returns error for missing key attr",
 			run: func() (string, error) {
 				return Key[userDoc](`{"name":"Bob"}`)
@@ -647,9 +602,6 @@ func TestStorageNsKeyPattern(t *testing.T) {
 	require.Equal(t, "user:tenant:*", StorageNsKeyPattern[userDoc]("tenant:*"))
 	require.Equal(t, "_m_:user:*", StorageNsKeyPattern[memUserDoc]("*"))
 	require.Equal(t, "tenantuser:*", StorageNsKeyPattern[multiKeyDoc]("*"))
-	require.Panics(t, func() {
-		StorageNsKeyPattern[invalidNsDoc]("*")
-	})
 }
 
 func TestValidateKeyPattern(t *testing.T) {
@@ -791,4 +743,341 @@ func TestScopeKeyRange(t *testing.T) {
 		require.Error(t, derr)
 		require.ErrorContains(t, derr, "unknown key range op")
 	})
+}
+
+// ============================================================
+// Schema factory tests (RegisterSchema)
+// ============================================================
+
+type regSchemaDocA string
+
+func (regSchemaDocA) Namespace() string  { return "regschemaa" }
+func (regSchemaDocA) Mem() bool          { return false }
+func (regSchemaDocA) KeyAttrs() []string { return []string{"id"} }
+func (r regSchemaDocA) RawJSON() string  { return string(r) }
+func (regSchemaDocA) TTL() time.Duration { return time.Hour }
+
+type legacyDoc string
+
+func (legacyDoc) Namespace() string  { return "legacy" }
+func (legacyDoc) Mem() bool          { return false }
+func (legacyDoc) KeyAttrs() []string { return []string{"id"} }
+func (l legacyDoc) RawJSON() string  { return string(l) }
+func (legacyDoc) TTL() time.Duration { return time.Hour }
+
+func TestRegisterSchema(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "returns schema with correct accessors",
+			run: func(t *testing.T) {
+				schema := RegisterSchema[regSchemaDocA]("regschemaa", false, time.Hour, "id")
+				require.Equal(t, "regschemaa", schema.Namespace())
+				require.False(t, schema.Mem())
+				require.Equal(t, []string{"id"}, schema.KeyAttrs())
+				require.Equal(t, time.Hour, schema.TTL())
+			},
+		},
+		{
+			name: "keyAttrs deep copy guards against input mutation",
+			run: func(t *testing.T) {
+				schema := RegisterSchema[regSchemaDocA]("regschemaa", false, time.Hour, "tenant", "id")
+				require.Equal(t, []string{"tenant", "id"}, schema.KeyAttrs())
+			},
+		},
+		{
+			name: "legacy zero-value Document still satisfies Schema",
+			run: func(t *testing.T) {
+				var doc legacyDoc
+				var schema Schema = doc
+				require.Equal(t, "legacy", schema.Namespace())
+				require.False(t, schema.Mem())
+				require.Equal(t, []string{"id"}, schema.KeyAttrs())
+				require.Equal(t, time.Hour, schema.TTL())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.run(t)
+		})
+	}
+}
+
+type validationTestDoc string
+
+func (validationTestDoc) Namespace() string  { return "test" }
+func (validationTestDoc) Mem() bool          { return false }
+func (validationTestDoc) KeyAttrs() []string { return []string{"id"} }
+func (v validationTestDoc) RawJSON() string  { return string(v) }
+func (validationTestDoc) TTL() time.Duration { return time.Hour }
+
+func TestRegisterSchema_Validation(t *testing.T) {
+	tests := []struct {
+		name         string
+		namespace    string
+		mem          bool
+		ttl          time.Duration
+		keyAttrs     []string
+		panicMsg     string
+		wantFinalTTL time.Duration
+	}{
+		{
+			name:      "rejects empty namespace",
+			namespace: "",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "namespace is required",
+		},
+		{
+			name:      "rejects namespace with underscore",
+			namespace: "user_admin",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "contains '_'",
+		},
+		{
+			name:      "rejects namespace with colon",
+			namespace: "user:admin",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "contains one of the reserved characters",
+		},
+		{
+			name:      "rejects namespace with wildcard",
+			namespace: "user*admin",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "contains one of the reserved characters",
+		},
+		{
+			name:      "rejects namespace starting with digit",
+			namespace: "1user",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "starts with lowercase letter",
+		},
+		{
+			name:      "rejects namespace exceeding 63 chars",
+			namespace: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "1-63 lowercase-letter-or-digit chars",
+		},
+		{
+			name:         "accepts ttl -1 (permanent)",
+			namespace:    "validns",
+			mem:          false,
+			ttl:          -1,
+			keyAttrs:     []string{"id"},
+			wantFinalTTL: -1,
+		},
+		{
+			name:         "accepts ttl 0 (no default, normalised to -1)",
+			namespace:    "validns",
+			mem:          false,
+			ttl:          0,
+			keyAttrs:     []string{"id"},
+			wantFinalTTL: -1,
+		},
+		{
+			name:         "accepts negative ttl (normalised to -1)",
+			namespace:    "validns",
+			mem:          false,
+			ttl:          -2 * time.Second,
+			keyAttrs:     []string{"id"},
+			wantFinalTTL: -1,
+		},
+		{
+			name:      "rejects no keyAttrs",
+			namespace: "validns",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{},
+			panicMsg:  "at least one keyAttr is required",
+		},
+		{
+			name:      "rejects empty keyAttr entry",
+			namespace: "validns",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{""},
+			panicMsg:  "keyAttrs contains empty entry",
+		},
+		{
+			name:      "rejects duplicate keyAttr entries",
+			namespace: "validns",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id", "id"},
+			panicMsg:  "keyAttrs contains duplicate entry",
+		},
+		{
+			name:      "accepts valid single keyAttr",
+			namespace: "validns",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "",
+		},
+		{
+			name:      "accepts valid composite keyAttrs",
+			namespace: "validns",
+			mem:       false,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"tenant", "id"},
+			panicMsg:  "",
+		},
+		{
+			name:      "accepts mem=true",
+			namespace: "validns",
+			mem:       true,
+			ttl:       time.Hour,
+			keyAttrs:  []string{"id"},
+			panicMsg:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.panicMsg != "" {
+				require.Panics(t, func() {
+					RegisterSchema[validationTestDoc](tt.namespace, tt.mem, tt.ttl, tt.keyAttrs...)
+				})
+			} else {
+				schema := RegisterSchema[validationTestDoc](tt.namespace, tt.mem, tt.ttl, tt.keyAttrs...)
+				require.Equal(t, tt.namespace, schema.Namespace())
+				require.Equal(t, tt.mem, schema.Mem())
+				wantTTL := tt.ttl
+				if tt.wantFinalTTL != 0 || tt.ttl <= 0 {
+					wantTTL = tt.wantFinalTTL
+				}
+				require.Equal(t, wantTTL, schema.TTL())
+				require.Equal(t, tt.keyAttrs, schema.KeyAttrs())
+			}
+		})
+	}
+}
+
+type validateUnitSchema struct {
+	ns       string
+	mem      bool
+	ttl      time.Duration
+	keyAttrs []string
+	json     string
+}
+
+func (v validateUnitSchema) Namespace() string  { return v.ns }
+func (v validateUnitSchema) Mem() bool          { return v.mem }
+func (v validateUnitSchema) KeyAttrs() []string { return v.keyAttrs }
+func (v validateUnitSchema) RawJSON() string    { return v.json }
+func (v validateUnitSchema) TTL() time.Duration { return v.ttl }
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name      string
+		schema    validateUnitSchema
+		errPhrase string
+	}{
+		{
+			name: "accepts canonical valid schema",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: []string{"id"},
+			},
+		},
+		{
+			name: "accepts ttl=-1 (permanent)",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: -1, keyAttrs: []string{"id"},
+			},
+		},
+		{
+			name: "accepts ttl=0 (no default; zero value)",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: 0, keyAttrs: []string{"id"},
+			},
+		},
+		{
+			name: "accepts mem=true",
+			schema: validateUnitSchema{
+				ns: "users", mem: true, ttl: time.Hour, keyAttrs: []string{"id"},
+			},
+		},
+		{
+			name: "accepts composite key attrs",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: []string{"tenant", "id"},
+			},
+		},
+		{
+			name: "rejects empty namespace",
+			schema: validateUnitSchema{
+				ns: "", mem: false, ttl: time.Hour, keyAttrs: []string{"id"},
+			},
+			errPhrase: "namespace is required",
+		},
+		{
+			name: "rejects namespace with underscore",
+			schema: validateUnitSchema{
+				ns: "user_admin", mem: false, ttl: time.Hour, keyAttrs: []string{"id"},
+			},
+			errPhrase: "contains '_'",
+		},
+		{
+			name: "rejects ttl less than -1",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: -2 * time.Second, keyAttrs: []string{"id"},
+			},
+			errPhrase: "ttl -2s is invalid",
+		},
+		{
+			name: "rejects empty keyAttrs slice",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: []string{},
+			},
+			errPhrase: "at least one keyAttr is required",
+		},
+		{
+			name: "rejects nil keyAttrs",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: nil,
+			},
+			errPhrase: "at least one keyAttr is required",
+		},
+		{
+			name: "rejects empty string entry in keyAttrs",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: []string{"id", "", "tenant"},
+			},
+			errPhrase: "keyAttrs[1] is empty",
+		},
+		{
+			name: "rejects duplicate keyAttrs",
+			schema: validateUnitSchema{
+				ns: "users", mem: false, ttl: time.Hour, keyAttrs: []string{"tenant", "id", "tenant"},
+			},
+			errPhrase: "keyAttrs contains duplicate entry \"tenant\"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Validate(tt.schema)
+			if tt.errPhrase == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errPhrase)
+			}
+		})
+	}
 }
