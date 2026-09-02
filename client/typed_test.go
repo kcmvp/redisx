@@ -605,7 +605,7 @@ func (s *ClientTestSuite) TestRegisterSchema() {
 		}, true, "ERR REGSCH schema"},
 		{"reserved field indexes rejected", func() error {
 			return RegisterSchemaFromJSON(`{"namespace":"p1x","indexes":[]}`)
-		}, true, "reserved field 'indexes'"},
+		}, true, `json: unknown field "indexes"`},
 	}
 	for _, tc := range tests {
 		s.Run(tc.name, func() {
