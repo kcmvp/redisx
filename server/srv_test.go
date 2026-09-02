@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/kcmvp/redisx/internal/privateip"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/x"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/redcon"
@@ -1059,10 +1059,10 @@ func readKeyOrEmptyInternal(t *testing.T, db *DB, slot string) string {
 
 func TestSetupDB(t *testing.T) {
 	tests := []struct {
-		name      string
-		dbPath    string
-		schemas   []x.Schema
-		wantOK    bool
+		name    string
+		dbPath  string
+		schemas []x.Schema
+		wantOK  bool
 	}{
 		{
 			name:   "normal path",
