@@ -2747,7 +2747,7 @@ func (s *DocTestSuite) TestAll_TABLE_DRIVEN() {
 	for _, tc := range tests {
 		tc := tc
 		s.Run(tc.name, func() {
-			res := All[UserDoc](tc.filters...)
+			res := All[UserDoc](false, tc.filters...)
 			s.Require().NoError(res.Error())
 			got := res.MustGet()
 
@@ -2759,6 +2759,24 @@ func (s *DocTestSuite) TestAll_TABLE_DRIVEN() {
 			s.Equal(tc.wantIDs, gotIDs)
 		})
 	}
+
+	s.Run("descending_is_reverse_of_ascending", func() {
+		asc := All[UserDoc](false)
+		s.Require().NoError(asc.Error())
+		ascDocs := asc.MustGet()
+		s.Require().Len(ascDocs, len(fixtures))
+
+		desc := All[UserDoc](true)
+		s.Require().NoError(desc.Error())
+		descDocs := desc.MustGet()
+		s.Require().Len(descDocs, len(ascDocs))
+
+		for i := range ascDocs {
+			s.Equal(string(ascDocs[i]), string(descDocs[len(ascDocs)-1-i]),
+				"index %d: All(true)[%d] must equal All(false)[%d] reversed",
+				i, len(ascDocs)-1-i, i)
+		}
+	})
 }
 
 func krDocID(id string) string  { return id }

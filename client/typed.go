@@ -366,6 +366,14 @@ func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 	return raw.Keys(fullKeyPattern)
 }
 
+// SearchIndex queries documents in namespace D through a secondary index.
+//
+// Ordering is by the **indexed field value** (ascending when desc=false,
+// descending when desc=true); ties within a single index value are broken
+// by the primary storage key lexicographically. The passed KeyRange scopes
+// which owner-document primary keys participate in the index scan; pass
+// [x.KeysPattern] with "<ns>:*" to scan the whole namespace through the
+// index. nil or empty filter is treated as "match every scanned row".
 func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if scopedKR == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
@@ -393,6 +401,13 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 	return mo.Ok(out)
 }
 
+// SearchKey queries documents in namespace D by primary storage-key range.
+//
+// Ordering is by the **primary storage key** (namespace:pk concatenation)
+// in lexicographic order — ascending when desc=false, descending when
+// desc=true. nil or empty filter is treated as "return every row in the
+// key range". Use [x.Between], [x.Prefix], [x.KeysPattern] or [x.Key] to
+// build the scoped KeyRange.
 func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if scopedKR == nil {
 		return mo.Err[[]D](errors.New("key range is required"))
@@ -415,7 +430,15 @@ func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 	return mo.Ok(out)
 }
 
-func All[D x.Document](filters ...x.Filter) mo.Result[[]D] {
+// All returns every document currently stored in namespace D.
+//
+// It is pure sugar over [SearchKey] with the key range set to
+// "<storageNs>:*" — as a direct consequence, ordering is by the
+// **primary storage key** (namespace:pk concatenation) in
+// lexicographic order: ascending when desc=false, descending when
+// desc=true. Any number of optional Filter arguments are AND-combined
+// together; passing none matches every row.
+func All[D x.Document](desc bool, filters ...x.Filter) mo.Result[[]D] {
 	fullKR := x.KeysPattern(x.StorageNsKeyPattern[D]("*"))
 
 	var filter x.Filter
@@ -423,7 +446,7 @@ func All[D x.Document](filters ...x.Filter) mo.Result[[]D] {
 		filter = x.And(filters...)
 	}
 
-	res := raw.SearchKey(fullKR, filter, false)
+	res := raw.SearchKey(fullKR, filter, desc)
 	if res.IsError() {
 		return mo.Err[[]D](res.Error())
 	}

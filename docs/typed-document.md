@@ -63,6 +63,27 @@ is one document-scoped sub-range:
 Typed helpers reject already-prefixed storage patterns such as
 `user:*`, because the namespace is already derived from `D`.
 
+### Ordering and the `desc` flag
+
+`SearchKey`, `SearchIndex`, and `All` all accept a final (or first, for
+`All`) boolean `desc` parameter controlling sort direction:
+
+| Function | Ordered by | `desc=false` | `desc=true` |
+|---|---|---|---|
+| `client.SearchKey[D](kr, filter, desc)` | **Primary storage key** (`<ns>:<pk>`) in lexicographic order | Ascending | Descending |
+| `client.SearchIndex[D](idx, kr, filter, desc)` | **Indexed field value** (ascending); ties within one value broken by primary storage key lexicographically | Ascending | Descending |
+| `client.All[D](desc, filters…)` | **Primary storage key** — `All` is pure sugar over `SearchKey` with `kr = x.KeysPattern("*")` | Ascending | Descending |
+
+Example:
+
+```go
+// Every user, primary-key ascending (same as SearchKey(kr, nil, false))
+users := client.All[UserDoc](false).MustGet()
+
+// Every user, primary-key descending — NEW with the v2 All signature
+usersDesc := client.All[UserDoc](true).MustGet()
+```
+
 ### Indexed search
 
 `client.SearchIndex[D]` applies the same document-scoped rule to both
