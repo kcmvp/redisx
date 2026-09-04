@@ -45,6 +45,8 @@ about.
 
 ## Start it in 30 seconds
 
+Unstructured KV first — no schema needed:
+
 ```go
 db := server.Start()
 defer server.Stop()
@@ -68,6 +70,88 @@ $ redis-cli -p 7379
 1) user:1
 2) user:2
 ```
+
+## Typed documents in 30 seconds
+
+For real apps, define a schema **once** with `x.RegisterSchema`, then
+derive a 5-method `Document` type. `redisx` auto-derives storage keys,
+writes with the correct default TTL, and routes mem vs disk based on the
+`mem` flag you set at registration time.
+
+```go
+package main
+
+import (
+    "time"
+
+    "github.com/kcmvp/redisx/client"
+    "github.com/kcmvp/redisx/server"
+    "github.com/kcmvp/redisx/x"
+)
+
+// 1. Register the schema (call once at init or boot time).
+//    x.RegisterSchema[T](namespace, mem, ttl, keyAttrs...)
+//    - namespace = "agg"   → storage key prefix "agg:"
+//    - mem       = true    → layer is "_m_:agg:" (hot path in RAM)
+//    - ttl       = 910s    → every write auto-expires in ~15 min
+//    - keyAttrs  = symbol, tradeTime, aggId  → PK = agg:<symbol>:<tradeTime>:<aggId>
+var AggTradeSchema = x.RegisterSchema[x.Document](
+    "agg",
+    true,
+    910*time.Second,
+    "symbol", "tradeTime", "aggId",
+)
+
+// 2. One type alias + 5 lines implements x.Document.
+//    RawJSON() simply IS the string (zero-copy). The other 4 methods
+//    delegate to the already-registered schema — no duplication.
+type AggTrade string
+
+func (a AggTrade) KeyAttrs() []string    { return AggTradeSchema.KeyAttrs() }
+func (a AggTrade) Mem() bool             { return AggTradeSchema.Mem() }
+func (a AggTrade) Namespace() string     { return AggTradeSchema.Namespace() }
+func (a AggTrade) RawJSON() string       { return string(a) }
+func (a AggTrade) TTL() time.Duration    { return AggTradeSchema.TTL() }
+
+func main() {
+    // 3. Start the server. Pass schemas directly to Start — they are
+    //    registered server-side before the listener opens, so client
+    //    writes always land on a known namespace. Start() reads
+    //    redisx.yaml from CWD if present, or uses system defaults
+    //    (ports 7379 app / 7381 ctrl, loopback bind, data at ~/.redisx).
+    db := server.Start(AggTradeSchema)
+    defer server.Stop()
+    if db == nil {
+        panic("redisx failed to start")
+    }
+
+    // 4. Bridge the typed client to the in-process server — no ports,
+    //    no auth keys, no yaml required. ConnectEmbedded() auto-picks
+    //    the ctrl listener that Start just opened and authenticates
+    //    with the shared per-process internal key. For cross-process
+    //    remote clients, use client.Connect(addr, auth) instead.
+    if err := client.ConnectEmbedded(); err != nil {
+        panic(err)
+    }
+
+    // 5. Writes — storage key auto-built from JSON attrs + schema keyAttrs.
+    //    TTL auto-applied from the schema (910 s).
+    _ = client.Set(AggTrade(`{"symbol":"BTCUSDT","tradeTime":1710000000000,"aggId":1,"price":68000}`))
+    _ = client.Set(AggTrade(`{"symbol":"BTCUSDT","tradeTime":1710000000001,"aggId":2,"price":68001}`))
+
+    // 6. Queries — typed reads return []AggTrade (not strings).
+    //    Ordering is by primary storage key; pass true for DESC.
+    recent := client.All[AggTrade](true).MustGet()   // DESC by key → newest first
+    older  := client.All[AggTrade](false).MustGet()  // ASC  by key → oldest first
+    _ = recent
+    _ = older
+}
+```
+
+That's it. One registration, one 5-liner type, and every `Set` /
+`Get` / `All` / `SearchKey` / `SearchIndex` call is fully typed,
+routed to the right layer, and auto-TTL'd.
+
 
 ## What else can it do?
 
