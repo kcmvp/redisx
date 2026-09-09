@@ -2572,6 +2572,17 @@ func (s *DocTestSuite) TestTypedWritesRespectDocumentTTL() {
 	s.Require().Error(err)
 }
 
+func (s *DocTestSuite) TestTypedSetWithTTLOverridesDocumentTTL() {
+	doc := UserDoc(`{"id":"ttl-override","name":"override"}`)
+	err := SetWithTTL(doc, 60*time.Millisecond)
+	s.Require().NoError(err)
+
+	time.Sleep(120 * time.Millisecond)
+
+	_, err = Get[UserDoc]("ttl-override")
+	s.Require().Error(err)
+}
+
 func (s *DocTestSuite) TestSearchIndexRejectsPrefixedStoragePattern() {
 	res := SearchIndex[UserDoc]("age", x.KeysPattern("user:*"), nil, false)
 	s.Require().True(res.IsError())

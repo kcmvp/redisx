@@ -334,20 +334,28 @@ func Get[D x.Document](key string) (D, error) {
 	return D(val), nil
 }
 
-func Set[D x.Document](d D) error {
+func SetWithTTL[D x.Document](d D, ttl time.Duration) error {
 	key, err := x.StorageKey(d)
 	if err != nil {
 		return err
 	}
-	return raw.SetWithTTL(key, d.RawJSON(), d.TTL())
+	return raw.SetWithTTL(key, d.RawJSON(), ttl)
 }
 
-func SetNX[D x.Document](d D) (bool, error) {
+func Set[D x.Document](d D) error {
+	return SetWithTTL(d, d.TTL())
+}
+
+func SetNXWithTTL[D x.Document](d D, ttl time.Duration) (bool, error) {
 	key, err := x.StorageKey(d)
 	if err != nil {
 		return false, err
 	}
-	return raw.SetNXWithTTL(key, d.RawJSON(), d.TTL())
+	return raw.SetNXWithTTL(key, d.RawJSON(), ttl)
+}
+
+func SetNX[D x.Document](d D) (bool, error) {
+	return SetNXWithTTL(d, d.TTL())
 }
 
 func Delete[D x.Document](d D) (bool, error) {
