@@ -23,7 +23,7 @@ const outputBufferSize = 512
 const (
 	websocketPingTimeout = 10 * time.Second
 	websocketPongTimeout = 10 * time.Second
-	websocketTimeout     = 600 * time.Second
+	websocketTimeout     = 60 * time.Second
 )
 
 var (
