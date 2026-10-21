@@ -5,7 +5,7 @@
 # AUTH keys are pinned here for the local demo (deterministic credentials for
 # tests / CI / CLI shortcuts). When left empty, on FIRST startup (brand-new DB
 # file) the server generates 2× crypto-rand hex keys, stores them under
-# "_auth_:app" and "_auth_:ctrl", prints a one-shot banner to stdout
+# "_auth_:app_0" and "_auth_:ctrl_0", prints a one-shot banner to stdout
 # containing both, and never re-prints on subsequent runs.
 
 app:

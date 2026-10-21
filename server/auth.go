@@ -192,6 +192,38 @@ func gate2_AuthKeyMatch(conn redcon.Conn, cmdName string, db *DB) (reject bool) 
 	return false
 }
 
+// connAuthenticated reports whether the connection has already completed AUTH
+// (or the equivalent HELLO ... AUTH). The identity lives in the connection
+// context, so its scope is one connection: a reconnect starts anonymous and
+// must authenticate again, exactly like native Redis.
+func connAuthenticated(conn redcon.Conn) bool {
+	ctx := conn.Context()
+	if ctx == nil {
+		return false
+	}
+	key, _ := ctx.(string)
+	return key != ""
+}
+
+// portAuthRequired reports whether the listener role the connection arrived on
+// has any AUTH key configured — i.e. whether anonymous commands must be refused.
+// A storage read failure fails closed (authRequired=true), so unauthenticated
+// clients cannot slip through on a transient storage I/O hiccup.
+func portAuthRequired(db *DB, role portRole) (authRequired bool, err error) {
+	appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
+	if err != nil {
+		return true, err
+	}
+	switch role {
+	case portRoleCtrl:
+		return len(ctrlValues) > 0, nil
+	case portRoleApp:
+		return len(appValues) > 0, nil
+	default:
+		return len(appValues) > 0 || len(ctrlValues) > 0, nil
+	}
+}
+
 // gate1_NoAuthNsAccessOnAppPort is the #1 filter in the command pipeline.
 // If the connection is the app port and the command touches any `_auth_:*`
 // key — either as a literal key (Arg1 has the _auth_: prefix) OR via a

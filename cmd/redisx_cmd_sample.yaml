@@ -24,7 +24,7 @@ app:
   bind: ""
   # AUTH key for the business port. Pass with -a when CLI is pointed at the
   # app port. On first server startup this key is auto-generated and stored
-  # under "_auth_:app"; leave empty when operating against a standard
+  # under "_auth_:app_0"; leave empty when operating against a standard
   # redisx deploy (see redis_srv_sample.yaml for bootstrap semantics).
   auth: ""
 
@@ -37,7 +37,7 @@ ctrl:
   # Default server-side value: "127.0.0.1"
   bind: "127.0.0.1"
   # AUTH key for the control-plane port. Pass with -a when the CLI is
-  # pointed at the ctrl port. Auto-generated and stored under "_auth_:ctrl"
+  # pointed at the ctrl port. Auto-generated and stored under "_auth_:ctrl_0"
   # on first server startup; see redis_srv_sample.yaml bootstrap notes.
   auth: ""
   # Informational mirror of server config (read-only reference for the

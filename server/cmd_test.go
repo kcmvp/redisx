@@ -169,10 +169,88 @@ func (s *CmdTestSuite) TestCmd() {
 			wantClosed: true,
 		},
 		{
-			name:        "hello command",
+			// This boot requires AUTH (bootstrap generates keys), so a bare HELLO
+			// is refused with Redis' NOAUTH wording instead of being served.
+			name:       "hello command",
+			auth:       false,
+			commands:   [][]string{{cmdHello}},
+			wantErrors: []string{"NOAUTH HELLO must be called with the client already authenticated"},
+		},
+		{
+			name:      "hello reports the protocol actually in use",
+			auth:      true,
+			commands:  [][]string{{cmdHello, "2"}},
+			wantBulks: []string{"proto", "2", "server", "redisx"},
+		},
+		{
+			name:       "hello with unsupported proto is rejected",
+			auth:       false,
+			commands:   [][]string{{cmdHello, "9"}},
+			wantErrors: []string{"NOPROTO unsupported protocol version"},
+		},
+		{
+			name:       "hello with unknown option is rejected",
+			auth:       false,
+			commands:   [][]string{{cmdHello, "2", "BOGUS"}},
+			wantErrors: []string{"ERR syntax error in HELLO option 'BOGUS'"},
+		},
+		{
+			name:      "hello inline auth on RESP2",
+			auth:      false,
+			commands:  [][]string{{cmdHello, "2", "AUTH", defaultUsername, internalAuthKey}},
+			wantBulks: []string{"proto", "2", "server", "redisx"},
+		},
+		{
+			name:      "hello inline auth on RESP3 still answers proto 2",
+			auth:      false,
+			commands:  [][]string{{cmdHello, "3", "AUTH", defaultUsername, internalAuthKey}},
+			wantBulks: []string{"proto", "2", "server", "redisx"},
+		},
+		{
+			// A failed inline HELLO AUTH keeps the socket open on purpose:
+			// go-redis falls back to the legacy `AUTH <password>` on the same
+			// connection, so the diagnostic must reach the client instead of a
+			// bare EOF. The trailing bare HELLO is followed by another answer on
+			// that same socket — proof the connection survived — and reports the
+			// session is still anonymous.
+			name:       "hello inline auth with unknown username is rejected",
+			auth:       false,
+			commands:   [][]string{{cmdHello, "2", "AUTH", "root", internalAuthKey}, {cmdHello, "2"}},
+			wantErrors: []string{"WRONGPASS invalid username-password pair or user is disabled.", "NOAUTH HELLO must be called with the client already authenticated"},
+			wantClosed: false,
+		},
+		{
+			name:       "hello inline auth with bad key stays unauthenticated",
+			auth:       false,
+			commands:   [][]string{{cmdHello, "2", "AUTH", defaultUsername, "wrong-key"}, {cmdHello, "2"}},
+			wantErrors: []string{"ERR authentication failed", "NOAUTH HELLO must be called with the client already authenticated"},
+			wantClosed: false,
+		},
+		{
+			name:        "auth ACL form with default user succeeds",
 			auth:        false,
-			commands:    [][]string{{cmdHello}},
-			wantStrings: []string{}, // WriteAny doesn't populate strings/bulks in mockConn currently
+			commands:    [][]string{{cmdAuth, defaultUsername, internalAuthKey}},
+			wantStrings: []string{"OK"},
+		},
+		{
+			name:       "auth ACL form with unknown username is rejected",
+			auth:       false,
+			commands:   [][]string{{cmdAuth, "root", internalAuthKey}},
+			wantErrors: []string{"WRONGPASS invalid username-password pair or user is disabled."},
+			wantClosed: true,
+		},
+		{
+			name:       "client maint notifications is rejected",
+			auth:       false,
+			commands:   [][]string{{cmdClient, "maint_notifications", "on", "internal-ip"}},
+			wantErrors: []string{"MAINT_NOTIFICATIONS"},
+		},
+		{
+			name:        "client setinfo is accepted after hello",
+			auth:        true,
+			commands:    [][]string{{cmdHello, "2"}, {cmdClient, "setinfo", "lib-name", "redisx-test"}},
+			wantBulks:   []string{"proto", "2"},
+			wantStrings: []string{"OK"},
 		},
 		{
 			name:        "client command",
@@ -2148,8 +2226,46 @@ func (s *CmdTestSuite) TestPortRoleGates() {
 	appAddr, ctrlAddr, _ := s.bootServerFor(appAuth, ctrlAuth)
 
 	s.Run("auth argc wrong closes conn", func() {
-		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"auth", appAuth, "extra"}})
+		// Four tokens match neither `AUTH <pass>` nor `AUTH <user> <pass>`.
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"auth", defaultUsername, appAuth, "extra"}})
 		s.Contains(resp, "ERR authentication failed")
+	})
+
+	s.Run("auth acl form authenticates on app port", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{
+			{"auth", defaultUsername, appAuth},
+			{"set", "authacl:ok", "v"},
+		})
+		s.Contains(resp, "+OK\r\n")
+	})
+
+	s.Run("auth acl form with unknown user is rejected", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"auth", "root", appAuth}})
+		s.Contains(resp, "WRONGPASS invalid username-password pair or user is disabled.")
+	})
+
+	s.Run("hello without inline auth on auth-required port answers NOAUTH", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"hello", "3"}})
+		s.Contains(resp, "NOAUTH HELLO must be called with the client already authenticated")
+	})
+
+	s.Run("hello with inline auth authenticates in one round trip", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{
+			{"hello", "2", "auth", defaultUsername, appAuth},
+			{"set", "helloone:ok", "v"},
+		})
+		s.Contains(resp, "$5\r\nproto\r\n")
+		s.Contains(resp, "+OK\r\n")
+	})
+
+	s.Run("hello with ctrl key on app port rejected", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"hello", "2", "auth", defaultUsername, ctrlAuth}})
+		s.Contains(resp, "WRONGPASS invalid or wrong auth key for app port")
+	})
+
+	s.Run("client maint notifications rejected", func() {
+		resp := respRoundTrip(s.T(), ctrlAddr, ctrlAuth, [][]string{{"client", "maint_notifications", "on", "internal-ip"}})
+		s.Contains(resp, "MAINT_NOTIFICATIONS")
 	})
 
 	s.Run("auth with ctrl key on app port rejected", func() {
