@@ -2258,9 +2258,46 @@ func (s *CmdTestSuite) TestPortRoleGates() {
 		s.Contains(resp, "+OK\r\n")
 	})
 
+	s.Run("hello without proto still accepts auth and setname", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{
+			{"hello", "auth", defaultUsername, appAuth, "setname", "demo-client"},
+			{"set", "helloomitproto:ok", "v"},
+		})
+		s.Contains(resp, "$5\r\nproto\r\n")
+		s.Contains(resp, "+OK\r\n")
+	})
+
+	s.Run("hello auth missing password is syntax error", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"hello", "2", "auth", defaultUsername}})
+		s.Contains(resp, "ERR syntax error in HELLO")
+	})
+
+	s.Run("hello setname missing value is syntax error", func() {
+		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"hello", "2", "setname"}})
+		s.Contains(resp, "ERR syntax error in HELLO")
+	})
+
 	s.Run("hello with ctrl key on app port rejected", func() {
 		resp := respRoundTrip(s.T(), appAddr, "", [][]string{{"hello", "2", "auth", defaultUsername, ctrlAuth}})
 		s.Contains(resp, "WRONGPASS invalid or wrong auth key for app port")
+	})
+
+	s.Run("hello same key after auth is idempotent", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{
+			{"hello", "2", "auth", defaultUsername, appAuth},
+			{"set", "hellosamekey:ok", "v"},
+		})
+		s.Contains(resp, "$5\r\nproto\r\n")
+		s.Contains(resp, "+OK\r\n")
+	})
+
+	s.Run("hello different key after auth keeps current session", func() {
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{
+			{"hello", "2", "auth", defaultUsername, "some-other-key"},
+			{"set", "helloreauth:ok", "v"},
+		})
+		s.Contains(resp, "ERR connection already authenticated")
+		s.Contains(resp, "+OK\r\n")
 	})
 
 	s.Run("client maint notifications rejected", func() {
@@ -2315,4 +2352,32 @@ func (s *CmdTestSuite) TestPortRoleGates() {
 		s.Contains(resp, "+OK\r\n")
 		s.Contains(resp, "$1\r\nv\r\n")
 	})
+}
+
+func TestParseAuthArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantUser string
+		wantKey  string
+		wantOK   bool
+	}{
+		{name: "legacy auth form", args: []string{"AUTH", "secret"}, wantUser: "", wantKey: "secret", wantOK: true},
+		{name: "acl auth form", args: []string{"AUTH", "default", "secret"}, wantUser: "default", wantKey: "secret", wantOK: true},
+		{name: "invalid argc", args: []string{"AUTH", "default", "secret", "extra"}, wantUser: "", wantKey: "", wantOK: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := redcon.Command{Args: make([][]byte, 0, len(tc.args))}
+			for _, arg := range tc.args {
+				cmd.Args = append(cmd.Args, []byte(arg))
+			}
+
+			gotUser, gotKey, gotOK := parseAuthArgs(cmd)
+			if gotUser != tc.wantUser || gotKey != tc.wantKey || gotOK != tc.wantOK {
+				t.Fatalf("parseAuthArgs() = (%q, %q, %v), want (%q, %q, %v)", gotUser, gotKey, gotOK, tc.wantUser, tc.wantKey, tc.wantOK)
+			}
+		})
+	}
 }

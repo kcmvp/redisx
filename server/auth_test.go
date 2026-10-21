@@ -337,13 +337,13 @@ func TestBootstrapAuth_IdempotentSeedsEqualPersisted(t *testing.T) {
 // gate2MockConn is a minimal mock for gate2 testing.
 type gate2MockConn struct {
 	redcon.Conn
-	ctx      any
-	lastErr  string
+	ctx     any
+	lastErr string
 }
 
-func (m *gate2MockConn) Context() any            { return m.ctx }
-func (m *gate2MockConn) WriteError(msg string)   { m.lastErr = msg }
-func (m *gate2MockConn) RemoteAddr() string      { return "127.0.0.1:0" }
+func (m *gate2MockConn) Context() any          { return m.ctx }
+func (m *gate2MockConn) WriteError(msg string) { m.lastErr = msg }
+func (m *gate2MockConn) RemoteAddr() string    { return "127.0.0.1:0" }
 
 func TestGate2_AuthKeyMatch(t *testing.T) {
 	db := mustOpenDB(t, mustTempDBFile(t, "gate2"))
@@ -495,4 +495,79 @@ func TestGate2_NoAuthConfigured(t *testing.T) {
 	if rejected {
 		t.Fatal("expected no rejection when auth not configured")
 	}
+}
+
+func TestConnAuthenticated(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  any
+		want bool
+	}{
+		{name: "nil context", ctx: nil, want: false},
+		{name: "wrong context type", ctx: 123, want: false},
+		{name: "empty string context", ctx: "", want: false},
+		{name: "non-empty auth key", ctx: "app-key-123", want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &gate2MockConn{ctx: tc.ctx}
+			if got := connAuthenticated(conn); got != tc.want {
+				t.Fatalf("connAuthenticated() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPortAuthRequired(t *testing.T) {
+	t.Run("reports auth requirement by role", func(t *testing.T) {
+		db := mustOpenDB(t, mustTempDBFile(t, "port-auth-required"))
+		if _, _, _, err := db.bootstrapAuth("app-key-123", "ctrl-key-456"); err != nil {
+			t.Fatalf("bootstrapAuth: %v", err)
+		}
+
+		tests := []struct {
+			name string
+			role portRole
+			want bool
+		}{
+			{name: "app role", role: portRoleApp, want: true},
+			{name: "ctrl role", role: portRoleCtrl, want: true},
+			{name: "unknown role", role: portRoleUnknown, want: true},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := portAuthRequired(db, tc.role)
+				if err != nil {
+					t.Fatalf("portAuthRequired() err = %v", err)
+				}
+				if got != tc.want {
+					t.Fatalf("portAuthRequired() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("storage read failure fails closed", func(t *testing.T) {
+		dbPath := mustTempDBFile(t, "port-auth-required-closed")
+		db := openDB(dbPath)
+		if db == nil {
+			t.Fatalf("openDB returned nil for %s", dbPath)
+		}
+		if _, _, _, err := db.bootstrapAuth("app-key-123", "ctrl-key-456"); err != nil {
+			t.Fatalf("bootstrapAuth: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close(): %v", err)
+		}
+
+		got, err := portAuthRequired(db, portRoleApp)
+		if err == nil {
+			t.Fatal("portAuthRequired() error = nil, want storage failure")
+		}
+		if !got {
+			t.Fatal("portAuthRequired() should fail closed and require auth on storage error")
+		}
+	})
 }
