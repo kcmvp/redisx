@@ -421,27 +421,16 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	// commands (REGSCH/REGIDX/DROPSCH/DROPIDX) are ordinary commands with
 	// exactly the same argc discipline as SET/GET/DEL.
 
-	if cmdName != cmdAuth && cmdName != cmdClient {
-		connAuthKey, _ := conn.Context().(string)
-		if conn.Context() == nil || connAuthKey == "" {
-			appValues, ctrlValues, _, _, err := loadAllAuthPortKeys(db)
+	// AUTH / CLIENT / HELLO are exempt from the anonymous-command gate: they are
+	// the commands that establish (AUTH, HELLO ... AUTH) or complete (CLIENT
+	// SETINFO right after HELLO) authentication. HELLO decides for itself, since
+	// it may carry inline credentials and knows how to answer NOAUTH.
+	if cmdName != cmdAuth && cmdName != cmdClient && cmdName != cmdHello {
+		if !connAuthenticated(conn) {
 			role := connPortRole(conn)
-			var authRequired bool
-			switch {
-			case err != nil:
-				// If storage read fails we fail-closed (require AUTH) so
-				// unauthenticated clients can't slip through on transient
-				// storage I/O hiccups.
-				authRequired = true
-			case role == portRoleCtrl:
-				authRequired = len(ctrlValues) > 0
-			case role == portRoleApp:
-				authRequired = len(appValues) > 0
-			default:
-				authRequired = len(appValues) > 0 || len(ctrlValues) > 0
-			}
+			authRequired, err := portAuthRequired(db, role)
 			if authRequired {
-				if cmdName == cmdHello || cmdName == cmdPing || cmdName == cmdQuit {
+				if cmdName == cmdPing || cmdName == cmdQuit {
 					conn.WriteError("NOAUTH authentication required")
 					slog.Warn("unauthenticated handshake/status command on port that requires AUTH",
 						"remote", conn.RemoteAddr(), "cmd", cmdName, "port_role", role.string(), "storage_error", err)

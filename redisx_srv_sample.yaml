@@ -15,12 +15,24 @@ app:
   # RFC1918 private IP, or fall back to 127.0.0.1. Default: (auto-detect)
   bind: ""
   # AUTH key for the business port. Empty = generated on FIRST startup and stored
-  # under the reserved "_auth_:app" namespace.
+  # under the reserved "_auth_:app_0" slot.
   #   · First run (brand-new DB) → generated once + banner printed to stdout ONCE
   #   · Subsequent runs → loaded silently from the DB
-  #   · Set explicitly here only when you need a DETERMINISTIC key (tests, CI,
-  #     key-roll pre-shared secret injection); an explicit value ALWAYS overwrites the DB
-  #     slot on collision).
+  #   · Set explicitly only when you need a DETERMINISTIC key (tests, CI,
+  #     pre-shared key roll, or a server that external clients must connect to).
+  #
+  # An explicit value ALWAYS wins over the stored slot, and the takeover is
+  # SILENT and IRREVERSIBLE:
+  #   · differing value → "_auth_:app_0" is OVERWRITTEN at startup and the old
+  #     key is lost for good (clients still holding it get WRONGPASS);
+  #   · NO banner is printed, because nothing was generated; the only trace is
+  #     "app_auth=explicit" in the startup log — easy to miss;
+  #   · clearing this field again does NOT revert to a generated key; the server
+  #     keeps serving the value you wrote ("app_auth=persisted").
+  # To rotate, edit this value and restart. To get a fresh RANDOM key instead,
+  # first delete the "_auth_:app_0" slot from the DB (or the whole DB file).
+  # Applies only when this config resolves to the SAME data_path as the previous
+  # run; a different data_path bootstraps a brand-new DB instead.
   auth: ""
 
 ctrl:
@@ -31,7 +43,7 @@ ctrl:
   # Default: "127.0.0.1"
   bind: "127.0.0.1"
   # AUTH key for the control-plane port. Same semantics as app.auth above; persisted
-  # under "_auth_:ctrl". See comments there.
+  # under "_auth_:ctrl_0". See comments there.
   auth: ""
   # Set to true when running behind a trusted L7 PROXY v2 + mTLS reverse proxy;
   # allows a non-loopback ctrl.bind without the danger flag.
@@ -56,5 +68,7 @@ logging:
 #  · port range MUST be 7001..65535
 #  · a non-loopback ctrl.bind is refused unless trust_proxy=true OR
 #    danger_bind_any=true
-#  · when both app.auth and ctrl.auth are set, they MUST be different strings
-#    (dual-port model requires separate credentials)
+#
+# —— Recommendations (NOT enforced) ——
+#  · app.auth and ctrl.auth SHOULD differ, so a key leaked from one port cannot
+#    be replayed against the other. Equal values are accepted.

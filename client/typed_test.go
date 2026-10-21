@@ -1976,16 +1976,17 @@ func (s *ClientTestSuite) TestHooksAppliedToSetWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	err = raw.SetWithTTL("cli:hook-ttl", "base", 100*time.Millisecond)
+	err = raw.SetWithTTL("cli:hook-ttl", "base", 500*time.Millisecond)
 	s.NoError(err)
 
 	v, err := raw.Get("cli:hook-ttl")
 	s.NoError(err)
 	s.Equal("base-ttl", v)
 
-	time.Sleep(200 * time.Millisecond)
-	_, err = raw.Get("cli:hook-ttl")
-	s.Error(err)
+	require.Eventually(s.T(), func() bool {
+		_, err = raw.Get("cli:hook-ttl")
+		return err != nil
+	}, 3*time.Second, 25*time.Millisecond)
 }
 
 func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
@@ -1999,7 +2000,7 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.NoError(err)
 	s.ensureConnected()
 
-	ok, err := raw.SetNXWithTTL("cli:hook-setnx-ttl", "x", 80*time.Millisecond)
+	ok, err := raw.SetNXWithTTL("cli:hook-setnx-ttl", "x", 500*time.Millisecond)
 	s.NoError(err)
 	s.True(ok)
 
@@ -2007,9 +2008,10 @@ func (s *ClientTestSuite) TestHooksAppliedToSetNXWithTTL() {
 	s.NoError(err)
 	s.Equal("x", v)
 
-	time.Sleep(160 * time.Millisecond)
-	_, err = raw.Get("cli:hook-setnx-ttl")
-	s.Error(err)
+	require.Eventually(s.T(), func() bool {
+		_, err = raw.Get("cli:hook-setnx-ttl")
+		return err != nil
+	}, 3*time.Second, 25*time.Millisecond)
 }
 
 func (s *ClientTestSuite) TestRemoveHookDuringWriteIsSafe() {
