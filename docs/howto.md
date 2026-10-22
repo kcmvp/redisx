@@ -290,10 +290,20 @@ connection.
 Go client:
 
 ```go
-ch := client.Subscribe("topic:user.updated").MustGet()
+ch, err := client.Subscribe("topic:user.updated").Get()
+if err != nil {
+    panic(err)
+}
 msg := <-ch
 _ = msg
 ```
+
+`Subscribe` is synchronous: it returns only after the server has
+acknowledged the subscription, so the returned channel is live. If the
+acknowledgement does not arrive before the timeout, the call fails and
+the topic is rolled back, so it is safe to retry. Calling it while the
+client is not connected fails immediately with `resp client is not
+connected`.
 
 ## JSON Query And Update Commands
 

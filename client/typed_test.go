@@ -234,6 +234,7 @@ func (s *ClientTestSuite) SetupTest() {
 
 	handlersMu.Lock()
 	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+	ackByTopic = make(map[string]chan struct{})
 	handlersMu.Unlock()
 
 	if prev := setSharedClient(nil); prev != nil {
@@ -247,8 +248,8 @@ func (s *ClientTestSuite) SetupTest() {
 	for len(pubChan) > 0 {
 		<-pubChan
 	}
-	for len(subscribeReqCh) > 0 {
-		<-subscribeReqCh
+	for len(subscribeNotifyCh) > 0 {
+		<-subscribeNotifyCh
 	}
 	atomic.StoreUint64(&pipeDrops, 0)
 
@@ -329,6 +330,16 @@ func (s *ClientTestSuite) ensureConnectedClientAndAuth() {
 }
 
 func (s *ClientTestSuite) TestSubscribeCommand() {
+	// An already-cancelled lifecycle context passes the connectivity gate but
+	// can never be acknowledged. That keeps the failure paths deterministic:
+	// no background reconnect loop can come alive under a dead context and
+	// silently acknowledge the subscription being tested.
+	stoppedLifecycle := func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		setLifecycleCtx(ctx, cancel)
+	}
+
 	tests := []struct {
 		name        string
 		topic       string
@@ -336,22 +347,51 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 		expectErr   bool
 		wantErrMsg  string
 		checkStored bool
+		checkAbsent bool
 	}{
-		{"Empty topic", "", nil, true, "topic is empty", false},
+		{"Empty topic", "", nil, true, "topic is empty", false, false},
+		{
+			"Not connected",
+			"orders_offline",
+			func() { setLifecycleCtx(nil, nil) },
+			true,
+			"not connected",
+			false,
+			true,
+		},
 		{
 			"Duplicate handler",
 			"orders",
-			func() { _ = Subscribe("orders") },
+			func() {
+				stoppedLifecycle()
+				handlersMu.Lock()
+				deliveryChByTopic["orders"] = make(chan *ReceivedMessage, bufferSize)
+				handlersMu.Unlock()
+			},
 			true,
 			"duplicated handler for topic",
+			false,
 			false,
 		},
 		{
 			"Success",
 			"orders_success",
-			nil,
+			func() { s.ensureConnectedClientAndAuth() },
 			false,
 			"",
+			true,
+			false,
+		},
+		{
+			// The topic is registered, then the client stops before the server
+			// acknowledges it: Subscribe must report failure and roll the
+			// registration back so the same topic can be retried.
+			"Stopped lifecycle rolls back",
+			"orders_stopped",
+			stoppedLifecycle,
+			true,
+			"client stopped before the subscription was acknowledged",
+			false,
 			true,
 		},
 	}
@@ -365,30 +405,64 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 
 			res := Subscribe(tc.topic)
 			if tc.expectErr {
-				s.True(res.IsError())
+				s.Require().True(res.IsError())
 				if tc.wantErrMsg != "" {
+					s.Require().NotNil(res.Error())
 					s.Contains(res.Error().Error(), tc.wantErrMsg)
 				}
 			} else {
-				s.False(res.IsError())
+				s.Require().False(res.IsError())
 				s.NotNil(res.MustGet())
 			}
 
-			if tc.checkStored {
-				handlersMu.RLock()
-				stored := deliveryChByTopic[tc.topic]
-				handlersMu.RUnlock()
-				s.NotNil(stored)
+			handlersMu.RLock()
+			stored := deliveryChByTopic[tc.topic]
+			handlersMu.RUnlock()
 
-				select {
-				case topic := <-subscribeReqCh:
-					s.Equal(tc.topic, topic)
-				default:
-					s.FailNow("subscribeReqCh should contain one subscription request")
-				}
+			if tc.checkStored {
+				s.NotNil(stored)
+			}
+			if tc.checkAbsent {
+				s.Nil(stored, "a failed Subscribe must not leave a registration behind")
 			}
 		})
 	}
+}
+
+func (s *ClientTestSuite) TestSubscribeAckTimeout() {
+	// Subscribe must report failure when the server never acknowledges within
+	// subscribeAckTimeout. A live server acks immediately, so the timeout is
+	// only reachable if no consumer can run at all.
+	//
+	// The dial below always fails: the lifecycle context has to be live to get
+	// past the connectivity gate, and this keeps that context from ever
+	// spawning a consumer (or a reconnect loop that later spawns one) which
+	// would acknowledge the subscription on our behalf.
+	origDial := internalDialForRespconnInternal
+	internalDialForRespconnInternal = func(o respconn.Options) (*respconn.DialResult, error) {
+		return nil, errors.New("dial disabled for the ack-timeout test")
+	}
+	defer func() { internalDialForRespconnInternal = origDial }()
+
+	origTimeout := subscribeAckTimeout
+	subscribeAckTimeout = 50 * time.Millisecond
+	defer func() { subscribeAckTimeout = origTimeout }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setLifecycleCtx(ctx, cancel)
+
+	res := Subscribe("orders_ack_timeout")
+	s.Require().True(res.IsError())
+	s.Require().NotNil(res.Error())
+	s.Contains(res.Error().Error(), "was not acknowledged within")
+
+	handlersMu.RLock()
+	stored := deliveryChByTopic["orders_ack_timeout"]
+	_, ackPending := ackByTopic["orders_ack_timeout"]
+	handlersMu.RUnlock()
+	s.Nil(stored, "a timed-out Subscribe must not leave a registration behind")
+	s.False(ackPending, "a timed-out Subscribe must not leave a pending ack channel behind")
 }
 
 func (s *ClientTestSuite) TestAuthCommand() {
@@ -1201,7 +1275,7 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 				handlersMu.Lock()
 				deliveryChByTopic["runtime-topic"] = runtimeHandler
 				handlersMu.Unlock()
-				subscribeReqCh <- "runtime-topic"
+				notifySubscribeChange()
 
 				deadline := time.After(2 * time.Second)
 				tick := time.NewTicker(30 * time.Millisecond)
@@ -1227,6 +1301,87 @@ func (s *ClientTestSuite) TestPubSubLifecycle() {
 				case <-time.After(2 * time.Second):
 					s.FailNow("consume() did not exit after cancel")
 				}
+			},
+		},
+		{
+			"ConsumeReconcilesCoalescedWakeUps",
+			func() {
+				client, _ := connect(clientTestServerAddr, clientTestExternalAuthKey)
+				s.T().Cleanup(func() { _ = client.Close() })
+
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- consume(ctx, client)
+				}()
+
+				// Let consume reach its main loop with an empty registry, so the
+				// topics below can only be picked up through the wake-up path.
+				time.Sleep(80 * time.Millisecond)
+
+				// Register one topic per wake-up, so the cap-1 signal has to
+				// coalesce them. Every topic must still be subscribed, because
+				// the consumer reconciles against the registry rather than
+				// draining a per-topic queue.
+				const topicCount = 5
+				handlers := make(map[string]chan *ReceivedMessage, topicCount)
+				topics := make([]string, 0, topicCount)
+				for i := 0; i < topicCount; i++ {
+					topic := fmt.Sprintf("coalesce-topic-%d", i)
+					ch := make(chan *ReceivedMessage, 1)
+					handlers[topic] = ch
+					topics = append(topics, topic)
+
+					handlersMu.Lock()
+					deliveryChByTopic[topic] = ch
+					handlersMu.Unlock()
+
+					notifySubscribeChange()
+				}
+
+				for _, topic := range topics {
+					payload := "payload-" + topic
+					tick := time.NewTicker(30 * time.Millisecond)
+					deadline := time.After(2 * time.Second)
+					delivered := false
+					for !delivered {
+						select {
+						case got := <-handlers[topic]:
+							s.Equal(topic, got.Channel)
+							s.Equal(payload, got.Payload)
+							delivered = true
+						case <-tick.C:
+							_ = client.Publish(context.Background(), topic, payload).Err()
+						case <-deadline:
+							tick.Stop()
+							s.FailNow("timeout waiting coalesced topic message: " + topic)
+						}
+					}
+					tick.Stop()
+				}
+
+				cancel()
+				select {
+				case err := <-errCh:
+					s.NoError(err)
+				case <-time.After(2 * time.Second):
+					s.FailNow("consume() did not exit after cancel")
+				}
+			},
+		},
+		{
+			"NotifySubscribeChangeCoalesces",
+			func() {
+				// No consumer runs here and no live lifecycle exists, so nothing
+				// can drain the wake-up channel: N wakes must collapse into the
+				// single pending signal. That is what makes a lost wake-up
+				// harmless, since the signal carries no data to lose.
+				for i := 0; i < 5; i++ {
+					notifySubscribeChange()
+				}
+
+				s.Equal(1, len(subscribeNotifyCh), "wake-ups must coalesce into one pending signal")
 			},
 		},
 		{

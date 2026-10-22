@@ -1,0 +1,232 @@
+# FR: Dynamic `Subscribe` Can Report Success Without Ever Subscribing
+
+- **Status:** Fixed — D1/D3/D5 fixed, D2 fixed by synchronous confirmation with timeout rollback, D4 closed as not-a-defect on `fix/dynamic-subscribe-reconcile`
+- **Date:** 2026-10-22
+
+---
+
+## 1. Summary
+
+`client.Subscribe` returns `mo.Ok(ch)` as soon as the **local registry** is updated.
+The actual remote `SUBSCRIBE` is issued later, by the background `consume`
+goroutine, through a request queue that **silently drops requests when full**.
+
+Result: a caller can be told "subscribed" for a topic that will never receive a
+single message, with no error and no way to detect it.
+
+Dynamic subscribe is intended behaviour, not an accident — it is exercised by
+`client/typed_test.go` (see §4).
+
+---
+
+## 2. Design At Time Of Report
+
+Two pieces of state describe the same fact:
+
+| State | Role | Written by | Read by |
+|---|---|---|---|
+| `deliveryChByTopic` (map) | authoritative registry | `Subscribe` | `consume` startup rebuild, message dispatch |
+| `subscribeReqCh` (`chan string`, cap 200) | incremental delta | `Subscribe` | `consume` main loop |
+
+`client/typed.go:114-123` — the map is written **first**, the queue push comes
+**second**, and the push is lossy:
+
+```go
+deliveryChByTopic[topic] = ch                 // registry updated
+handlersMu.Unlock()
+
+select {
+case subscribeReqCh <- topic:
+default:                                      // queue full -> silently dropped
+    slog.Warn("subscribe request dropped before remote subscribe", ...)
+}
+return mo.Ok[<-chan *ReceivedMessage](ch)     // success returned anyway
+```
+
+---
+
+## 3. Defects
+
+### D1 — Lossy queue causes permanent registry/remote divergence
+
+When the `default` branch fires, the map contains the topic but the remote
+subscription was never issued. The caller already holds `mo.Ok(ch)`.
+
+The topic stays silent for the entire lifetime of the current consumer. It only
+self-heals on the next reconnect, when `consume` rebuilds from the map
+(`client/typed.go:735-741`).
+
+Windows where the 200-slot queue can actually fill:
+
+1. `Connect` has returned but the `consume` goroutine has not reached its
+   `select` yet.
+2. `consume` already returned on an error and is no longer draining.
+3. `consume` is blocked inside `consumer.Receive(ctx)`
+   (`client/typed.go:711`) while awaiting the first subscribe confirmation —
+   the main loop is not running, so nothing drains the queue.
+
+### D2 — No confirmation semantics: subscribe-then-publish loses messages
+
+`consumer.Subscribe(ctx, topic)` (`client/typed.go:720`) is **asynchronous** in
+go-redis: it writes the command and returns; the confirmation arrives later.
+The code immediately records `subscribed[topic] = struct{}{}` as if the
+subscription were live.
+
+So `Subscribe` returning does not mean the subscription is effective. A
+`Publish` issued right after can be delivered before the remote `SUBSCRIBE` is
+established — the message is lost, silently.
+
+This is visible in the existing tests: one case relies on a bare `80ms` sleep to
+win the race, and another works around it by **re-publishing on a ticker** until
+delivery succeeds (`client/typed_test.go:1210-1221`).
+
+### D3 — Remote subscribe failure is not retried
+
+If `client/typed.go:720` returns an error, `consume` returns immediately and the
+request is consumed and discarded. The topic recovers only after the next
+reconnect triggers a full map rebuild. Until then the caller has no signal that
+anything went wrong.
+
+### D4 — `resetHandlers` does not drain `subscribeReqCh`
+
+`resetHandlers` (`client/typed.go:66-75`) clears the map and closes the delivery
+channels, but leaves `subscribeReqCh` untouched.
+
+Tests hide this by draining the channel manually in `SetupTest`
+(`client/typed_test.go:249-251`). Any other path that triggers `disconnect()`
+would leave stale topic names queued; the next `consume` would then subscribe to
+a topic that no longer exists in the map. Message dispatch for it hits
+`h == nil` and drops silently (`client/typed.go:759-761`).
+
+### D5 — Two sources of truth (structural)
+
+`deliveryChByTopic` is authoritative (the rebuild loop reads all of it on every
+consumer start); `subscribeReqCh` is a delta. For a `Subscribe` issued *before*
+`Connect` both paths fire: the rebuild covers the topic, and the queued request
+is drained later and no-ops against `subscribed`. Harmless, but it shows the
+queue is redundant on its own normal path.
+
+---
+
+## 4. Evidence
+
+`client/typed_test.go:1201-1221` codifies dynamic subscribe: it writes the map
+and injects into the queue directly, then asserts the message arrives:
+
+```go
+handlersMu.Lock()
+deliveryChByTopic["runtime-topic"] = runtimeHandler
+handlersMu.Unlock()
+subscribeReqCh <- "runtime-topic"
+```
+
+Note this test writes the map first and the queue second — the same ordering as
+`Subscribe`, so it reproduces the same coupling rather than testing around it.
+
+`client/typed.go:125-127` already documents the divergence:
+
+> Potential issue: if the subscribe request is dropped above, the local topic ->
+> channel mapping still exists, but the remote SUBSCRIBE is not issued for the
+> current consumer lifecycle.
+
+---
+
+## 5. Root Cause
+
+`subscribeReqCh` is a **data-carrying** queue. Losing one entry loses
+information that exists nowhere else — while the map still claims the topic is
+registered. Any lossy data queue will diverge from an authoritative store.
+
+A **notification** channel would be safe to coalesce or drop, because the
+consumer would re-derive state from the map instead of consuming a message.
+`subscribeReqCh` is not that.
+
+---
+
+## 6. Directions To Evaluate
+
+| # | Direction | Notes |
+|---|---|---|
+| A | Make the map the only source of truth; replace the data queue with a coalescible wake-up signal (buffer-1 `chan struct{}`), and have `consume` diff the map against the confirmed remote state on each wake | Fixes D1, D3, D5. D4 turned out not to be a defect at all (see §8). Loss of a wake-up is harmless because reconciliation is idempotent. |
+| B | Keep the queue but make the push blocking (or grow it) | Fixes D1 only. Blocks `Subscribe` when the consumer is stalled; D3/D4/D5 remain. |
+| C | Give `Subscribe` real confirmation semantics (wait for the remote subscribe ack) | Addresses D2. Separate concern from D1/D3/D4/D5; can be layered on A or B. **Chosen, layered on A.** |
+| D | Remove dynamic subscribe entirely (freeze topics at `Connect`) | Side-steps all of D1–D5 by removing the feature, but drops the capability the test above relies on. |
+
+Open questions:
+
+1. ~~Should `Subscribe` keep returning before the remote subscription is
+   confirmed, or must it be a synchronous, confirmed operation?~~ **Resolved:**
+   it is now synchronous and confirmed (direction C layered on A). See §8.
+2. If the queue is replaced by a wake-up signal, does `consume` reconcile on a
+   timer, on signal, or both? A signal alone still loses races when the
+   consumer is blocked in `Receive`. (Answered in §8 — the premise is false.)
+3. Does `resetHandlers` need to drain the queue, or does design A make that
+   unnecessary?
+
+---
+
+## 7. Acceptance (for whichever direction is chosen)
+
+1. No code path can leave `deliveryChByTopic` containing a topic that is not
+   subscribed remotely in a steady state.
+2. A `Subscribe` that returns success is either confirmed effective, or the
+   documentation states the exact consistency guarantee. **Met:** success now
+   means the server acknowledged the SUBSCRIBE; failure means the registration
+   was rolled back, so the call is retry-safe. See §8.
+3. `go test -race -tags testonly -count=1 ./client/...` green, including a test
+   that exercises the "queue/wake-up lost" path. **Met, differently:** with a
+   cap-1 signal plus a full registry re-read the lost wake-up is structurally
+   harmless rather than merely unlikely, so no test can observe a loss.
+   `TestPubSubLifecycle/NotifySubscribeChangeCoalesces` pins the coalescing
+   that makes it so, and
+   `TestPubSubLifecycle/ConsumeReconcilesCoalescedWakeUps` pins that a
+   coalesced wake-up still subscribes every topic.
+
+---
+
+## 8. Fix Status (branch `fix/dynamic-subscribe-reconcile`)
+
+Direction **A** was chosen.
+
+| Defect | Status | Change |
+|---|---|---|
+| D1 | Fixed | `subscribeReqCh` (`chan string`, cap 200, lossy push) → `subscribeNotifyCh` (`chan struct{}`, cap 1, `notifySubscribeChange()`). A lost/coalesced wake-up is now harmless. |
+| D5 | Fixed | `deliveryChByTopic` is the single source of truth. `consume` no longer consumes per-topic deltas; it re-reads the registry and reconciles via an idempotent `reconcile()` closure, run on consumer start and on each wake-up. |
+| D3 | Fixed | Remote state is now bookkept from the server's own acks (`*redis.Subscription` pushes via `ChannelWithSubscriptions`) instead of from the optimistic assumption that a SUBSCRIBE write succeeded. `reconcile` drives every topic towards `remoteSubConfirmed`; anything still `remoteSubPending` is re-issued on the next reconciliation. An explicit `Subscribe` error still restarts the lifecycle, as before. |
+| D4 | Closed — not a defect | Unsubscribe is a pseudo-requirement: the only removal path is client shutdown, and subscriptions are bound to the connection on both ends (client `consumer.Close()` → go-redis `closeTheCn`; server redcon drops the conn's btree entries on read error). No bidirectional reconcile branch is needed. |
+| D2 | Fixed | `Subscribe` is now synchronous: it waits on a per-topic ack channel that `consume` closes when the server acknowledges the SUBSCRIBE (`*redis.Subscription`). It fails fast with `resp client is not connected` when no lifecycle exists, fails with `client stopped before the subscription was acknowledged` when the lifecycle ends, and fails with `subscription %q was not acknowledged within %s` after `subscribeAckTimeout` (= `reconnectEvery + dialTimeout + 1s`, so a healthy reconnect is never misreported). On any failure the registration is rolled back from `deliveryChByTopic`/`ackByTopic`, which makes the call retry-safe. |
+
+### Correction to §3/§6
+
+The earlier claim that "a signal alone still loses races when the consumer is
+blocked in `Receive`" does **not** hold after D1/D5: with a cap-1 buffer plus a
+full registry re-read, a coalesced signal loses nothing. A periodic tick would
+therefore have been near-worthless — the actual gap was the optimistic
+bookkeeping, not the wake-up mechanism.
+
+### Test coverage and its limits
+
+- `TestSubscribeCommand/` covers the public contract: `Not connected` and
+  `Stopped lifecycle rolls back` assert both the error and that no
+  registration survives, `Duplicate handler` asserts duplicate rejection, and
+  `Success` performs a real end-to-end Connect + ack. The failure cases drive
+  an already-cancelled lifecycle context, so no background reconnect loop can
+  come alive and silently acknowledge the subscription under test.
+- `TestPubSubLifecycle/ConsumeReconcilesCoalescedWakeUps` registers 5 topics
+  and fires one wake-up per registration, then requires all 5 to be subscribed.
+  With a cap-1 signal those wake-ups must coalesce, so this is the regression
+  guard against going back to a data-carrying per-topic queue.
+- `TestPubSubLifecycle/NotifySubscribeChangeCoalesces` asserts the coalescing
+  itself: with no consumer draining, 5 wakes leave exactly one pending signal.
+- `ConsumeDispatchesInitialAndRuntimeTopics` / `ConsumePreservesSubscriptionsAcrossRestart`
+  cover the confirmed-dispatch and rebuild paths end to end, under `-race`.
+- `TestSubscribeAckTimeout` covers the timeout branch end to end: a live
+  lifecycle context with a dial that always fails, so no consumer can ever ack,
+  and a shortened `subscribeAckTimeout`. It asserts both the error and that
+  neither `deliveryChByTopic` nor `ackByTopic` keeps an entry.
+
+Not covered:
+
+- the `remoteSubPending` → re-issue transition has no deterministic test,
+  because a local server acks a SUBSCRIBE immediately. Asserting it would need
+  a mock connection that withholds the ack.
