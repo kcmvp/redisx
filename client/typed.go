@@ -47,18 +47,39 @@ type outgoingMessage struct {
 }
 
 var (
-	pubChan        = make(chan outgoingMessage, bufferSize)
-	pipeDrops      uint64
-	subscribeReqCh = make(chan string, bufferSize)
+	pubChan           = make(chan outgoingMessage, bufferSize)
+	pipeDrops         uint64
+	subscribeNotifyCh = make(chan struct{}, 1)
 
 	handlersMu        sync.RWMutex
 	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+	ackByTopic        = make(map[string]chan struct{})
+
+	// subscribeAckTimeout bounds how long Subscribe blocks waiting for the
+	// server to acknowledge the SUBSCRIBE. It must exceed the worst case
+	// reconnect window (reconnectEvery + dialTimeout), otherwise a healthy
+	// reconnect would be reported to the caller as a failure.
+	subscribeAckTimeout = reconnectEvery + dialTimeout + time.Second
 
 	cliOnce sync.Once
 
 	signalNotifyFn = signal.Notify
 	signalStopFn   = signal.Stop
 )
+
+// notifySubscribeChange wakes the background consumer so it can reconcile the
+// remote SUBSCRIBE state against deliveryChByTopic, which is the single
+// authoritative registry.
+//
+// The signal carries no data, so coalescing or dropping it is safe: the
+// consumer always re-reads the whole registry instead of draining a per-topic
+// queue. That is what makes a lost wake-up harmless.
+func notifySubscribeChange() {
+	select {
+	case subscribeNotifyCh <- struct{}{}:
+	default:
+	}
+}
 
 // resetHandlers closes all registered subscription channels and clears the
 // topic registry. This is reserved for explicit full shutdown paths such as
@@ -72,6 +93,11 @@ func resetHandlers() {
 		}
 	}
 	deliveryChByTopic = make(map[string]chan *ReceivedMessage)
+	// Pending ack channels are deliberately not closed: a Subscribe blocked on
+	// one must observe a failure during shutdown, not a fabricated success.
+	// Its lifecycle context is cancelled before this runs, so it returns Err
+	// instead of waiting for the full subscribeAckTimeout.
+	ackByTopic = make(map[string]chan struct{})
 }
 
 func setSharedClient(client *redis.Client) *redis.Client {
@@ -86,20 +112,26 @@ func clearSharedClientIf(target *redis.Client) {
 	conn.ClearSharedClientIf(target)
 }
 
-// Subscribe registers one local delivery channel for a topic and returns that
-// read-only channel to the caller.
+// Subscribe registers one local delivery channel for a topic and blocks until
+// the server acknowledges the SUBSCRIBE, then returns that read-only channel.
 //
-// Internally it does two things:
-//   - stores the topic -> channel mapping in deliveryChByTopic so incoming
-//     messages can be dispatched locally
-//   - enqueues a request on subscribeReqCh so the background consumer can
-//     sync the remote SUBSCRIBE state for newly added topics
+// It records the topic -> channel mapping in deliveryChByTopic, which is the
+// single authoritative registry of subscriptions, and then wakes the
+// background consumer so it can sync the remote SUBSCRIBE state from that
+// registry. The wake-up is a coalescible signal: it can never be lost in a way
+// that leaves the registry and the remote side diverged.
 //
-// Callers consume messages from the returned channel. Duplicate topic
-// registration is rejected.
+// Success means the server confirmed the subscription, so the channel is live.
+// On failure the registration is rolled back, which leaves the topic free to
+// be retried. Duplicate topic registration is rejected.
 func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
 		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
+	}
+
+	lifecycle, _ := getLifecycleCtx()
+	if lifecycle == nil {
+		return mo.Err[<-chan *ReceivedMessage](errors.New("resp client is not connected"))
 	}
 
 	handlersMu.Lock()
@@ -108,28 +140,44 @@ func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
 	}
 	ch := make(chan *ReceivedMessage, bufferSize)
+	ack := make(chan struct{})
 	deliveryChByTopic[topic] = ch
+	ackByTopic[topic] = ack
 	handlersMu.Unlock()
 
+	notifySubscribeChange()
+
+	var ackErr error
 	select {
-	case subscribeReqCh <- topic:
-	default:
-		slog.Warn(
-			"subscribe request dropped before remote subscribe",
-			"topic", topic,
-			"queue_len", len(subscribeReqCh),
-			"queue_cap", cap(subscribeReqCh),
-		)
+	case <-ack:
+		return mo.Ok[<-chan *ReceivedMessage](ch)
+	case <-lifecycle.Done():
+		ackErr = errors.New("client stopped before the subscription was acknowledged")
+	case <-time.After(subscribeAckTimeout):
+		ackErr = fmt.Errorf("subscription %q was not acknowledged within %s", topic, subscribeAckTimeout)
 	}
 
-	// Potential issue: if the subscribe request is dropped above, the local
-	// topic -> channel mapping still exists, but the remote SUBSCRIBE is not
-	// issued for the current consumer lifecycle.
-	return mo.Ok[<-chan *ReceivedMessage](ch)
+	// Roll back so the caller can retry the same topic. The delivery channel is
+	// intentionally not closed: the consumer may still hold a reference to it
+	// and would panic on a send to a closed channel. Removing the registry
+	// entry is enough, because an unacknowledged topic is either re-issued by
+	// the next reconciliation (if still registered) or left alone (if not).
+	handlersMu.Lock()
+	if deliveryChByTopic[topic] == ch {
+		delete(deliveryChByTopic, topic)
+		delete(ackByTopic, topic)
+	}
+	handlersMu.Unlock()
+
+	return mo.Err[<-chan *ReceivedMessage](ackErr)
 }
 
 func setLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
 	conn.SetLifecycleCtx(ctx, cancel)
+}
+
+func clearLifecycleCtx() {
+	conn.ClearLifecycleCtx()
 }
 
 func getLifecycleCtx() (context.Context, context.CancelFunc) {
@@ -641,7 +689,7 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := internalDialForRespconnInternal(respconn.Options{
+	res, err := currentRespDial()(respconn.Options{
 		Host:         host,
 		Port:         port,
 		Auth:         authKey,
@@ -660,7 +708,31 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	return res.Client, nil
 }
 
-var internalDialForRespconnInternal = respconn.DialAndHandshake
+// respDialFn performs the RESP dial + handshake used by connect.
+type respDialFn func(respconn.Options) (*respconn.DialResult, error)
+
+// respDial is the RESP dial seam. Reconnect goroutines kept alive by an earlier
+// Connect can call connect() concurrently with a test swapping this value, so
+// it is stored in an atomic pointer instead of a plain variable.
+var respDial atomic.Pointer[respDialFn]
+
+func init() {
+	fn := respDialFn(respconn.DialAndHandshake)
+	respDial.Store(&fn)
+}
+
+// currentRespDial returns the RESP dial seam currently in effect.
+func currentRespDial() respDialFn {
+	return *respDial.Load()
+}
+
+// setRespDial swaps the RESP dial seam and returns a function restoring the
+// previous one. Callers must wait for it to return before resuming.
+func setRespDial(fn respDialFn) (restore func()) {
+	prev := respDial.Load()
+	respDial.Store(&fn)
+	return func() { respDial.Store(prev) }
+}
 
 // produce publishes messages from pubChan using the provided client until ctx is done.
 func produce(ctx context.Context, client *redis.Client) error {
@@ -680,47 +752,56 @@ func produce(ctx context.Context, client *redis.Client) error {
 	}
 }
 
-// consume rebuilds remote subscriptions from deliveryChByTopic, applies
-// incremental subscription requests from subscribeReqCh, and dispatches
-// incoming messages to the registered local handlers.
+// remoteSubState tracks one topic's position in the remote subscription
+// lifecycle. A topic counts as subscribed only once the server acknowledges
+// the SUBSCRIBE with a push frame; until that ack arrives the topic is merely
+// pending and must be re-issued.
+type remoteSubState uint8
+
+const (
+	remoteSubPending remoteSubState = iota
+	remoteSubConfirmed
+)
+
+// consume reconciles the remote SUBSCRIBE state with deliveryChByTopic (the
+// single authoritative registry) and dispatches incoming messages to the
+// registered local handlers.
+//
+// Reconciliation is idempotent: it runs on every consumer start and on every
+// wake-up from subscribeNotifyCh, driving every registered topic towards a
+// confirmed remote subscription. Because the wake-up carries no data, a
+// coalesced or missed signal can never desynchronize the two sides.
+//
+// Remote state is bookkept from the server's own acknowledgements
+// (*redis.Subscription pushes) rather than from the optimistic assumption that
+// a SUBSCRIBE write succeeded. A topic the server never confirmed therefore
+// stays pending and is re-issued on the next reconciliation, instead of being
+// silently treated as live forever.
 func consume(ctx context.Context, client *redis.Client) error {
-	consumerTopics := make(map[string]struct{})
-
-	handlersMu.RLock()
-	for topic := range deliveryChByTopic {
-		if topic != "" {
-			consumerTopics[topic] = struct{}{}
-		}
-	}
-	handlersMu.RUnlock()
-
 	var consumer *redis.PubSub
-	var remoteMsgCh <-chan *redis.Message
-	subscribed := make(map[string]struct{}, len(consumerTopics))
+	var remoteCh <-chan interface{}
+	remoteState := make(map[string]remoteSubState)
 
+	// remoteSubscription drives one topic towards a confirmed subscription.
+	// Topics already confirmed remotely are left alone; anything else is
+	// (re-)issued and recorded as pending until the ack arrives.
 	remoteSubscription := func(topic string) error {
 		if topic == "" {
 			return nil
 		}
-		if _, exists := subscribed[topic]; exists {
+		if remoteState[topic] == remoteSubConfirmed {
 			return nil
 		}
 
 		if consumer == nil {
-			consumer = client.Subscribe(ctx, topic)
-			if _, err := consumer.Receive(ctx); err != nil {
-				slog.Warn("redisx subscribe receive error", "error", err)
-				return err
-			}
-			remoteMsgCh = consumer.Channel()
-			subscribed[topic] = struct{}{}
-			return nil
+			consumer = client.Subscribe(ctx)
+			remoteCh = consumer.ChannelWithSubscriptions(redis.WithChannelSize(bufferSize))
 		}
 
 		if err := consumer.Subscribe(ctx, topic); err != nil {
 			return err
 		}
-		subscribed[topic] = struct{}{}
+		remoteState[topic] = remoteSubPending
 		return nil
 	}
 
@@ -732,37 +813,75 @@ func consume(ctx context.Context, client *redis.Client) error {
 		}
 	}()
 
+	// reconcile drives every registered topic towards a confirmed remote
+	// subscription. It always re-reads the registry, so topics registered while
+	// this consumer was busy are picked up as well.
+	reconcile := func() error {
+		handlersMu.RLock()
+		topics := make([]string, 0, len(deliveryChByTopic))
+		for topic := range deliveryChByTopic {
+			if topic != "" {
+				topics = append(topics, topic)
+			}
+		}
+		handlersMu.RUnlock()
+
+		for _, topic := range topics {
+			if err := remoteSubscription(topic); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Rebuild all already-registered subscriptions on each fresh consumer
 	// lifecycle, including reconnects.
-	for topic := range consumerTopics {
-		if err := remoteSubscription(topic); err != nil {
-			return err
-		}
+	if err := reconcile(); err != nil {
+		return err
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		// Handle newly registered subscriptions after this consumer started.
-		case topic := <-subscribeReqCh:
-			if err := remoteSubscription(topic); err != nil {
+		// A topic was registered after this consumer started: re-read the
+		// authoritative registry and subscribe whatever is still missing.
+		case <-subscribeNotifyCh:
+			if err := reconcile(); err != nil {
 				return err
 			}
-		case msg, ok := <-remoteMsgCh:
+		case pushed, ok := <-remoteCh:
 			if !ok {
 				return fmt.Errorf("subscribe channel closed")
 			}
-			handlersMu.RLock()
-			h := deliveryChByTopic[msg.Channel]
-			handlersMu.RUnlock()
-			if h == nil {
-				continue
-			}
-			select {
-			case h <- &ReceivedMessage{Channel: msg.Channel, Pattern: msg.Pattern, Payload: msg.Payload}:
-			default:
-				slog.Warn("message handler channel full, message dropped", "topic", msg.Channel)
+			switch p := pushed.(type) {
+			// The server acknowledged a subscription: only now is the topic
+			// actually subscribed.
+			case *redis.Subscription:
+				if p.Kind == "subscribe" && p.Channel != "" {
+					remoteState[p.Channel] = remoteSubConfirmed
+					// Release a Subscribe caller blocked on this
+					// acknowledgement. A rolled-back topic has no entry here,
+					// which is exactly what makes a late ack harmless.
+					handlersMu.Lock()
+					if ack, ok := ackByTopic[p.Channel]; ok {
+						close(ack)
+						delete(ackByTopic, p.Channel)
+					}
+					handlersMu.Unlock()
+				}
+			case *redis.Message:
+				handlersMu.RLock()
+				h := deliveryChByTopic[p.Channel]
+				handlersMu.RUnlock()
+				if h == nil {
+					continue
+				}
+				select {
+				case h <- &ReceivedMessage{Channel: p.Channel, Pattern: p.Pattern, Payload: p.Payload}:
+				default:
+					slog.Warn("message handler channel full, message dropped", "topic", p.Channel)
+				}
 			}
 		}
 	}
