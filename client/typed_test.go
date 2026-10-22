@@ -353,7 +353,7 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 		{
 			"Not connected",
 			"orders_offline",
-			func() { setLifecycleCtx(nil, nil) },
+			func() { clearLifecycleCtx() },
 			true,
 			"not connected",
 			false,

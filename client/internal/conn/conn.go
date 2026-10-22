@@ -53,6 +53,14 @@ func SetLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
 	}{ctx: ctx, cancel: cancel})
 }
 
+// ClearLifecycleCtx removes the bridge lifecycle context entirely.
+func ClearLifecycleCtx() {
+	lifecycleCtx.Store(struct {
+		ctx    context.Context
+		cancel context.CancelFunc
+	}{})
+}
+
 // GetLifecycleCtx returns the lifecycle context and cancel func, or (nil, nil)
 // when no lifecycle has been installed yet.
 func GetLifecycleCtx() (context.Context, context.CancelFunc) {

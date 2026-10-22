@@ -176,6 +176,10 @@ func setLifecycleCtx(ctx context.Context, cancel context.CancelFunc) {
 	conn.SetLifecycleCtx(ctx, cancel)
 }
 
+func clearLifecycleCtx() {
+	conn.ClearLifecycleCtx()
+}
+
 func getLifecycleCtx() (context.Context, context.CancelFunc) {
 	return conn.GetLifecycleCtx()
 }
