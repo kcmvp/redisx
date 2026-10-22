@@ -438,11 +438,10 @@ func (s *ClientTestSuite) TestSubscribeAckTimeout() {
 	// past the connectivity gate, and this keeps that context from ever
 	// spawning a consumer (or a reconnect loop that later spawns one) which
 	// would acknowledge the subscription on our behalf.
-	origDial := internalDialForRespconnInternal
-	internalDialForRespconnInternal = func(o respconn.Options) (*respconn.DialResult, error) {
+	restoreDial := setRespDial(func(o respconn.Options) (*respconn.DialResult, error) {
 		return nil, errors.New("dial disabled for the ack-timeout test")
-	}
-	defer func() { internalDialForRespconnInternal = origDial }()
+	})
+	defer restoreDial()
 
 	origTimeout := subscribeAckTimeout
 	subscribeAckTimeout = 50 * time.Millisecond
@@ -2327,8 +2326,8 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 func TestConnectProbePlainRedisNoCapsNoError(t *testing.T) {
 	called := make(chan struct{}, 1)
 	dialCh := make(chan *respconn.DialResult, 1)
-	origDial := internalDialForRespconnInternal
-	internalDialForRespconnInternal = func(o respconn.Options) (*respconn.DialResult, error) {
+	origDial := currentRespDial()
+	restoreDial := setRespDial(func(o respconn.Options) (*respconn.DialResult, error) {
 		res, err := origDial(o)
 		if res != nil {
 			select {
@@ -2337,8 +2336,8 @@ func TestConnectProbePlainRedisNoCapsNoError(t *testing.T) {
 			}
 		}
 		return res, err
-	}
-	defer func() { internalDialForRespconnInternal = origDial }()
+	})
+	defer restoreDial()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

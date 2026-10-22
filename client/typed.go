@@ -685,7 +685,7 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := internalDialForRespconnInternal(respconn.Options{
+	res, err := currentRespDial()(respconn.Options{
 		Host:         host,
 		Port:         port,
 		Auth:         authKey,
@@ -704,7 +704,31 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 	return res.Client, nil
 }
 
-var internalDialForRespconnInternal = respconn.DialAndHandshake
+// respDialFn performs the RESP dial + handshake used by connect.
+type respDialFn func(respconn.Options) (*respconn.DialResult, error)
+
+// respDial is the RESP dial seam. Reconnect goroutines kept alive by an earlier
+// Connect can call connect() concurrently with a test swapping this value, so
+// it is stored in an atomic pointer instead of a plain variable.
+var respDial atomic.Pointer[respDialFn]
+
+func init() {
+	fn := respDialFn(respconn.DialAndHandshake)
+	respDial.Store(&fn)
+}
+
+// currentRespDial returns the RESP dial seam currently in effect.
+func currentRespDial() respDialFn {
+	return *respDial.Load()
+}
+
+// setRespDial swaps the RESP dial seam and returns a function restoring the
+// previous one. Callers must wait for it to return before resuming.
+func setRespDial(fn respDialFn) (restore func()) {
+	prev := respDial.Load()
+	respDial.Store(&fn)
+	return func() { respDial.Store(prev) }
+}
 
 // produce publishes messages from pubChan using the provided client until ctx is done.
 func produce(ctx context.Context, client *redis.Client) error {
