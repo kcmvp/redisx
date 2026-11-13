@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +33,24 @@ func (testMemUserDoc) Mem() bool          { return true }
 func (testMemUserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u testMemUserDoc) RawJSON() string  { return string(u) }
 func (testMemUserDoc) TTL() time.Duration { return 0 }
+
+// TTL-normalisation fixtures: x.RegisterSchema now derives TTL from the
+// document type, so each distinct raw TTL needs its own type.
+type ttlNormNegOneDoc string
+
+func (ttlNormNegOneDoc) Namespace() string  { return "ttlnormn1" }
+func (ttlNormNegOneDoc) Mem() bool          { return false }
+func (ttlNormNegOneDoc) KeyAttrs() []string { return []string{"pk"} }
+func (u ttlNormNegOneDoc) RawJSON() string  { return string(u) }
+func (ttlNormNegOneDoc) TTL() time.Duration { return -1 }
+
+type ttlNormNegThreeSecDoc string
+
+func (ttlNormNegThreeSecDoc) Namespace() string  { return "ttlnormneg" }
+func (ttlNormNegThreeSecDoc) Mem() bool          { return false }
+func (ttlNormNegThreeSecDoc) KeyAttrs() []string { return []string{"pk"} }
+func (u ttlNormNegThreeSecDoc) RawJSON() string  { return string(u) }
+func (ttlNormNegThreeSecDoc) TTL() time.Duration { return -3 * time.Second }
 
 type DBSuite struct {
 	suite.Suite
@@ -152,192 +169,20 @@ func (suite *DBSuite) TestRegisterIndexes() {
 
 	suite.Run("rejects empty index name", func() {
 		err := suite.db.registerIndexes(x.Index{})
-		suite.EqualError(err, "index name is required")
+		suite.EqualError(err, "registerIndexes: index name is required")
 	})
 
-	suite.Run("duplicate index declaration is idempotent via writeIndexSpec", func() {
+	suite.Run("duplicate index declaration is rejected", func() {
 		idx := x.Idx[testUserDoc]("dup", "*", "age")
 		suite.NoError(suite.db.registerIndexes(idx))
 		err := suite.db.registerIndexes(idx)
-		suite.NoError(err)
+		suite.Error(err)
+		suite.Contains(err.Error(), "index exists")
 	})
 }
 
-func (suite *DBSuite) TestLoadIndexes() {
-	suite.Run("loads disk index meta and builds BTree", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		spec := idxSpec{
-			OwnerNs:    "user",
-			Logical:    "age",
-			KeyPattern: "user:*",
-			Paths:      []string{"age"},
-		}
-		versionHex, _ := canonicalIdxMD5(spec)
-		spec.Version = versionHex
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		metaKey := naming.IdxMetaKey(spec.fullName(), versionHex)
-		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, string(raw), nil)
-			return e
-		}))
-
-		suite.NoError(db.loadIndexes())
-		loaded, ok := db.idxRegSpec[spec.fullName()]
-		suite.True(ok, "index should be registered")
-		suite.Equal(spec.fullName(), loaded.fullName())
-		suite.Equal(spec.Paths, loaded.Paths)
-		suite.Equal(versionHex, loaded.Version)
-		suite.False(naming.HasMemPrefix(loaded.OwnerNs))
-
-		suite.NoError(db.Set("user:1", `{"id":"1","age":20}`))
-		suite.NoError(db.Set("user:2", `{"id":"2","age":30}`))
-		res := db.SearchIndex(spec.fullName(), x.KeysPattern("user:*"), nil, false)
-		suite.True(res.IsOk())
-		suite.Len(res.MustGet(), 2)
-	})
-
-	suite.Run("loads mem index meta and builds BTree", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		memStorageNs := naming.BuildStorageNs("user", true)
-		spec := idxSpec{
-			OwnerNs:    memStorageNs,
-			Logical:    "rank",
-			KeyPattern: naming.StorageNsKeyPattern(memStorageNs),
-			Paths:      []string{"rank"},
-		}
-		versionHex, _ := canonicalIdxMD5(spec)
-		spec.Version = versionHex
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		metaKey := naming.IdxMetaKey(spec.fullName(), versionHex)
-		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, string(raw), nil)
-			return e
-		}))
-
-		suite.NoError(db.loadIndexes())
-		loaded, ok := db.idxRegSpec[spec.fullName()]
-		suite.True(ok, "mem index should be registered")
-		suite.True(naming.HasMemPrefix(loaded.OwnerNs))
-		suite.Equal(versionHex, loaded.Version)
-
-		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(naming.BuildStorageKey(memStorageNs, "x1"), `{"id":"x1","rank":5}`, nil)
-			return e
-		}))
-		res := db.SearchIndex(spec.fullName(), x.KeysPattern(naming.StorageNsKeyPattern(memStorageNs)), nil, false)
-		suite.True(res.IsOk())
-		suite.Len(res.MustGet(), 1)
-	})
-
-	suite.Run("corrupt meta record returns error", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		metaKey := naming.IdxMetaKey("user_broken", "placeholder")
-		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, "{not json", nil)
-			return e
-		}))
-
-		err := db.loadIndexes()
-		suite.Error(err)
-		suite.Contains(err.Error(), "index "+metaKey+": unmarshal idxSpec")
-	})
-
-	suite.Run("index with empty FullName returns error", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		spec := idxSpec{
-			OwnerNs: "user", Logical: "x",
-			KeyPattern: "user:*", Paths: []string{"x"},
-		}
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		badRaw := strings.ReplaceAll(string(raw), `"owner_ns":"user"`, `"owner_ns":""`)
-		metaKey := naming.IdxMetaKey("user_bad", "placeholder")
-		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, badRaw, nil)
-			return e
-		}))
-
-		err = db.loadIndexes()
-		suite.Error(err)
-		suite.Contains(err.Error(), "index "+metaKey+": missing owner_ns/logical")
-	})
-}
-
-func (suite *DBSuite) TestLoadDocSpecs() {
-	suite.Run("loads disk doc meta and registers namespace", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		spec := docSpec{
-			Namespace: "profile",
-			Mem:       false,
-			KeyAttrs:  []string{"uid"},
-			TTL:       2 * time.Hour,
-		}
-		versionHex, _ := canonicalDocMD5(spec)
-		spec.Version = versionHex
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		metaKey := naming.DocMetaKey(spec.storageNs(), versionHex)
-		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, string(raw), nil)
-			return e
-		}))
-
-		suite.NoError(db.loadDocSpecs())
-		loaded, ok := db.docRegSpec[spec.storageNs()]
-		suite.True(ok, "doc should be registered")
-		suite.Equal("profile", loaded.Namespace)
-		suite.Equal([]string{"uid"}, loaded.KeyAttrs)
-		suite.Equal(2*time.Hour, loaded.TTL)
-		suite.Equal(versionHex, loaded.Version)
-	})
-
-	suite.Run("loads mem doc meta", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		spec := docSpec{
-			Namespace: "session",
-			Mem:       true,
-			KeyAttrs:  []string{"sid"},
-			TTL:       0,
-		}
-		versionHex, _ := canonicalDocMD5(spec)
-		spec.Version = versionHex
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		metaKey := naming.DocMetaKey(spec.storageNs(), versionHex)
-		suite.NoError(db.rawMem().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, string(raw), nil)
-			return e
-		}))
-
-		suite.NoError(db.loadDocSpecs())
-		loaded, ok := db.docRegSpec[spec.storageNs()]
-		suite.True(ok)
-		suite.True(loaded.Mem)
-		suite.Equal("session", loaded.Namespace)
-		suite.Equal(versionHex, loaded.Version)
-	})
-
-	suite.Run("semantic change (TTL) via writeDocSpec after load triggers version upgrade", func() {
+func (suite *DBSuite) TestWriteDocSpecSemantics() {
+	suite.Run("semantic change (TTL) via writeDocSpec triggers version upgrade", func() {
 		db := openDB(testutil.DBPath(suite.T()))
 		suite.NotNil(db)
 		defer func() { _ = db.Close() }()
@@ -351,8 +196,6 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		v1created := db.docRegSpec[older.storageNs()].CreatedAt
 		suite.NotEmpty(v1hex)
 		suite.False(v1created.IsZero())
-
-		suite.NoError(db.loadDocSpecs())
 
 		incoming := docSpec{
 			Namespace: "account", Mem: false, KeyAttrs: []string{"id"},
@@ -378,7 +221,6 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 			TTL: time.Minute,
 		}
 		suite.NoError(db.writeDocSpec(spec))
-		suite.NoError(db.loadDocSpecs())
 		firstUpdated := db.docRegSpec[spec.storageNs()].UpdatedAt
 		err := db.writeDocSpec(spec)
 		suite.NoError(err, "writeDocSpec with identical MD5 returns nil no-op")
@@ -398,7 +240,6 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		}
 		suite.NoError(db.writeDocSpec(spec))
 		v1created := db.docRegSpec[spec.storageNs()].CreatedAt
-		suite.NoError(db.loadDocSpecs())
 
 		bad := docSpec{
 			Namespace: "conflict", Mem: false, KeyAttrs: []string{"b"},
@@ -413,7 +254,7 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 		suite.False(overwritten.UpdatedAt.IsZero(), "UpdatedAt set on KeyAttrs upgrade")
 	})
 
-	suite.Run("corrupt meta record returns error", func() {
+	suite.Run("corrupt persisted meta fails writeDocSpec closed", func() {
 		db := openDB(testutil.DBPath(suite.T()))
 		suite.NotNil(db)
 		defer func() { _ = db.Close() }()
@@ -423,27 +264,9 @@ func (suite *DBSuite) TestLoadDocSpecs() {
 			_, _, e := tx.Set(metaKey, "not a json", nil)
 			return e
 		}))
-		err := db.loadDocSpecs()
+		err := db.writeDocSpec(docSpec{Namespace: "brokenns", Mem: false, KeyAttrs: []string{"id"}, TTL: 0})
 		suite.Error(err)
-		suite.Contains(err.Error(), "doc "+metaKey+": unmarshal docSpec")
-	})
-
-	suite.Run("empty Namespace in meta returns error", func() {
-		db := openDB(testutil.DBPath(suite.T()))
-		suite.NotNil(db)
-		defer func() { _ = db.Close() }()
-
-		spec := docSpec{KeyAttrs: []string{"id"}, TTL: time.Hour}
-		raw, err := json.Marshal(spec)
-		suite.NoError(err)
-		metaKey := naming.DocMetaKey("bad", "placeholder")
-		suite.NoError(db.raw().Update(func(tx *buntdb.Tx) error {
-			_, _, e := tx.Set(metaKey, string(raw), nil)
-			return e
-		}))
-		err = db.loadDocSpecs()
-		suite.Error(err)
-		suite.Contains(err.Error(), "doc "+metaKey+": empty namespace")
+		suite.Contains(err.Error(), "unmarshal")
 	})
 }
 
@@ -615,18 +438,10 @@ func (suite *DBSuite) TestCheatsheetSymmetry() {
 	}))
 	userDiskSN := naming.BuildStorageNs("cheatdoc", false)
 	sessionMemSN := naming.BuildStorageNs("cheatsess", true)
-	suite.NoError(db.writeIndexSpec(idxSpec{
-		OwnerNs:    userDiskSN,
-		Logical:    "age",
-		KeyPattern: naming.StorageNsKeyPattern(userDiskSN),
-		Paths:      []string{"age"},
-	}))
-	suite.NoError(db.writeIndexSpec(idxSpec{
-		OwnerNs:    sessionMemSN,
-		Logical:    "last",
-		KeyPattern: naming.StorageNsKeyPattern(sessionMemSN),
-		Paths:      []string{"last_ts"},
-	}))
+	suite.NoError(db.registerIndexes(
+		x.RawIndex(naming.BuildIdxFullName(userDiskSN, "age"), naming.StorageNsKeyPattern(userDiskSN), "age"),
+		x.RawIndex(naming.BuildIdxFullName(sessionMemSN, "last"), naming.StorageNsKeyPattern(sessionMemSN), "last_ts"),
+	))
 
 	userDocFullKey := naming.BuildStorageKey(userDiskSN, naming.JoinPKAttrValues([]string{"acme", "7"}))
 	suite.Equal("cheatdoc:acme_7", userDocFullKey, "cheatsheet CheatDoc full key = cheatdoc:{tenant}_{id} for {acme,7}")
@@ -638,8 +453,6 @@ func (suite *DBSuite) TestCheatsheetSymmetry() {
 	sessionLastIdx := naming.BuildIdxFullName(sessionMemSN, "last")
 	suite.Equal("cheatdoc:age", userAgeIdx, "cheatsheet cheatdoc index full name = {storageNs}:age")
 	suite.Equal("_m_:cheatsess:last", sessionLastIdx, "cheatsheet cheatsess index full name = {storageNs}:last")
-	suite.Equal("_idx_:cheatdoc:age:v_placeholder", naming.IdxMetaKey(userAgeIdx, "placeholder"), "cheatsheet cheatdoc index meta")
-	suite.Equal("_idx_:_m_:cheatsess:last:v_placeholder", naming.IdxMetaKey(sessionLastIdx, "placeholder"), "cheatsheet cheatsess index meta")
 
 	suite.NoError(db.Set(userDocFullKey, `{"tenant":"acme","id":"7","age":30,"status":"cold"}`))
 	suite.NoError(db.Set(sessionDocFullKey, `{"sid":"abc","user_id":1,"last_ts":1000}`))
@@ -650,32 +463,29 @@ func (suite *DBSuite) TestCheatsheetSymmetry() {
 
 	db = openDB(path)
 	suite.NotNil(db)
-	suite.NoError(db.loadIndexes())
-	suite.NoError(db.loadDocSpecs())
 	defer func() { _ = db.Close() }()
 
-	// Registry persistence must follow storage layer symmetry: mem-only specs
-	// (Docs + Indexes) live on mem-layer meta store so they are dropped on
-	// restart; disk-layer specs persist across restart.
-	userMemSN := naming.BuildStorageNs("cheatdoc", true)
-	diskIdx := naming.BuildIdxFullName(userDiskSN, "age")
-	memIdx := naming.BuildIdxFullName(userMemSN, "age")
-	_, hasDiskDoc := db.docRegSpec[userDiskSN]
-	suite.True(hasDiskDoc, "disk doc %s must remain registered after restart", userDiskSN)
-	_, hasMemDoc := db.docRegSpec[userMemSN]
-	suite.False(hasMemDoc, "mem doc %s must be dropped on restart (meta lives on mem-layer store)", userMemSN)
-	_, hasDiskIdx := db.idxRegSpec[diskIdx]
-	suite.True(hasDiskIdx, "disk index %s must remain registered after restart", diskIdx)
-	_, hasMemIdx := db.idxRegSpec[memIdx]
-	suite.False(hasMemIdx, "mem index %s must be dropped on restart (meta lives on mem-layer store)", memIdx)
+	// Asymmetric persistence contract:
+	//   - doc meta is an AUDIT trail only: it survives on disk but is NEVER
+	//     replayed into the in-memory registry on boot;
+	//   - indexes are code-only and never persisted at all.
+	// So both registries start empty after a restart, on every storage layer.
+	suite.Empty(db.docRegSpec, "doc meta must NOT be replayed into memory on boot")
+	suite.Empty(db.idxRegSpec, "indexes are code-only and must NOT survive restart")
+
+	// The disk-layer doc meta still exists as an on-disk audit record.
+	var auditKeys []string
+	suite.NoError(db.raw().View(func(tx *buntdb.Tx) error {
+		return tx.AscendKeys(naming.DocMetaGlobFor(userDiskSN), func(k, _ string) bool {
+			auditKeys = append(auditKeys, k)
+			return true
+		})
+	}))
+	suite.Len(auditKeys, 1, "disk doc meta keeps exactly one audit record for %s", userDiskSN)
 
 	// Cheatsheet §3 symmetric restart — CheatDoc disk vs CheatSess mem.
 	suite.True(db.Get(userDocFullKey).IsOk(), "cheatsheet: CheatDoc disk value cheatdoc:acme_7 must survive restart")
 	suite.True(db.Get(sessionDocFullKey).IsError(), "cheatsheet: CheatSess mem value _m_:cheatsess:abc must NOT survive restart")
-	_, hasSessionDocReg := db.docRegSpec[sessionMemSN]
-	suite.False(hasSessionDocReg, "cheatsheet: CheatSess mem docSpec _doc_:_m_:cheatsess must NOT auto-re-register on restart")
-	_, hasSessionLastIdx := db.idxRegSpec[sessionLastIdx]
-	suite.False(hasSessionLastIdx, "cheatsheet: CheatSess mem idxSpec _idx_:_m_:cheatsess:last must NOT auto-re-register on restart")
 }
 
 func TestDBSuite(t *testing.T) {
@@ -755,13 +565,10 @@ func (suite *DBSuite) TestCompositeIndexOrderAscend() {
 	docSN := naming.BuildStorageNs("compositens", false)
 	suite.NoError(suite.db.writeDocSpec(docSpec{Namespace: "compositens", Mem: false, KeyAttrs: []string{"id"}}))
 
-	idx := idxSpec{
-		OwnerNs:    docSN,
-		Logical:    "tenantage",
-		KeyPattern: docSN + ":*",
-		Paths:      []string{"tenant", "age"},
-	}
-	suite.NoError(suite.db.writeIndexSpec(idx))
+	idxFullName := naming.BuildIdxFullName(docSN, "tenantage")
+	suite.NoError(suite.db.registerIndexes(
+		x.RawIndex(idxFullName, naming.StorageNsKeyPattern(docSN), "tenant", "age"),
+	))
 
 	docs := []struct {
 		id     string
@@ -781,7 +588,7 @@ func (suite *DBSuite) TestCompositeIndexOrderAscend() {
 		suite.NoError(suite.db.Set(key, val))
 	}
 
-	asc := suite.db.SearchIndex(idx.fullName(), x.KeysPattern(docSN+":*"), nil, false)
+	asc := suite.db.SearchIndex(idxFullName, x.KeysPattern(docSN+":*"), nil, false)
 	if !suite.True(asc.IsOk(), "SearchIndex ASC err: %v", asc.Error()) {
 		return
 	}
@@ -797,7 +604,7 @@ func (suite *DBSuite) TestCompositeIndexOrderAscend() {
 		suite.Equal(wantAgeOrder[i], gotAge, "ASC idx=%d age mismatch; raw=%s", i, raw)
 	}
 
-	desc := suite.db.SearchIndex(idx.fullName(), x.KeysPattern(docSN+":*"), nil, true)
+	desc := suite.db.SearchIndex(idxFullName, x.KeysPattern(docSN+":*"), nil, true)
 	suite.True(desc.IsOk(), "SearchIndex DESC err: %v", desc.Error())
 	gotDesc := desc.MustGet()
 	suite.Len(gotDesc, 6)
@@ -828,29 +635,6 @@ func (suite *DBSuite) TestDocSpecPersistsCreatedAt() {
 	ca := gjson.Get(raw, "created_at")
 	suite.True(ca.Exists(), "doc meta raw json must contain created_at; got: %s", raw)
 	suite.NotEmpty(ca.String())
-
-	spec2 := idxSpec{OwnerNs: spec.storageNs(), Logical: "age", KeyPattern: spec.storageNs() + ":*", Paths: []string{"age"}}
-	suite.NoError(suite.db.writeIndexSpec(spec2))
-	var iraw string
-	idxMetaGlob := naming.IdxMetaGlobFor(spec2.fullName())
-	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
-		found := false
-		scanErr := tx.AscendKeys(idxMetaGlob, func(k, v string) bool {
-			iraw = v
-			found = true
-			return false
-		})
-		if scanErr != nil {
-			return scanErr
-		}
-		if !found {
-			return fmt.Errorf("no idx meta key found under %s", idxMetaGlob)
-		}
-		return nil
-	}))
-	ica := gjson.Get(iraw, "created_at")
-	suite.True(ica.Exists(), "idx meta raw json must contain created_at; got: %s", iraw)
-	suite.NotEmpty(ica.String())
 }
 
 func (suite *DBSuite) TestWriteDocSpecLifecycleRetainsCreatedAt() {
@@ -894,66 +678,6 @@ func (suite *DBSuite) TestWriteDocSpecLifecycleRetainsCreatedAt() {
 	suite.Len(metaKeys, 1, "disk invariant: exactly 1 _doc_:*:v_* key per logical ns after 2 versions + noop; got: %v", metaKeys)
 }
 
-func (suite *DBSuite) TestWriteIndexSpecVersionChangeDropsOldAndMountsNewComparator() {
-	suite.NoError(suite.db.writeDocSpec(docSpec{Namespace: "cycleidx", Mem: false, KeyAttrs: []string{"id"}, TTL: 0}))
-	ownerNs := naming.BuildStorageNs("cycleidx", false)
-
-	idxV1 := idxSpec{OwnerNs: ownerNs, Logical: "age", KeyPattern: ownerNs + ":*", Paths: []string{"age"}}
-	suite.NoError(suite.db.writeIndexSpec(idxV1))
-	regV1, ok := suite.db.idxRegSpec[idxV1.fullName()]
-	suite.True(ok)
-	suite.NotEmpty(regV1.Version)
-	v1hex := regV1.Version
-	suite.False(regV1.CreatedAt.IsZero())
-	suite.True(regV1.UpdatedAt.IsZero())
-
-	docs := []string{
-		`{"id":"a","age":10,"score":900}`,
-		`{"id":"b","age":30,"score":100}`,
-		`{"id":"c","age":20,"score":500}`,
-	}
-	for _, d := range docs {
-		suite.NoError(suite.db.Set(ownerNs+":"+gjson.Get(d, "id").String(), d))
-	}
-
-	resV1 := suite.db.SearchIndex(idxV1.fullName(), x.KeysPattern(ownerNs+":*"), nil, false)
-	suite.True(resV1.IsOk())
-	gotV1 := resV1.MustGet()
-	suite.Len(gotV1, 3)
-	suite.Equal([]int64{10, 20, 30}, []int64{
-		gjson.Get(gotV1[0], "age").Int(),
-		gjson.Get(gotV1[1], "age").Int(),
-		gjson.Get(gotV1[2], "age").Int(),
-	}, "V1 index must order rows by age ASC")
-
-	idxV2 := idxSpec{OwnerNs: ownerNs, Logical: "age", KeyPattern: ownerNs + ":*", Paths: []string{"score"}}
-	suite.NoError(suite.db.writeIndexSpec(idxV2))
-	regV2, ok := suite.db.idxRegSpec[idxV2.fullName()]
-	suite.True(ok)
-	suite.NotEqual(v1hex, regV2.Version, "paths change must produce different MD5 version")
-	suite.Equal(regV1.CreatedAt, regV2.CreatedAt, "CreatedAt immutable across index versions")
-	suite.False(regV2.UpdatedAt.IsZero(), "UpdatedAt must refresh on version change")
-
-	resV2 := suite.db.SearchIndex(idxV2.fullName(), x.KeysPattern(ownerNs+":*"), nil, false)
-	suite.True(resV2.IsOk())
-	gotV2 := resV2.MustGet()
-	suite.Len(gotV2, 3)
-	suite.Equal([]int64{100, 500, 900}, []int64{
-		gjson.Get(gotV2[0], "score").Int(),
-		gjson.Get(gotV2[1], "score").Int(),
-		gjson.Get(gotV2[2], "score").Int(),
-	}, "V2 index must order rows by score ASC after DropIndex+CreateIndex remount")
-
-	var metaKeys []string
-	suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
-		return tx.AscendKeys(naming.IdxMetaGlobFor(idxV1.fullName()), func(k, v string) bool {
-			metaKeys = append(metaKeys, k)
-			return true
-		})
-	}))
-	suite.Len(metaKeys, 1, "disk invariant: exactly 1 _idx_:*:v_* key per logical index after 2 versions; got: %v", metaKeys)
-}
-
 func (suite *DBSuite) TestSingleMetaVersionPerLogicalOnDiskInvariant() {
 	storageNs := naming.BuildStorageNs("invariant", false)
 	writeDoc := func(ttl time.Duration, keyAttrs []string) {
@@ -993,33 +717,6 @@ func (suite *DBSuite) TestSingleMetaVersionPerLogicalOnDiskInvariant() {
 		})
 	}))
 	suite.Equal(1, memMetaCount, "mem layer doc meta also single-versioned; symmetric storage check")
-
-	idxFull := naming.BuildIdxFullName(storageNs, "sort")
-	writeIdx := func(paths []string) {
-		suite.T().Helper()
-		spec := idxSpec{OwnerNs: storageNs, Logical: "sort", KeyPattern: storageNs + ":*", Paths: paths}
-		suite.NoError(suite.db.writeIndexSpec(spec))
-	}
-	countIdxMeta := func() int {
-		suite.T().Helper()
-		var n int
-		suite.NoError(suite.db.raw().View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(naming.IdxMetaGlobFor(idxFull), func(k, v string) bool {
-				n++
-				return true
-			})
-		}))
-		return n
-	}
-
-	writeIdx([]string{"a"})
-	suite.Equal(1, countIdxMeta(), "idx V1: 1 meta key")
-	writeIdx([]string{"a", "b"})
-	suite.Equal(1, countIdxMeta(), "idx V2: add path, old meta deleted → 1 meta key")
-	writeIdx([]string{"c"})
-	suite.Equal(1, countIdxMeta(), "idx V3: change path entirely → 1 meta key")
-	writeIdx([]string{"c"})
-	suite.Equal(1, countIdxMeta(), "idx V3 noop: still 1 meta key")
 }
 
 func requireTTLPositive(t *testing.T, db *DB, key string) {
@@ -2208,50 +1905,6 @@ func TestOpenDB_EdgeCases(t *testing.T) {
 	}
 }
 
-// ─── idxSpec.UnmarshalJSON ───
-
-func TestIdxSpecUnmarshalJSON(t *testing.T) {
-	tests := []struct {
-		name     string
-		json     string
-		wantPath []string
-		wantErr  bool
-	}{
-		{
-			name:     "new paths field",
-			json:     `{"owner_ns":"user","logical":"age","paths":["$.age","$.name"]}`,
-			wantPath: []string{"$.age", "$.name"},
-		},
-		{
-			name:     "legacy single path field",
-			json:     `{"owner_ns":"user","logical":"age","path":"$.age"}`,
-			wantPath: []string{"$.age"},
-		},
-		{
-			name:     "both fields paths wins",
-			json:     `{"owner_ns":"user","logical":"age","paths":["$.a"],"path":"$.b"}`,
-			wantPath: []string{"$.a"},
-		},
-		{
-			name:    "invalid json",
-			json:    `{invalid`,
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var idx idxSpec
-			err := json.Unmarshal([]byte(tt.json), &idx)
-			if tt.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, tt.wantPath, idx.Paths)
-		})
-	}
-}
-
 // ─── applyPatternRange ───
 
 func TestApplyPatternRange(t *testing.T) {
@@ -2355,7 +2008,7 @@ func TestWriteDocSpecValidationParityWithXRegisterSchema(t *testing.T) {
 	})
 
 	t.Run("sdk_and_server_parity_via_x_validate", func(t *testing.T) {
-		xGood := x.RegisterSchema[testUserDoc]("registeredgood", false, time.Hour, "tenant", "id")
+		xGood := x.RegisterSchema[testUserDoc]()
 		require.NotNil(t, xGood)
 		specFromGood := docSpec{
 			Namespace: xGood.Namespace(), Mem: xGood.Mem(),
@@ -2385,14 +2038,14 @@ func TestTTLSsoTNormalisation(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	t.Run("register_schema_ttl0_normalised_to_minus1_in_memory", func(t *testing.T) {
-		sch := x.RegisterSchema[testUserDoc]("ttlnorm0", false, 0, "pk")
+		sch := x.RegisterSchema[testMemUserDoc]()
 		require.Equal(t, time.Duration(-1), sch.TTL(),
 			"x.RegisterSchema with ttl=0 must return TTL=-1 (permanent SSoT)")
 
-		schN1 := x.RegisterSchema[testUserDoc]("ttlnormn1", false, -1, "pk")
+		schN1 := x.RegisterSchema[ttlNormNegOneDoc]()
 		require.Equal(t, time.Duration(-1), schN1.TTL())
 
-		schNeg := x.RegisterSchema[testUserDoc]("ttlnormneg", false, -3*time.Second, "pk")
+		schNeg := x.RegisterSchema[ttlNormNegThreeSecDoc]()
 		require.Equal(t, time.Duration(-1), schNeg.TTL(),
 			"negative TTLs beyond -1 are also clamped to -1 post-validation")
 	})

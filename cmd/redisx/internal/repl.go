@@ -152,14 +152,14 @@ func wireCmdHelp(want string) (string, []string, bool) {
 }
 
 // printCatalogue renders the client-builtin SSoT command catalogue (Basic /
-// Extended / Meta Management) plus the connection status line. It works with
+// Extended) plus the connection status line. It works with
 // or without a session — the catalogue is decoupled from the server.
 func printCatalogue(data *AppData) {
 	if data == nil {
 		return
 	}
 	groups := map[string][][2]string{}
-	order := []string{"Basic", "Extended", "Meta Management"}
+	order := []string{"Basic", "Extended"}
 	for _, g := range order {
 		groups[g] = nil
 	}

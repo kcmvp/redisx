@@ -21,8 +21,8 @@ import (
 // lookups):
 //
 //  1. If arg1 does NOT contain ':' → Doc Pattern. arg1 is treated as a
-//     logical document namespace and MUST have been registered via
-//     server.Start(schemas…) or the REGSCH registry command. A bare no-colon
+//     logical document namespace and MUST have been declared in code via
+//     x.RegisterSchema and passed to server.Start(schemas…). A bare no-colon
 //     key that is not a registered namespace is rejected outright; the
 //     system never falls back to plain-KV mode for it.
 //  2. If arg1 contains ':' → KV Pattern. arg1 is treated as the literal
@@ -100,10 +100,10 @@ type Schema interface {
 	//
 	// The returned value is always either -1 (permanent / no default TTL)
 	// or a strictly-positive duration. Callers never observe the Go zero
-	// value 0; the three public entry points (RegisterSchema,
-	// regSchemaCommand, writeDocSpec) all coalesce any non-positive input
-	// to -1 before the value is stored or validated, so MD5 canonical
-	// fingerprints are version-stable across entry points.
+	// value 0; the two public entry points (RegisterSchema and
+	// server.writeDocSpec) coalesce any non-positive input to -1 before the
+	// value is stored or validated, so the audit MD5 fingerprint is stable
+	// across entry points.
 	TTL() time.Duration
 }
 
@@ -133,6 +133,7 @@ type registeredSchema struct {
 	mem       bool
 	keyAttrs  []string
 	ttl       time.Duration
+	indexes   []Index
 }
 
 func (s registeredSchema) Namespace() string  { return s.namespace }
@@ -140,13 +141,19 @@ func (s registeredSchema) Mem() bool          { return s.mem }
 func (s registeredSchema) KeyAttrs() []string { return append([]string(nil), s.keyAttrs...) }
 func (s registeredSchema) TTL() time.Duration { return s.ttl }
 
+// Indexes returns a copy of the secondary indexes declared alongside this
+// schema at its definition site. The server reads them through the optional
+// interface { Indexes() []Index } at boot; the returned slice is a defensive
+// copy so callers can never mutate the registry in place.
+func (s registeredSchema) Indexes() []Index { return append([]Index(nil), s.indexes...) }
+
 var _ Schema = registeredSchema{}
 
 // Validate runs the full input-validation contract over any Schema value.
 // It is the single source of truth for ALL schema-validity checks across
 // both code paths:
 //   - Go SDK callers via RegisterSchema (panics on invalid input)
-//   - Wire/REGSCH callers via server.writeDocSpec (returns ERR to client)
+//   - code-declared schemas at boot via server.writeDocSpec (returns ERR)
 //
 // TTL normalisation (any non-positive value → -1) runs BEFORE Validate at
 // every entry point, so Validate itself always observes TTL ∈ {-1} ∪ ℝ⁺.
@@ -184,35 +191,126 @@ func Validate(s Schema) error {
 	return nil
 }
 
-// RegisterSchema creates a Schema bound to a concrete Document type T.
-// Panics on invalid input. Returns a Schema value whose 4 accessors
-// return the registered values.
+// RegisterSchema creates and validates a [Schema] for the concrete Document
+// type T, together with the secondary indexes declared at the very same
+// definition site.
+//
+// All schema metadata is read from T's own methods (Namespace / Mem /
+// KeyAttrs / TTL), so there are no redundant parameters to keep in sync with
+// the type. Indexes are declared inline via [IndexOn] / [IndexOnPattern] and
+// bound here to T's storage namespace, so callers never need a separate
+// runtime registration call:
+//
+//	var OrderSchema = x.RegisterSchema[Order](x.IndexOn("ordid", OrdIDAttr))
+//
+//	server.StartWith(cfg, OrderSchema, ...)
+//
+// The returned value satisfies [Schema] and is passed to server.Start /
+// server.StartWith unchanged; the server reads the declared indexes through
+// the optional interface { Indexes() []Index }.
 //
 // Input validation is delegated entirely to [Validate] (the SSoT); this
 // function only wraps the returned error in a panic so that SDK-side
 // factory errors are fail-fast at program boot (no silent corruption of
 // the registry later).
-func RegisterSchema[T Document](namespace string, mem bool, ttl time.Duration, keyAttrs ...string) Schema {
+func RegisterSchema[T Document](defs ...IndexDef) Schema {
+	var zero T
+	ttl := zero.TTL()
 	if ttl <= 0 {
 		ttl = -1
 	}
 	s := registeredSchema{
-		namespace: namespace,
-		mem:       mem,
-		keyAttrs:  append([]string(nil), keyAttrs...),
+		namespace: zero.Namespace(),
+		mem:       zero.Mem(),
+		keyAttrs:  append([]string(nil), zero.KeyAttrs()...),
 		ttl:       ttl,
 	}
 	if err := Validate(s); err != nil {
 		panic(fmt.Sprintf("RegisterSchema: %v", err))
 	}
+	s.indexes = bindIndexes(s.namespace, s.mem, defs)
 	return s
 }
 
+// ——— Declarative index section ———
+//
+// Secondary indexes are declared inline at the schema definition site (see
+// [RegisterSchema]), so there is no runtime registration call and no chained
+// builder method:
+//
+//	var OrderSchema = x.RegisterSchema[Order](x.IndexOn("ordid", OrdIDAttr))
+//
+//	server.StartWith(cfg, OrderSchema, ...)
+//
+// RegisterSchema binds each declared [IndexDef] to the owning schema's storage
+// namespace; the server reads the bound indexes through the optional interface
+// { Indexes() []Index }.
+
+// IndexDef is an unbound secondary-index declaration: an index name, an
+// optional doc-scoped key pattern (default "*") and the JSON paths. It is
+// bound to a concrete schema — and thereby to a storage namespace — by
+// [RegisterSchema].
+type IndexDef struct {
+	idxName    string
+	keyPattern string
+	paths      []string
+}
+
+// IndexOn declares a secondary index over the given JSON paths, scoped to
+// every key of the owning document (key pattern "*"). Paths accept dotted
+// JSON notation; dots are normalised to '_' as required by the buntdb JSON
+// indexer.
+func IndexOn(idxName string, paths ...string) IndexDef {
+	return IndexOnPattern(idxName, "*", paths...)
+}
+
+// IndexOnPattern is [IndexOn] with an explicit doc-scoped key pattern (for
+// example "us_*" to index only a sub-range). [RegisterSchema] resolves
+// the pattern against the owning document's storage namespace.
+func IndexOnPattern(idxName, keyPattern string, paths ...string) IndexDef {
+	if idxName == "" {
+		panic("IndexOn: index name is required")
+	}
+	if len(paths) == 0 {
+		panic("IndexOn: at least one json path is required")
+	}
+	normalized := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			panic("IndexOn: json path entries must not be empty")
+		}
+		normalized = append(normalized, strings.ReplaceAll(p, ".", "_"))
+	}
+	if keyPattern == "" {
+		keyPattern = "*"
+	}
+	return IndexDef{idxName: strings.ToLower(idxName), keyPattern: keyPattern, paths: normalized}
+}
+
+// bindIndexes binds unbound [IndexDef] declarations to the storage namespace
+// derived from ns/mem, producing fully-qualified [Index] values. It never
+// reads the model's type parameters, so it is safe to call during package
+// initialisation.
+func bindIndexes(ns string, mem bool, defs []IndexDef) []Index {
+	if len(defs) == 0 {
+		return nil
+	}
+	storageNs := naming.BuildStorageNs(ns, mem)
+	out := make([]Index, 0, len(defs))
+	for _, def := range defs {
+		out = append(out, Index{
+			name:       naming.BuildIdxFullName(storageNs, def.idxName),
+			keyPattern: naming.StorageNsScope(storageNs) + def.keyPattern,
+			paths:      append([]string(nil), def.paths...),
+		})
+	}
+	return out
+}
+
 // Index describes one declared JSON BTree index. Instances are normally
-// produced by [Idx] or [RawIndex] and then passed to
-// server.Start / DB.CreateIndex at boot; the REGIDX registry command does
-// not use this struct — it writes idxSpec metadata directly via
-// applyIndexSpec.
+// produced by [Idx] / [RawIndex], or bound from an [IndexDef] by
+// [RegisterSchema], and are mounted (as in-process BuntDB btrees) at boot via
+// server.Start — indexes are code-only and never persisted.
 //
 // An Index is always bound to one storage layer (disk XOR mem) via the
 // owner document's Mem() flag; cross-layer index searches are rejected
@@ -319,7 +417,7 @@ func validateStorageNs[D Schema]() string {
 // joined pk string. For glob patterns and index key-patterns (which may
 // legitimately contain reserved characters such as '*' or literal ':' in the
 // pattern payload) use [StorageNsKeyPattern] or [RawIndex] respectively.
-func StorageKeyValue[D Document](v string) string {
+func StorageKeyValue[D Schema](v string) string {
 	storageNs := validateStorageNs[D]()
 	return naming.BuildStorageKey(storageNs, v)
 }
@@ -426,7 +524,7 @@ func RawIndex(name string, keyPattern string, jsonPaths ...string) Index {
 // logical index name.
 //
 // All character-set and separator decisions are delegated to the naming SSoT.
-func IdxFullName[D Document](idxName string) string {
+func IdxFullName[D Schema](idxName string) string {
 	if idxName == "" {
 		panic("index name is required")
 	}
@@ -447,7 +545,7 @@ func IdxFullName[D Document](idxName string) string {
 // For composite (multi-field) indexes, pass multiple jsonPaths in ORDER-BY
 // priority; buntdb.IndexJSON natively consumes the variadic path list to
 // build a compound BTree key.
-func Idx[D Document](idxName string, keyPattern string, jsonPaths ...string) Index {
+func Idx[D Schema](idxName string, keyPattern string, jsonPaths ...string) Index {
 	if keyPattern == "" {
 		panic("index key pattern is required")
 	}
@@ -475,7 +573,7 @@ func Idx[D Document](idxName string, keyPattern string, jsonPaths ...string) Ind
 // ValidateKeyPattern resolves one document-scoped key pattern into its full
 // storage pattern. It rejects already-prefixed storage patterns because the
 // document type itself already determines the namespace prefix.
-func ValidateKeyPattern[D Document](keyPattern string) (string, error) {
+func ValidateKeyPattern[D Schema](keyPattern string) (string, error) {
 	fullNamespace := StorageKeyValue[D]("")
 	fullPrefix := naming.StorageNsScope(fullNamespace)
 	if keyPattern == fullNamespace || strings.HasPrefix(keyPattern, fullPrefix) {
@@ -487,7 +585,7 @@ func ValidateKeyPattern[D Document](keyPattern string) (string, error) {
 // ValidateIdxName resolves one logical document index name into its full
 // runtime name. It rejects already-prefixed index names because the document
 // type itself already determines the namespace prefix.
-func ValidateIdxName[D Document](idxName string) (string, error) {
+func ValidateIdxName[D Schema](idxName string) (string, error) {
 	if idxName == "" {
 		return "", fmt.Errorf("index name is required")
 	}
@@ -587,32 +685,29 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 //                 → storageNs:                  "user"                      (disk layer, durable across restart)
 //                 → full key format:            "user:{tenant}_{id}"           (multi-segment pk JOINED by '_' only WITHIN the pk suffix)
 //                                                 for {"tenant":"acme","id":"7"}  → value "user:acme_7"
-//                 → doc meta key format:        "_doc_:{storageNs}"
-//                                                 for storageNs="user"          → value "_doc_:user"
+//                 → doc meta key format:        "_doc_:{storageNs}:v_{md5}"   (audit record only; never replayed)
+//                                                 for storageNs="user"          → e.g. "_doc_:user:v_1a2b3c4d5e6f"
 //                 → index "age" full name:      "{storageNs}:age"              (ALL hierarchical levels JOINED by ':')
 //                                                 for storageNs="user"          → value "user:age"
 //                 → composite index "tenantage": "{storageNs}:tenantage"
-//                   (REGIDX user tenantage tenant,age)
+//                   (declared via x.IndexOn("tenantage", "tenant", "age"))
 //                                                 for storageNs="user"          → value "user:tenantage"
 //                                                 ordered by (tenant ASC, age ASC) via buntdb.IndexJSON("tenant","age")
-//                 → index meta key format:      "_idx_:{indexFullName}"
-//                                                 for indexFullName="user:age"  → value "_idx_:user:age"
+//                                                 (indexes are in-process only: NO meta key is persisted)
 //
 //   - SessionDoc: Namespace="session", Mem=true,  KeyAttrs=["sid"],          TTL=30m
 //                 → storageNs:                  "_m_:session"               (mem layer, dropped on restart)
 //                 → full key format:            "_m_:session:{sid}"
 //                                                 for {"sid":"abc"}            → value "_m_:session:abc"
-//                 → doc meta key format:        "_doc_:{storageNs}"
-//                                                 for storageNs="_m_:session"  → value "_doc_:_m_:session"
+//                 → doc meta key format:        "_doc_:{storageNs}:v_{md5}"   (audit record only; never replayed)
+//                                                 for storageNs="_m_:session"  → e.g. "_doc_:_m_:session:v_1a2b3c4d5e6f"
 //                 → index "last" full name:     "{storageNs}:last"           (consistent colon-based hierarchy)
 //                                                 for storageNs="_m_:session"  → value "_m_:session:last"
 //                 → composite index "uidlast":  "{storageNs}:uidlast"
-//                   (REGIDX _m_:session uidlast user_id,last_ts)
+//                   (declared via x.IndexOn("uidlast", "user_id", "last_ts"))
 //                                                 for storageNs="_m_:session"  → value "_m_:session:uidlast"
 //                                                 ordered by (user_id ASC, last_ts ASC)
-//                 → index meta key format:      "_idx_:{indexFullName}"
-//                                                 for indexFullName="_m_:session:last"
-//                                                                               → value "_idx_:_m_:session:last"
+//                                                 (indexes are in-process only: NO meta key is persisted)
 //
 // Single mental model, no character mixing ever:
 //   ┌─ ':'  = hierarchical boundary (layer / namespace / index-logical / pk prefix)
@@ -724,21 +819,25 @@ func ParseUpdate(jsonStr string) ([]Mutation, error) {
 //      DEL app:config:theme           → OK, deleted
 //
 // ------------------------------------------------------------
-// 3. Symmetric persistence (Doc/Index meta follow their storage layer)
+// 3. Registry lives in code; schema meta is audit-only
 // ------------------------------------------------------------
-//   - Restart behavior for UserDoc (disk):
-//       data "user:acme_7"         → still on disk, present
-//       _doc_:user meta           → still on disk → docSpec re-registered automatically
-//       _idx_:user_age meta       → still on disk → BTree rebuilt, backfill works
+//   The in-process registry (docRegSpec / idxRegSpec) is populated ONLY from
+//   the schemas passed to Start*, never replayed from persisted meta keys.
 //
-//   - Restart behavior for SessionDoc (mem):
-//       data "_m_:session:abc"    → mem store is new buntdb.Open(":memory:") → GONE
-//       _doc_:_m_:session meta    → mem store gone → docSpec NOT auto-registered
-//                                      caller MUST re-declare at Start(..., SessionDoc(""))
-//       _idx_:_m_:session_last  → mem store gone → idxSpec NOT auto-registered
-//                                      caller MUST re-declare at Start or re-run REGIDX
+//   - UserDoc (disk) restart:
+//       data "user:acme_7"       → still on disk, present
+//       _doc_:user meta          → still on disk (audit record: md5 + timestamps)
+//                                  but NOT replayed; UserDoc must be re-declared
+//                                  via Start(...) exactly like the mem variant.
+//       index "user:age"         → rebuilt from the x.IndexOn declarations
+//                                  passed to x.RegisterSchema at boot
 //
-//   This symmetry is intentional: "if a doc lives on the mem layer and
-//   its data is gone on restart, then its registry metadata is gone
-//   too" so the system never ends up with a dangling empty registry
-//   pointing at an empty mem-layer namespace.
+//   - SessionDoc (mem) restart:
+//       data "_m_:session:abc"   → mem store is a fresh buntdb.Open(":memory:") → GONE
+//       _doc_:_m_:session meta   → nothing to replay (mem meta is gone anyway)
+//       index "_m_:session:last" → rebuilt from code at boot, over an empty store
+//
+//   Indexes are NEVER persisted and have no reload path: whatever the running
+//   code declares is exactly what exists. Schema meta keys are kept purely as
+//   an audit trail (which namespace was registered when), so a binary that no
+//   longer declares a namespace simply leaves its stale meta record untouched.

@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,7 +17,6 @@ import (
 	"github.com/kcmvp/redisx/client/internal/conn"
 	"github.com/kcmvp/redisx/client/raw"
 	"github.com/kcmvp/redisx/internal"
-	"github.com/kcmvp/redisx/internal/naming"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/respconn"
 	"github.com/kcmvp/redisx/x"
@@ -526,93 +523,42 @@ func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Muta
 	return raw.Update(fullKR, filter, values...)
 }
 
-func RegisterSchema[T x.Schema]() error {
-	var zero T
-	type raw struct {
-		Namespace string        `json:"namespace"`
-		Mem       bool          `json:"mem"`
-		KeyAttrs  []string      `json:"key_attrs"`
-		TTL       time.Duration `json:"ttl_ns"`
-	}
-	r := raw{
-		Namespace: zero.Namespace(),
-		Mem:       zero.Mem(),
-		KeyAttrs:  append([]string(nil), zero.KeyAttrs()...),
-		TTL:       zero.TTL(),
-	}
-	b, err := json.Marshal(r)
-	if err != nil {
-		return err
-	}
-	return RegisterSchemaFromJSON(string(b))
+// RegisterSchema registers a typed-document schema (and, optionally, its inline
+// secondary indexes) on the connected server immediately, mirroring
+// x.RegisterSchema's shape:
+//
+//	client.RegisterSchema[Order](x.IndexOn("ordid", OrdIDAttr))
+//
+// It is a plain command against the current connection (like Set), so it must
+// be called while connected. The server applies it idempotently: an unchanged
+// schema spec is a no-op and an already-existing index is not recreated, so
+// calling it repeatedly is always safe. When and how often to (re)declare —
+// including anything like re-declaring after a reconnect — is the caller's
+// concern, not this function's.
+func RegisterSchema[T x.Document](defs ...x.IndexDef) error {
+	return raw.RegisterSchema(buildSchemaPayload(x.RegisterSchema[T](defs...)))
 }
 
-func RegisterIndex[D x.Document](logical string, keyPattern string, jsonPaths ...string) error {
-	if logical == "" {
-		return errors.New("logical index name is empty")
+// buildSchemaPayload projects one x.Schema, plus the indexes it declares
+// through the optional { Indexes() []x.Index } interface, onto the shared wire
+// payload.
+func buildSchemaPayload(s x.Schema) proto.SchemaPayload {
+	payload := proto.SchemaPayload{
+		Namespace: s.Namespace(),
+		Mem:       s.Mem(),
+		KeyAttrs:  append([]string(nil), s.KeyAttrs()...),
+		TTL:       s.TTL(),
 	}
-	if keyPattern == "" {
-		return errors.New("key pattern is empty")
-	}
-	if len(jsonPaths) == 0 {
-		return errors.New("at least one jsonPath is required")
-	}
-	var zero D
-	ns := zero.Namespace()
-	mem := zero.Mem()
-	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
-		return err
-	}
-	storageNs := naming.BuildStorageNs(ns, mem)
-	paths := make([]string, 0, len(jsonPaths))
-	for _, p := range jsonPaths {
-		if p == "" {
-			return errors.New("jsonPaths contains empty path")
+	if withIdx, ok := s.(interface{ Indexes() []x.Index }); ok {
+		for _, idx := range withIdx.Indexes() {
+			payload.Indexes = append(payload.Indexes, proto.IndexPayload{
+				Name:       idx.Name(),
+				KeyPattern: idx.KeyPattern(),
+				Paths:      append([]string(nil), idx.Paths()...),
+			})
 		}
-		paths = append(paths, strings.ReplaceAll(p, ".", "_"))
 	}
-	type raw struct {
-		OwnerNs    string   `json:"owner_ns"`
-		OwnerMem   bool     `json:"owner_mem,omitempty"`
-		Logical    string   `json:"logical"`
-		Paths      []string `json:"paths"`
-		KeyPattern string   `json:"key_pattern"`
-	}
-	spec := raw{
-		OwnerNs:    storageNs,
-		OwnerMem:   mem,
-		Logical:    strings.ToLower(logical),
-		Paths:      paths,
-		KeyPattern: keyPattern,
-	}
-	b, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("RegisterIndex build JSON: %w", err)
-	}
-	return RegisterIndexFromJSON(string(b))
-}
-
-func DropSchema[T x.Schema]() error {
-	var zero T
-	ns := zero.Namespace()
-	if ns == "" {
-		return errors.New("schema returned empty namespace")
-	}
-	return raw.DropSchema(ns)
-}
-
-func DropIndex[D x.Document](logical string) error {
-	if logical == "" {
-		return errors.New("logical index name is empty")
-	}
-	var zero D
-	ns := zero.Namespace()
-	mem := zero.Mem()
-	if err := naming.ValidateDocLogicalNamespace(ns); err != nil {
-		return err
-	}
-	storageNs := naming.BuildStorageNs(ns, mem)
-	return raw.DropIndex(storageNs, strings.ToLower(logical))
+	return payload
 }
 
 // Auth authenticates the shared resp client connection with the given key.
@@ -885,77 +831,4 @@ func consume(ctx context.Context, client *redis.Client) error {
 			}
 		}
 	}
-}
-
-func RegisterSchemaFromJSON(specJSON string) error {
-	if specJSON == "" {
-		return errors.New("schema spec json is empty")
-	}
-	client := getSharedClient()
-	if client == nil {
-		return errors.New("resp client is not connected")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	return client.Do(ctx, proto.CmdRegisterSchema, specJSON).Err()
-}
-
-func RegisterIndexShort(ownerNs, logical string, paths ...string) error {
-	if ownerNs == "" {
-		return errors.New("owner_ns is empty")
-	}
-	if logical == "" {
-		return errors.New("logical is empty")
-	}
-	if len(paths) == 0 {
-		return errors.New("at least one path is required")
-	}
-	clean := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if p == "" {
-			return errors.New("paths contains an empty entry")
-		}
-		clean = append(clean, strings.ReplaceAll(p, ".", "_"))
-	}
-	type raw struct {
-		OwnerNs    string   `json:"owner_ns"`
-		Logical    string   `json:"logical"`
-		Paths      []string `json:"paths"`
-		KeyPattern string   `json:"key_pattern,omitempty"`
-	}
-	ownerMem := strings.HasPrefix(ownerNs, "_m_")
-	nsScope := ownerNs
-	if !ownerMem {
-		nsScope = "_d_" + ownerNs
-	}
-	spec := raw{
-		OwnerNs:    ownerNs,
-		Logical:    strings.ToLower(logical),
-		Paths:      clean,
-		KeyPattern: nsScope + ":*",
-	}
-	b, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("RegisterIndexShort build JSON: %w", err)
-	}
-	client := getSharedClient()
-	if client == nil {
-		return errors.New("resp client is not connected")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	return client.Do(ctx, proto.CmdRegisterIndex, string(b)).Err()
-}
-
-func RegisterIndexFromJSON(specJSON string) error {
-	if specJSON == "" {
-		return errors.New("index spec json is empty")
-	}
-	client := getSharedClient()
-	if client == nil {
-		return errors.New("resp client is not connected")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	return client.Do(ctx, proto.CmdRegisterIndex, specJSON).Err()
 }

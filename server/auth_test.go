@@ -405,7 +405,7 @@ func TestGate2_AuthKeyMatch(t *testing.T) {
 		},
 		{
 			name:       "correct ctrl key on ctrl port passes",
-			cmdName:    "REGSCH",
+			cmdName:    "KEYS",
 			ctx:        "ctrl-key-456",
 			role:       portRoleCtrl,
 			wantReject: false,
@@ -420,7 +420,7 @@ func TestGate2_AuthKeyMatch(t *testing.T) {
 		},
 		{
 			name:       "app key on ctrl port rejected",
-			cmdName:    "REGSCH",
+			cmdName:    "KEYS",
 			ctx:        "app-key-123",
 			role:       portRoleCtrl,
 			wantReject: true,

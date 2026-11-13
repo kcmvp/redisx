@@ -62,7 +62,7 @@ const sepSentinel = "\x00sep"
 
 func bannerLines(connected string, endpoints []LocalEndpoint) []string {
 	headPure := "Redisx (Compatible with Redis Shell)"
-	extPure := []string{"sk", "si", "upd", "regsch", "dropsch", "regidx", "dropidx"}
+	extPure := []string{"sk", "si", "upd"}
 	hintPure := `Type "help <command>" for help — "quit" / Ctrl-C to exit.`
 	body := []string{"connect: con [-h host] [-p port] [-a auth] | con <host> <port> [auth]"}
 	body = append(body, "")

@@ -23,7 +23,6 @@ type matrixRow struct {
 	wantStorageNs    string
 	wantStorageKey   string
 	wantDocMetaKey   string
-	wantIdxMetaKey   string
 	wantIdxFull      string
 	wantAuthStoreKey string
 }
@@ -38,7 +37,6 @@ var coreMatrix = []matrixRow{
 		wantStorageNs:    "user",
 		wantStorageKey:   "user:0100",
 		wantDocMetaKey:   "_doc_:user:v_" + testMD512,
-		wantIdxMetaKey:   "_idx_:user:age:v_" + testMD512,
 		wantIdxFull:      "user:age",
 		wantAuthStoreKey: "_auth_:0100",
 	},
@@ -51,7 +49,6 @@ var coreMatrix = []matrixRow{
 		wantStorageNs:    "tenantuser",
 		wantStorageKey:   "tenantuser:acme_202",
 		wantDocMetaKey:   "_doc_:tenantuser:v_" + testMD512,
-		wantIdxMetaKey:   "_idx_:tenantuser:score:v_" + testMD512,
 		wantIdxFull:      "tenantuser:score",
 		wantAuthStoreKey: "_auth_:demo-key",
 	},
@@ -64,7 +61,6 @@ var coreMatrix = []matrixRow{
 		wantStorageNs:    "_m_:hot",
 		wantStorageKey:   "_m_:hot:0100",
 		wantDocMetaKey:   "_doc_:_m_:hot:v_" + testMD512,
-		wantIdxMetaKey:   "_idx_:_m_:hot:hitratio:v_" + testMD512,
 		wantIdxFull:      "_m_:hot:hitratio",
 		wantAuthStoreKey: "_auth_:ext-50",
 	},
@@ -77,7 +73,6 @@ var coreMatrix = []matrixRow{
 		wantStorageNs:    "_m_:cache",
 		wantStorageKey:   "_m_:cache:acme_7",
 		wantDocMetaKey:   "_doc_:_m_:cache:v_" + testMD512,
-		wantIdxMetaKey:   "_idx_:_m_:cache:price:v_" + testMD512,
 		wantIdxFull:      "_m_:cache:price",
 		wantAuthStoreKey: "_auth_:abc",
 	},
@@ -90,7 +85,6 @@ var coreMatrix = []matrixRow{
 		wantStorageNs:    "product",
 		wantStorageKey:   "product:sku",
 		wantDocMetaKey:   "_doc_:product:v_" + testMD512,
-		wantIdxMetaKey:   "_idx_:product:cat:v_" + testMD512,
 		wantIdxFull:      "product:cat",
 		wantAuthStoreKey: "_auth_:k",
 	},
@@ -115,9 +109,6 @@ func TestCoreMatrix_BuildShapeCheck(t *testing.T) {
 			if idxFull != r.wantIdxFull {
 				t.Fatalf("BuildIdxFullName(%q, %q) = %q, want %q", storageNs, r.idxFullArgs.logicalIndex, idxFull, r.wantIdxFull)
 			}
-			if got := IdxMetaKey(idxFull, testMD512); got != r.wantIdxMetaKey {
-				t.Fatalf("IdxMetaKey(%q, %q) = %q, want %q", idxFull, testMD512, got, r.wantIdxMetaKey)
-			}
 			if got := StorageNsKeyPattern(storageNs); got != storageNs+":*" {
 				t.Fatalf("StorageNsKeyPattern(%q) = %q, want %q", storageNs, got, storageNs+":*")
 			}
@@ -126,8 +117,8 @@ func TestCoreMatrix_BuildShapeCheck(t *testing.T) {
 	if got := AuthStorageKey("external-50"); got != "_auth_:external-50" {
 		t.Fatalf("AuthStorageKey = %q", got)
 	}
-	if DocMetaGlob() != "_doc_:*:v_*" || IdxMetaGlob() != "_idx_:*:v_*" || AuthStorageGlob() != "_auth_:*" {
-		t.Fatalf("globs mismatch: doc=%s idx=%s auth=%s", DocMetaGlob(), IdxMetaGlob(), AuthStorageGlob())
+	if DocMetaGlob() != "_doc_:*:v_*" || AuthStorageGlob() != "_auth_:*" {
+		t.Fatalf("globs mismatch: doc=%s auth=%s", DocMetaGlob(), AuthStorageGlob())
 	}
 }
 
@@ -400,7 +391,6 @@ func TestBuildersPanicOnInvalidInputs(t *testing.T) {
 		{"BuildIdxFullName empty ns", func() { _ = BuildIdxFullName("", "age") }},
 		{"BuildIdxFullName bad logical", func() { _ = BuildIdxFullName("user", "user_age") }},
 		{"DocMetaKey empty", func() { _ = DocMetaKey("", "") }},
-		{"IdxMetaKey empty", func() { _ = IdxMetaKey("", "") }},
 		{"AuthStorageKey empty", func() { _ = AuthStorageKey("") }},
 		{"StorageNsKeyPattern empty", func() { _ = StorageNsKeyPattern("") }},
 	}

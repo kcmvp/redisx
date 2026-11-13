@@ -45,7 +45,6 @@ func (cheatsheetSessionDoc) TTL() time.Duration { return 30 * time.Minute }
 //   - doc meta key       (_doc_:{storageNs})
 //   - index full name    (Idx[T].Name / ValidateIdxName — logical index
 //     names match cheatsheet: "age" / "last")
-//   - index meta key     (_idx_:{indexFullName})
 func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 	// ------------------------------------------------------------
 	// UserDoc (disk)
@@ -77,8 +76,6 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 		"cheatsheet UserDoc index \"age\" full name = {storageNs}:age → \"user:age\"")
 	require.Equal(t, userAgeIdxName, Idx[cheatsheetUserDoc]("age", "*", "age").Name(),
 		"ValidateIdxName[T] and Idx[T].Name must agree on the full index name")
-	require.Equal(t, "_idx_:user:age:v_placeholder", naming.IdxMetaKey(userAgeIdxName, "placeholder"),
-		"cheatsheet UserDoc index meta = _idx_:{indexFullName}:v_<12hex> → \"_idx_:user:age:v_placeholder\"")
 
 	// ------------------------------------------------------------
 	// SessionDoc (mem)
@@ -107,8 +104,6 @@ func TestCheatsheetSchemaReference_ExactKeyCoordinates(t *testing.T) {
 		"cheatsheet SessionDoc index \"last\" full name = _m_:session:last")
 	require.Equal(t, sessLastIdxName, Idx[cheatsheetSessionDoc]("last", "*", "last_ts").Name(),
 		"ValidateIdxName[T] and Idx[T].Name must agree on mem index name")
-	require.Equal(t, "_idx_:_m_:session:last:v_placeholder", naming.IdxMetaKey(sessLastIdxName, "placeholder"),
-		"cheatsheet SessionDoc index meta = _idx_:_m_:session:last:v_<12hex>")
 }
 
 // TestCheatsheetSchemaReference_KeyAttrValueContainingColonRejects mirrors
@@ -771,9 +766,9 @@ func TestRegisterSchema(t *testing.T) {
 		run  func(*testing.T)
 	}{
 		{
-			name: "returns schema with correct accessors",
+			name: "reads all metadata from the document type",
 			run: func(t *testing.T) {
-				schema := RegisterSchema[regSchemaDocA]("regschemaa", false, time.Hour, "id")
+				schema := RegisterSchema[regSchemaDocA]()
 				require.Equal(t, "regschemaa", schema.Namespace())
 				require.False(t, schema.Mem())
 				require.Equal(t, []string{"id"}, schema.KeyAttrs())
@@ -781,10 +776,25 @@ func TestRegisterSchema(t *testing.T) {
 			},
 		},
 		{
-			name: "keyAttrs deep copy guards against input mutation",
+			name: "KeyAttrs returns a defensive copy",
 			run: func(t *testing.T) {
-				schema := RegisterSchema[regSchemaDocA]("regschemaa", false, time.Hour, "tenant", "id")
-				require.Equal(t, []string{"tenant", "id"}, schema.KeyAttrs())
+				schema := RegisterSchema[regSchemaDocA]()
+				attrs := schema.KeyAttrs()
+				attrs[0] = "mutated"
+				require.Equal(t, []string{"id"}, schema.KeyAttrs())
+			},
+		},
+		{
+			name: "binds declared indexes to the schema storage namespace",
+			run: func(t *testing.T) {
+				schema := RegisterSchema[regSchemaDocA](IndexOn("byid", "id"))
+				withIdx, ok := schema.(interface{ Indexes() []Index })
+				require.True(t, ok, "registered schema must expose Indexes()")
+				idx := withIdx.Indexes()
+				require.Len(t, idx, 1)
+				require.Equal(t, IdxFullName[regSchemaDocA]("byid"), idx[0].Name())
+				require.Equal(t, StorageNsKeyPattern[regSchemaDocA]("*"), idx[0].KeyPattern())
+				require.Equal(t, []string{"id"}, idx[0].Paths())
 			},
 		},
 		{
@@ -807,165 +817,37 @@ func TestRegisterSchema(t *testing.T) {
 	}
 }
 
-type validationTestDoc string
+// invalidKeyAttrsDoc / zeroTTLDoc are RegisterSchema-specific fixtures: now
+// that metadata is derived from the type, per-case TTL/keyAttrs values are no
+// longer injectable through parameters, so each case needs its own document
+// type. The comprehensive input-validation matrix lives in TestValidate.
+type invalidKeyAttrsDoc string
 
-func (validationTestDoc) Namespace() string  { return "test" }
-func (validationTestDoc) Mem() bool          { return false }
-func (validationTestDoc) KeyAttrs() []string { return []string{"id"} }
-func (v validationTestDoc) RawJSON() string  { return string(v) }
-func (validationTestDoc) TTL() time.Duration { return time.Hour }
+func (invalidKeyAttrsDoc) Namespace() string  { return "validns" }
+func (invalidKeyAttrsDoc) Mem() bool          { return false }
+func (invalidKeyAttrsDoc) KeyAttrs() []string { return nil }
+func (v invalidKeyAttrsDoc) RawJSON() string  { return string(v) }
+func (invalidKeyAttrsDoc) TTL() time.Duration { return time.Hour }
+
+type zeroTTLDoc string
+
+func (zeroTTLDoc) Namespace() string  { return "zerottl" }
+func (zeroTTLDoc) Mem() bool          { return false }
+func (zeroTTLDoc) KeyAttrs() []string { return []string{"id"} }
+func (v zeroTTLDoc) RawJSON() string  { return string(v) }
+func (zeroTTLDoc) TTL() time.Duration { return 0 }
 
 func TestRegisterSchema_Validation(t *testing.T) {
-	tests := []struct {
-		name         string
-		namespace    string
-		mem          bool
-		ttl          time.Duration
-		keyAttrs     []string
-		panicMsg     string
-		wantFinalTTL time.Duration
-	}{
-		{
-			name:      "rejects empty namespace",
-			namespace: "",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "namespace is required",
-		},
-		{
-			name:      "rejects namespace with underscore",
-			namespace: "user_admin",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "contains '_'",
-		},
-		{
-			name:      "rejects namespace with colon",
-			namespace: "user:admin",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "contains one of the reserved characters",
-		},
-		{
-			name:      "rejects namespace with wildcard",
-			namespace: "user*admin",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "contains one of the reserved characters",
-		},
-		{
-			name:      "rejects namespace starting with digit",
-			namespace: "1user",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "starts with lowercase letter",
-		},
-		{
-			name:      "rejects namespace exceeding 63 chars",
-			namespace: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "1-63 lowercase-letter-or-digit chars",
-		},
-		{
-			name:         "accepts ttl -1 (permanent)",
-			namespace:    "validns",
-			mem:          false,
-			ttl:          -1,
-			keyAttrs:     []string{"id"},
-			wantFinalTTL: -1,
-		},
-		{
-			name:         "accepts ttl 0 (no default, normalised to -1)",
-			namespace:    "validns",
-			mem:          false,
-			ttl:          0,
-			keyAttrs:     []string{"id"},
-			wantFinalTTL: -1,
-		},
-		{
-			name:         "accepts negative ttl (normalised to -1)",
-			namespace:    "validns",
-			mem:          false,
-			ttl:          -2 * time.Second,
-			keyAttrs:     []string{"id"},
-			wantFinalTTL: -1,
-		},
-		{
-			name:      "rejects no keyAttrs",
-			namespace: "validns",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{},
-			panicMsg:  "at least one keyAttr is required",
-		},
-		{
-			name:      "rejects empty keyAttr entry",
-			namespace: "validns",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{""},
-			panicMsg:  "keyAttrs contains empty entry",
-		},
-		{
-			name:      "rejects duplicate keyAttr entries",
-			namespace: "validns",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id", "id"},
-			panicMsg:  "keyAttrs contains duplicate entry",
-		},
-		{
-			name:      "accepts valid single keyAttr",
-			namespace: "validns",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "",
-		},
-		{
-			name:      "accepts valid composite keyAttrs",
-			namespace: "validns",
-			mem:       false,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"tenant", "id"},
-			panicMsg:  "",
-		},
-		{
-			name:      "accepts mem=true",
-			namespace: "validns",
-			mem:       true,
-			ttl:       time.Hour,
-			keyAttrs:  []string{"id"},
-			panicMsg:  "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.panicMsg != "" {
-				require.Panics(t, func() {
-					RegisterSchema[validationTestDoc](tt.namespace, tt.mem, tt.ttl, tt.keyAttrs...)
-				})
-			} else {
-				schema := RegisterSchema[validationTestDoc](tt.namespace, tt.mem, tt.ttl, tt.keyAttrs...)
-				require.Equal(t, tt.namespace, schema.Namespace())
-				require.Equal(t, tt.mem, schema.Mem())
-				wantTTL := tt.ttl
-				if tt.wantFinalTTL != 0 || tt.ttl <= 0 {
-					wantTTL = tt.wantFinalTTL
-				}
-				require.Equal(t, wantTTL, schema.TTL())
-				require.Equal(t, tt.keyAttrs, schema.KeyAttrs())
-			}
+	t.Run("panics when the document type declares no key attrs", func(t *testing.T) {
+		require.Panics(t, func() {
+			RegisterSchema[invalidKeyAttrsDoc]()
 		})
-	}
+	})
+
+	t.Run("normalises a zero TTL to -1 (permanent)", func(t *testing.T) {
+		schema := RegisterSchema[zeroTTLDoc]()
+		require.Equal(t, time.Duration(-1), schema.TTL())
+	})
 }
 
 type validateUnitSchema struct {

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -97,22 +96,15 @@ func (s *CmdTestSuite) TestCmd() {
 	}); err != nil {
 		t.Fatalf("failed to seed user doc spec: %v", err)
 	}
-	if err := s.db.writeIndexSpec(idxSpec{
-		OwnerNs:    "user",
-		Logical:    "age",
-		KeyPattern: "user:*",
-		Paths:      []string{"age"},
-	}); err != nil {
+	if err := s.db.registerIndexes(
+		x.RawIndex(naming.BuildIdxFullName("user", "age"), naming.StorageNsKeyPattern("user"), "age"),
+	); err != nil {
 		t.Fatalf("failed to seed user:age index: %v", err)
 	}
 
 	seedDocVer, err := canonicalDocMD5(docSpec{Namespace: "user", KeyAttrs: []string{"id"}, Mem: false})
 	if err != nil {
 		t.Fatalf("canonicalDocMD5: %v", err)
-	}
-	seedIdxVer, err := canonicalIdxMD5(idxSpec{OwnerNs: "user", Logical: "age", KeyPattern: "user:*", Paths: []string{"age"}})
-	if err != nil {
-		t.Fatalf("canonicalIdxMD5: %v", err)
 	}
 
 	tests := []struct {
@@ -360,10 +352,10 @@ func (s *CmdTestSuite) TestCmd() {
 			wantArrays: [][]string{{naming.DocMetaKey("user", seedDocVer)}},
 		},
 		{
-			name:       "keys_idx_meta_introspection",
+			name:       "keys_idx_meta_is_empty_indexes_leave_no_trace",
 			auth:       true,
 			commands:   [][]string{{cmdKeys, "_idx_:*"}},
-			wantArrays: [][]string{{naming.IdxMetaKey(naming.BuildIdxFullName("user", "age"), seedIdxVer)}},
+			wantArrays: [][]string{{}},
 		},
 		{
 			name:       "keys_auth_meta_still_forbidden",
@@ -838,12 +830,9 @@ func (s *CmdTestSuite) TestXCmd() {
 	}); err != nil {
 		t.Fatalf("failed to seed user doc spec for XCmd: %v", err)
 	}
-	if err := s.db.writeIndexSpec(idxSpec{
-		OwnerNs:    "user",
-		Logical:    "age",
-		KeyPattern: "user:*",
-		Paths:      []string{"age"},
-	}); err != nil {
+	if err := s.db.registerIndexes(
+		x.RawIndex(naming.BuildIdxFullName("user", "age"), naming.StorageNsKeyPattern("user"), "age"),
+	); err != nil {
 		t.Fatalf("failed to seed user:age index for XCmd: %v", err)
 	}
 
@@ -1251,6 +1240,26 @@ func (s *CmdTestSuite) TestXCmd() {
 	}
 }
 
+// strictUserDoc declares the "strictuser" schema (id+org key attrs, 1h TTL)
+// used by TestStrictGates. Schemas are code-only now, so this declaration is
+// passed to StartWith instead of being pushed over the wire via the removed
+// REGSCH command.
+type strictUserDoc string
+
+func (strictUserDoc) Namespace() string  { return "strictuser" }
+func (strictUserDoc) Mem() bool          { return false }
+func (strictUserDoc) KeyAttrs() []string { return []string{"id", "org"} }
+func (strictUserDoc) TTL() time.Duration { return time.Hour }
+
+// regDelDoc declares the "regdel" schema used by the doc-path DEL batch
+// matrix in TestRegistryCommands.
+type regDelDoc string
+
+func (regDelDoc) Namespace() string  { return "regdel" }
+func (regDelDoc) Mem() bool          { return false }
+func (regDelDoc) KeyAttrs() []string { return []string{"id"} }
+func (regDelDoc) TTL() time.Duration { return 0 }
+
 func (s *CmdTestSuite) TestStrictGates() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
@@ -1262,7 +1271,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	s.db = StartWith(cfg)
+	s.db = StartWith(cfg, strictUserDoc(""))
 	if s.db == nil {
 		t.Fatalf("StartWith returned nil for strict gates; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
@@ -1309,12 +1318,6 @@ func (s *CmdTestSuite) TestStrictGates() {
 			}
 		}
 		return sb.String(), closed
-	}
-
-	specStr := `{"namespace":"strictuser","mem":false,"key_attrs":["id","org"],"ttl_ns":3600000000000}`
-	resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", specStr}})
-	if !strings.Contains(resp, "+OK\r\n") {
-		t.Fatalf("REGSCH failed — expected OK, got: %s", resp)
 	}
 
 	t.Run("KV_no_colon_SET", func(t *testing.T) {
@@ -1372,12 +1375,6 @@ func (s *CmdTestSuite) TestStrictGates() {
 		require.Contains(t, resp, "alone is not a delete target")
 	})
 
-	t.Run("Doc_REGSCH_reserved_indexes_field_ERR", func(t *testing.T) {
-		bad := `{"namespace":"bad_ns","mem":false,"key_attrs":["id"],"indexes":[{"name":"x"}]}`
-		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"regsch", bad}})
-		require.Contains(t, resp, `json: unknown field "indexes"`)
-	})
-
 	t.Run("Doc_SET_object_ok", func(t *testing.T) {
 		doc := `{"id":"u1","org":"acme","age":30}`
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
@@ -1420,7 +1417,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 
 	t.Run("Doc_SEARCHKEY_unregistered_ns_ERR", func(t *testing.T) {
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{{"searchkey", "ghostns:*", "{}"}})
-		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses REGSCH gate; SEARCHKEY returns 0 matched values")
+		require.Contains(t, resp, "*0\r\n", "kv-pattern range (with ':') bypasses the doc-namespace gate; SEARCHKEY returns 0 matched values")
 	})
 
 	t.Run("Doc_SEARCHINDEX_unregistered_owner_ns_ERR", func(t *testing.T) {
@@ -1443,27 +1440,6 @@ func (s *CmdTestSuite) TestStrictGates() {
 		require.Contains(t, resp, "strictuser:u_admin2_acme")
 	})
 
-	t.Run("REGSCH_DROPSCH_roundtrip_present", func(t *testing.T) {
-		docJSON := `{"namespace":"strictmeta","mem":false,"key_attrs":["id"],"ttl_ns":0}`
-		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
-			{"regsch", docJSON},
-			{"dropsch", "strictmeta"},
-			{"regsch", docJSON},
-		})
-		require.Contains(t, resp, "+OK\r\n+OK\r\n+OK\r\n", "registry cmd all OK: reg + drop + reg")
-	})
-
-	t.Run("REGIDX_DROPIDX_roundtrip_present", func(t *testing.T) {
-		docJSON := `{"namespace":"strictidxowner","mem":false,"key_attrs":["id"],"ttl_ns":0}`
-		idxJSON := `{"owner_ns":"strictidxowner","logical":"age","paths":["age"],"key_pattern":"_d_strictidxowner:*"}`
-		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
-			{"regsch", docJSON},
-			{"regidx", idxJSON},
-			{"dropidx", "strictidxowner", "age"},
-		})
-		require.Contains(t, resp, "+OK\r\n+OK\r\n+OK\r\n", "registry cmd all OK: regsch + regidx + dropidx")
-	})
-
 	t.Run("KV_mutation_internal_doc_ns_ERR", func(t *testing.T) {
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
 			{"set", "_doc_:strictuser", `{"ns":"evil"}`},
@@ -1471,7 +1447,7 @@ func (s *CmdTestSuite) TestStrictGates() {
 			{"setex", "_auth_:keyleak", "60", "5"},
 			{"del", "_auth_:client-test-external-key"},
 		})
-		require.Contains(t, resp, "managed exclusively via dedicated registry commands", "any mutation of _doc_/_idx_/_auth_ must raise the Write Guard ERR")
+		require.Contains(t, resp, "managed exclusively", "any mutation of _doc_/_idx_/_auth_ must raise the Write Guard ERR")
 	})
 	t.Run("KV_DEL_multi_full_keys_ERR", func(t *testing.T) {
 		resp, _ := runRESP(ctrlAddr, ctrlAuth, [][]string{
@@ -1551,10 +1527,8 @@ func respRoundTrip(t *testing.T, addr, auth string, cmds [][]string) string {
 	return sb.String()
 }
 
-// TestRegistryCommands exercises the REGSCH/REGIDX/DROPSCH/DROPIDX wire
-// command matrix (happy paths, idempotent re-register, fingerprint upgrade,
-// argv/JSON/semantic rejections) plus the DEL doc-path multi-pk batch and
-// the DB-level CreateIndex / deleteBatchAtomic entry points.
+// TestRegistryCommands exercises the DEL doc-path multi-pk batch and the
+// DB-level CreateIndex / deleteBatchAtomic entry points.
 func (s *CmdTestSuite) TestRegistryCommands() {
 	t := s.T()
 	dbPath := testutil.DBPath(t)
@@ -1565,7 +1539,7 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: "regcmd-app-key"},
 		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
 	}
-	s.db = StartWith(cfg)
+	s.db = StartWith(cfg, regDelDoc(""))
 	if s.db == nil {
 		t.Fatalf("StartWith returned nil for registry commands; appPort=%d ctrlPort=%d", appPort, ctrlPort)
 	}
@@ -1575,231 +1549,7 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 		return respRoundTrip(t, ctrlAddr, ctrlAuth, cmds)
 	}
 
-	sch := func(ns string, mem bool, attrs ...string) string {
-		b, _ := json.Marshal(map[string]any{
-			"namespace": ns,
-			"mem":       mem,
-			"key_attrs": attrs,
-			"ttl_ns":    0,
-		})
-		return string(b)
-	}
-
-	t.Run("REGSCH_matrix", func(t *testing.T) {
-		tests := []struct {
-			name    string
-			cmds    [][]string
-			want    string
-			wantNot string
-		}{
-			{"disk happy", [][]string{{"regsch", sch("regcmd", false, "id")}}, "+OK\r\n", ""},
-			{"mem happy", [][]string{{"regsch", sch("regcmdmem", true, "id")}}, "+OK\r\n", ""},
-			{"idempotent re-register", [][]string{
-				{"regsch", sch("regschidem", false, "id")},
-				{"regsch", sch("regschidem", false, "id")},
-			}, "+OK\r\n+OK\r\n", ""},
-			{"fingerprint upgrade adds attr", [][]string{
-				{"regsch", sch("regschup", false, "id")},
-				{"regsch", sch("regschup", false, "id", "email")},
-			}, "+OK\r\n+OK\r\n", ""},
-			{"argc missing json", [][]string{{"regsch"}}, "wrong number of arguments for 'regsch'", ""},
-			{"invalid json", [][]string{{"regsch", "{bad"}}, "ERR REGSCH invalid JSON format", ""},
-			{"unknown field", [][]string{{"regsch", `{"namespace":"regcmdx","zzz":1}`}}, "ERR REGSCH schema:", ""},
-			{"invalid namespace underscore", [][]string{{"regsch", sch("_bad", false, "id")}}, "ERR REGSCH writeDocSpec:", ""},
-			{"empty key attr", [][]string{{"regsch", sch("regbad", false, "id", "")}}, "ERR REGSCH writeDocSpec: schema: keyAttrs[1] is empty", ""},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				resp := runRESP(tc.cmds)
-				require.Contains(t, resp, tc.want)
-				if tc.wantNot != "" {
-					require.NotContains(t, resp, tc.wantNot)
-				}
-			})
-		}
-	})
-
-	t.Run("REGSCH_ttl_default", func(t *testing.T) {
-		cases := []struct {
-			name    string
-			ns      string
-			payload string
-			wantTTL time.Duration
-		}{
-			{"absent ttl_ns defaults to permanent -1", "regttlns",
-				`{"namespace":"regttlns","mem":false,"key_attrs":["id"]}`, -1},
-			{"null ttl_ns defaults to permanent -1", "regttlnull",
-				`{"namespace":"regttlnull","mem":false,"key_attrs":["id"],"ttl_ns":null}`, -1},
-			{"explicit ttl_ns 0 normalises to permanent -1", "regttlzero",
-				`{"namespace":"regttlzero","mem":false,"key_attrs":["id"],"ttl_ns":0}`, -1},
-			{"explicit ttl_ns 5s stays 5s", "regttl5s",
-				`{"namespace":"regttl5s","mem":false,"key_attrs":["id"],"ttl_ns":5000000000}`, 5 * time.Second},
-		}
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				require.Contains(t, runRESP([][]string{{"regsch", tc.payload}}), "+OK\r\n")
-				spec, exists, err := s.db.loadDocSpec(naming.BuildStorageNs(tc.ns, false))
-				require.NoError(t, err)
-				require.True(t, exists)
-				require.Equal(t, tc.wantTTL, spec.TTL)
-			})
-		}
-	})
-
-	t.Run("REGIDX_matrix", func(t *testing.T) {
-		require.Contains(t, runRESP([][]string{{"regsch", sch("regidxowner", false, "id")}}), "+OK\r\n")
-		require.Contains(t, runRESP([][]string{{"regsch", sch("regidxmem", true, "id")}}), "+OK\r\n")
-
-		tests := []struct {
-			name string
-			cmds [][]string
-			want string
-		}{
-			{"owner_ns plus logical", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"age","paths":["age"]}`},
-			}, "+OK\r\n"},
-			{"full_name form", [][]string{
-				{"regidx", `{"full_name":"regidxowner:email","paths":["email"],"key_pattern":"regidxowner:*"}`},
-			}, "+OK\r\n"},
-			{"owner_doc_logical_ns disk", [][]string{
-				{"regidx", `{"owner_doc_logical_ns":"regidxowner","logical":"org","paths":["org"]}`},
-			}, "+OK\r\n"},
-			{"owner_doc_logical_ns mem", [][]string{
-				{"regidx", `{"owner_doc_logical_ns":"regidxmem","owner_mem":true,"logical":"age","paths":["age"]}`},
-			}, "+OK\r\n"},
-			{"mem owner_ns form", [][]string{
-				{"regidx", `{"owner_ns":"_m_:regidxmem","logical":"email","paths":["email"]}`},
-			}, "+OK\r\n"},
-			{"default key_pattern omitted", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"nick","paths":["nick"]}`},
-			}, "+OK\r\n"},
-			{"idempotent re-register", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"dup","paths":["age"]}`},
-				{"regidx", `{"owner_ns":"regidxowner","logical":"dup","paths":["age"]}`},
-			}, "+OK\r\n+OK\r\n"},
-			{"fingerprint upgrade paths change", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"upg","paths":["age"],"key_pattern":"regidxowner:*"}`},
-				{"regidx", `{"owner_ns":"regidxowner","logical":"upg","paths":["age","email"],"key_pattern":"regidxowner:*"}`},
-			}, "+OK\r\n+OK\r\n"},
-			{"path dot to underscore", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"pfx","paths":["profile.email"]}`},
-			}, "+OK\r\n"},
-			{"argc too few", [][]string{{"regidx"}}, "wrong number of arguments for 'regidx'"},
-			{"argc too many", [][]string{{"regidx", "a", "b"}}, "wrong number of arguments for 'regidx'"},
-			{"invalid json", [][]string{{"regidx", "{bad"}}, "ERR REGIDX invalid JSON format"},
-			{"full_name no separator", [][]string{
-				{"regidx", `{"full_name":"regidxownerage","paths":["age"]}`},
-			}, "ERR REGIDX index full name"},
-			{"owner_ns without logical", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","paths":["age"]}`},
-			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
-			{"no identity fields", [][]string{
-				{"regidx", `{"paths":["age"]}`},
-			}, "ERR REGIDX either full_name or owner_ns + logical is required"},
-			{"owner_doc_logical_ns missing logical", [][]string{
-				{"regidx", `{"owner_doc_logical_ns":"regidxowner","paths":["age"]}`},
-			}, "ERR REGIDX logical is required"},
-			{"owner_doc_logical_ns invalid", [][]string{
-				{"regidx", `{"owner_doc_logical_ns":"_bad","logical":"age","paths":["age"]}`},
-			}, "ERR REGIDX "},
-			{"logical reserved chars", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"a-g-e","paths":["age"]}`},
-			}, "ERR REGIDX logical index name"},
-			{"logical underscore join char", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"a_b","paths":["age"]}`},
-			}, "ERR REGIDX logical index name"},
-			{"paths missing", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"nopaths"}`},
-			}, `ERR REGIDX either "path" (string, single-field) or "paths" ([string], multi-field) is required`},
-			{"paths empty entry", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"emptyp","paths":["age",""]}`},
-			}, "ERR REGIDX paths[1] is empty or not a string"},
-			{"key_pattern leading wildcard", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"wild","paths":["age"],"key_pattern":"*"}`},
-			}, "key_pattern cannot start with wildcard"},
-			{"single path legacy form", [][]string{
-				{"regidx", `{"owner_ns":"regidxowner","logical":"single","path":"age"}`},
-			}, "+OK\r\n"},
-			{"owner_ns with owner_doc_logical_ns overrides storage ns", [][]string{
-				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"regidxowner","paths":["age"]}`},
-			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
-			{"owner_ns with owner_doc_logical_ns mem fallback", [][]string{
-				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"regidxmem","owner_mem":true,"paths":["age"]}`},
-			}, "ERR REGIDX either full_name or (owner_ns + logical) is required"},
-			{"owner_ns with invalid owner_doc_logical_ns", [][]string{
-				{"regidx", `{"owner_ns":"ignoredraw","owner_doc_logical_ns":"_bad","paths":["age"]}`},
-			}, "ERR REGIDX "},
-			{"owner_doc_logical_ns with invalid logical name", [][]string{
-				{"regidx", `{"owner_doc_logical_ns":"regidxowner","logical":"a-g-e","paths":["age"]}`},
-			}, "ERR REGIDX logical index name"},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				resp := runRESP(tc.cmds)
-				require.Contains(t, resp, tc.want, "resp=%s", resp)
-			})
-		}
-	})
-
-	t.Run("DROPSCH_DROPIDX_matrix", func(t *testing.T) {
-		require.Contains(t, runRESP([][]string{
-			{"regsch", sch("regdrop", false, "id")},
-			{"regidx", `{"owner_ns":"regdrop","logical":"age","paths":["age"]}`},
-			{"regsch", sch("regdropsolo", false, "id")},
-		}), "+OK\r\n+OK\r\n+OK\r\n")
-
-		tests := []struct {
-			name string
-			cmds [][]string
-			want string
-		}{
-			{"dropsch blocked by attached index", [][]string{
-				{"dropsch", "regdrop"},
-			}, "still has 1 attached index(es)"},
-			{"dropidx two-arg form", [][]string{
-				{"dropidx", "regdrop", "age"},
-			}, "+OK\r\n"},
-			{"dropsch after index removed", [][]string{
-				{"dropsch", "regdrop"},
-			}, "+OK\r\n"},
-			{"dropsch unregistered", [][]string{
-				{"dropsch", "neverreg"},
-			}, "not registered"},
-			{"dropidx full name form", [][]string{
-				{"regsch", sch("regdropfull", false, "id")},
-				{"regidx", `{"owner_ns":"regdropfull","logical":"age","paths":["age"]}`},
-				{"dropidx", "regdropfull:age"},
-			}, "+OK\r\n+OK\r\n+OK\r\n"},
-			{"dropidx unregistered", [][]string{
-				{"dropidx", "neverreg", "age"},
-			}, "not registered"},
-			{"dropsch argc zero", [][]string{{"dropsch"}}, "wrong number of arguments for 'dropsch'"},
-			{"dropsch argc too many", [][]string{{"dropsch", "a", "b"}}, "wrong number of arguments for 'dropsch'"},
-			{"dropidx argc zero", [][]string{{"dropidx"}}, "wrong number of arguments for 'dropidx'"},
-			{"dropidx argc too many", [][]string{{"dropidx", "a", "b", "c"}}, "wrong number of arguments for 'dropidx'"},
-			{"dropsch solo schema", [][]string{
-				{"dropsch", "regdropsolo"},
-			}, "+OK\r\n"},
-			{"dropsch invalid ns name", [][]string{
-				{"dropsch", "_bad"},
-			}, "ERR DROPSCH "},
-			{"dropidx invalid ns name", [][]string{
-				{"dropidx", "_bad", "age"},
-			}, "ERR DROPIDX "},
-			{"dropidx invalid logical name", [][]string{
-				{"dropidx", "regidxowner", "a-g-e"},
-			}, "ERR DROPIDX "},
-		}
-		for _, tc := range tests {
-			t.Run(tc.name, func(t *testing.T) {
-				resp := runRESP(tc.cmds)
-				require.Contains(t, resp, tc.want, "resp=%s", resp)
-			})
-		}
-	})
-
 	t.Run("DEL_doc_multipk_batch", func(t *testing.T) {
-		require.Contains(t, runRESP([][]string{{"regsch", sch("regdel", false, "id")}}), "+OK\r\n")
 		seed := [][]string{
 			{"set", "regdel", `{"id":"d1","age":1}`},
 			{"set", "regdel", `{"id":"d2","age":2}`},
@@ -1836,7 +1586,7 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 		)))
 		err := s.db.createIndex(x.RawIndex("bogusns:cidx", "*", "age"))
 		require.Error(t, err)
-		require.Contains(t, err.Error(), "key_pattern cannot start with wildcard")
+		require.Contains(t, err.Error(), "key_pattern must be a concrete (non-wildcard) ns")
 	})
 
 	t.Run("DB_level_deleteBatchAtomic_direct", func(t *testing.T) {
@@ -1851,6 +1601,193 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 		_, err = s.db.deleteBatchAtomic([]string{"regdel:dup", "regdel:dup"})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "duplicate key")
+	})
+}
+
+// TestSchemaCommand drives the SCHEMA command end to end over the wire:
+// the happy path (declare doc spec + inline index, then read it back via
+// SEARCHINDEX), idempotent re-declaration, and every input-validation
+// branch in schemaCommand / registerSchemaPayload (argc, JSON, unknown
+// fields, empty index fields).
+func (s *CmdTestSuite) TestSchemaCommand() {
+	t := s.T()
+	dbPath := testutil.DBPath(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
+	appAuth := "schema-app-key"
+	ctrlAuth := "schema-ctrl-key"
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+	}
+	db := StartWith(cfg)
+	require.NotNil(t, db, "StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+	ctrlAddr := cfg.Ctrl.Addr()
+	appAddr := cfg.App.Addr()
+
+	// payloadJSON builds a SCHEMA body from a doc spec and optional indexes.
+	// Index names are already fully-qualified (e.g. "schemadoc:age") because
+	// the wire payload carries storage-layer index names, not logical names.
+	payloadJSON := func(ns string, mem bool, keyAttrs []string, ttlNS int64, idxs ...[]string) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, `{"namespace":%q,"mem":%t,"key_attrs":[`, ns, mem)
+		for i, ka := range keyAttrs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "%q", ka)
+		}
+		fmt.Fprintf(&b, `],"ttl_ns":%d`, ttlNS)
+		if len(idxs) > 0 {
+			b.WriteString(`,"indexes":[`)
+			for i, idx := range idxs {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				fmt.Fprintf(&b, `{"name":%q,"key_pattern":%q,"paths":[`, idx[0], idx[1])
+				for j, p := range idx[2:] {
+					if j > 0 {
+						b.WriteByte(',')
+					}
+					fmt.Fprintf(&b, "%q", p)
+				}
+				b.WriteString(`]}`)
+			}
+			b.WriteString(`]`)
+		}
+		b.WriteString(`}`)
+		return b.String()
+	}
+
+	rt := func(addr, auth string, cmds [][]string) string {
+		return respRoundTrip(t, addr, auth, cmds)
+	}
+
+	tests := []struct {
+		name    string
+		addr    string
+		auth    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "argc too few",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: "", // no payload arg at all → handled by caller
+			want:    "wrong number of arguments for 'schema' command",
+		},
+		{
+			name:    "invalid json",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: "{bad json",
+			want:    "ERR SCHEMA",
+		},
+		{
+			name:    "unknown field rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"schemadoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"bogus":1}`,
+			want:    "ERR SCHEMA",
+		},
+		{
+			name:    "doc spec only no indexes",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("schemadoc", false, []string{"id"}, 0),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "doc spec with inline index",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("idxdoc", false, []string{"id"}, 0, []string{"idxdoc:age", "idxdoc:*", "age"}),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "redeclare identical is idempotent",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("idxdoc", false, []string{"id"}, 0, []string{"idxdoc:age", "idxdoc:*", "age"}),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "index missing name rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"","key_pattern":"baddoc:*","paths":["age"]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index missing key_pattern rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"","paths":["age"]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index empty paths rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"baddoc:*","paths":[]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index empty path element rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"baddoc:*","paths":[""]}]}`,
+			want:    `has an empty path`,
+		},
+		{
+			name:    "app port rejects SCHEMA as ctrl-only",
+			addr:    appAddr,
+			auth:    appAuth,
+			payload: payloadJSON("appdoc", false, []string{"id"}, 0),
+			want:    "No Privilege",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		s.Run(tc.name, func() {
+			var cmds [][]string
+			if tc.payload == "" {
+				// argc too few: send SCHEMA with no payload
+				cmds = [][]string{{"schema"}}
+			} else {
+				cmds = [][]string{{"schema", tc.payload}}
+			}
+			resp := rt(tc.addr, tc.auth, cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+
+	// End-to-end: after declaring idxdoc with an inline age index, a SET
+	// followed by SEARCHINDEX must return the indexed document. This proves
+	// registerSchemaPayload actually mounted the btree index.
+	s.Run("declare then set then searchindex end to end", func() {
+		resp := rt(ctrlAddr, ctrlAuth, [][]string{
+			{"set", "idxdoc", `{"id":"e1","age":30}`},
+			{"set", "idxdoc", `{"id":"e2","age":40}`},
+			{"searchindex", "idxdoc:age", `{"op":"pattern","p":"idxdoc:*"}`, "{}", "ASC"},
+		})
+		s.Contains(resp, `{"id":"e1","age":30}`)
+		s.Contains(resp, `{"id":"e2","age":40}`)
+	})
+
+	// registerIndexIfAbsent skip path: declaring an index whose name was
+	// already mounted by an earlier SCHEMA push must be a silent no-op
+	// (the idxRegSpec pre-check hits), so SEARCHINDEX still works.
+	s.Run("duplicate index name from second schema is silently skipped", func() {
+		resp := rt(ctrlAddr, ctrlAuth, [][]string{
+			{"schema", payloadJSON("idxdoc2", false, []string{"id"}, 0, []string{"idxdoc2:age", "idxdoc2:*", "age"})},
+			{"set", "idxdoc2", `{"id":"z1","age":50}`},
+			{"searchindex", "idxdoc2:age", `{"op":"pattern","p":"idxdoc2:*"}`, "{}", "ASC"},
+		})
+		s.Contains(resp, "+OK\r\n")
+		s.Contains(resp, `{"id":"z1","age":50}`)
 	})
 }
 
@@ -2055,12 +1992,9 @@ func (s *CmdTestSuite) TestSearchArgvMatrix() {
 		Namespace: "srchdoc",
 		KeyAttrs:  []string{"id"},
 	}))
-	require.NoError(s.T(), db.writeIndexSpec(idxSpec{
-		OwnerNs:    "srchdoc",
-		Logical:    "age",
-		KeyPattern: "srchdoc:*",
-		Paths:      []string{"age"},
-	}))
+	require.NoError(s.T(), db.registerIndexes(
+		x.RawIndex(naming.BuildIdxFullName("srchdoc", "age"), naming.StorageNsKeyPattern("srchdoc"), "age"),
+	))
 	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
 	kr := `{"op":"pattern","p":"srchdoc:*"}`
 
@@ -2139,12 +2073,9 @@ func (s *CmdTestSuite) TestKeysArgvMatrix() {
 		Namespace: "keysdoc",
 		KeyAttrs:  []string{"id"},
 	}))
-	require.NoError(s.T(), db.writeIndexSpec(idxSpec{
-		OwnerNs:    "keysdoc",
-		Logical:    "age",
-		KeyPattern: "keysdoc:*",
-		Paths:      []string{"age"},
-	}))
+	require.NoError(s.T(), db.registerIndexes(
+		x.RawIndex(naming.BuildIdxFullName("keysdoc", "age"), naming.StorageNsKeyPattern("keysdoc"), "age"),
+	))
 	rt := func(cmds [][]string) string { return respRoundTrip(s.T(), ctrlAddr, ctrlAuth, cmds) }
 	require.Contains(s.T(), rt([][]string{{"set", "keysdoc", `{"id":"k1","age":1}`}}), "+OK\r\n")
 
@@ -2158,7 +2089,7 @@ func (s *CmdTestSuite) TestKeysArgvMatrix() {
 		{"keys empty pattern", [][]string{{"keys", ""}}, "ERR KEYS storage key or pattern is required"},
 		{"keys leading wildcard", [][]string{{"keys", "*x"}}, "ERR forbidden key pattern"},
 		{"keys auth ns forbidden", [][]string{{"keys", "_auth_:x"}}, "ERR forbidden key pattern"},
-		{"keys bare idx ns expands", [][]string{{"keys", "_idx_"}}, "_idx_"},
+		{"keys bare idx ns returns empty indexes_not_persisted", [][]string{{"keys", "_idx_"}}, "*0\r\n"},
 		{"keys bare doc ns expands", [][]string{{"keys", "_doc_"}}, "_doc_"},
 		{"keys doc ns glob forbidden", [][]string{{"keys", "abc*"}}, "ERR KEYS for doc-path requires bare"},
 		{"keys bare unregistered ns", [][]string{{"keys", "notregns"}}, "not registered"},
@@ -2340,7 +2271,10 @@ func (s *CmdTestSuite) TestPortRoleGates() {
 	})
 
 	s.Run("gate3 ctrl-only command on app port", func() {
-		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{{"regsch", `{"namespace":"g","key_attrs":["id"]}`}})
+		// With REGSCH/REGIDX/DROPSCH/DROPIDX removed, KEYS is the remaining
+		// ctrl-only command word; a bare (wildcard-free) pattern passes Gate 1
+		// and must be rejected by the Gate-3 ctrl-port allowlist.
+		resp := respRoundTrip(s.T(), appAddr, appAuth, [][]string{{"keys", "user"}})
 		s.Contains(resp, "only allowed on the ctrl port")
 	})
 

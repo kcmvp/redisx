@@ -329,8 +329,10 @@ Important constraints:
 - `index_name` is the full runtime index name, such as `user:age`
 - the second wire arg is a sealed `KeyRange` JSON payload — see
   [KeyRange constructors](#keyrange-json-shape) below
-- indexes must be registered before use (via `REGIDX` or
-  `client.RegisterIndex`)
+- indexes must be declared in code (`x.IndexOn` passed to
+  `x.RegisterSchema`) and handed to `server.Start` as part of the schema;
+  they are rebuilt from those declarations on every boot and never
+  persisted
 - the index chooses the storage layer; a `KeyRange` that resolves to a
   **different** layer is rejected
 
@@ -539,8 +541,8 @@ Typed API rules:
 - typed Go helpers use logical index names and document-scoped
   sub-patterns
 - `SEARCHKEY`, `UPDATE`, and `KEYS` reject leading-wildcard patterns
-- `SEARCHINDEX` requires indexes declared via `REGIDX` or
-  `client.RegisterIndex`
+- `SEARCHINDEX` requires indexes declared in code via `x.IndexOn`,
+  passed to `x.RegisterSchema`
 - external connections must authenticate before using stateful commands
 - memory-layer keys use `_m_:` prefix (with colon): `_m_:user:200`, not
   `_m_user:200`
