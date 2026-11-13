@@ -71,56 +71,52 @@ redisx 目前的 typed document 体系（`x.Document` [x.go#L261-L292](file:///U
 
 ### 3.2 「Index 挂 Doc」模型：A1 外部关系一等化
 
-**关键设计决策：`x.Document` 接口**维持今天的 [x.go#L261-L292](file:///Users/kcmvp/sandbox/redisx/x/x.go#L261-L292) 5 个方法**完全不变**，不新增 `Indexes()` 方法。Index 与 Doc 的关系通过**外部 registry** 一等关联，不是 Doc struct 的字段/方法：
+**关键设计决策：`x.Schema` / `x.Document` 接口**维持 [document.go Schema/Document](file:///Users/kcmvp/sandbox/redisx/x/document.go#L70-L117) 的 4 个方法（Namespace / Mem / KeyAttrs / TTL，外加 `RawJSON() string`）**完全不变**，不新增 `Indexes()` 方法。Index 与 Doc 的关系改为**在 schema 定义点一次性声明**：`x.RegisterSchema[D](x.IndexOn(...))` 把索引作为**函数参数**传入，`RegisterSchema` 返回一个 `x.Schema`（索引承载在其底层实现上，不再有 `Definition` / `WithIndexes` 这类第二方法），照常传给 `server.Start` / `server.StartWith`，服务端通过可选接口 `interface{ Indexes() []x.Index }` 读取声明并逐条 `CreateIndex`（buntdb 回填现存行）。关系仍是「外部」一等关联（不落在 D 类型上）：
 
 ```
-                    ┌───────────────────────────────────────────────────────────────┐
-                    │        Doc Registry (global — memory only, non-SSoT)          │
-                    │                                                                 │
-                    │  ns -> RegistryDocEntry{                                       │
-                    │    PersistentDocSpec (ssot snapshot, NO indexes field)         │
-                    │    + IndexesRuntimeCache: []IndexSpec  ← 非持久化，非 SSoT     │
-                    │                              每次 DescribeDoc 强制重算，不用 trust │
-                    │    CreatedAt, TypeName                                         │
-                    │  }                                                              │
-                    └────▲─────────────────────────────────────▲─────────────────────┘
-                         │                                     │
-         RegisterDoc[D]() │            RegisterIndex[D](name,path)│
-          (Go typed API)  │         (Go typed / RESP cmd)        │
-                         │                                     │
-     ┌──────────────┐    │     ┌──────────────────────────────┐
-     │  x.Document  │    │     │  x.Index (existing)           │
-     │  interface   │    │     │  name/keyPattern/path         │
-     │  (unchanged) │    │     │  (underlying impl, unchanged) │
-     └──────────────┘    │     └──────────────────────────────┘
+                    ┌────────────────────────────────────────────────────────┐
+                    │   code-declared declarations (唯一 SSoT)                 │
+                    │   x.Schema = x.RegisterSchema[D](                      │
+                    │                   x.IndexOn(…))                        │
+                    └────▲────────────────────────────────▲──────────────────┘
+                         │ schema                            │ indexes
+          server.Start(schemas …)                             │  (via interface{
+                         │                                    │   Indexes() []x.Index })
+     ┌──────────────┐    │     ┌──────────────────────────────┴────────┐
+     │  x.Schema    │    │     │  x.Index                             │
+     │  (unchanged) │    │     │  name / keyPattern / paths           │
+     └──────────────┘    │     └──────────────────────────────────────┘
                          │
-              ┌──────────┴─────────────────────────────────────────────────┐
-              │  storage (buntdb two-layer — 真正 SSoT, 永远两套分开)          │
-              │  ① 用户数据行:                                               │
-              │      <ns>:<pk>                        → disk JSON rows      │
-              │      _m_:<ns>:<pk>                    → mem JSON rows       │
-              │  ② 元数据 (两套独立, 绝对不合并):                                │
-              │      _doc_:<storageNs>                → PersistentDocSpec   │
-              │                                              (NO indexes)   │
-              │      _idx_:<[_m_:]<ns>_<logical>>     → IndexSpec           │
-              │                                              (独立 KV)     │
-              └─────────────────────────────────────────────────────────────┘
+              ┌──────────┴────────────────────────────────────────────────┐
+              │  storage (buntdb two-layer — SSoT, 永远两套分开)              │
+              │  ① 用户数据行:                                              │
+              │      <ns>:<pk>                      → disk JSON rows      │
+              │      _m_:<ns>:<pk>                  → mem JSON rows       │
+              │  ② Schema 审计记录 (audit only — 启动不 replay):             │
+              │      _doc_:<storageNs>:v_<md5>      → docSpec             │
+              │  Index 不落库: idxRegSpec 纯内存, 每次启动按代码重建             │
+              │      (_idx_: 前缀已彻底不再使用)                               │
+              └───────────────────────────────────────────────────────────┘
 ```
 
-> **三套 struct 严格分离（A1 模型的核心保障，用户 2026-08-22 决策：元数据分开）**：
+> **Schema 与 Index 的不对称（2026-11-13 决策：Schema 落库仅作审计，Index 零持久化）**：
 >
-> | Go 结构体 | 出现位置 | 是否持久化（_doc_:* / _idx_:*） | 是否允许出现 `indexes` 字段 | SSoT 来源 |
-> |---|---|---|---|---|
-> | **`x.PersistentDocSpec`** | `_doc_:<ns>` 磁盘 JSON / `db.RegisterDocFromSpec(spec)` 入参 / RESP `REGISTERTABLE <ns> <json>` 入参 / `!CREATEDOC` 输出 | ✅ 是（= 磁盘格式 byte-for-byte）| ❌ **绝对禁止**（任何包含 `indexes` 字段的 spec → `ERR PersistentDocSpec must not contain indexes; use REGISTER INDEX separately`）| 用户决策：元数据分开，Index 可以后定义 |
-> | **`x.IndexSpec`** | `_idx_:<full>` 磁盘 JSON / `db.RegisterIndexFromSpec(spec)` 入参 / RESP `REGISTER INDEX <full> <json>` 入参 / `!REGISTER INDEX` 输出 | ✅ 是 | *(不适用，独立 struct)* | Index 自身独立存在，通过 `full = [_m_:]<ns>_<logical>` 中的 `<ns>` 段天然归属 Doc（§11 推论 1）|
-> | **`x.DescribeDocResult`** | `db.DescribeDoc(ns)` 返回给业务层 / RESP `DESCRIBEDOC <ns>` 返回值 | ❌ 不持久化（运行时拼装）| ✅ **允许**（聚合返回给用户看）| 运行时先读 `_doc_:<storageNs>` = PersistentDocSpec → 再 glob `_idx_:<ns>_*` 列齐所有 IndexSpec → 两者拼成 DescribeDocResult。**永远不把 DescribeDocResult 序列化回磁盘**（否则就会出现 schema 冲突）。|
-> | **`internal.registryDocEntry`** (internal 包私有，不 export) | 内存 registry map ns→entry 的 value | ❌ 纯内存 | 可带 `indexesRuntimeCache`，但每次 DescribeDoc 必须**忽略 cache** 重新 glob 重算（cache 仅作 debug 用，非 SSoT）| - |
+> | 维度 | Schema | Index |
+> |---|---|---|
+> | 落库 | ✅ 写 `_doc_:<storageNs>:v_<md5>` | ❌ 零持久化，不留痕迹（`_idx_:*` 已彻底不再使用）|
+> | 启动时 reload | ❌ 不 replay —— 只记录「曾经注册过哪些 Schema」，实际以代码声明为准 | n/a（每次启动按代码声明重建）|
+> | SSoT 来源 | 代码（`RegisterSchema`）；落库记录**仅供审计** | 代码（`RegisterSchema` + `x.IndexOn`）|
+> | 唯一键 | `(Namespace, Mem)` → `storageNs`；KeyAttrs / TTL 变了**直接覆盖**，不报错 | full name = `<storageNs>:<logical>`；重复声明**报错**（buntdb `ErrIndexExists`）|
+> | 内存载体 | `db.docRegSpec map[string]docSpec`（仅由代码声明填充）| `db.idxRegSpec map[string]idxSpec{OwnerNs, Logical}`（纯内存，无 `Paths`）|
+>
+> `_doc_:` 记录中的 `md5` 指纹由 **Namespace + Mem + KeyAttrs + TTL** 算出（**不含** `Version` / `CreatedAt` / `UpdatedAt`），因此它的唯一作用就是审计：可以回溯「这个 schema 的声明曾经长什么样」。
 
 A1 模型为什么是 MVP 正确的选择（vs A2 Indexes() 写进 D 接口）：
 
 1. **Doc 是「宽泛的表形状」** — 只定义关键属性（Namespace/KeyAttrs/Mem/TTL/RawJSON），符合你最初的直觉；Index 是「可选加速结构」，与 shape 解耦。
-2. **动态 CREATE INDEX 在类型层面天然可行** — Index 不是 D 的编译期属性，运行时加不需要改 Go 类型定义。
-3. **零破坏** — 任何已有的 `type UserDoc string` 实现代码不需要改一行；index 迁移是纯加功能。
+2. **声明点前移** — 索引作为 `x.RegisterSchema` 的**函数参数**一次声明（`x.IndexOn(…)`），`Start` 时自动 `CreateIndex` 并回填现存行。原先的 4 个 ctrl 注册命令（`REGSCH` / `REGIDX` / `DROPSCH` / `DROPIDX`）已删除；运行时**唯一**保留的 wire 通道是单条 **`SCHEMA <json-payload>`** 命令（ctrl-only），由 `client.RegisterSchema` 在**连接后立即**把「一个 schema + 它的 inline index 声明」推给服务端。
+   这与「代码即 SSoT」不冲突：服务端**不 replay**、也不把一次 `SCHEMA` 推送当成持久注册表 —— 它只是把这条声明**即刻落一次库**（schema 指纹未变则 no-op、索引已挂载则 skip），把「何时 / 是否需要在重连后重新声明」完全留给调用方（`client.RegisterSchema`）。
+3. **D 类型零改动** — `x.Schema` / `x.Document` 仍是 4+1 个方法，D 类型上不需要任何 `Indexes()` 方法。但 `x.RegisterSchema` 的签名由「显式 4 参数」改为「从 D 读元数据 + `…IndexDef`」是一次 breaking change，需 bump 版本（v0.2.0）。
 
 ### 3.3 「Namespace 约定」与 ScopeGuard 关系
 
@@ -602,12 +598,15 @@ Note: Client SDK generic surface `Get[D]`, `Set[D]`, `Keys[D]`, `SearchIndex[D]`
 - [x] **UPDATE `LIMIT n` flag** (`n>0`, positive integer). Illegal tail tokens → parameter ERR.
 - [x] **No half-written cross-layer batches**: `setBatchAtomic` and `deleteBatchAtomic` reject `len(layers)!=1` ("cannot span storage layers"). This prevents user-defined Mem flag mismatches across a doc-path batch from silently splitting writes.
 
-#### 7.4.4 Wire Registry Commands (REGSCH/DROPSCH/REGIDX/DROPIDX)
+#### 7.4.4 Wire Registry Command (SCHEMA)
 
-- [x] REGSCH: exactly 1 arg = JSON. `DisallowUnknownFields` decoder. Top-level `"indexes"` key present → ERR ("indexes registered via REGIDX, not inside REGSCH payload").
-- [x] DROPSCH: attached-index guard. If any `_idx_:<ns>_*` meta key still exists for this schema ns → ERR (explicitly list count; require DROPIDX first).
-- [x] REGIDX: exactly 1 arg = JSON (`{owner_ns, logical, paths:[…], key_pattern, …}`). Latest-wins MD5 fingerprint; mismatch → atomically drop then recreate buntdb native index + delete old meta key version + persist new `:v_<md5>` version.
-- [x] DROPIDX: 1 or 2 args. Full name alone OR owner + logical. No guard (orphan indexes allowed to drop freely).
+> **Revision（2026-11-13）：** 原 4 个 ctrl 注册命令 —— `REGSCH` / `DROPSCH` / `REGIDX` / `DROPIDX` —— **已删除**（schema 与 index 的声明以代码为准）。运行时**唯一**保留的 wire 通道是单条 `SCHEMA`。
+
+- [x] `SCHEMA <json-payload>`：恰好 1 个参数，即 `proto.SchemaPayload` 的 JSON（`{namespace, mem, key_attrs, ttl_ns, indexes:[{name, key_pattern, paths}]}`）。解码 `DisallowUnknownFields`；参数个数不对 / JSON 非法 / 未知字段 → `ERR`。
+- [x] **ctrl-only by omission**：`SCHEMA` 故意不在 `appPortCmdAllowlist` 内，app 口经 Gate-1 特权门拒绝（`ERR No Privilege: 'schema' is a Meta Management command…`）。
+- [x] **幂等**：doc spec 走 `writeDocSpec`（MD5 指纹未变 → no-op），每个 index 走 `registerIndexIfAbsent`（同名已挂载 → 静默 skip），因此**重复推送同一份声明始终返回 `OK`**，不会因 buntdb `ErrIndexExists` 报错。
+- [x] **无 replay / 无持久注册表**：服务端启动时**不**重放任何 schema，也**不**把一次 `SCHEMA` 推送视为持久状态（`_doc_:<storageNs>:v_<md5>` 记录仅供审计）。重连后是否重新声明，由调用方决定。
+- [x] **Client 入口**：`client.RegisterSchema[T x.Document](defs ...x.IndexDef) error` —— 一条立即执行的命令（同 `Set`），只返回 `error`，因此必须在已连接状态下调用。
 
 ### 7.5 `_doc_:*` / `_idx_:*` Persistence + Crash Recovery
 

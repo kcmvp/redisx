@@ -21,9 +21,9 @@ func TestShlexSplitBasic(t *testing.T) {
 		wantOK bool
 	}{
 		{"empty", "  \t ", nil, true},
-		{"simple", "regsch foo", []string{"regsch", "foo"}, true},
-		{"doubleQuotes", `regsch "hello world" foo`, []string{"regsch", "hello world", "foo"}, true},
-		{"singleQuotes", `dropsch 'a:b:c'`, []string{"dropsch", "a:b:c"}, true},
+		{"simple", "searchkey foo", []string{"searchkey", "foo"}, true},
+		{"doubleQuotes", `searchkey "hello world" foo`, []string{"searchkey", "hello world", "foo"}, true},
+		{"singleQuotes", `update 'a:b:c'`, []string{"update", "a:b:c"}, true},
 		{"escapeInDouble", `"a\"b"`, []string{`a"b`}, true},
 		{"escapeOutDouble", `a\ b c`, []string{"a b", "c"}, true},
 		{"unterminatedDouble", `"abc`, nil, false},
@@ -314,14 +314,11 @@ func TestGlobalHelpShowsAllGroupsStatic(t *testing.T) {
 	if !strings.Contains(out, cBold("Extended Commands")+":") {
 		t.Fatalf("global help should always advertise Extended Commands group (SSoT passthrough, server-side privilege gating): %q", out)
 	}
-	if !strings.Contains(out, cBold("Meta Management")+":") {
-		t.Fatalf("global help should always advertise Meta Management group (SSoT passthrough, server-side privilege gating): %q", out)
-	}
 	if !strings.Contains(out, cBold("Basic Commands")+":") {
 		t.Fatalf("global help must still show Basic Commands group: %q", out)
 	}
-	if !strings.Contains(out, "example regsch") || !strings.Contains(out, "example regidx") || !strings.Contains(out, "example dropsch") || !strings.Contains(out, "example dropidx") {
-		t.Fatalf("Meta Management zero-length list should hint ALL 4 example templates (docs+indexes; server enforces privilege): %q", out)
+	if strings.Contains(out, "Meta Management") || strings.Contains(out, "regsch") || strings.Contains(out, "regidx") || strings.Contains(out, "dropsch") || strings.Contains(out, "dropidx") {
+		t.Fatalf("registry commands (REGSCH/REGIDX/DROPSCH/DROPIDX) were removed from the server — help must NOT advertise them: %q", out)
 	}
 	if !strings.Contains(out, "example searchkey") || !strings.Contains(out, "example searchindex") || !strings.Contains(out, "example update") {
 		t.Fatalf("Extended Commands zero-length list should hint ALL 3 search/update example templates: %q", out)
@@ -460,7 +457,7 @@ func TestBannerStaticContent(t *testing.T) {
 			t.Fatalf("banner should include host:port connected line: %q", out)
 		}
 		stripped := stripANSIStrict(out)
-		if !strings.Contains(stripped, "Extended: sk, si, upd, regsch, dropsch, regidx, dropidx") {
+		if !strings.Contains(stripped, "Extended: sk, si, upd") {
 			t.Fatalf("Extended command list missing: %q", out)
 		}
 		if !strings.Contains(stripped, `Type "help <command>" for help`) {
@@ -594,8 +591,7 @@ func TestCommandsListStaticAllGroups(t *testing.T) {
 	out := buf.String()
 	outPlain := stripANSIStrict(out)
 	mustContain := []string{
-		"Extended:", "Meta Management:",
-		"regsch", "regidx", "searchkey",
+		"Extended:", "searchkey",
 		"127.0.0.1:7381",
 		"Not connected:",
 		"con [host] [port] [auth]",
@@ -603,6 +599,11 @@ func TestCommandsListStaticAllGroups(t *testing.T) {
 	for _, m := range mustContain {
 		if !strings.Contains(outPlain, m) {
 			t.Fatalf("commands output missing %q — plain output:\n%s", m, outPlain)
+		}
+	}
+	for _, gone := range []string{"Meta Management", "regsch", "regidx", "dropsch", "dropidx"} {
+		if strings.Contains(outPlain, gone) {
+			t.Fatalf("catalogue must not advertise removed registry command %q:\n%s", gone, outPlain)
 		}
 	}
 	if strings.Contains(outPlain, "generic-redis") || strings.Contains(outPlain, "not a redisx server") {

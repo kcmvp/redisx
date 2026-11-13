@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,18 +42,67 @@ const defaultHookTimeout = 100 * time.Millisecond
 
 var cliServerSeedOnce sync.Once
 
-type wireSchemaJSON struct {
-	Namespace string        `json:"namespace"`
-	Mem       bool          `json:"mem"`
-	KeyAttrs  []string      `json:"key_attrs"`
-	TTL       time.Duration `json:"ttl_ns"`
+// clientSuiteSchemas returns every schema/index declaration the client test
+// server is booted with. Schemas and their secondary indexes now live in code
+// exclusively (the REGSCH / REGIDX registry commands were removed), so the
+// declarations that used to be pushed over the wire in sharedSeedBody are
+// hoisted here and replayed at every server.StartWith call site.
+func clientSuiteSchemas() []x.Schema {
+	return []x.Schema{
+		x.RegisterSchema[testUserDoc](
+			x.IndexOn("age", "age"),
+			x.IndexOn("email", "email"),
+		),
+		x.RegisterSchema[UserDoc](),
+		x.RegisterSchema[ExpiringUserDoc](),
+
+		x.RegisterSchema[SearchFixtureDoc](
+			x.IndexOn("score", "score"),
+			x.IndexOn("bucket", "bucket"),
+			x.IndexOn("sparseamt", "sparse_amt"),
+		),
+		x.RegisterSchema[UpdateFixtureDoc](),
+
+		x.RegisterSchema[DocSearchFixture](
+			x.IndexOn("score", "score"),
+			x.IndexOn("bucket", "bucket"),
+			x.IndexOn("sparseamt", "sparse_amt"),
+		),
+		x.RegisterSchema[DocUpdateFixture](),
+
+		x.RegisterSchema[probeNegCliDoc](),
+		x.RegisterSchema[probeServerDoc](),
+		x.RegisterSchema[probeNegDocDoc](),
+	}
 }
 
-type wireIndexJSON struct {
-	FullName   string   `json:"full_name"`
-	KeyPattern string   `json:"key_pattern"`
-	Paths      []string `json:"paths"`
-}
+// probeNegCliDoc / probeServerDoc / probeNegDocDoc are registration-only
+// fixtures: their namespaces must be declared in code so the server's
+// doc-pattern registry gate accepts UPDATE / SEARCHKEY against them, but no
+// data is ever seeded under them (they model the cross-contamination probes).
+type probeNegCliDoc string
+
+func (probeNegCliDoc) Namespace() string  { return "probenegcli" }
+func (probeNegCliDoc) Mem() bool          { return false }
+func (probeNegCliDoc) KeyAttrs() []string { return []string{"id"} }
+func (d probeNegCliDoc) RawJSON() string  { return string(d) }
+func (probeNegCliDoc) TTL() time.Duration { return 0 }
+
+type probeServerDoc string
+
+func (probeServerDoc) Namespace() string  { return "probeserver" }
+func (probeServerDoc) Mem() bool          { return true }
+func (probeServerDoc) KeyAttrs() []string { return []string{"id"} }
+func (d probeServerDoc) RawJSON() string  { return string(d) }
+func (probeServerDoc) TTL() time.Duration { return 0 }
+
+type probeNegDocDoc string
+
+func (probeNegDocDoc) Namespace() string  { return "probenegdoc" }
+func (probeNegDocDoc) Mem() bool          { return false }
+func (probeNegDocDoc) KeyAttrs() []string { return []string{"id"} }
+func (d probeNegDocDoc) RawJSON() string  { return string(d) }
+func (probeNegDocDoc) TTL() time.Duration { return 0 }
 
 func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 	t.Helper()
@@ -66,54 +114,6 @@ func sharedSeedBody(t *testing.T, internalSet func(k, v string) error) {
 	ctx := context.Background()
 	rdb := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 	defer func() { _ = rdb.Close() }()
-
-	wireREGSCH := func(ns string, mem bool, keyAttrs []string, ttl time.Duration) {
-		t.Helper()
-		b, err := json.Marshal(wireSchemaJSON{Namespace: ns, Mem: mem, KeyAttrs: keyAttrs, TTL: ttl})
-		require.NoError(err, "marshal REGSCH for %s (mem=%v)", ns, mem)
-		status := rdb.Do(ctx, "REGSCH", string(b))
-		require.NoError(status.Err(), "REGSCH %s (mem=%v)", ns, mem)
-		require.Equal("OK", status.Val(), "REGSCH %s (mem=%v) want OK got %v", ns, mem, status.Val())
-	}
-	wireREGIDX := func(idx x.Index) {
-		t.Helper()
-		paths := idx.Paths()
-		if paths == nil {
-			paths = []string{}
-		}
-		b, err := json.Marshal(wireIndexJSON{FullName: idx.Name(), KeyPattern: idx.KeyPattern(), Paths: paths})
-		require.NoError(err, "marshal REGIDX for %s", idx.Name())
-		status := rdb.Do(ctx, "REGIDX", string(b))
-		require.NoError(status.Err(), "REGIDX %s", idx.Name())
-		require.Equal("OK", status.Val(), "REGIDX %s want OK got %v", idx.Name(), status.Val())
-	}
-
-	wireREGSCH("probenegcli", false, []string{"id"}, 0)
-	wireREGSCH("probeserver", true, []string{"id"}, 0)
-	wireREGSCH("probenegdoc", false, []string{"id"}, 0)
-
-	wireREGIDX(x.Idx[testUserDoc]("age", "*", "age"))
-	wireREGIDX(x.Idx[testUserDoc]("email", "*", "email"))
-
-	probeClientKP := testutil.KeyRangeKeyPattern(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
-	probeClientStorageNs := naming.BuildStorageNs(searchKRClientNamespace, testutil.KeyRangeFixtureMem())
-	idxClientProbeScore := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "score"), probeClientKP, "score")
-	idxClientProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "bucket"), probeClientKP, "bucket")
-	idxClientProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeClientStorageNs, "sparseamt"), probeClientKP, "sparse_amt")
-	wireREGIDX(idxClientProbeScore)
-	wireREGIDX(idxClientProbeBucket)
-	wireREGIDX(idxClientProbeSparse)
-
-	probeDocKP := testutil.KeyRangeKeyPattern(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
-	probeDocStorageNs := naming.BuildStorageNs(searchKRDocNamespace, testutil.KeyRangeFixtureMem())
-	idxDocProbeScore := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "score"), probeDocKP, "score")
-	idxDocProbeBucket := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "bucket"), probeDocKP, "bucket")
-	idxDocProbeSparse := x.RawIndex(naming.BuildIdxFullName(probeDocStorageNs, "sparseamt"), probeDocKP, "sparse_amt")
-	wireREGIDX(idxDocProbeScore)
-	wireREGIDX(idxDocProbeBucket)
-	wireREGIDX(idxDocProbeSparse)
-
-	wireREGIDX(x.Idx[UserDoc]("age", "*", "age"))
 
 	for _, kv := range testutil.LoadXFor(t, searchKRClientNamespace, testutil.KeyRangeFixtureMem()) {
 		require.NoError(rdb.Set(ctx, kv.K, kv.V, 0).Err(), "seed probe-client fixture failed for %s", kv.K)
@@ -158,15 +158,7 @@ func ensureServerAndSeed(t *testing.T) {
 			Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 		}
 		clientTestServerAddr = cfg.Ctrl.Addr()
-		db := server.StartWith(cfg,
-			testUserDoc(""),
-			SearchFixtureDoc(""),
-			UpdateFixtureDoc(""),
-			UserDoc(""),
-			ExpiringUserDoc(""),
-			DocSearchFixture(""),
-			DocUpdateFixture(""),
-		)
+		db := server.StartWith(cfg, clientSuiteSchemas()...)
 		require.NotNil(db)
 		sharedSeedBody(t, func(k, v string) error {
 			return db.Set(k, v)
@@ -271,15 +263,7 @@ func (s *ClientTestSuite) SetupSuite() {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	clientTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWith(cfg,
-		testUserDoc(""),
-		SearchFixtureDoc(""),
-		UpdateFixtureDoc(""),
-		UserDoc(""),
-		ExpiringUserDoc(""),
-		DocSearchFixture(""),
-		DocUpdateFixture(""),
-	)
+	db := server.StartWith(cfg, clientSuiteSchemas()...)
 	s.Require().NotNil(db)
 
 	sharedSeedBody(s.T(), func(k, v string) error {
@@ -627,212 +611,6 @@ func (s *ClientTestSuite) TestConnectCommand() {
 					)
 				}
 			}
-		})
-	}
-}
-
-// p1RegSchDoc / p1RegSchV2Doc share namespace "p1regsch" but differ in
-// KeyAttrs so the suite can exercise REGSCH idempotent-skip and
-// fingerprint-upgrade paths through the client facades.
-type p1RegSchDoc string
-
-func (p1RegSchDoc) Namespace() string  { return "p1regsch" }
-func (p1RegSchDoc) Mem() bool          { return false }
-func (p1RegSchDoc) KeyAttrs() []string { return []string{"id"} }
-func (d p1RegSchDoc) RawJSON() string  { return string(d) }
-func (p1RegSchDoc) TTL() time.Duration { return 0 }
-
-type p1RegSchV2Doc string
-
-func (p1RegSchV2Doc) Namespace() string  { return "p1regsch" }
-func (p1RegSchV2Doc) Mem() bool          { return false }
-func (p1RegSchV2Doc) KeyAttrs() []string { return []string{"id", "email"} }
-func (d p1RegSchV2Doc) RawJSON() string  { return string(d) }
-func (p1RegSchV2Doc) TTL() time.Duration { return 0 }
-
-type p1DropSchDoc string
-
-func (p1DropSchDoc) Namespace() string  { return "p1dropsch" }
-func (p1DropSchDoc) Mem() bool          { return false }
-func (p1DropSchDoc) KeyAttrs() []string { return []string{"id"} }
-func (d p1DropSchDoc) RawJSON() string  { return string(d) }
-func (p1DropSchDoc) TTL() time.Duration { return 0 }
-
-func (s *ClientTestSuite) TestRegisterSchema() {
-	s.SetupTest()
-	s.ensureConnectedClientAndAuth()
-
-	tests := []struct {
-		name       string
-		fn         func() error
-		wantErr    bool
-		wantErrMsg string
-	}{
-		{"success new schema", func() error { return RegisterSchema[p1RegSchDoc]() }, false, ""},
-		{"idempotent identical re-register", func() error { return RegisterSchema[p1RegSchDoc]() }, false, ""},
-		{"upgrade on fingerprint change", func() error { return RegisterSchema[p1RegSchV2Doc]() }, false, ""},
-		{"empty json", func() error { return RegisterSchemaFromJSON("") }, true, "schema spec json is empty"},
-		{"invalid json format", func() error { return RegisterSchemaFromJSON("{bad") }, true, "ERR REGSCH invalid JSON format"},
-		{"unknown field rejected", func() error {
-			return RegisterSchemaFromJSON(`{"namespace":"p1x","bogus":1}`)
-		}, true, "ERR REGSCH schema"},
-		{"reserved field indexes rejected", func() error {
-			return RegisterSchemaFromJSON(`{"namespace":"p1x","indexes":[]}`)
-		}, true, `json: unknown field "indexes"`},
-	}
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			err := tc.fn()
-			if tc.wantErr {
-				s.Require().Error(err)
-				s.Contains(err.Error(), tc.wantErrMsg)
-			} else {
-				s.NoError(err)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestRegisterIndex() {
-	s.SetupTest()
-	s.ensureConnectedClientAndAuth()
-
-	// Self-contained: guarantee the owner schema exists regardless of
-	// TestRegisterSchema's outcome.
-	s.Require().NoError(RegisterSchema[p1RegSchDoc]())
-
-	tests := []struct {
-		name       string
-		fn         func() error
-		wantErr    bool
-		wantErrMsg string
-	}{
-		{"success", func() error {
-			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age")
-		}, false, ""},
-		{"idempotent identical re-register", func() error {
-			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age")
-		}, false, ""},
-		{"empty logical", func() error {
-			return RegisterIndex[p1RegSchDoc]("", "p1regsch:*", "age")
-		}, true, "logical index name is empty"},
-		{"empty key pattern", func() error {
-			return RegisterIndex[p1RegSchDoc]("age", "", "age")
-		}, true, "key pattern is empty"},
-		{"no paths", func() error {
-			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*")
-		}, true, "at least one jsonPath is required"},
-		{"empty path entry", func() error {
-			return RegisterIndex[p1RegSchDoc]("age", "p1regsch:*", "age", "")
-		}, true, "jsonPaths contains empty path"},
-		{"short success", func() error {
-			return RegisterIndexShort("p1regsch", "email", "profile.email")
-		}, false, ""},
-		{"short empty owner ns", func() error {
-			return RegisterIndexShort("", "email", "age")
-		}, true, "owner_ns is empty"},
-		{"short empty logical", func() error {
-			return RegisterIndexShort("p1regsch", "", "age")
-		}, true, "logical is empty"},
-		{"short no paths", func() error {
-			return RegisterIndexShort("p1regsch", "email")
-		}, true, "at least one path is required"},
-		{"short empty path entry", func() error {
-			return RegisterIndexShort("p1regsch", "email", "age", "")
-		}, true, "paths contains an empty entry"},
-		{"from json empty", func() error {
-			return RegisterIndexFromJSON("")
-		}, true, "index spec json is empty"},
-		{"from json invalid", func() error {
-			return RegisterIndexFromJSON("{bad")
-		}, true, "ERR REGIDX invalid JSON format"},
-	}
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			err := tc.fn()
-			if tc.wantErr {
-				s.Require().Error(err)
-				s.Contains(err.Error(), tc.wantErrMsg)
-			} else {
-				s.NoError(err)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestDropSchemaAndDropIndex() {
-	s.SetupTest()
-	s.ensureConnectedClientAndAuth()
-
-	// Self-contained fixture: schema + attached index on "p1dropsch".
-	s.Require().NoError(RegisterSchema[p1DropSchDoc]())
-	s.Require().NoError(RegisterIndex[p1DropSchDoc]("age", "p1dropsch:*", "age"))
-
-	tests := []struct {
-		name       string
-		fn         func() error
-		wantErr    bool
-		wantErrMsg string
-	}{
-		{"drop schema blocked by attached index", func() error {
-			return DropSchema[p1DropSchDoc]()
-		}, true, "attached index"},
-		{"drop index empty logical", func() error {
-			return DropIndex[p1DropSchDoc]("")
-		}, true, "logical index name is empty"},
-		{"raw drop schema empty ns", func() error {
-			return raw.DropSchema("")
-		}, true, "logical ns is empty"},
-		{"raw drop index empty ns", func() error {
-			return raw.DropIndex("")
-		}, true, "owner ns or full name is required"},
-		{"raw drop index too many args", func() error {
-			return raw.DropIndex("p1dropsch", "age", "extra")
-		}, true, "at most 2 args"},
-		{"drop index success", func() error {
-			return DropIndex[p1DropSchDoc]("age")
-		}, false, ""},
-		{"drop schema success after index removed", func() error {
-			return DropSchema[p1DropSchDoc]()
-		}, false, ""},
-	}
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			err := tc.fn()
-			if tc.wantErr {
-				s.Require().Error(err)
-				s.Contains(err.Error(), tc.wantErrMsg)
-			} else {
-				s.NoError(err)
-			}
-		})
-	}
-}
-
-func (s *ClientTestSuite) TestRegistryAPIsRequireConnection() {
-	// SetupTest disconnects the shared client; every registry facade must
-	// fail fast instead of panicking on a nil client.
-	s.SetupTest()
-
-	tests := []struct {
-		name string
-		fn   func() error
-	}{
-		{"RegisterSchemaFromJSON", func() error { return RegisterSchemaFromJSON(`{"namespace":"x"}`) }},
-		{"RegisterIndexFromJSON", func() error {
-			return RegisterIndexFromJSON(`{"owner_ns":"x","logical":"y","paths":["a"],"key_pattern":"x:*"}`)
-		}},
-		{"RegisterIndexShort", func() error { return RegisterIndexShort("x", "y", "a") }},
-		{"DropSchema", func() error { return DropSchema[testUserDoc]() }},
-		{"DropIndex", func() error { return DropIndex[testUserDoc]("age") }},
-		{"raw.DropSchema", func() error { return raw.DropSchema("x") }},
-		{"raw.DropIndex", func() error { return raw.DropIndex("x", "y") }},
-	}
-	for _, tc := range tests {
-		s.Run(tc.name, func() {
-			err := tc.fn()
-			s.Require().Error(err)
-			s.Contains(err.Error(), "resp client is not connected")
 		})
 	}
 }
@@ -2257,28 +2035,17 @@ func TestAppPortMetaCmdRejectsNoPrivilege(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	type tc struct {
-		name string
-		args []any
-	}
-	cases := []tc{
-		{"regsch", []any{"REGSCH", `{"namespace":"user","mem":false,"key_attrs":["id"]}`}},
-		{"dropsch", []any{"DROPSCH", "user"}},
-		{"regidx", []any{"REGIDX", `{"owner_ns":"user","logical":"age","paths":["age"],"key_pattern":"_d_user:*"}`}},
-		{"dropidx", []any{"DROPIDX", "user", "age"}},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			err := probe.Do(ctx, c.args...).Err()
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "ERR No Privilege:",
-				"expected No Privilege for %s on app-port, got: %v", c.name, err)
-			cmdWord, _ := c.args[0].(string)
-			require.Contains(t, err.Error(), "'"+strings.ToLower(cmdWord)+"'",
-				"expected cmd name %q in error, got: %v", cmdWord, err)
-			require.Contains(t, err.Error(), "Meta Management")
-		})
-	}
+	// With REGSCH / REGIDX / DROPSCH / DROPIDX gone (schema & index
+	// declarations now live in code only), KEYS is the sole remaining
+	// ctrl-only command word. The app port must still reject it through the
+	// Gate-3 Meta-Management privilege gate.
+	err = probe.Do(ctx, "KEYS", "user").Err()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ERR No Privilege:",
+		"expected No Privilege for KEYS on app-port, got: %v", err)
+	require.Contains(t, err.Error(), "'keys'",
+		"expected cmd name 'keys' in error, got: %v", err)
+	require.Contains(t, err.Error(), "Meta Management")
 }
 
 func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
@@ -2621,6 +2388,102 @@ func BenchmarkHooksStoreLoadBaseline(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = hook.Snapshot()
 	}
+}
+
+// registerProbeDoc is an end-to-end fixture for client.RegisterSchema. Its
+// namespace is deliberately absent from clientSuiteSchemas(), so a doc-pattern
+// write must be rejected until RegisterSchema declares the schema over the wire.
+type registerProbeDoc string
+
+func (registerProbeDoc) Namespace() string  { return "regprobe" }
+func (registerProbeDoc) Mem() bool          { return false }
+func (registerProbeDoc) KeyAttrs() []string { return []string{"id"} }
+func (d registerProbeDoc) RawJSON() string  { return string(d) }
+func (registerProbeDoc) TTL() time.Duration { return 0 }
+
+// TestRegisterSchemaE2E drives client.RegisterSchema against a real server over
+// the wire: the normal path (declare → write → index-search) plus the abnormal
+// ones (offline call, app-port privilege rejection, unregistered namespace
+// before any declaration).
+func TestRegisterSchemaE2E(t *testing.T) {
+	appPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	ctrlPort, err := testutil.AllocateFreePort()
+	require.NoError(t, err)
+	ctrlAuth := "regschema-ctrl-auth"
+	appAuth := "regschema-app-auth"
+	cfg := &server.Config{
+		DataPath: testutil.DBPath(t),
+		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+	}
+	db := server.StartWith(cfg, clientSuiteSchemas()...)
+	require.NotNil(t, db)
+	defer stopAndResetGlobalState()
+
+	// clearConn drops any shared client left behind by an earlier subtest. Raw
+	// connect() is used instead of Connect() so no reconnect lifecycle goroutine
+	// can come alive and race the assertions.
+	clearConn := func() {
+		if prev := setSharedClient(nil); prev != nil {
+			_ = prev.Close()
+		}
+	}
+	withConn := func(t *testing.T, addr, auth string) *redis.Client {
+		t.Helper()
+		clearConn()
+		cli, err := connect(addr, auth)
+		require.NoError(t, err)
+		setSharedClient(cli)
+		t.Cleanup(func() {
+			clearSharedClientIf(cli)
+			_ = cli.Close()
+		})
+		return cli
+	}
+
+	t.Run("offline call returns not-connected error", func(t *testing.T) {
+		clearConn()
+		err := RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "resp client is not connected")
+	})
+
+	t.Run("ctrl port: declare, write and index-search end to end", func(t *testing.T) {
+		withConn(t, cfg.Ctrl.Addr(), ctrlAuth)
+
+		// Nothing has declared this schema yet, so its index is not mounted and
+		// an index search must fail before any SCHEMA reaches the server.
+		pre := SearchIndex[registerProbeDoc]("rid", x.KeysPattern("*"), nil, false)
+		require.True(t, pre.IsError(), "index search must fail before the schema is declared")
+
+		// One declaration installs both the doc spec and its inline index.
+		require.NoError(t, RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid")))
+
+		// Re-declaring the identical schema is idempotent: the doc spec is a
+		// no-op and the already-mounted index is not recreated.
+		for i := 0; i < 3; i++ {
+			require.NoError(t, RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid")),
+				"re-declaring an unchanged schema must be a no-op (attempt %d)", i)
+		}
+
+		require.NoError(t, Set(registerProbeDoc(`{"id":"r1","rid":"a"}`)))
+		require.NoError(t, Set(registerProbeDoc(`{"id":"r2","rid":"b"}`)))
+
+		res := SearchIndex[registerProbeDoc]("rid", x.KeysPattern("*"), nil, false)
+		require.NoError(t, res.Error())
+		require.Len(t, res.MustGet(), 2)
+	})
+
+	t.Run("app port rejects SCHEMA as ctrl-only", func(t *testing.T) {
+		withConn(t, cfg.App.Addr(), appAuth)
+
+		err := RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "ERR No Privilege:")
+		require.Contains(t, err.Error(), "'schema'")
+		require.Contains(t, err.Error(), "Meta Management")
+	})
 }
 
 type DocTestSuite struct {

@@ -173,7 +173,7 @@ any command not listed below is forwarded VERBATIM as a raw RESP wire call,
 and the connected peer decides whether to accept, reject, or ignore it.
 
 Run without sub-commands to enter the interactive REPL. Pass sub-commands
-to execute a single action and exit (e.g. "redisx regsch").
+to execute a single action and exit (e.g. "redisx searchkey").
 
 `)
 			sb.WriteString("USAGE:\n")
@@ -182,11 +182,10 @@ to execute a single action and exit (e.g. "redisx regsch").
 			sb.WriteString("GLOBAL FLAGS (must come before any subcommand):\n")
 			sb.WriteString(flagHelpText)
 			sb.WriteString("\n")
-			order := []string{"Basic Commands", "Extended Commands", "Meta Management"}
+			order := []string{"Basic Commands", "Extended Commands"}
 			regrouped := map[string][]tui.GroupEntry{
 				"Basic Commands":    {},
 				"Extended Commands": {},
-				"Meta Management":   {},
 			}
 			_ = groups
 			for _, name := range currentCmdOrder {
@@ -204,8 +203,6 @@ to execute a single action and exit (e.g. "redisx regsch").
 				switch g {
 				case "Extended Commands":
 					hints = []string{"example searchkey", "example searchindex", "example update"}
-				case "Meta Management":
-					hints = []string{"example regsch", "example regidx", "example dropsch", "example dropidx"}
 				}
 				if len(hints) > 0 {
 					extra += "  (no locally-registered shortcuts here — entries are raw RESP passthrough."
@@ -276,9 +273,6 @@ func trackCmd(name string, c *tui.CLICommand) {
 }
 
 func groupOf(name string) string {
-	switch name {
-	case "!createsch", "!createidx", "!dropidx":
-		return "Meta Management"
-	}
+	_ = name
 	return "Basic Commands"
 }

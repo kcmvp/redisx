@@ -68,9 +68,9 @@ func TestValidateKVMutationKey(t *testing.T) {
 		phrase  string
 	}{
 		{name: "no colon bare key", key: "userkey", wantErr: true, phrase: "namespace separator"},
-		{name: "_doc_: WRITE REJECTED (dedicated registry cmd)", key: "_doc_:abc", wantErr: true, phrase: "managed exclusively via dedicated"},
-		{name: "_idx_: WRITE REJECTED", key: "_idx_:user_age:v_123", wantErr: true, phrase: "dedicated registry commands"},
-		{name: "_auth_: WRITE REJECTED", key: "_auth_:leak", wantErr: true, phrase: "REGSCH/DROPSCH/REGIDX/DROPIDX/AUTH"},
+		{name: "_doc_: WRITE REJECTED (audit-only record)", key: "_doc_:abc", wantErr: true, phrase: "managed exclusively by the server"},
+		{name: "_idx_: WRITE REJECTED", key: "_idx_:user_age:v_123", wantErr: true, phrase: "managed exclusively by the server"},
+		{name: "_auth_: WRITE REJECTED", key: "_auth_:leak", wantErr: true, phrase: "managed exclusively by the server"},
 		{name: "unrecognised underscore WRITE REJECTED", key: "_future_:abc", wantErr: true, phrase: "reserved internal prefix"},
 		{name: "normal user:pk WRITE OK", key: "user:123", wantErr: false},
 		{name: "mem layer WRITE OK (not internal)", key: "_m_:user:abc", wantErr: false},

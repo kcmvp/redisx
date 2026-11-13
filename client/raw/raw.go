@@ -2,6 +2,7 @@ package raw
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -287,35 +288,22 @@ func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]st
 	return mo.Ok(res)
 }
 
-func DropSchema(logicalNs string) error {
-	if logicalNs == "" {
-		return errors.New("logical ns is empty")
-	}
+// RegisterSchema pushes one schema declaration (together with its inline
+// secondary indexes) to the connected server through the SCHEMA command.
+//
+// The server applies it idempotently: an unchanged schema spec is skipped and
+// an already-existing index is not recreated, so calling this repeatedly is
+// safe.
+func RegisterSchema(payload proto.SchemaPayload) error {
 	client := conn.GetSharedClient()
 	if client == nil {
 		return errors.New("resp client is not connected")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	return client.Do(ctx, proto.CmdDropSchema, logicalNs).Err()
-}
-
-func DropIndex(ownerNsOrFull string, logical ...string) error {
-	if ownerNsOrFull == "" {
-		return errors.New("owner ns or full name is required")
-	}
-	client := conn.GetSharedClient()
-	if client == nil {
-		return errors.New("resp client is not connected")
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to serialize schema: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	switch len(logical) {
-	case 0:
-		return client.Do(ctx, proto.CmdDropIndex, ownerNsOrFull).Err()
-	case 1:
-		return client.Do(ctx, proto.CmdDropIndex, ownerNsOrFull, logical[0]).Err()
-	default:
-		return errors.New("DropIndex takes at most 2 args: (fullName) or (ownerNs, logical)")
-	}
+	return client.Do(ctx, proto.CmdSchema, string(body)).Err()
 }

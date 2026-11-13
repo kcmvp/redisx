@@ -89,29 +89,28 @@ import (
     "github.com/kcmvp/redisx/x"
 )
 
-// 1. Register the schema (call once at init or boot time).
-//    x.RegisterSchema[T](namespace, mem, ttl, keyAttrs...)
+// 1. One type alias + 5 methods implements x.Document. The methods ARE the
+//    single source of truth: x.RegisterSchema reads all metadata from them,
+//    so there are no duplicated parameters to keep in sync.
 //    - namespace = "agg"   → storage key prefix "agg:"
 //    - mem       = true    → layer is "_m_:agg:" (hot path in RAM)
 //    - ttl       = 910s    → every write auto-expires in ~15 min
 //    - keyAttrs  = symbol, tradeTime, aggId  → PK = agg:<symbol>:<tradeTime>:<aggId>
-var AggTradeSchema = x.RegisterSchema[x.Document](
-    "agg",
-    true,
-    910*time.Second,
-    "symbol", "tradeTime", "aggId",
-)
-
-// 2. One type alias + 5 lines implements x.Document.
-//    RawJSON() simply IS the string (zero-copy). The other 4 methods
-//    delegate to the already-registered schema — no duplication.
 type AggTrade string
 
-func (a AggTrade) KeyAttrs() []string    { return AggTradeSchema.KeyAttrs() }
-func (a AggTrade) Mem() bool             { return AggTradeSchema.Mem() }
-func (a AggTrade) Namespace() string     { return AggTradeSchema.Namespace() }
-func (a AggTrade) RawJSON() string       { return string(a) }
-func (a AggTrade) TTL() time.Duration    { return AggTradeSchema.TTL() }
+func (a AggTrade) KeyAttrs() []string { return []string{"symbol", "tradeTime", "aggId"} }
+func (a AggTrade) Mem() bool          { return true }
+func (a AggTrade) Namespace() string  { return "agg" }
+func (a AggTrade) RawJSON() string    { return string(a) }
+func (a AggTrade) TTL() time.Duration { return 910 * time.Second }
+
+// 2. Register the schema (call once at init or boot time). Secondary indexes
+//    are declared inline at the very same site:
+//
+//      var AggTradeSchema = x.RegisterSchema[AggTrade](
+//          x.IndexOn("bytime", "tradeTime"),
+//      )
+var AggTradeSchema = x.RegisterSchema[AggTrade]()
 
 func main() {
     // 3. Start the server. Pass schemas directly to Start — they are

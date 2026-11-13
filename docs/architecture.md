@@ -23,7 +23,7 @@ redisx always opens **two** TCP listeners:
 | Port | Role | Purpose |
 |---|---|---|
 | **App port** (default 7379) | Client-facing | RESP commands: SET, GET, SEARCHINDEX, pub/sub, … |
-| **Ctrl port** (default 7381) | Admin-facing | Schema/index registry (REGSCH, REGIDX, DROPSCH, DROPIDX), internal client bridge |
+| **Ctrl port** (default 7381) | Admin-facing | Internal client bridge; meta-management commands (e.g. `KEYS`) |
 
 The ctrl port is bound to `127.0.0.1` by default and is not meant for
 external traffic. The embedded Go client (`client.ConnectEmbedded`) uses
@@ -77,21 +77,23 @@ Rules:
 
 ### Registering indexes
 
-Indexes are **not** passed as Go parameters to `Start`. They are created
-at runtime via the ctrl port:
-
-```text
-REGIDX user age user:* age
-```
-
-Or from Go, using the typed client:
+Indexes are declared in code, at the same site as the schema, and passed
+to `Start` together with it:
 
 ```go
-_ = client.RegisterIndex[UserDoc]("age", "*", "age")
+var UserSchema = x.RegisterSchema[UserDoc](x.IndexOn("age", "age"))
+
+db := server.Start(UserSchema)
 ```
 
-`SEARCHINDEX` can only use indexes that have been registered. Indexes
-persist to the matching storage layer and are auto-recovered on restart.
+`x.IndexOn(logical, paths...)` scopes the index to every key of the
+owning document; use `x.IndexOnPattern` for an explicit doc-scoped key
+pattern.
+
+`SEARCHINDEX` can only use indexes declared this way. Indexes are
+**in-process only** — no meta key is written to disk, and every boot
+rebuilds them from the declarations above (buntdb backfills existing
+rows on `CreateIndex`).
 
 ---
 

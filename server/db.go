@@ -212,8 +212,8 @@ func (db *DB) bootstrapAuth(seedApp, seedCtrl string) (finalApp, finalCtrl strin
 	return finalApp, finalCtrl, anyGenerated, nil
 }
 
-// CreateIndex is a small alias over registerIndexes; see registerIndexes for
-// the actual x.Index → idxSpec conversion + writeIndexSpec persistence flow.
+// createIndex is a small alias over registerIndexes (memory-only index
+// mounting); see registerIndexes for the x.Index → btree lifecycle.
 func (db *DB) createIndex(idx x.Index) error {
 	return db.registerIndexes(idx)
 }
@@ -317,8 +317,9 @@ func (db *DB) Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Re
 }
 
 // SearchIndex scans via a buntdb-native secondary index handle. The index
-// name must already be registered (REGIDX / boot registerSchemas seed or
-// runtime REGIDX); an unregistered name returns Err "index not found". Key-
+// name must already be mounted in-process (declared in code via
+// x.RegisterSchema(x.IndexOn(...)) and mounted at boot); an unregistered name
+// returns Err "index not found". Key-
 // range layer and index ownerNs layer must match (cross-layer searches are
 // parameter-ERR). Matched rows are optionally narrowed by filter.Eval; the
 // SEARCHINDEX command also respects colon-routing (cmd.go searchIndexCommand

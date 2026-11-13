@@ -119,7 +119,7 @@ func validateKVMutationKey(fullKey string) error {
 		return err
 	}
 	if naming.IsInternalStorageNs(head) {
-		return fmt.Errorf("internal storage namespace %q is managed exclusively via dedicated registry commands (REGSCH/DROPSCH/REGIDX/DROPIDX/AUTH); direct KV mutation via SET/SETEX/SETNX/DEL is forbidden", head)
+		return fmt.Errorf("internal storage namespace %q is managed exclusively by the server (AUTH keys and code-declared schema audit records); direct KV mutation via SET/SETEX/SETNX/DEL is forbidden", head)
 	}
 	return nil
 }

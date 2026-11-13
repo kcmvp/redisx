@@ -2,7 +2,6 @@ package raw_test
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,54 +32,12 @@ func (rawTestUserDoc) KeyAttrs() []string { return []string{"id"} }
 func (u rawTestUserDoc) RawJSON() string  { return string(u) }
 func (rawTestUserDoc) TTL() time.Duration { return 0 }
 
-type wireSchemaJSON struct {
-	Namespace string        `json:"namespace"`
-	Mem       bool          `json:"mem"`
-	KeyAttrs  []string      `json:"key_attrs"`
-	TTL       time.Duration `json:"ttl_ns"`
-}
-
-type wireIndexJSON struct {
-	FullName   string   `json:"full_name"`
-	KeyPattern string   `json:"key_pattern"`
-	Paths      []string `json:"paths"`
-}
-
 func seedRawTestServer(t *testing.T, db *server.DB, addr string) {
 	t.Helper()
 	req := require.New(t)
+	_ = addr
 
 	req.NoError(db.Set(naming.AuthStorageKey(rawTestAuthKey), rawTestAuthLimit))
-
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: addr, Password: rawTestAuthKey})
-	defer func() { _ = rdb.Close() }()
-
-	wireREGSCH := func(ns string, mem bool, keyAttrs []string, ttl time.Duration) {
-		t.Helper()
-		b, err := json.Marshal(wireSchemaJSON{Namespace: ns, Mem: mem, KeyAttrs: keyAttrs, TTL: ttl})
-		req.NoError(err)
-		status := rdb.Do(ctx, "REGSCH", string(b))
-		req.NoError(status.Err())
-		req.Equal("OK", status.Val())
-	}
-	wireREGIDX := func(idx x.Index) {
-		t.Helper()
-		paths := idx.Paths()
-		if paths == nil {
-			paths = []string{}
-		}
-		b, err := json.Marshal(wireIndexJSON{FullName: idx.Name(), KeyPattern: idx.KeyPattern(), Paths: paths})
-		req.NoError(err)
-		status := rdb.Do(ctx, "REGIDX", string(b))
-		req.NoError(status.Err())
-		req.Equal("OK", status.Val())
-	}
-
-	wireREGSCH("user", false, []string{"id"}, 0)
-
-	wireREGIDX(x.Idx[rawTestUserDoc]("age", "*", "age"))
-	wireREGIDX(x.Idx[rawTestUserDoc]("email", "*", "email"))
 }
 
 type RawTestSuite struct {
@@ -98,7 +55,8 @@ func (s *RawTestSuite) SetupSuite() {
 		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort},
 	}
 	rawTestServerAddr = cfg.Ctrl.Addr()
-	db := server.StartWith(cfg, rawTestUserDoc(""))
+	db := server.StartWith(cfg, x.RegisterSchema[rawTestUserDoc](
+		x.IndexOn("age", "age"), x.IndexOn("email", "email")))
 	s.Require().NotNil(db)
 
 	seedRawTestServer(s.T(), db, rawTestServerAddr)
@@ -519,82 +477,3 @@ func (s *RawTestSuite) TestUpdateCommand() {
 	}
 }
 
-// ─── DropSchema / DropIndex ───
-
-func (s *RawTestSuite) TestDropSchemaAndIndex() {
-	tests := []struct {
-		name       string
-		setup      func()
-		action     func() error
-		expectErr  bool
-		errPhrase  string
-	}{
-		{
-			name:      "DropSchema not connected",
-			setup:     nil,
-			action:    func() error { return raw.DropSchema("user") },
-			expectErr: true,
-			errPhrase: "resp client is not connected",
-		},
-		{
-			name:      "DropSchema empty ns",
-			setup:     func() { s.connectRaw() },
-			action:    func() error { return raw.DropSchema("") },
-			expectErr: true,
-			errPhrase: "logical ns is empty",
-		},
-		{
-			name:      "DropIndex not connected",
-			setup:     nil,
-			action:    func() error { return raw.DropIndex("user", "age") },
-			expectErr: true,
-			errPhrase: "resp client is not connected",
-		},
-		{
-			name:      "DropIndex empty arg",
-			setup:     func() { s.connectRaw() },
-			action:    func() error { return raw.DropIndex("") },
-			expectErr: true,
-			errPhrase: "owner ns or full name is required",
-		},
-		{
-			name:      "DropIndex too many args",
-			setup:     func() { s.connectRaw() },
-			action:    func() error { return raw.DropIndex("a", "b", "c") },
-			expectErr: true,
-			errPhrase: "at most 2 args",
-		},
-		{
-			name:      "DropSchema nonexistent",
-			setup:     func() { s.connectRaw() },
-			action:    func() error { return raw.DropSchema("nonexistent") },
-			expectErr: true,
-			errPhrase: "not registered",
-		},
-		{
-			name:      "DropIndex nonexistent",
-			setup:     func() { s.connectRaw() },
-			action:    func() error { return raw.DropIndex("nonexistent", "fakeidx") },
-			expectErr: true,
-			errPhrase: "not registered",
-		},
-	}
-
-	for _, tt := range tests {
-		s.Run(tt.name, func() {
-			s.SetupTest()
-			if tt.setup != nil {
-				tt.setup()
-			}
-			err := tt.action()
-			if tt.expectErr {
-				s.Error(err)
-				if tt.errPhrase != "" {
-					s.Contains(err.Error(), tt.errPhrase)
-				}
-			} else {
-				s.NoError(err)
-			}
-		})
-	}
-}

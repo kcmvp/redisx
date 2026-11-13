@@ -71,10 +71,7 @@ var (
 	cmdUpdate      = proto.LowerCmdUpdate
 	cmdSearchIndex = proto.LowerCmdSearchIndex
 	cmdSearchKey   = proto.LowerCmdSearchKey
-	cmdRegSch      = proto.LowerCmdRegisterSchema
-	cmdDropSch     = proto.LowerCmdDropSchema
-	cmdRegIdx      = proto.LowerCmdRegisterIndex
-	cmdDropIdx     = proto.LowerCmdDropIndex
+	cmdSchema      = proto.LowerCmdSchema
 )
 
 type commandHandler func(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubSub)
@@ -97,10 +94,7 @@ var commandRegistry = map[string]commandHandler{
 	cmdUpdate:      updateCommand,
 	cmdSearchIndex: searchIndexCommand,
 	cmdSearchKey:   searchKeyCommand,
-	cmdRegSch:      regSchemaCommand,
-	cmdDropSch:     dropSchemaCommand,
-	cmdRegIdx:      regIdxCommand,
-	cmdDropIdx:     dropIndexCommand,
+	cmdSchema:      schemaCommand,
 }
 
 var supportedCommandList = func() string {
@@ -155,10 +149,12 @@ var (
 //     slog.Info when an existing DB value is being overwritten. If the
 //     resolved pair would end up equal after merge → hard error.
 //
-// On boot, redisx automatically rebuilds its BuntDB index registry by
-// scanning all "_idx_:*" meta keys stored on disk and in the volatile
-// mem-layer. Indexes are NO LONGER declared as Go parameters passed to any
-// Start variant; they must be created via the ctrl CLI (regidx command).
+// On boot, redisx mounts indexes exclusively from the schemas passed in: every
+// schema declaring indexes via x.RegisterSchema(x.IndexOn(...)) is re-created
+// as an in-process BuntDB btree index. Indexes are NEVER persisted — there is
+// no index meta key and no reload path; what the code declares here (plus any
+// runtime SCHEMA push, see client.RegisterSchema) is the single source of
+// truth.
 //
 // Example (harness-style direct embed):
 //
@@ -417,9 +413,7 @@ func handleCommand(conn redcon.Conn, cmd redcon.Command, db *DB, ps *redcon.PubS
 	if gate4_SourceAndMTLS(conn, cmdName) {
 		return
 	}
-	// Note: per-command argc validation lives inside each handler. Registry
-	// commands (REGSCH/REGIDX/DROPSCH/DROPIDX) are ordinary commands with
-	// exactly the same argc discipline as SET/GET/DEL.
+	// Note: per-command argc validation lives inside each handler.
 
 	// AUTH / CLIENT / HELLO are exempt from the anonymous-command gate: they are
 	// the commands that establish (AUTH, HELLO ... AUTH) or complete (CLIENT
@@ -461,22 +455,6 @@ func setupDB(dbPath string, schemas []x.Schema) (*DB, bool) {
 		}
 		return nil, false
 	}
-	if err := db.loadIndexes(); err != nil {
-		slog.Error("failed to load indexes from _idx_:* records", "error", err)
-		_ = db.Close()
-		if exitFn := getOsExitFn(); exitFn != nil {
-			exitFn(1)
-		}
-		return nil, false
-	}
-	if err := db.loadDocSpecs(); err != nil {
-		slog.Error("failed to load doc specs from _doc_:* records", "error", err)
-		_ = db.Close()
-		if exitFn := getOsExitFn(); exitFn != nil {
-			exitFn(1)
-		}
-		return nil, false
-	}
 	if err := loadAuthKeyLimits(db); err != nil {
 		slog.Error("failed to load auth key limits", "error", err)
 		_ = db.Close()
@@ -490,6 +468,17 @@ func setupDB(dbPath string, schemas []x.Schema) (*DB, bool) {
 	globalMu.Unlock()
 	if err := db.registerSchemas(schemas...); err != nil {
 		slog.Error("failed to register schemas", "error", err)
+		_ = db.Close()
+		globalMu.Lock()
+		currentDB = nil
+		globalMu.Unlock()
+		if exitFn := getOsExitFn(); exitFn != nil {
+			exitFn(1)
+		}
+		return nil, false
+	}
+	if err := db.registerDeclaredIndexes(schemas...); err != nil {
+		slog.Error("failed to register declared indexes", "error", err)
 		_ = db.Close()
 		globalMu.Lock()
 		currentDB = nil

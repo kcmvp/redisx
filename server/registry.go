@@ -7,12 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/kcmvp/redisx/internal/naming"
-	"github.com/samber/lo"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 
@@ -31,26 +28,6 @@ type docSpec struct {
 	Mem       bool          `json:"mem"`
 	KeyAttrs  []string      `json:"key_attrs"`
 	TTL       time.Duration `json:"ttl_ns"`
-
-	Version   string    `json:"version"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
-}
-
-// idxSpec stores a single registered secondary index (server-internal version
-// of x.Index). Same "exactly one live copy per fullName" invariant as docSpec.
-// Composite indexes are buntdb-native JSON-path comparators (see
-// indexJSONComposite) that are re-created whenever the canonical fingerprint
-// changes.
-//
-// UnmarshalJSON accepts both "path" (single) and "paths" (array) keys for
-// backwards-compatibility with legacy JSON payloads; "path" is rewritten into
-// a single-element "paths" array.
-type idxSpec struct {
-	OwnerNs    string   `json:"owner_ns"`
-	Logical    string   `json:"logical"`
-	KeyPattern string   `json:"key_pattern"`
-	Paths      []string `json:"paths"`
 
 	Version   string    `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
@@ -81,25 +58,13 @@ func (a schemaAdapter) TTL() time.Duration { return a.p.TTL }
 
 var _ x.Schema = schemaAdapter{}
 
-// FullName returns the canonical composite key used for idx meta-keys and the
-// buntdb native index handle: "<ownerNs>!_!<logical>".
-func (i idxSpec) fullName() string { return naming.BuildIdxFullName(i.OwnerNs, i.Logical) }
-
-func (i *idxSpec) UnmarshalJSON(b []byte) error {
-	type rawIdx idxSpec
-	aux := &struct {
-		Path string `json:"path"`
-		*rawIdx
-	}{
-		rawIdx: (*rawIdx)(i),
-	}
-	if err := json.Unmarshal(b, aux); err != nil {
-		return err
-	}
-	if len(aux.Paths) == 0 && aux.Path != "" {
-		aux.Paths = []string{aux.Path}
-	}
-	return nil
+// idxSpec is the in-process (memory-only) description of a registered btree
+// index. Indexes are NEVER persisted: they are declared in code via
+// x.RegisterSchema(x.IndexOn(...)) and rebuilt from scratch on every boot, so
+// this struct exists purely to answer SearchIndex's owner-layer lookup.
+type idxSpec struct {
+	OwnerNs string
+	Logical string
 }
 
 // ——— Meta helpers: fingerprint + meta-key load/delete (no multi-version) ———
@@ -140,29 +105,6 @@ func canonicalDocMD5(spec docSpec) (string, error) {
 	})
 }
 
-// canonicalIdxMD5 mirrors canonicalDocMD5 for idxSpec. Dots inside JSON paths
-// are collapsed to underscores before hashing so buntdb comparator key-paths
-// are always stable regardless of input spelling.
-func canonicalIdxMD5(spec idxSpec) (string, error) {
-	paths := lo.Map(spec.Paths, func(p string, _ int) string {
-		return strings.ReplaceAll(p, ".", "_")
-	})
-	if len(paths) == 0 {
-		paths = []string{}
-	}
-	return md5VersionHex(struct {
-		OwnerNs    string   `json:"owner_ns"`
-		Logical    string   `json:"logical"`
-		KeyPattern string   `json:"key_pattern"`
-		Paths      []string `json:"paths"`
-	}{
-		OwnerNs:    spec.OwnerNs,
-		Logical:    spec.Logical,
-		KeyPattern: spec.KeyPattern,
-		Paths:      paths,
-	})
-}
-
 // indexJSONComposite builds a buntdb-index comparator over one or more JSON
 // paths. Single path delegates to buntdb.IndexJSON; multiple paths produce a
 // lexicographic multi-field comparator that evaluates each gjson path in order
@@ -193,9 +135,8 @@ func indexJSONComposite(paths ...string) func(a, b string) bool {
 
 // loadDocSpec reads the single persisted doc spec key for a storageNs.
 // exists=false means the namespace is not registered (registry fail-closed
-// invariant for typed-doc paths). Boot (loadDocSpecs) and writeDocSpec are
-// the only writers; this is the single read-path for the "exactly one live
-// version" invariant.
+// invariant for typed-doc paths). writeDocSpec is the only writer; this is
+// the single read-path for the "exactly one live version" invariant.
 func (db *DB) loadDocSpec(storageNs string) (spec docSpec, exists bool, err error) {
 	if storageNs == "" {
 		return spec, false, errors.New("loadDocSpec: storageNs is required")
@@ -219,38 +160,10 @@ func (db *DB) loadDocSpec(storageNs string) (spec docSpec, exists bool, err erro
 	return spec, exists, err
 }
 
-// loadIdxSpec mirrors loadDocSpec for an index fullName.
-func (db *DB) loadIdxSpec(idxFullName string) (spec idxSpec, exists bool, err error) {
-	if idxFullName == "" {
-		return spec, false, errors.New("loadIdxSpec: idxFullName is required")
-	}
-	ownerNs, _, perr := naming.ParseIdxFullName(idxFullName)
-	if perr != nil {
-		return spec, false, fmt.Errorf("loadIdxSpec: %w", perr)
-	}
-	layer, constrained, lerr := resolveLayer(ownerNs)
-	if lerr != nil || !constrained {
-		return spec, false, fmt.Errorf("loadIdxSpec: ownerNs %q is not a concrete ns (err=%v constrained=%v)", ownerNs, lerr, constrained)
-	}
-	glob := naming.IdxMetaGlobFor(idxFullName)
-	_ = db.store(layer).View(func(tx *buntdb.Tx) error {
-		_ = tx.AscendKeys(glob, func(k, raw string) bool {
-			if e := json.Unmarshal([]byte(raw), &spec); e != nil {
-				err = fmt.Errorf("loadIdxSpec: %s unmarshal: %w", k, e)
-				return false
-			}
-			exists = true
-			return false
-		})
-		return nil
-	})
-	return spec, exists, err
-}
-
 // deleteMetaKeys deletes all persisted meta keys that match a glob inside a
 // running BuntDB tx. The "what" label is used for error messages (callers pass
-// e.g. "deleteDocSpecMeta" / "deleteIdxSpecMeta" so the origin of a delete
-// failure is clear). Missing keys (ErrNotFound) are ignored because the
+// e.g. "deleteDocSpecMeta" so the origin of a delete failure is clear).
+// Missing keys (ErrNotFound) are ignored because the
 // invariant of "exactly one live version" means zero matches just means
 // nothing to delete.
 //
@@ -278,15 +191,11 @@ func deleteDocSpecMeta(tx *buntdb.Tx, storageNs string) error {
 	return deleteMetaKeys(tx, naming.DocMetaGlobFor(storageNs), "deleteDocSpecMeta")
 }
 
-// deleteIdxSpecMeta mirrors deleteDocSpecMeta for an index fullName.
-func deleteIdxSpecMeta(tx *buntdb.Tx, idxFullName string) error {
-	return deleteMetaKeys(tx, naming.IdxMetaGlobFor(idxFullName), "deleteIdxSpecMeta")
-}
+// ——— Core writers: writeDocSpec ———
 
-// ——— Core writers: writeDocSpec / writeIndexSpec ———
-
-// writeDocSpec is the single entry point for doc-spec writes (REGSCH command,
-// boot registerSchemas, ctrl seed fixtures). Input spec carries only the
+// writeDocSpec is the single entry point for doc-spec writes (x.RegisterSchema
+// declarations passed to Start, plus runtime client.RegisterSchema pushes).
+// Input spec carries only the
 // four user-visible x.Schema fields; Version/CreatedAt/UpdatedAt are computed
 // & stamped here internally.
 //
@@ -369,250 +278,78 @@ func (db *DB) writeDocSpec(spec docSpec) error {
 	return nil
 }
 
-// writeIndexSpec mirrors writeDocSpec for indexes. Extra behaviour vs
-// writeDocSpec:
-//   - On fingerprint change (paths/order/key_pattern drift) the buntdb native
-//     btree index is dropped then re-created before the meta-key is written;
-//     the query comparator is thus always in sync with the stored meta-key.
-//   - CreateIndex happens OUTSIDE idxRegMu (btree operations are potentially
-//     expensive). The lock is held only for the final idxRegSpec map write.
-func (db *DB) writeIndexSpec(spec idxSpec) error {
-	if spec.OwnerNs == "" {
-		return errors.New("writeIndexSpec: owner_ns is required")
-	}
-	if spec.Logical == "" {
-		return errors.New("writeIndexSpec: logical is required")
-	}
-	fullName := spec.fullName()
-	if spec.KeyPattern == "" {
-		return fmt.Errorf("writeIndexSpec %q: key_pattern is required", fullName)
-	}
-	if len(spec.Paths) == 0 {
-		return fmt.Errorf("writeIndexSpec %q: at least one path is required", fullName)
-	}
-	for i, p := range spec.Paths {
-		if p == "" {
-			return fmt.Errorf("writeIndexSpec %q: paths[%d] is empty", fullName, i)
-		}
-	}
-	patternLayer, constrained, err := resolveLayer(spec.KeyPattern)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: %w", fullName, err)
-	}
-	if !constrained {
-		return fmt.Errorf("writeIndexSpec %q: key_pattern cannot start with wildcard", fullName)
-	}
+// ——— Index registration (memory-only) ———
 
-	versionHex, err := canonicalIdxMD5(spec)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: md5: %w", fullName, err)
-	}
-	oldSpec, hadOld, err := db.loadIdxSpec(fullName)
-	if err != nil {
-		return err
-	}
-	if hadOld && oldSpec.Version == versionHex {
-		slog.Debug("writeIndexSpec: unchanged fingerprint, skipping",
-			"full", fullName, "version", versionHex)
-		return nil
-	}
-
-	metaLayer, metaConstrained, metaLerr := resolveLayer(spec.OwnerNs)
-	if metaLerr != nil || !metaConstrained {
-		return fmt.Errorf("writeIndexSpec %q: owner_ns %q is not a concrete ns (err=%v constrained=%v)", fullName, spec.OwnerNs, metaLerr, metaConstrained)
-	}
-	if hadOld {
-		if err := db.store(metaLayer).DropIndex(fullName); err != nil && !errors.Is(err, buntdb.ErrNotFound) {
-			return fmt.Errorf("writeIndexSpec %q: drop prior btree: %w", fullName, err)
-		}
-	}
-	if err := db.store(patternLayer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
-		return fmt.Errorf("writeIndexSpec %q: create btree: %w", fullName, err)
-	}
-
-	now := time.Now().UTC()
-	if hadOld {
-		spec.CreatedAt = oldSpec.CreatedAt
-		spec.UpdatedAt = now
-	} else {
-		spec.CreatedAt = now
-		spec.UpdatedAt = time.Time{}
-	}
-	spec.Version = versionHex
-
-	raw, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("writeIndexSpec %q: marshal: %w", fullName, err)
-	}
-	targetKey := naming.IdxMetaKey(fullName, versionHex)
-
-	if err := db.store(metaLayer).Update(func(tx *buntdb.Tx) error {
-		if err := deleteIdxSpecMeta(tx, fullName); err != nil {
-			return err
-		}
-		_, _, setErr := tx.Set(targetKey, string(raw), nil)
-		return setErr
-	}); err != nil {
-		return fmt.Errorf("writeIndexSpec %q: persist %s: %w", fullName, targetKey, err)
-	}
-
-	db.idxRegMu.Lock()
-	db.idxRegSpec[fullName] = spec
-	db.idxRegMu.Unlock()
-
-	if hadOld {
-		slog.Info("writeIndexSpec: index rebuilt (new fingerprint)",
-			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
-			"old_version", oldSpec.Version, "new_version", versionHex,
-			"paths", spec.Paths,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano),
-			"updated_at", spec.UpdatedAt.Format(time.RFC3339Nano))
-	} else {
-		slog.Info("writeIndexSpec: new index persisted",
-			"full", fullName, "owner_ns", spec.OwnerNs, "logical", spec.Logical,
-			"version", versionHex, "paths", spec.Paths,
-			"created_at", spec.CreatedAt.Format(time.RFC3339Nano))
-	}
-	return nil
-}
-
-// ——— Registry load + register lifecycle ———
-
-// registerIndexes converts one or more x.Index values into idxSpec and
-// delegates to writeIndexSpec (see writeIndexSpec for the MD5-fingerprint +
-// btree lifecycle). Used by: REGIDX cmd, CreateIndex alias and boot fixtures.
+// registerIndexes mounts one or more x.Index values as in-process btree
+// indexes. Indexes are NEVER persisted: they are declared in code via
+// x.RegisterSchema(x.IndexOn(...)) and rebuilt from scratch on every boot, so
+// there is no meta key, no MD5 fingerprint and no reload path. Called by: boot
+// declared-index mounting, the runtime SCHEMA command
+// (registerIndexIfAbsent) and the CreateIndex alias.
+//
+// Duplicate declarations are rejected: buntdb's CreateIndex fails when an
+// index with the same name already exists, so re-declaring an index in code
+// is reported as an error.
 func (db *DB) registerIndexes(indexes ...x.Index) error {
+	if db == nil {
+		return errors.New("registerIndexes: db is nil")
+	}
 	for _, idx := range indexes {
 		fullName := idx.Name()
 		if fullName == "" {
-			return fmt.Errorf("index name is required")
+			return errors.New("registerIndexes: index name is required")
 		}
 		ownerNs, logical, err := naming.ParseIdxFullName(fullName)
 		if err != nil {
-			return fmt.Errorf("index %q: parse full name: %w", fullName, err)
+			return fmt.Errorf("registerIndexes %q: %w", fullName, err)
 		}
-		spec := idxSpec{
-			OwnerNs:    ownerNs,
-			Logical:    logical,
-			KeyPattern: idx.KeyPattern(),
-			Paths:      idx.Paths(),
+		keyPattern := idx.KeyPattern()
+		layer, constrained, lerr := resolveLayer(keyPattern)
+		if lerr != nil || !constrained {
+			return fmt.Errorf("registerIndexes %q: key_pattern must be a concrete (non-wildcard) ns (err=%v constrained=%v)", fullName, lerr, constrained)
 		}
-		if err := db.writeIndexSpec(spec); err != nil {
-			return err
+		paths := idx.Paths()
+		if len(paths) == 0 {
+			return fmt.Errorf("registerIndexes %q: at least one json path is required", fullName)
 		}
+		if err := db.store(layer).CreateIndex(fullName, keyPattern, indexJSONComposite(paths...)); err != nil {
+			return fmt.Errorf("registerIndexes %q: create btree: %w", fullName, err)
+		}
+		db.idxRegMu.Lock()
+		db.idxRegSpec[fullName] = idxSpec{OwnerNs: ownerNs, Logical: logical}
+		db.idxRegMu.Unlock()
+		slog.Debug("index registered",
+			"name", fullName, "owner_ns", ownerNs, "key_pattern", keyPattern, "paths", paths)
 	}
 	return nil
 }
 
-// loadIndexes scans disk+mem layers for persisted idx meta keys and mounts
-// every idxSpec found. Intentionally runs BEFORE serving begins (openDB →
-// StartWith bootstrap). Caller holds idxRegMu for the entire pass.
-//
-// The "no multi-version" invariant applies here: writeIndexSpec always
-// deletes the prior meta key before writing the new one, so AscendKeys only
-// ever returns 0 or 1 matches per fullName; there is no version-priority
-// dedup step because it cannot happen.
-func (db *DB) loadIndexes() error {
-	type kv struct {
-		metaKey string
-		raw     string
-	}
-	patterns := []struct {
-		layer storageLayer
-		glob  string
-	}{
-		{layer: storageDisk, glob: naming.IdxMetaGlob()},
-		{layer: storageMem, glob: naming.IdxMetaGlob()},
-	}
-	db.idxRegMu.Lock()
-	defer db.idxRegMu.Unlock()
-	for _, p := range patterns {
-		var collected []kv
-		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
-				collected = append(collected, kv{metaKey: metaKey, raw: value})
-				return true
-			})
-		})
-		if err != nil {
-			return err
-		}
-		for _, c := range collected {
-			var spec idxSpec
-			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
-				return fmt.Errorf("index %s: unmarshal idxSpec: %w", c.metaKey, err)
-			}
-			if spec.OwnerNs == "" || spec.Logical == "" {
-				return fmt.Errorf("index %s: missing owner_ns/logical", c.metaKey)
-			}
-			fullName := spec.fullName()
-			layer, constrained, err := resolveLayer(spec.KeyPattern)
-			if err != nil {
-				return fmt.Errorf("index %s: %w", fullName, err)
-			}
-			if !constrained {
-				return fmt.Errorf("index %s: key_pattern cannot start with wildcard", fullName)
-			}
-			if len(spec.Paths) == 0 {
-				return fmt.Errorf("index %s: at least one json path is required", fullName)
-			}
-			if err := db.store(layer).CreateIndex(fullName, spec.KeyPattern, indexJSONComposite(spec.Paths...)); err != nil {
-				return fmt.Errorf("index %s: create btree: %w", fullName, err)
-			}
-			db.idxRegSpec[fullName] = spec
+// registerDeclaredIndexes mounts every index declared via
+// x.RegisterSchema(x.IndexOn(...)) on the given schemas. Indexes are
+// code-driven and never persisted, so this runs once per boot right after
+// registerSchemas; schemas that declare no indexes are simply skipped.
+func (db *DB) registerDeclaredIndexes(schemas ...x.Schema) error {
+	var indexes []x.Index
+	for _, sch := range schemas {
+		if def, ok := sch.(interface{ Indexes() []x.Index }); ok {
+			indexes = append(indexes, def.Indexes()...)
 		}
 	}
-	slog.Debug("index registry loaded", "count", len(db.idxRegSpec))
-	return nil
-}
-
-// loadDocSpecs mirrors loadIndexes for the doc-spec registry. Same "exactly-
-// one-version-per-storageNs invariant applies; AscendKeys dedup step is unnecessary.
-func (db *DB) loadDocSpecs() error {
-	type kv struct {
-		metaKey string
-		raw     string
+	if len(indexes) == 0 {
+		return nil
 	}
-	patterns := []struct {
-		layer storageLayer
-		glob  string
-	}{
-		{layer: storageDisk, glob: naming.DocMetaGlob()},
-		{layer: storageMem, glob: naming.DocMetaGlob()},
-	}
-	db.docRegMu.Lock()
-	defer db.docRegMu.Unlock()
-	for _, p := range patterns {
-		var collected []kv
-		err := db.store(p.layer).View(func(tx *buntdb.Tx) error {
-			return tx.AscendKeys(p.glob, func(metaKey, value string) bool {
-				collected = append(collected, kv{metaKey: metaKey, raw: value})
-				return true
-			})
-		})
-		if err != nil {
-			return err
-		}
-		for _, c := range collected {
-			var spec docSpec
-			if err := json.Unmarshal([]byte(c.raw), &spec); err != nil {
-				return fmt.Errorf("doc %s: unmarshal docSpec: %w", c.metaKey, err)
-			}
-			if spec.Namespace == "" {
-				return fmt.Errorf("doc %s: empty namespace", c.metaKey)
-			}
-			db.docRegSpec[spec.storageNs()] = spec
-		}
-	}
-	slog.Debug("doc registry loaded", "count", len(db.docRegSpec))
-	return nil
+	return db.registerIndexes(indexes...)
 }
 
 // registerSchemas converts x.Schema values into docSpec and delegates to
-// writeDocSpec (the single persistence entry point). Used by: REGSCH cmd,
-// boot fixtures. x.Schema only provides the 4 user-visible fields; the 3
-// internal fields (Version/CreatedAt/UpdatedAt) are stamped inside
-// writeDocSpec.
+// writeDocSpec (the single persistence entry point). Used by: boot
+// x.RegisterSchema declarations. x.Schema only provides the 4 user-visible
+// fields; the 3 internal fields (Version/CreatedAt/UpdatedAt) are stamped
+// inside writeDocSpec.
+//
+// The persisted doc meta record is an AUDIT trail only — it is never replayed
+// into the in-memory registry on boot (schemas come exclusively from code, so
+// a namespace the current binary no longer declares is intentionally absent).
 func (db *DB) registerSchemas(schemas ...x.Schema) error {
 	for _, sch := range schemas {
 		spec := docSpec{
@@ -625,133 +362,5 @@ func (db *DB) registerSchemas(schemas ...x.Schema) error {
 			return err
 		}
 	}
-	return nil
-}
-
-// ——— Registry drop ———
-
-// dropIndexByFullName is the DROPIDX command implementation (1 arg = fullName
-// or 2 args = ownerNs + logical, resolved in cmd.go dropIdxCommand). idxRegMu
-// is held for the entire op (spec read → btree DropIndex → meta probe/delete
-// → map delete). Ctrl ops are low frequency so coarse lock scope keeps the
-// reasoning symmetric with DROPSCH.
-func (db *DB) dropIndexByFullName(fullName string) error {
-	if db == nil {
-		return errors.New("dropIndexByFullName: db is nil")
-	}
-	if fullName == "" {
-		return errors.New("dropIndexByFullName: full_name is required")
-	}
-	ownerNs, _, err := naming.ParseIdxFullName(fullName)
-	if err != nil {
-		return fmt.Errorf("dropIndexByFullName: %w", err)
-	}
-	layer, constrained, lerr := resolveLayer(ownerNs)
-	if lerr != nil || !constrained {
-		return fmt.Errorf("dropIndexByFullName: ownerNs %q is not a concrete ns (err=%v constrained=%v)", ownerNs, lerr, constrained)
-	}
-	// Symmetric with dropSchemaByLogicalNs: acquire the registry write-lock up
-	// front for the entire operation (spec lookup → btree DropIndex → meta
-	// probe/delete → map delete). Ctrl registry ops are low frequency so the
-	// coarse lock scope keeps reasoning simple and symmetric with DROPSCH.
-	db.idxRegMu.Lock()
-	defer db.idxRegMu.Unlock()
-	spec, ok := db.idxRegSpec[fullName]
-	if !ok {
-		return fmt.Errorf("dropIndexByFullName: index %q not registered", fullName)
-	}
-	if err := db.store(layer).DropIndex(fullName); err != nil && !errors.Is(err, buntdb.ErrNotFound) {
-		return fmt.Errorf("dropIndexByFullName: drop btree: %w", err)
-	}
-	glob := naming.IdxMetaGlobFor(fullName)
-	hasAnyMeta := false
-	if err := db.store(layer).View(func(tx *buntdb.Tx) error {
-		_ = tx.AscendKeys(glob, func(_, _ string) bool {
-			hasAnyMeta = true
-			return false
-		})
-		return nil
-	}); err != nil {
-		return fmt.Errorf("dropIndexByFullName: probe %s meta: %w", fullName, err)
-	}
-	if hasAnyMeta {
-		if err := db.store(layer).Update(func(tx *buntdb.Tx) error {
-			return deleteIdxSpecMeta(tx, fullName)
-		}); err != nil {
-			return fmt.Errorf("dropIndexByFullName: delete %s meta: %w", fullName, err)
-		}
-	}
-	delete(db.idxRegSpec, fullName)
-	slog.Debug("index dropped",
-		"name", fullName, "owner_ns", spec.OwnerNs,
-		"logical", spec.Logical, "mem", naming.HasMemPrefix(spec.OwnerNs))
-	return nil
-}
-
-// dropSchemaByLogicalNs is the DROPSCH command implementation. It checks for
-// attached indexes first (hard ERR with names when count>0; caller drops them
-// via DROPIDX first), then deletes meta keys + docRegSpec entries on disk
-// AND mem layers (both candidates probed). Coarse docRegMu lock is held for
-// the candidates loop (symmetric with DROPIDX).
-func (db *DB) dropSchemaByLogicalNs(logicalNs string) error {
-	if db == nil {
-		return errors.New("dropSchemaByLogicalNs: db is nil")
-	}
-	if logicalNs == "" {
-		return errors.New("dropSchemaByLogicalNs: logical ns is required")
-	}
-	if err := naming.ValidateDocLogicalNamespace(logicalNs); err != nil {
-		return fmt.Errorf("dropSchemaByLogicalNs: %w", err)
-	}
-	memStorageNs := naming.BuildStorageNs(logicalNs, true)
-	diskStorageNs := naming.BuildStorageNs(logicalNs, false)
-	db.idxRegMu.RLock()
-	attachedNames := lo.FilterMap(lo.Entries(db.idxRegSpec), func(e lo.Entry[string, idxSpec], _ int) (string, bool) {
-		base, _ := naming.StripMemPrefixIfMem(e.Value.OwnerNs)
-		return e.Key, base == logicalNs || e.Value.OwnerNs == memStorageNs || e.Value.OwnerNs == diskStorageNs
-	})
-	db.idxRegMu.RUnlock()
-	if len(attachedNames) > 0 {
-		sort.Strings(attachedNames)
-		return fmt.Errorf("doc %q still has %d attached index(es): %s — drop indexes first via DROPIDX", logicalNs, len(attachedNames), strings.Join(attachedNames, ","))
-	}
-	candidates := []struct {
-		storageNs string
-		layer     storageLayer
-	}{
-		{storageNs: diskStorageNs, layer: storageDisk},
-		{storageNs: memStorageNs, layer: storageMem},
-	}
-	db.docRegMu.Lock()
-	defer db.docRegMu.Unlock()
-	anyFound := false
-	for _, cand := range candidates {
-		foundOnLayer := false
-		if viewErr := db.store(cand.layer).View(func(tx *buntdb.Tx) error {
-			_ = tx.AscendKeys(naming.DocMetaGlobFor(cand.storageNs), func(_, _ string) bool {
-				foundOnLayer = true
-				return false
-			})
-			return nil
-		}); viewErr != nil {
-			return fmt.Errorf("dropSchemaByLogicalNs: probe %s meta: %w", cand.storageNs, viewErr)
-		}
-		if foundOnLayer {
-			anyFound = true
-			if upErr := db.store(cand.layer).Update(func(tx *buntdb.Tx) error {
-				return deleteDocSpecMeta(tx, cand.storageNs)
-			}); upErr != nil {
-				return fmt.Errorf("dropSchemaByLogicalNs: delete %s meta: %w", cand.storageNs, upErr)
-			}
-		}
-		if _, ok := db.docRegSpec[cand.storageNs]; ok {
-			anyFound = true
-			delete(db.docRegSpec, cand.storageNs)
-		}
-	}
-	if !anyFound {
-		return fmt.Errorf("dropSchemaByLogicalNs: doc %q not registered (disk+mem both empty)", logicalNs)
-	}
-	slog.Debug("doc dropped", "logical_ns", logicalNs)
 	return nil
 }

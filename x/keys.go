@@ -558,7 +558,7 @@ func LayerRoutingConstrained(kr KeyRange, layerForKey func(string) any) (any /*s
 // legacy string path). Every string field in the 6 sealed ctors is prefixed
 // with the D namespace + separator, and any LIMIT set on the input scopedKR
 // is carried onto the returned sealed range via .Limit(old).
-func ScopeKeyRange[D Document](scopedKR KeyRange) (KeyRange, error) {
+func ScopeKeyRange[D Schema](scopedKR KeyRange) (KeyRange, error) {
 	fullNamespace := StorageKeyValue[D]("")
 	fullPrefix := naming.StorageNsScope(fullNamespace)
 
