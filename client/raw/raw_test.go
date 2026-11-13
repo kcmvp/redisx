@@ -10,6 +10,7 @@ import (
 	"github.com/kcmvp/redisx/client/internal/hook"
 	"github.com/kcmvp/redisx/client/raw"
 	"github.com/kcmvp/redisx/internal/naming"
+	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/internal/testutil"
 	"github.com/kcmvp/redisx/server"
 	"github.com/kcmvp/redisx/x"
@@ -477,3 +478,62 @@ func (s *RawTestSuite) TestUpdateCommand() {
 	}
 }
 
+// TestRegisterSchema covers raw.RegisterSchema: the not-connected error path
+// and the happy path where a declared schema + inline index is mounted and
+// searchable over the wire.
+func (s *RawTestSuite) TestRegisterSchema() {
+	tests := []struct {
+		name       string
+		connect    bool
+		payload    proto.SchemaPayload
+		expectErr  bool
+		wantErrMsg string
+	}{
+		{
+			name:       "not connected returns error",
+			connect:    false,
+			payload:    proto.SchemaPayload{Namespace: "rawunreg", Mem: false, KeyAttrs: []string{"id"}},
+			expectErr:  true,
+			wantErrMsg: "resp client is not connected",
+		},
+		{
+			name:    "declare schema with inline index succeeds",
+			connect: true,
+			payload: proto.SchemaPayload{
+				Namespace: "rawsch",
+				Mem:       false,
+				KeyAttrs:  []string{"id"},
+				Indexes: []proto.IndexPayload{{
+					Name:       "rawsch:age",
+					KeyPattern: "rawsch:*",
+					Paths:      []string{"age"},
+				}},
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		s.Run(tt.name, func() {
+			s.SetupTest()
+			if tt.connect {
+				s.connectRaw()
+			}
+			err := raw.RegisterSchema(tt.payload)
+			if tt.expectErr {
+				s.Error(err)
+				s.Contains(err.Error(), tt.wantErrMsg)
+				return
+			}
+			s.NoError(err)
+
+			// The declared index must be mounted: SET then SEARCHINDEX over
+			// rawsch:age must return the written document.
+			s.NoError(raw.Set("rawsch:r1", `{"id":"r1","age":30}`))
+			res := raw.SearchIndex("rawsch:age", x.KeysPattern("rawsch:*"), nil, false)
+			s.False(res.IsError(), "searchindex err: %v", res.Error())
+			s.Len(res.MustGet(), 1)
+		})
+	}
+}

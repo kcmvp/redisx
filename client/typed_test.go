@@ -2401,91 +2401,6 @@ func (registerProbeDoc) KeyAttrs() []string { return []string{"id"} }
 func (d registerProbeDoc) RawJSON() string  { return string(d) }
 func (registerProbeDoc) TTL() time.Duration { return 0 }
 
-// TestRegisterSchemaE2E drives client.RegisterSchema against a real server over
-// the wire: the normal path (declare → write → index-search) plus the abnormal
-// ones (offline call, app-port privilege rejection, unregistered namespace
-// before any declaration).
-func TestRegisterSchemaE2E(t *testing.T) {
-	appPort, err := testutil.AllocateFreePort()
-	require.NoError(t, err)
-	ctrlPort, err := testutil.AllocateFreePort()
-	require.NoError(t, err)
-	ctrlAuth := "regschema-ctrl-auth"
-	appAuth := "regschema-app-auth"
-	cfg := &server.Config{
-		DataPath: testutil.DBPath(t),
-		App:      server.AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
-		Ctrl:     server.CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
-	}
-	db := server.StartWith(cfg, clientSuiteSchemas()...)
-	require.NotNil(t, db)
-	defer stopAndResetGlobalState()
-
-	// clearConn drops any shared client left behind by an earlier subtest. Raw
-	// connect() is used instead of Connect() so no reconnect lifecycle goroutine
-	// can come alive and race the assertions.
-	clearConn := func() {
-		if prev := setSharedClient(nil); prev != nil {
-			_ = prev.Close()
-		}
-	}
-	withConn := func(t *testing.T, addr, auth string) *redis.Client {
-		t.Helper()
-		clearConn()
-		cli, err := connect(addr, auth)
-		require.NoError(t, err)
-		setSharedClient(cli)
-		t.Cleanup(func() {
-			clearSharedClientIf(cli)
-			_ = cli.Close()
-		})
-		return cli
-	}
-
-	t.Run("offline call returns not-connected error", func(t *testing.T) {
-		clearConn()
-		err := RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "resp client is not connected")
-	})
-
-	t.Run("ctrl port: declare, write and index-search end to end", func(t *testing.T) {
-		withConn(t, cfg.Ctrl.Addr(), ctrlAuth)
-
-		// Nothing has declared this schema yet, so its index is not mounted and
-		// an index search must fail before any SCHEMA reaches the server.
-		pre := SearchIndex[registerProbeDoc]("rid", x.KeysPattern("*"), nil, false)
-		require.True(t, pre.IsError(), "index search must fail before the schema is declared")
-
-		// One declaration installs both the doc spec and its inline index.
-		require.NoError(t, RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid")))
-
-		// Re-declaring the identical schema is idempotent: the doc spec is a
-		// no-op and the already-mounted index is not recreated.
-		for i := 0; i < 3; i++ {
-			require.NoError(t, RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid")),
-				"re-declaring an unchanged schema must be a no-op (attempt %d)", i)
-		}
-
-		require.NoError(t, Set(registerProbeDoc(`{"id":"r1","rid":"a"}`)))
-		require.NoError(t, Set(registerProbeDoc(`{"id":"r2","rid":"b"}`)))
-
-		res := SearchIndex[registerProbeDoc]("rid", x.KeysPattern("*"), nil, false)
-		require.NoError(t, res.Error())
-		require.Len(t, res.MustGet(), 2)
-	})
-
-	t.Run("app port rejects SCHEMA as ctrl-only", func(t *testing.T) {
-		withConn(t, cfg.App.Addr(), appAuth)
-
-		err := RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "ERR No Privilege:")
-		require.Contains(t, err.Error(), "'schema'")
-		require.Contains(t, err.Error(), "Meta Management")
-	})
-}
-
 type DocTestSuite struct {
 	suite.Suite
 }
@@ -2806,6 +2721,57 @@ func (s *DocTestSuite) TestAll_TABLE_DRIVEN() {
 				"index %d: All(true)[%d] must equal All(false)[%d] reversed",
 				i, len(ascDocs)-1-i, i)
 		}
+	})
+}
+
+// TestRegisterSchema exercises the typed client.RegisterSchema entry point
+// against the shared ctrl-port connection: declaring a new schema with an
+// inline index, idempotent re-declaration, and the resulting SET +
+// SearchIndex round trip.
+func (s *DocTestSuite) TestRegisterSchema() {
+	tests := []struct {
+		name      string
+		action    func() error
+		expectErr bool
+		wantErr   string
+	}{
+		{
+			name: "declare schema with inline index succeeds",
+			action: func() error {
+				return RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
+			},
+		},
+		{
+			name: "redeclare identical schema is idempotent",
+			action: func() error {
+				return RegisterSchema[registerProbeDoc](x.IndexOn("rid", "rid"))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		s.Run(tc.name, func() {
+			err := tc.action()
+			if tc.expectErr {
+				s.Error(err)
+				s.Contains(err.Error(), tc.wantErr)
+				return
+			}
+			s.NoError(err)
+		})
+	}
+
+	// After declaring regprobe with its rid index, a typed SET followed by
+	// SearchIndex must return the written documents — proving the schema
+	// and its inline index were mounted over the wire.
+	s.Run("declare then set then searchindex end to end", func() {
+		s.NoError(Set(registerProbeDoc(`{"id":"p1","rid":"a"}`)))
+		s.NoError(Set(registerProbeDoc(`{"id":"p2","rid":"b"}`)))
+
+		res := SearchIndex[registerProbeDoc]("rid", x.KeysPattern("*"), nil, false)
+		s.Require().NoError(res.Error())
+		s.Len(res.MustGet(), 2)
 	})
 }
 

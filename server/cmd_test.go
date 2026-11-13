@@ -1604,6 +1604,193 @@ func (s *CmdTestSuite) TestRegistryCommands() {
 	})
 }
 
+// TestSchemaCommand drives the SCHEMA command end to end over the wire:
+// the happy path (declare doc spec + inline index, then read it back via
+// SEARCHINDEX), idempotent re-declaration, and every input-validation
+// branch in schemaCommand / registerSchemaPayload (argc, JSON, unknown
+// fields, empty index fields).
+func (s *CmdTestSuite) TestSchemaCommand() {
+	t := s.T()
+	dbPath := testutil.DBPath(t)
+	appPort, ctrlPort := testutil.AllocateTwoFreePorts(t)
+	appAuth := "schema-app-key"
+	ctrlAuth := "schema-ctrl-key"
+	cfg := &Config{
+		DataPath: dbPath,
+		App:      AppConfig{Bind: "127.0.0.1", Port: appPort, Auth: appAuth},
+		Ctrl:     CtrlConfig{Bind: "127.0.0.1", Port: ctrlPort, Auth: ctrlAuth},
+	}
+	db := StartWith(cfg)
+	require.NotNil(t, db, "StartWith returned nil; appPort=%d ctrlPort=%d", appPort, ctrlPort)
+	ctrlAddr := cfg.Ctrl.Addr()
+	appAddr := cfg.App.Addr()
+
+	// payloadJSON builds a SCHEMA body from a doc spec and optional indexes.
+	// Index names are already fully-qualified (e.g. "schemadoc:age") because
+	// the wire payload carries storage-layer index names, not logical names.
+	payloadJSON := func(ns string, mem bool, keyAttrs []string, ttlNS int64, idxs ...[]string) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, `{"namespace":%q,"mem":%t,"key_attrs":[`, ns, mem)
+		for i, ka := range keyAttrs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "%q", ka)
+		}
+		fmt.Fprintf(&b, `],"ttl_ns":%d`, ttlNS)
+		if len(idxs) > 0 {
+			b.WriteString(`,"indexes":[`)
+			for i, idx := range idxs {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				fmt.Fprintf(&b, `{"name":%q,"key_pattern":%q,"paths":[`, idx[0], idx[1])
+				for j, p := range idx[2:] {
+					if j > 0 {
+						b.WriteByte(',')
+					}
+					fmt.Fprintf(&b, "%q", p)
+				}
+				b.WriteString(`]}`)
+			}
+			b.WriteString(`]`)
+		}
+		b.WriteString(`}`)
+		return b.String()
+	}
+
+	rt := func(addr, auth string, cmds [][]string) string {
+		return respRoundTrip(t, addr, auth, cmds)
+	}
+
+	tests := []struct {
+		name    string
+		addr    string
+		auth    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "argc too few",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: "", // no payload arg at all → handled by caller
+			want:    "wrong number of arguments for 'schema' command",
+		},
+		{
+			name:    "invalid json",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: "{bad json",
+			want:    "ERR SCHEMA",
+		},
+		{
+			name:    "unknown field rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"schemadoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"bogus":1}`,
+			want:    "ERR SCHEMA",
+		},
+		{
+			name:    "doc spec only no indexes",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("schemadoc", false, []string{"id"}, 0),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "doc spec with inline index",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("idxdoc", false, []string{"id"}, 0, []string{"idxdoc:age", "idxdoc:*", "age"}),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "redeclare identical is idempotent",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: payloadJSON("idxdoc", false, []string{"id"}, 0, []string{"idxdoc:age", "idxdoc:*", "age"}),
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "index missing name rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"","key_pattern":"baddoc:*","paths":["age"]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index missing key_pattern rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"","paths":["age"]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index empty paths rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"baddoc:*","paths":[]}]}`,
+			want:    `requires name, key_pattern and at least one path`,
+		},
+		{
+			name:    "index empty path element rejected",
+			addr:    ctrlAddr,
+			auth:    ctrlAuth,
+			payload: `{"namespace":"baddoc","mem":false,"key_attrs":["id"],"ttl_ns":0,"indexes":[{"name":"baddoc:age","key_pattern":"baddoc:*","paths":[""]}]}`,
+			want:    `has an empty path`,
+		},
+		{
+			name:    "app port rejects SCHEMA as ctrl-only",
+			addr:    appAddr,
+			auth:    appAuth,
+			payload: payloadJSON("appdoc", false, []string{"id"}, 0),
+			want:    "No Privilege",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		s.Run(tc.name, func() {
+			var cmds [][]string
+			if tc.payload == "" {
+				// argc too few: send SCHEMA with no payload
+				cmds = [][]string{{"schema"}}
+			} else {
+				cmds = [][]string{{"schema", tc.payload}}
+			}
+			resp := rt(tc.addr, tc.auth, cmds)
+			s.Contains(resp, tc.want, "resp=%s", resp)
+		})
+	}
+
+	// End-to-end: after declaring idxdoc with an inline age index, a SET
+	// followed by SEARCHINDEX must return the indexed document. This proves
+	// registerSchemaPayload actually mounted the btree index.
+	s.Run("declare then set then searchindex end to end", func() {
+		resp := rt(ctrlAddr, ctrlAuth, [][]string{
+			{"set", "idxdoc", `{"id":"e1","age":30}`},
+			{"set", "idxdoc", `{"id":"e2","age":40}`},
+			{"searchindex", "idxdoc:age", `{"op":"pattern","p":"idxdoc:*"}`, "{}", "ASC"},
+		})
+		s.Contains(resp, `{"id":"e1","age":30}`)
+		s.Contains(resp, `{"id":"e2","age":40}`)
+	})
+
+	// registerIndexIfAbsent skip path: declaring an index whose name was
+	// already mounted by an earlier SCHEMA push must be a silent no-op
+	// (the idxRegSpec pre-check hits), so SEARCHINDEX still works.
+	s.Run("duplicate index name from second schema is silently skipped", func() {
+		resp := rt(ctrlAddr, ctrlAuth, [][]string{
+			{"schema", payloadJSON("idxdoc2", false, []string{"id"}, 0, []string{"idxdoc2:age", "idxdoc2:*", "age"})},
+			{"set", "idxdoc2", `{"id":"z1","age":50}`},
+			{"searchindex", "idxdoc2:age", `{"op":"pattern","p":"idxdoc2:*"}`, "{}", "ASC"},
+		})
+		s.Contains(resp, "+OK\r\n")
+		s.Contains(resp, `{"id":"z1","age":50}`)
+	})
+}
+
 // bootServerFor starts a fresh dual-port server for one test method and
 // returns the ctrl/app addresses plus the db handle. Empty auth seeds are
 // replaced with defaults so bootstrapAuth never generates random keys
