@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kcmvp/redisx/client/internal/conn"
+	clienterrs "github.com/kcmvp/redisx/client/internal/errs"
 	"github.com/kcmvp/redisx/client/raw"
 	"github.com/kcmvp/redisx/internal"
 	"github.com/kcmvp/redisx/internal/proto"
@@ -123,18 +123,18 @@ func clearSharedClientIf(target *redis.Client) {
 // be retried. Duplicate topic registration is rejected.
 func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	if topic == "" {
-		return mo.Err[<-chan *ReceivedMessage](errors.New("topic is empty"))
+		return mo.Err[<-chan *ReceivedMessage](clienterrs.New(clienterrs.ErrTopicEmpty, "topic is empty"))
 	}
 
 	lifecycle, _ := getLifecycleCtx()
 	if lifecycle == nil {
-		return mo.Err[<-chan *ReceivedMessage](errors.New("resp client is not connected"))
+		return mo.Err[<-chan *ReceivedMessage](clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected"))
 	}
 
 	handlersMu.Lock()
 	if _, exists := deliveryChByTopic[topic]; exists {
 		handlersMu.Unlock()
-		return mo.Err[<-chan *ReceivedMessage](errors.New("duplicated handler for topic"))
+		return mo.Err[<-chan *ReceivedMessage](clienterrs.New(clienterrs.ErrDuplicatedHandler, "duplicated handler for topic"))
 	}
 	ch := make(chan *ReceivedMessage, bufferSize)
 	ack := make(chan struct{})
@@ -149,9 +149,9 @@ func Subscribe(topic string) mo.Result[<-chan *ReceivedMessage] {
 	case <-ack:
 		return mo.Ok[<-chan *ReceivedMessage](ch)
 	case <-lifecycle.Done():
-		ackErr = errors.New("client stopped before the subscription was acknowledged")
+		ackErr = clienterrs.New(clienterrs.ErrSubscriptionStopped, "client stopped before the subscription was acknowledged")
 	case <-time.After(subscribeAckTimeout):
-		ackErr = fmt.Errorf("subscription %q was not acknowledged within %s", topic, subscribeAckTimeout)
+		ackErr = clienterrs.New(clienterrs.ErrSubscribeAckTimeout, "subscription %q was not acknowledged within %s", topic, subscribeAckTimeout)
 	}
 
 	// Roll back so the caller can retry the same topic. The delivery channel is
@@ -184,7 +184,7 @@ func getLifecycleCtx() (context.Context, context.CancelFunc) {
 // Connect starts the bridge lifecycle.
 func Connect(respAddr, authKey string) error {
 	if authKey == "" {
-		return errors.New("auth key is empty")
+		return clienterrs.New(clienterrs.ErrAuthKeyEmpty, "auth key is empty")
 	}
 
 	cliOnce.Do(func() {
@@ -341,7 +341,7 @@ func Connect(respAddr, authKey string) error {
 func ConnectEmbedded() error {
 	addr := internal.CtrlAddr()
 	if addr == "" {
-		return errors.New("ConnectEmbedded: no in-process ctrl address registered; call server.StartWith first, or use Connect(addr, auth) for remote servers")
+		return fmt.Errorf("ConnectEmbedded: no in-process ctrl address registered; call server.StartWith first, or use Connect(addr, auth) for remote servers")
 	}
 	return Connect(addr, internal.AuthKey())
 }
@@ -429,7 +429,7 @@ func Keys[D x.Document](keyPattern string) mo.Result[[]string] {
 // index. nil or empty filter is treated as "match every scanned row".
 func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if scopedKR == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
+		return mo.Err[[]D](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	fullIdxName, err := x.ValidateIdxName[D](idxName)
 	if err != nil {
@@ -463,7 +463,7 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 // build the scoped KeyRange.
 func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo.Result[[]D] {
 	if scopedKR == nil {
-		return mo.Err[[]D](errors.New("key range is required"))
+		return mo.Err[[]D](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	fullKR, err := x.ScopeKeyRange[D](scopedKR)
 	if err != nil {
@@ -514,7 +514,7 @@ func All[D x.Document](desc bool, filters ...x.Filter) mo.Result[[]D] {
 
 func Update[D x.Document](scopedKR x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if scopedKR == nil {
-		return mo.Err[[]string](errors.New("key range is required"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	fullKR, err := x.ScopeKeyRange[D](scopedKR)
 	if err != nil {
@@ -564,18 +564,18 @@ func buildSchemaPayload(s x.Schema) proto.SchemaPayload {
 // Auth authenticates the shared resp client connection with the given key.
 func Auth(authKey string) error {
 	if authKey == "" {
-		return errors.New("auth key is empty")
+		return clienterrs.New(clienterrs.ErrAuthKeyEmpty, "auth key is empty")
 	}
 
 	client := getSharedClient()
 	if client == nil {
-		return errors.New("resp client is not connected")
+		return clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	return client.Do(ctx, "AUTH", authKey).Err()
+	return clienterrs.Normalize(client.Do(ctx, "AUTH", authKey).Err())
 }
 
 // Publish enqueues a message for publishing to a specific topic.
@@ -629,7 +629,7 @@ func hostPortFromAddr(addr string) (string, int, error) {
 // Caller must handle cleanup (Close) if an error is returned.
 func connect(respAddr, authKey string) (*redis.Client, error) {
 	if authKey == "" {
-		return nil, errors.New("auth key is empty")
+		return nil, clienterrs.New(clienterrs.ErrAuthKeyEmpty, "auth key is empty")
 	}
 	host, port, err := hostPortFromAddr(respAddr)
 	if err != nil {
@@ -649,7 +649,7 @@ func connect(respAddr, authKey string) (*redis.Client, error) {
 				slog.Warn("redisx close client after failed dial handshake failed", "error", closeErr)
 			}
 		}
-		return nil, err
+		return nil, clienterrs.Normalize(err)
 	}
 	return res.Client, nil
 }

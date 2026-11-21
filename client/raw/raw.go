@@ -3,12 +3,12 @@ package raw
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/kcmvp/redisx/client/internal/conn"
+	clienterrs "github.com/kcmvp/redisx/client/internal/errs"
 	"github.com/kcmvp/redisx/client/internal/hook"
 	"github.com/kcmvp/redisx/internal/proto"
 	"github.com/kcmvp/redisx/x"
@@ -23,13 +23,13 @@ func Get(key string) (string, error) {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return "", errors.New("resp client is not connected")
+		return "", clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	val, err := client.Get(ctx, key).Result()
 	if err != nil {
-		return "", err
+		return "", clienterrs.Normalize(err)
 	}
 	return val, nil
 }
@@ -40,7 +40,7 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return errors.New("resp client is not connected")
+		return clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	reg := hook.Snapshot()
 	finalVal := value
@@ -61,7 +61,7 @@ func SetWithTTL(key, value string, ttl time.Duration) error {
 	if reg != nil {
 		hook.RunAfter(reg, key, valBytes, committed, werr)
 	}
-	return werr
+	return clienterrs.Normalize(werr)
 }
 
 func Set(key, value string) error {
@@ -74,7 +74,7 @@ func SetNX(key, value string) (bool, error) {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return false, errors.New("resp client is not connected")
+		return false, clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	reg := hook.Snapshot()
 	finalVal := value
@@ -96,7 +96,7 @@ func SetNX(key, value string) (bool, error) {
 	if reg != nil {
 		hook.RunAfter(reg, key, valBytes, committed, werr)
 	}
-	return ok, werr
+	return ok, clienterrs.Normalize(werr)
 }
 
 func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
@@ -108,7 +108,7 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return false, errors.New("resp client is not connected")
+		return false, clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	reg := hook.Snapshot()
 	finalVal := value
@@ -129,7 +129,7 @@ func SetNXWithTTL(key, value string, ttl time.Duration) (bool, error) {
 	if reg != nil {
 		hook.RunAfter(reg, key, valBytes, committed, werr)
 	}
-	return ok, werr
+	return ok, clienterrs.Normalize(werr)
 }
 
 func Delete(key string) (bool, error) {
@@ -138,12 +138,12 @@ func Delete(key string) (bool, error) {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return false, errors.New("resp client is not connected")
+		return false, clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	res, err := client.Del(ctx, key).Result()
-	return res > 0, err
+	return res > 0, clienterrs.Normalize(err)
 }
 
 func Keys(keyPattern string) mo.Result[[]string] {
@@ -152,23 +152,27 @@ func Keys(keyPattern string) mo.Result[[]string] {
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return mo.Err[[]string](errors.New("resp client is not connected"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	return mo.TupleToResult(client.Keys(ctx, keyPattern).Result())
+	keys, err := client.Keys(ctx, keyPattern).Result()
+	if err != nil {
+		return mo.Err[[]string](clienterrs.Normalize(err))
+	}
+	return mo.Ok(keys)
 }
 
 func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if indexName == "" {
-		return mo.Err[[]string](errors.New("index name is required"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrIndexNameRequired, "index name is required"))
 	}
 	if kr == nil {
-		return mo.Err[[]string](errors.New("key range is required"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return mo.Err[[]string](errors.New("resp client is not connected"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -199,18 +203,18 @@ func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo
 	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
-		return mo.Err[[]string](err)
+		return mo.Err[[]string](clienterrs.Normalize(err))
 	}
 	return mo.Ok(res)
 }
 
 func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
-		return mo.Err[[]string](errors.New("key range is required"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return mo.Err[[]string](errors.New("resp client is not connected"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -241,21 +245,21 @@ func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
-		return mo.Err[[]string](err)
+		return mo.Err[[]string](clienterrs.Normalize(err))
 	}
 	return mo.Ok(res)
 }
 
 func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {
 	if kr == nil {
-		return mo.Err[[]string](errors.New("key range is required"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
 	}
 	if len(values) == 0 {
-		return mo.Err[[]string](errors.New("no update values provided"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrNoUpdateValues, "no update values provided"))
 	}
 	client := conn.GetSharedClient()
 	if client == nil {
-		return mo.Err[[]string](errors.New("resp client is not connected"))
+		return mo.Err[[]string](clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
@@ -283,7 +287,7 @@ func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]st
 	cmd := client.Do(ctx, args...)
 	res, err := cmd.StringSlice()
 	if err != nil {
-		return mo.Err[[]string](err)
+		return mo.Err[[]string](clienterrs.Normalize(err))
 	}
 	return mo.Ok(res)
 }
@@ -297,7 +301,7 @@ func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]st
 func RegisterSchema(payload proto.SchemaPayload) error {
 	client := conn.GetSharedClient()
 	if client == nil {
-		return errors.New("resp client is not connected")
+		return clienterrs.New(clienterrs.ErrNotConnected, "resp client is not connected")
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -305,5 +309,5 @@ func RegisterSchema(payload proto.SchemaPayload) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	return client.Do(ctx, proto.CmdSchema, string(body)).Err()
+	return clienterrs.Normalize(client.Do(ctx, proto.CmdSchema, string(body)).Err())
 }
