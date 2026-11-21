@@ -208,6 +208,14 @@ func SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc bool) mo
 	return mo.Ok(res)
 }
 
+func CountByIndex(indexName string, kr x.KeyRange, filter x.Filter) mo.Result[int] {
+	res := SearchIndex(indexName, kr, filter, false)
+	if res.IsError() {
+		return mo.Err[int](res.Error())
+	}
+	return mo.Ok(len(res.MustGet()))
+}
+
 func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 	if kr == nil {
 		return mo.Err[[]string](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
@@ -248,6 +256,14 @@ func SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]string] {
 		return mo.Err[[]string](clienterrs.Normalize(err))
 	}
 	return mo.Ok(res)
+}
+
+func CountByKey(kr x.KeyRange, filter x.Filter) mo.Result[int] {
+	res := SearchKey(kr, filter, false)
+	if res.IsError() {
+		return mo.Err[int](res.Error())
+	}
+	return mo.Ok(len(res.MustGet()))
 }
 
 func Update(kr x.KeyRange, filter x.Filter, values ...x.Mutation) mo.Result[[]string] {

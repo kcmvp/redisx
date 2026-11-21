@@ -454,6 +454,25 @@ func SearchIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Fil
 	return mo.Ok(out)
 }
 
+// CountByIndex returns how many documents in namespace D match the given
+// secondary-index query.
+func CountByIndex[D x.Document](idxName string, scopedKR x.KeyRange, filter x.Filter) mo.Result[int] {
+	if scopedKR == nil {
+		return mo.Err[int](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
+	}
+	fullIdxName, err := x.ValidateIdxName[D](idxName)
+	if err != nil {
+		return mo.Err[int](err)
+	}
+
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[int](err)
+	}
+
+	return raw.CountByIndex(fullIdxName, fullKR, filter)
+}
+
 // SearchKey queries documents in namespace D by primary storage-key range.
 //
 // Ordering is by the **primary storage key** (namespace:pk concatenation)
@@ -481,6 +500,20 @@ func SearchKey[D x.Document](scopedKR x.KeyRange, filter x.Filter, desc bool) mo
 		out = append(out, D(raw))
 	}
 	return mo.Ok(out)
+}
+
+// CountByKey returns how many documents in namespace D match the given primary
+// storage-key range query.
+func CountByKey[D x.Document](scopedKR x.KeyRange, filter x.Filter) mo.Result[int] {
+	if scopedKR == nil {
+		return mo.Err[int](clienterrs.New(clienterrs.ErrKeyRangeRequired, "key range is required"))
+	}
+	fullKR, err := x.ScopeKeyRange[D](scopedKR)
+	if err != nil {
+		return mo.Err[int](err)
+	}
+
+	return raw.CountByKey(fullKR, filter)
 }
 
 // All returns every document currently stored in namespace D.

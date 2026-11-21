@@ -403,6 +403,16 @@ func (db *DB) SearchIndex(indexName string, kr x.KeyRange, filter x.Filter, desc
 	return mo.Ok(results)
 }
 
+// CountByIndex returns the number of records that SearchIndex would return for
+// the same inputs.
+func (db *DB) CountByIndex(indexName string, kr x.KeyRange, filter x.Filter) mo.Result[int] {
+	res := db.SearchIndex(indexName, kr, filter, false)
+	if res.IsError() {
+		return mo.Err[int](res.Error())
+	}
+	return mo.Ok(len(res.MustGet()))
+}
+
 // SearchKey walks the raw storage-key order (no secondary index) for a key-
 // range; used both for typed-doc queries (colon-routing doc-path, KeyRange
 // anchor resolves to storageNs) AND for generic KV-pattern passthrough (colon-
@@ -452,6 +462,16 @@ func (db *DB) SearchKey(kr x.KeyRange, filter x.Filter, desc bool) mo.Result[[]s
 		return mo.Err[[]string](err)
 	}
 	return mo.Ok(results)
+}
+
+// CountByKey returns the number of records that SearchKey would return for the
+// same inputs.
+func (db *DB) CountByKey(kr x.KeyRange, filter x.Filter) mo.Result[int] {
+	res := db.SearchKey(kr, filter, false)
+	if res.IsError() {
+		return mo.Err[int](res.Error())
+	}
+	return mo.Ok(len(res.MustGet()))
 }
 
 // ——— Raw KV passthrough (Set/SetNX/Get/Delete/Keys) ———
