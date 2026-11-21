@@ -148,8 +148,9 @@ func main() {
 ```
 
 That's it. One registration, one 5-liner type, and every `Set` /
-`Get` / `All` / `SearchKey` / `SearchIndex` call is fully typed,
-routed to the right layer, and auto-TTL'd.
+`Get` / `All` / `SearchKey` / `SearchIndex` / `CountByKey` /
+`CountByIndex` call is fully typed, routed to the right layer, and
+auto-TTL'd.
 
 
 ## What else can it do?

@@ -2485,10 +2485,16 @@ func (s *DocTestSuite) TestGenericDocMethods() {
 	searchRes := SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), false)
 	s.Require().NoError(searchRes.Error())
 	s.Contains(searchRes.MustGet(), UserDoc(jsonStr))
+	countByKeyRes := CountByKey[UserDoc](x.KeysPattern("*"), x.Eq("age", 30))
+	s.Require().NoError(countByKeyRes.Error())
+	s.Equal(1, countByKeyRes.MustGet())
 
 	idxRes := SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Eq("age", float64(30)), false)
 	s.Require().NoError(idxRes.Error())
 	s.Contains(idxRes.MustGet(), UserDoc(jsonStr))
+	countByIndexRes := CountByIndex[UserDoc]("age", x.KeysPattern("*"), x.Eq("age", float64(30)))
+	s.Require().NoError(countByIndexRes.Error())
+	s.Equal(1, countByIndexRes.MustGet())
 
 	updRes := Update[UserDoc](x.KeysPattern("*"), x.Eq("age", 30), x.Set("age", 31))
 	s.Require().NoError(updRes.Error())
@@ -2550,6 +2556,12 @@ func (s *DocTestSuite) TestSearchKeyRejectsPrefixedStoragePattern() {
 	s.Contains(res.Error().Error(), "document-scoped")
 }
 
+func (s *DocTestSuite) TestCountByKeyRejectsNilKeyRange() {
+	res := CountByKey[UserDoc](nil, nil)
+	s.Require().True(res.IsError())
+	s.ErrorIs(res.Error(), ErrKeyRangeRequired)
+}
+
 func (s *DocTestSuite) TestKeysRejectsPrefixedStoragePattern() {
 	res := Keys[UserDoc]("user:*")
 	s.Require().True(res.IsError())
@@ -2566,6 +2578,18 @@ func (s *DocTestSuite) TestSearchIndexRejectsFullIdxName() {
 	res := SearchIndex[UserDoc]("user_age", x.KeysPattern("*"), nil, false)
 	s.Require().True(res.IsError())
 	s.Contains(res.Error().Error(), "fully-qualified index name")
+}
+
+func (s *DocTestSuite) TestCountByIndexRejectsFullIdxName() {
+	res := CountByIndex[UserDoc]("user_age", x.KeysPattern("*"), nil)
+	s.Require().True(res.IsError())
+	s.Contains(res.Error().Error(), "fully-qualified index name")
+}
+
+func (s *DocTestSuite) TestCountByIndexRejectsNilKeyRange() {
+	res := CountByIndex[UserDoc]("age", nil, nil)
+	s.Require().True(res.IsError())
+	s.ErrorIs(res.Error(), ErrKeyRangeRequired)
 }
 
 func (s *DocTestSuite) TestSearchKeyScopedLimitCarry4LayerAlignment() {
@@ -2833,6 +2857,13 @@ func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeSeedCountIs100() {
 	s.Len(got.MustGet(), testutil.CountX())
 }
 
+func (s *DocSearchKeyRangeSuite) TestCountByKeyRangeSeedCountIs100() {
+	kr := x.KeysPattern("p*")
+	got := CountByKey[DocSearchFixture](kr, nil)
+	s.False(got.IsError(), "CountByKey err: %v", got.Error())
+	s.Equal(testutil.CountX(), got.MustGet())
+}
+
 func (s *DocSearchKeyRangeSuite) TestSearchKeyRangeNoCrossContamination() {
 	krServer := x.KeysPattern(testutil.XKeyPrefix("probeserver", true) + "*")
 	resServer := SearchKey[DocSearchFixture](krServer, nil, false)
@@ -2898,6 +2929,13 @@ func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeScoreSeedCountIs100() {
 	res := SearchIndex[DocSearchFixture]("score", krAll, nil, false)
 	s.False(res.IsError(), "SearchIndex err: %v", res.Error())
 	s.Len(res.MustGet(), testutil.CountX())
+}
+
+func (s *DocSearchKeyRangeSuite) TestCountByIndexRangeScoreSeedCountIs100() {
+	krAll := x.KeysPattern("p*")
+	res := CountByIndex[DocSearchFixture]("score", krAll, nil)
+	s.False(res.IsError(), "CountByIndex err: %v", res.Error())
+	s.Equal(testutil.CountX(), res.MustGet())
 }
 
 func (s *DocSearchKeyRangeSuite) TestSearchIndexRangeScoreOrderingMatchesSearchKeyIdOrder() {

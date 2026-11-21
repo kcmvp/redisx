@@ -358,6 +358,63 @@ func (s *RawTestSuite) TestSearchIndexCommand() {
 	}
 }
 
+func (s *RawTestSuite) TestCountByIndexCommand() {
+	s.SetupTest()
+	s.connectRaw()
+
+	data := []struct {
+		key string
+		val string
+	}{
+		{"user:1", `{"id": "1", "email": "ken@example.com", "age": 30, "status": "active"}`},
+		{"user:2", `{"id": "2", "email": "john@example.com", "age": 20, "status": "pending"}`},
+		{"user:3", `{"id": "3", "email": "admin@example.com", "age": 40, "status": "active"}`},
+	}
+
+	for _, d := range data {
+		err := raw.Set(d.key, d.val)
+		s.NoError(err)
+	}
+
+	tests := []struct {
+		name        string
+		index       string
+		kr          x.KeyRange
+		filter      x.Filter
+		expectErr   bool
+		expectCount int
+	}{
+		{"Missing index", "", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), true, 0},
+		{"Unknown index", "user:unknown", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), true, 0},
+		{"Unregistered namespace", "ghost:age", x.KeysPattern("ghost:*"), nil, true, 0},
+		{"Eq string", x.Idx[rawTestUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, 1},
+		{"Gt number", x.Idx[rawTestUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 25), false, 2},
+		{"And false", x.Idx[rawTestUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.And(x.Gt("age", 35), x.Eq("status", "pending")), false, 0},
+		{"Key pattern narrows index scan", x.Idx[rawTestUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:2"), nil, false, 1},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			res := raw.CountByIndex(tt.index, tt.kr, tt.filter)
+
+			if tt.expectErr {
+				s.True(res.IsError())
+				switch tt.name {
+				case "Missing index":
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNameRequired)
+				case "Unknown index":
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNotFound)
+				case "Unregistered namespace":
+					s.ErrorIs(res.Error(), clientpkg.ErrNamespaceNotRegistered)
+				}
+			} else {
+				s.False(res.IsError())
+				s.Equal(tt.expectCount, res.MustGet())
+			}
+		})
+	}
+}
+
 func (s *RawTestSuite) TestSearchKeyCommand() {
 	s.SetupTest()
 	s.connectRaw()
@@ -408,6 +465,55 @@ func (s *RawTestSuite) TestSearchKeyCommand() {
 				s.False(res.IsError())
 				results := res.MustGet()
 				s.Len(results, tt.expectLen)
+			}
+		})
+	}
+}
+
+func (s *RawTestSuite) TestCountByKeyCommand() {
+	s.SetupTest()
+	s.connectRaw()
+
+	data := []struct {
+		key string
+		val string
+	}{
+		{"product:1", `{"id": "1", "name": "Apple", "price": 10, "stock": 100}`},
+		{"product:2", `{"id": "2", "name": "Banana", "price": 5, "stock": 50}`},
+		{"product:3", `{"id": "3", "name": "Orange", "price": 8, "stock": 200}`},
+	}
+
+	for _, d := range data {
+		err := raw.Set(d.key, d.val)
+		s.NoError(err)
+	}
+
+	tests := []struct {
+		name        string
+		kr          x.KeyRange
+		filter      x.Filter
+		expectErr   bool
+		expectCount int
+	}{
+		{"Missing pattern", nil, x.Eq("name", "Apple"), true, 0},
+		{"Match one", x.KeysPattern("product:*"), x.Eq("name", "Apple"), false, 1},
+		{"Match none by filter", x.KeysPattern("product:*"), x.Eq("name", "Grape"), false, 0},
+		{"Gt number", x.KeysPattern("product:*"), x.Gt("price", 6), false, 2},
+		{"Empty filter", x.KeysPattern("product:*"), nil, false, 3},
+	}
+
+	for _, tt := range tests {
+		s.Run(tt.name, func() {
+			res := raw.CountByKey(tt.kr, tt.filter)
+
+			if tt.expectErr {
+				s.True(res.IsError())
+				if tt.name == "Missing pattern" {
+					s.ErrorIs(res.Error(), clientpkg.ErrKeyRangeRequired)
+				}
+			} else {
+				s.False(res.IsError())
+				s.Equal(tt.expectCount, res.MustGet())
 			}
 		})
 	}

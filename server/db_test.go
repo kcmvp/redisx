@@ -1059,6 +1059,69 @@ func (suite *SearchSuite) TestSearchIndex() {
 	}
 }
 
+func (suite *SearchSuite) TestCountByIndex() {
+	tests := []struct {
+		name      string
+		indexName string
+		kr        x.KeyRange
+		filter    x.Filter
+		wantErr   bool
+		wantCount int
+	}{
+		{
+			name:      "Count ascending-style all",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:*"),
+			filter:    nil,
+			wantCount: 5,
+		},
+		{
+			name:      "Count with filter",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:*"),
+			filter:    x.Gt("age", float64(28)),
+			wantCount: 2,
+		},
+		{
+			name:      "Count with key pattern filter",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("user:Engineering_*"),
+			filter:    nil,
+			wantCount: 3,
+		},
+		{
+			name:      "Count empty index name",
+			indexName: "",
+			kr:        x.KeysPattern("user:*"),
+			wantErr:   true,
+		},
+		{
+			name:      "Count unknown non-empty index",
+			indexName: "nonexistent_idx_zzz",
+			kr:        x.KeysPattern("user:*"),
+			wantErr:   true,
+		},
+		{
+			name:      "Count unanchored wildcard KeyRange",
+			indexName: x.Idx[testUserDoc]("age", "*", "age").Name(),
+			kr:        x.KeysPattern("*user:*"),
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.name, func() {
+			res := suite.db.CountByIndex(tt.indexName, tt.kr, tt.filter)
+			if tt.wantErr {
+				suite.True(res.IsError())
+			} else {
+				suite.True(res.IsOk())
+				suite.Equal(tt.wantCount, res.MustGet())
+			}
+		})
+	}
+}
+
 func (suite *SearchSuite) TestSearchKey() {
 	tests := []struct {
 		name      string
@@ -1121,6 +1184,52 @@ func (suite *SearchSuite) TestSearchKey() {
 			} else {
 				suite.Len(got, tt.wantLen)
 			}
+		})
+	}
+}
+
+func (suite *SearchSuite) TestCountByKey() {
+	tests := []struct {
+		name      string
+		kr        x.KeyRange
+		filter    x.Filter
+		wantErr   bool
+		wantCount int
+	}{
+		{
+			name:      "Count Engineering department",
+			kr:        x.KeysPattern("user:Engineering_*"),
+			filter:    nil,
+			wantCount: 3,
+		},
+		{
+			name:      "Count with filter",
+			kr:        x.KeysPattern("user:*"),
+			filter:    x.Eq("is_active", true),
+			wantCount: 3,
+		},
+		{
+			name:      "Count no match",
+			kr:        x.KeysPattern("user:Marketing_*"),
+			wantCount: 0,
+		},
+		{
+			name:    "Count rejects cross-layer wildcard",
+			kr:      x.KeysPattern("*user:*"),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		suite.Run(tt.name, func() {
+			res := suite.db.CountByKey(tt.kr, tt.filter)
+			if tt.wantErr {
+				suite.True(res.IsError())
+				suite.Contains(res.Error().Error(), "cannot start with wildcard")
+				return
+			}
+			suite.True(res.IsOk())
+			suite.Equal(tt.wantCount, res.MustGet())
 		})
 	}
 }
@@ -1295,6 +1404,13 @@ func (s *SearchKeyRangeSuite) TestSeedCountIs100() {
 	s.Len(got.MustGet(), testutil.CountX())
 }
 
+func (s *SearchKeyRangeSuite) TestCountByKeySeedCountIs100() {
+	kr := x.KeysPattern(krID("*"))
+	got := s.db.CountByKey(kr, nil)
+	s.True(got.IsOk(), "CountByKey err: %v", got.Error())
+	s.Equal(testutil.CountX(), got.MustGet())
+}
+
 func (s *SearchKeyRangeSuite) TestNoCrossContamination() {
 	krDisk := x.KeysPattern("user:*")
 	resDisk := s.db.SearchKey(krDisk, nil, false)
@@ -1347,6 +1463,13 @@ func (s *SearchKeyRangeSuite) TestSIScoreSeedCountIs100() {
 	got := s.db.SearchIndex(s.idxScoreName, kr, nil, false)
 	s.True(got.IsOk(), "SearchIndex score ASC err: %v", got.Error())
 	s.Len(got.MustGet(), testutil.CountX())
+}
+
+func (s *SearchKeyRangeSuite) TestCountByIndexScoreSeedCountIs100() {
+	kr := x.KeysPattern(krID("*"))
+	got := s.db.CountByIndex(s.idxScoreName, kr, nil)
+	s.True(got.IsOk(), "CountByIndex score err: %v", got.Error())
+	s.Equal(testutil.CountX(), got.MustGet())
 }
 
 func (s *SearchKeyRangeSuite) TestSIScoreOrderingMatchesSKIdOrder() {
