@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	clientpkg "github.com/kcmvp/redisx/client"
 	"github.com/kcmvp/redisx/client/internal/conn"
 	"github.com/kcmvp/redisx/client/internal/hook"
 	"github.com/kcmvp/redisx/client/raw"
@@ -170,6 +171,12 @@ func (s *RawTestSuite) TestGetSetCommand() {
 				if tc.wantErrMsg != "" && err != nil {
 					s.Contains(err.Error(), tc.wantErrMsg)
 				}
+				switch tc.name {
+				case "Get not connected":
+					s.ErrorIs(err, clientpkg.ErrNotConnected)
+				case "SetWithTTL Success and Expire":
+					s.ErrorIs(err, clientpkg.ErrNotFound)
+				}
 			} else {
 				s.NoError(err)
 				s.Equal(tc.expectVal, val)
@@ -183,7 +190,7 @@ func (s *RawTestSuite) TestCrudCommands() {
 		s.SetupTest()
 		ok, err := raw.SetNXWithTTL("raw:k", "v", time.Second)
 		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
 		s.False(ok)
 	})
 
@@ -225,30 +232,30 @@ func (s *RawTestSuite) TestCrudCommands() {
 
 		_, err = raw.Get("raw:setnx-ttl")
 		s.Error(err)
-		s.Contains(err.Error(), "redis: nil")
+		s.ErrorIs(err, clientpkg.ErrNotFound)
 	})
 
 	s.Run("SetNX not connected", func() {
 		s.SetupTest()
 		ok, err := raw.SetNX("raw:k", "v")
 		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
 		s.False(ok)
 	})
 
 	s.Run("Delete not connected", func() {
 		s.SetupTest()
-		deleted, err := raw.Delete("raw:k")
+		ok, err := raw.Delete("raw:k")
 		s.Error(err)
-		s.Contains(err.Error(), "resp client is not connected")
-		s.False(deleted)
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
+		s.False(ok)
 	})
 
 	s.Run("Keys not connected", func() {
 		s.SetupTest()
-		keysRes := raw.Keys("raw:k*")
+		keysRes := raw.Keys("raw:*")
 		s.True(keysRes.IsError())
-		s.Contains(keysRes.Error().Error(), "resp client is not connected")
+		s.ErrorIs(keysRes.Error(), clientpkg.ErrNotConnected)
 	})
 
 	s.Run("SetNX Delete Keys Success", func() {
@@ -314,7 +321,8 @@ func (s *RawTestSuite) TestSearchIndexCommand() {
 		expectLen int
 	}{
 		{"Missing index", "", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
-		{"Unknown index", "unknown", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Unknown index", "user:unknown", x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, true, 0},
+		{"Unregistered namespace", "ghost:age", x.KeysPattern("ghost:*"), nil, false, true, 0},
 		{"Eq string", x.Idx[rawTestUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "ken@example.com"), false, false, 1},
 		{"Eq false", x.Idx[rawTestUserDoc]("email", "*", "email").Name(), x.KeysPattern("user:*"), x.Eq("email", "nobody@example.com"), false, false, 0},
 		{"Gt number", x.Idx[rawTestUserDoc]("age", "*", "age").Name(), x.KeysPattern("user:*"), x.Gt("age", 25), false, false, 2},
@@ -333,6 +341,14 @@ func (s *RawTestSuite) TestSearchIndexCommand() {
 
 			if tt.expectErr {
 				s.True(res.IsError())
+				switch tt.name {
+				case "Missing index":
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNameRequired)
+				case "Unknown index":
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNotFound)
+				case "Unregistered namespace":
+					s.ErrorIs(res.Error(), clientpkg.ErrNamespaceNotRegistered)
+				}
 			} else {
 				s.False(res.IsError())
 				results := res.MustGet()
@@ -385,6 +401,9 @@ func (s *RawTestSuite) TestSearchKeyCommand() {
 
 			if tt.expectErr {
 				s.True(res.IsError())
+				if tt.name == "Missing pattern" {
+					s.ErrorIs(res.Error(), clientpkg.ErrKeyRangeRequired)
+				}
 			} else {
 				s.False(res.IsError())
 				results := res.MustGet()
@@ -487,14 +506,15 @@ func (s *RawTestSuite) TestRegisterSchema() {
 		connect    bool
 		payload    proto.SchemaPayload
 		expectErr  bool
+		wantErrIs  error
 		wantErrMsg string
 	}{
 		{
-			name:       "not connected returns error",
-			connect:    false,
-			payload:    proto.SchemaPayload{Namespace: "rawunreg", Mem: false, KeyAttrs: []string{"id"}},
-			expectErr:  true,
-			wantErrMsg: "resp client is not connected",
+			name:      "not connected returns error",
+			connect:   false,
+			payload:   proto.SchemaPayload{Namespace: "rawunreg", Mem: false, KeyAttrs: []string{"id"}},
+			expectErr: true,
+			wantErrIs: clientpkg.ErrNotConnected,
 		},
 		{
 			name:    "declare schema with inline index succeeds",
@@ -523,7 +543,12 @@ func (s *RawTestSuite) TestRegisterSchema() {
 			err := raw.RegisterSchema(tt.payload)
 			if tt.expectErr {
 				s.Error(err)
-				s.Contains(err.Error(), tt.wantErrMsg)
+				if tt.wantErrIs != nil {
+					s.ErrorIs(err, tt.wantErrIs)
+				}
+				if tt.wantErrMsg != "" {
+					s.Contains(err.Error(), tt.wantErrMsg)
+				}
 				return
 			}
 			s.NoError(err)

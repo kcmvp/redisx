@@ -329,17 +329,19 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 		topic       string
 		setup       func()
 		expectErr   bool
+		wantErrIs   error
 		wantErrMsg  string
 		checkStored bool
 		checkAbsent bool
 	}{
-		{"Empty topic", "", nil, true, "topic is empty", false, false},
+		{"Empty topic", "", nil, true, ErrTopicEmpty, "", false, false},
 		{
 			"Not connected",
 			"orders_offline",
 			func() { clearLifecycleCtx() },
 			true,
-			"not connected",
+			ErrNotConnected,
+			"",
 			false,
 			true,
 		},
@@ -353,7 +355,8 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 				handlersMu.Unlock()
 			},
 			true,
-			"duplicated handler for topic",
+			ErrDuplicatedHandler,
+			"",
 			false,
 			false,
 		},
@@ -362,6 +365,7 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 			"orders_success",
 			func() { s.ensureConnectedClientAndAuth() },
 			false,
+			nil,
 			"",
 			true,
 			false,
@@ -374,7 +378,8 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 			"orders_stopped",
 			stoppedLifecycle,
 			true,
-			"client stopped before the subscription was acknowledged",
+			ErrSubscriptionStopped,
+			"",
 			false,
 			true,
 		},
@@ -390,6 +395,9 @@ func (s *ClientTestSuite) TestSubscribeCommand() {
 			res := Subscribe(tc.topic)
 			if tc.expectErr {
 				s.Require().True(res.IsError())
+				if tc.wantErrIs != nil {
+					s.ErrorIs(res.Error(), tc.wantErrIs)
+				}
 				if tc.wantErrMsg != "" {
 					s.Require().NotNil(res.Error())
 					s.Contains(res.Error().Error(), tc.wantErrMsg)
@@ -438,6 +446,7 @@ func (s *ClientTestSuite) TestSubscribeAckTimeout() {
 	res := Subscribe("orders_ack_timeout")
 	s.Require().True(res.IsError())
 	s.Require().NotNil(res.Error())
+	s.ErrorIs(res.Error(), ErrSubscribeAckTimeout)
 	s.Contains(res.Error().Error(), "was not acknowledged within")
 
 	handlersMu.RLock()
@@ -454,19 +463,20 @@ func (s *ClientTestSuite) TestAuthCommand() {
 		authKey    string
 		setup      func()
 		expectErr  bool
+		wantErrIs  error
 		wantErrMsg string
 	}{
 		{
 			"Empty auth key",
 			"",
 			nil,
-			true, "auth key is empty",
+			true, ErrAuthKeyEmpty, "",
 		},
 		{
 			"Not connected",
 			"token",
 			nil,
-			true, "resp client is not connected",
+			true, ErrNotConnected, "",
 		},
 		{
 			"Success",
@@ -475,7 +485,7 @@ func (s *ClientTestSuite) TestAuthCommand() {
 				mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr, Password: clientTestExternalAuthKey})
 				setSharedClient(mockClient)
 			},
-			false, "",
+			false, nil, "",
 		},
 		{
 			"Invalid password",
@@ -484,7 +494,7 @@ func (s *ClientTestSuite) TestAuthCommand() {
 				mockClient := redis.NewClient(&redis.Options{Addr: clientTestServerAddr})
 				setSharedClient(mockClient)
 			},
-			true, "ERR authentication failed",
+			true, ErrAuthFailed, "ERR authentication failed",
 		},
 	}
 
@@ -498,6 +508,9 @@ func (s *ClientTestSuite) TestAuthCommand() {
 			err := Auth(tc.authKey)
 			if tc.expectErr {
 				s.Error(err)
+				if tc.wantErrIs != nil {
+					s.ErrorIs(err, tc.wantErrIs)
+				}
 				if tc.wantErrMsg != "" && err != nil {
 					s.Contains(err.Error(), tc.wantErrMsg)
 				}
@@ -514,6 +527,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 		addr        string
 		authKey     string
 		expectErr   bool
+		wantErrIs   error
 		wantErrMsg  string
 		checkExceed bool
 		useConnect  bool
@@ -522,7 +536,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 			"Empty auth key",
 			clientTestServerAddr,
 			"",
-			true, "auth key is empty",
+			true, ErrAuthKeyEmpty, "",
 			false,
 			false,
 		},
@@ -530,7 +544,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 			"Invalid address",
 			"bad-addr:12345",
 			"token",
-			true, "dial",
+			true, nil, "dial",
 			false,
 			true,
 		},
@@ -538,7 +552,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 			"Success",
 			clientTestServerAddr,
 			clientTestExternalAuthKey,
-			false, "",
+			false, nil, "",
 			false,
 			false,
 		},
@@ -546,7 +560,7 @@ func (s *ClientTestSuite) TestConnectCommand() {
 			"Exceed max connections",
 			clientTestServerAddr,
 			clientTestExternalAuthKey,
-			true, "connection reset by peer",
+			true, nil, "connection reset by peer",
 			true,
 			false,
 		},
@@ -565,6 +579,9 @@ func (s *ClientTestSuite) TestConnectCommand() {
 
 				if tc.expectErr {
 					s.Error(err)
+					if tc.wantErrIs != nil {
+						s.ErrorIs(err, tc.wantErrIs)
+					}
 					if tc.wantErrMsg != "" && err != nil && tc.name != "Invalid address" {
 						s.Contains(err.Error(), tc.wantErrMsg)
 					}
@@ -2069,23 +2086,27 @@ func TestConnectAuthMismatchReturnsRawServerErr(t *testing.T) {
 	t.Run("app port with ctrl auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
 		_, dialErr := connect(cfg.App.Addr(), ctrlAuth)
 		require.Error(t, dialErr)
+		require.ErrorIs(t, dialErr, ErrAuthFailed)
 		require.Contains(t, dialErr.Error(), "WRONGPASS")
 		require.Contains(t, dialErr.Error(), "app port")
 	})
 	t.Run("ctrl port with app auth key → connect() returns raw WRONGPASS from server", func(t *testing.T) {
 		_, dialErr := connect(cfg.Ctrl.Addr(), appAuth)
 		require.Error(t, dialErr)
+		require.ErrorIs(t, dialErr, ErrAuthFailed)
 		require.Contains(t, dialErr.Error(), "WRONGPASS")
 		require.Contains(t, dialErr.Error(), "ctrl port")
 	})
 	t.Run("ctrl port with no auth → Connect() refuses empty auth key pre-wire", func(t *testing.T) {
 		err := Connect(cfg.Ctrl.Addr(), "")
 		require.Error(t, err)
+		require.ErrorIs(t, err, ErrAuthKeyEmpty)
 		require.Contains(t, err.Error(), "auth key is empty")
 	})
 	t.Run("ctrl port with invalid non-empty auth key → connect() returns raw ERR authentication failed", func(t *testing.T) {
 		_, dialErr := connect(cfg.Ctrl.Addr(), "wrong-wrong-wrong")
 		require.Error(t, dialErr)
+		require.ErrorIs(t, dialErr, ErrAuthFailed)
 		require.Contains(t, dialErr.Error(), "ERR authentication failed")
 	})
 }
@@ -3316,7 +3337,7 @@ func (s *DocUpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
 func (s *DocUpdateKeyRangeSuite) TestNilKRRejects() {
 	res := Update[DocUpdateFixture](nil, nil, x.Set("nil_tag", true))
 	s.Require().True(res.IsError(), "nil kr must reject")
-	s.Contains(res.Error().Error(), "key range is required")
+	s.ErrorIs(res.Error(), ErrKeyRangeRequired)
 }
 
 func (s *DocUpdateKeyRangeSuite) TestTypedScopedLimitCarry4LayerAlignment() {
@@ -3556,15 +3577,13 @@ func (s *SearchKeyRangeSuite) TestSearchIndexRange_InvalidInputs_EmptyIndexAndNi
 	s.Run("empty index name → early error", func() {
 		res := raw.SearchIndex("", x.KeysPattern(krClientID("*")), nil, false)
 		s.Require().True(res.IsError(), "expected Err for empty indexName; got Ok len=%d", len(res.OrEmpty()))
-		s.Contains(res.Error().Error(), "index name is required",
-			"err=%v", res.Error())
+		s.ErrorIs(res.Error(), ErrIndexNameRequired, "err=%v", res.Error())
 	})
 	s.Run("nil keyrange → early error", func() {
 		idxScore := testutil.KeyRangeIndexName(searchKRClientNamespace, testutil.KeyRangeFixtureMem(), "score")
 		res := raw.SearchIndex(idxScore, nil, nil, false)
 		s.Require().True(res.IsError(), "expected Err for nil kr; got Ok len=%d", len(res.OrEmpty()))
-		s.Contains(res.Error().Error(), "key range is required",
-			"err=%v", res.Error())
+		s.ErrorIs(res.Error(), ErrKeyRangeRequired, "err=%v", res.Error())
 	})
 }
 
@@ -3907,13 +3926,13 @@ func (s *UpdateKeyRangeSuite) TestFilterUpdatesOnlyMatched() {
 func (s *UpdateKeyRangeSuite) TestNilKRRejects() {
 	res := raw.Update(nil, nil, x.Set("nil_tag", true))
 	s.Require().True(res.IsError(), "nil kr must reject")
-	s.Contains(res.Error().Error(), "key range is required")
+	s.ErrorIs(res.Error(), ErrKeyRangeRequired)
 }
 
 func (s *UpdateKeyRangeSuite) TestEmptyValuesRejects() {
 	res := raw.Update(x.KeysPattern(updClientID("*")), nil)
 	s.Require().True(res.IsError(), "no mutation values must reject")
-	s.Contains(res.Error().Error(), "no update values provided")
+	s.ErrorIs(res.Error(), ErrNoUpdateValues)
 }
 
 func TestUpdateKeyRangeSuite(t *testing.T) {
