@@ -2,7 +2,6 @@ package raw_test
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -174,9 +173,9 @@ func (s *RawTestSuite) TestGetSetCommand() {
 				}
 				switch tc.name {
 				case "Get not connected":
-					s.True(errors.Is(err, clientpkg.ErrNotConnected))
+					s.ErrorIs(err, clientpkg.ErrNotConnected)
 				case "SetWithTTL Success and Expire":
-					s.True(errors.Is(err, clientpkg.ErrNotFound))
+					s.ErrorIs(err, clientpkg.ErrNotFound)
 				}
 			} else {
 				s.NoError(err)
@@ -191,7 +190,7 @@ func (s *RawTestSuite) TestCrudCommands() {
 		s.SetupTest()
 		ok, err := raw.SetNXWithTTL("raw:k", "v", time.Second)
 		s.Error(err)
-		s.True(errors.Is(err, clientpkg.ErrNotConnected))
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
 		s.False(ok)
 	})
 
@@ -233,14 +232,14 @@ func (s *RawTestSuite) TestCrudCommands() {
 
 		_, err = raw.Get("raw:setnx-ttl")
 		s.Error(err)
-		s.True(errors.Is(err, clientpkg.ErrNotFound))
+		s.ErrorIs(err, clientpkg.ErrNotFound)
 	})
 
 	s.Run("SetNX not connected", func() {
 		s.SetupTest()
 		ok, err := raw.SetNX("raw:k", "v")
 		s.Error(err)
-		s.True(errors.Is(err, clientpkg.ErrNotConnected))
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
 		s.False(ok)
 	})
 
@@ -248,7 +247,7 @@ func (s *RawTestSuite) TestCrudCommands() {
 		s.SetupTest()
 		ok, err := raw.Delete("raw:k")
 		s.Error(err)
-		s.True(errors.Is(err, clientpkg.ErrNotConnected))
+		s.ErrorIs(err, clientpkg.ErrNotConnected)
 		s.False(ok)
 	})
 
@@ -256,7 +255,7 @@ func (s *RawTestSuite) TestCrudCommands() {
 		s.SetupTest()
 		keysRes := raw.Keys("raw:*")
 		s.True(keysRes.IsError())
-		s.True(errors.Is(keysRes.Error(), clientpkg.ErrNotConnected))
+		s.ErrorIs(keysRes.Error(), clientpkg.ErrNotConnected)
 	})
 
 	s.Run("SetNX Delete Keys Success", func() {
@@ -344,11 +343,11 @@ func (s *RawTestSuite) TestSearchIndexCommand() {
 				s.True(res.IsError())
 				switch tt.name {
 				case "Missing index":
-					s.True(errors.Is(res.Error(), clientpkg.ErrIndexNameRequired))
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNameRequired)
 				case "Unknown index":
-					s.True(errors.Is(res.Error(), clientpkg.ErrIndexNotFound))
+					s.ErrorIs(res.Error(), clientpkg.ErrIndexNotFound)
 				case "Unregistered namespace":
-					s.True(errors.Is(res.Error(), clientpkg.ErrNamespaceNotRegistered))
+					s.ErrorIs(res.Error(), clientpkg.ErrNamespaceNotRegistered)
 				}
 			} else {
 				s.False(res.IsError())
@@ -403,7 +402,7 @@ func (s *RawTestSuite) TestSearchKeyCommand() {
 			if tt.expectErr {
 				s.True(res.IsError())
 				if tt.name == "Missing pattern" {
-					s.True(errors.Is(res.Error(), clientpkg.ErrKeyRangeRequired))
+					s.ErrorIs(res.Error(), clientpkg.ErrKeyRangeRequired)
 				}
 			} else {
 				s.False(res.IsError())
