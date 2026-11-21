@@ -346,6 +346,12 @@ if res.IsError() {
 }
 raws := res.MustGet()
 _ = raws
+
+count := raw.CountByIndex("user:age", kr, x.Gte("age", 18))
+if count.IsError() {
+    panic(count.Error())
+}
+_ = count.MustGet()
 ```
 
 ### `SEARCHKEY`
@@ -406,6 +412,15 @@ if res.IsError() {
 }
 rawJSONs := res.MustGet()
 _ = rawJSONs
+
+count := raw.CountByKey(
+    x.KeysPattern("user:*"),
+    x.Eq("status", "active"),
+)
+if count.IsError() {
+    panic(count.Error())
+}
+_ = count.MustGet()
 ```
 
 ### `UPDATE`
@@ -495,16 +510,20 @@ got, _ := client.Get[UserDoc]("200")
 
 // SearchIndex — idxName is logical ("age"), not runtime ("user:age")
 idx := client.SearchIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18), false)
+idxCount := client.CountByIndex[UserDoc]("age", x.KeysPattern("*"), x.Gte("age", 18))
 
 // SearchKey
 keys := client.SearchKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"), false)
+keyCount := client.CountByKey[UserDoc](x.KeysPattern("*"), x.Eq("status", "active"))
 
 // Update
 updated := client.Update[UserDoc](x.KeysPattern("*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
 _ = idx
+_ = idxCount
 _ = keys
+_ = keyCount
 _ = updated
 ```
 
@@ -518,12 +537,16 @@ got := db.Get("user:200").MustGet()
 
 // JSON commands work directly on *server.DB
 idx := db.SearchIndex("user:age", x.KeysPattern("user:*"), x.Gte("age", 18), false)
+idxCount := db.CountByIndex("user:age", x.KeysPattern("user:*"), x.Gte("age", 18))
 keys := db.SearchKey(x.KeysPattern("user:*"), x.Eq("status", "active"), false)
+keyCount := db.CountByKey(x.KeysPattern("user:*"), x.Eq("status", "active"))
 updated := db.Update(x.KeysPattern("user:*"), x.Eq("id", "200"), x.Set("name", "Updated"))
 
 _ = got
 _ = idx.MustGet()
+_ = idxCount.MustGet()
 _ = keys.MustGet()
+_ = keyCount.MustGet()
 _ = updated.MustGet()
 ```
 

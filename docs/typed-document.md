@@ -11,9 +11,9 @@
 helpers on both the client and the embedded server side.
 
 - **Remote mode (RESP)**: generic functions in the `client` package —
-  `client.Set[D]`, `client.Get[D]`, `client.SearchKey[D]`, …
+  `client.Set[D]`, `client.Get[D]`, `client.SearchKey[D]`, `client.CountByKey[D]`, …
 - **Embedded mode (in-process)**: methods on `*server.DB` —
-  `db.Set`, `db.Get`, `db.SearchKey`, …
+  `db.Set`, `db.Get`, `db.SearchKey`, `db.CountByKey`, …
 
 This layer exists so callers can work with document-scoped inputs
 instead of manually composing storage keys, key patterns, and index
@@ -52,11 +52,13 @@ storage-scoped names from `D` for you.
 
 ### Pattern-based APIs
 
-For methods that accept a `KeyRange` (`SearchKey`, `Update`), the range
+For methods that accept a `KeyRange` (`SearchKey`, `CountByKey`, `Update`), the range
 is one document-scoped sub-range:
 
 - `client.Keys[D]("*")` means `user:*`
 - `client.SearchKey[D](x.KeysPattern("*"), filter, false)` searches over
+  `user:*`
+- `client.CountByKey[D](x.KeysPattern("*"), filter)` counts matches in
   `user:*`
 - `client.Update[D](x.KeysPattern("*"), filter, ...)` updates `user:*`
 
@@ -95,6 +97,9 @@ inputs:
   `x.KeysPattern("*")`, not one full storage pattern such as
   `x.KeysPattern("user:*")`
 
+`client.CountByIndex[D]` uses the same scoping and logical index-name
+rules as `client.SearchIndex[D]`, but returns only the match count.
+
 ### TTL behavior
 
 - `client.Set[D](d)` and `client.SetNX[D](d)` write with `d.TTL()`
@@ -111,6 +116,11 @@ db := server.Start(UserDoc(""))
 _ = db.Set("user:200", `{"id":"200","name":"Test","age":30}`)
 got := db.Get("user:200").MustGet()
 idx := db.SearchIndex("user:age", x.KeysPattern("user:*"), x.Gte("age", 18), false)
+idxCount := db.CountByIndex("user:age", x.KeysPattern("user:*"), x.Gte("age", 18))
+keyCount := db.CountByKey(x.KeysPattern("user:*"), x.Eq("age", 30))
+_ = idx
+_ = idxCount
+_ = keyCount
 ```
 
 The embedded `*server.DB` methods use full storage keys and full index
