@@ -200,7 +200,8 @@ func deleteDocSpecMeta(tx *buntdb.Tx, storageNs string) error {
 // & stamped here internally.
 //
 // Invariants enforced:
-//   - MD5 unchanged → noop.
+//   - MD5 unchanged → no disk write, but docRegSpec memory map IS repopulated
+//     (from the on-disk oldSpec) so the in-memory registry survives a restart.
 //   - MD5 changed → atomic BuntDB Update(): deleteDocSpecMeta then Set the
 //     new v_<md5> meta key (so the "exactly one live version" invariant is
 //     kept within a single tx).
@@ -224,7 +225,15 @@ func (db *DB) writeDocSpec(spec docSpec) error {
 		return err
 	}
 	if hadOld && oldSpec.Version == versionHex {
-		slog.Debug("writeDocSpec: unchanged fingerprint, skipping",
+		// Skip the disk write (the audit record already matches) but STILL
+		// repopulate the in-memory registry: it is rebuilt from code
+		// declarations on every boot, and for an unchanged spec this early
+		// return is the only path taken after a restart. Reuse oldSpec so the
+		// on-disk Version/CreatedAt/UpdatedAt values are preserved verbatim.
+		db.docRegMu.Lock()
+		db.docRegSpec[storageNs] = oldSpec
+		db.docRegMu.Unlock()
+		slog.Debug("writeDocSpec: unchanged fingerprint, skipping disk write",
 			"ns", spec.Namespace, "storage_ns", storageNs, "version", versionHex)
 		return nil
 	}
