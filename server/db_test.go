@@ -209,6 +209,18 @@ func (suite *DBSuite) TestWriteDocSpecSemantics() {
 		suite.NotEqual(v1hex, upgraded.Version, "version must change after MD5 differs")
 		suite.Equal(v1created, upgraded.CreatedAt, "CreatedAt must be preserved across upgrades")
 		suite.False(upgraded.UpdatedAt.IsZero(), "UpdatedAt must be set on first upgrade")
+
+		// After an upgrade the persisted audit record and the in-memory registry
+		// must agree: the on-disk meta version equals docRegSpec[ns].Version.
+		var rawMeta string
+		suite.NoError(db.raw().View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(naming.DocMetaGlobFor(older.storageNs()), func(k, v string) bool {
+				rawMeta = v
+				return false
+			})
+		}))
+		suite.Equal(upgraded.Version, gjson.Get(rawMeta, "version").String(),
+			"on-disk meta version must match the in-memory registry after upgrade")
 	})
 
 	suite.Run("re-applying identical schema is no-op (MD5 matches)", func() {
@@ -252,6 +264,39 @@ func (suite *DBSuite) TestWriteDocSpecSemantics() {
 		suite.Equal([]string{"b"}, overwritten.KeyAttrs, "KeyAttrs must reflect latest spec on upgrade")
 		suite.Equal(v1created, overwritten.CreatedAt, "CreatedAt preserved across KeyAttrs upgrade")
 		suite.False(overwritten.UpdatedAt.IsZero(), "UpdatedAt set on KeyAttrs upgrade")
+	})
+
+	suite.Run("unchanged fingerprint after restart repopulates in-memory registry", func() {
+		path := testutil.DBPath(suite.T())
+		db := openDB(path)
+		suite.NotNil(db)
+
+		spec := docSpec{
+			Namespace: "restartns", Mem: false, KeyAttrs: []string{"id"},
+			TTL: time.Hour,
+		}
+		suite.NoError(db.writeDocSpec(spec))
+		first := db.docRegSpec[spec.storageNs()]
+		suite.NotEmpty(first.Version)
+		suite.False(first.CreatedAt.IsZero())
+		suite.NoError(db.Close())
+
+		// Reopen on the same data file: the persisted meta survives as an audit
+		// record but is never replayed, so the registry starts empty until the
+		// code-declared schemas are re-registered on boot.
+		db = openDB(path)
+		suite.NotNil(db)
+		defer func() { _ = db.Close() }()
+		suite.Empty(db.docRegSpec, "registry must start empty before schemas are re-declared")
+
+		// Re-declaring the identical schema is the boot registerSchemas path: the
+		// disk write is a no-op, but the in-memory registry MUST be rebuilt.
+		suite.NoError(db.writeDocSpec(spec))
+		reloaded, ok := db.docRegSpec[spec.storageNs()]
+		suite.True(ok, "unchanged spec must repopulate the in-memory registry on restart")
+		suite.Equal(first.Version, reloaded.Version, "version preserved from the on-disk audit record")
+		suite.Equal(first.CreatedAt, reloaded.CreatedAt, "CreatedAt preserved from disk")
+		suite.Equal(first.UpdatedAt, reloaded.UpdatedAt, "UpdatedAt preserved from disk (no upgrade)")
 	})
 
 	suite.Run("corrupt persisted meta fails writeDocSpec closed", func() {
